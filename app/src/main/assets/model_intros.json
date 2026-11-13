@@ -1,0 +1,7 @@
+{
+ "version": 1,
+ "generated_at": "",
+ "count": 0,
+ "note": "空表。本仓库不内置任何模型介绍数据。请运行 tools/collect_model_intros.py 从你自己的 ComfyUI 服务器采集模型清单与介绍，生成后放回本路径。",
+ "models": {}
+}

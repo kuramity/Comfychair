@@ -1,0 +1,147 @@
+{
+ "name": "文生图·Krea2 初生图",
+ "description": "Krea2 单次采样出图：速度与质量的平衡档，用作后续二次采样或重绘的底图。",
+ "workflow_type": "TTI",
+ "defaults": {
+  "positive_prompt": "",
+  "width": 768,
+  "height": 1280,
+  "clip_name": "",
+  "vae_name": "",
+  "seed": 1100330313288064,
+  "steps": 10,
+  "cfg": 1,
+  "sampler_name": "euler",
+  "scheduler": "simple",
+  "unet_name": "",
+  "lora_name": ""
+ },
+ "nodes": {
+  "180": {
+   "class_type": "ConditioningKrea2Rebalance",
+   "inputs": {
+    "multiplier": 4,
+    "per_layer_weights": "1.0,1.0,1.0,1.0,1.0,1.0,1.0,2.5,5.0,1.1,4.0,1.0"
+   }
+  },
+  "137": {
+   "class_type": "VAEDecode",
+   "inputs": {
+    "samples": [
+     "158",
+     0
+    ],
+    "vae": [
+     "167",
+     0
+    ]
+   }
+  },
+  "156": {
+   "class_type": "EmptyLatentImage",
+   "inputs": {
+    "width": "{{width}}",
+    "height": "{{height}}",
+    "batch_size": 1
+   }
+  },
+  "140": {
+   "class_type": "ConditioningZeroOut",
+   "inputs": {
+    "conditioning": [
+     "164",
+     0
+    ]
+   }
+  },
+  "166": {
+   "class_type": "CLIPLoader",
+   "inputs": {
+    "clip_name": "{{clip_name}}",
+    "type": "krea2",
+    "device": "default"
+   }
+  },
+  "167": {
+   "class_type": "VAELoader",
+   "inputs": {
+    "vae_name": "{{vae_name}}"
+   }
+  },
+  "173": {
+   "class_type": "CLIPTextEncode",
+   "inputs": {
+    "clip": [
+     "166",
+     0
+    ],
+    "text": "马赛克, mosaic, censored, 模糊，低分辨率，低质量图像，扭曲的肢体，诡异的外观，丑陋，噪点，网格感，JPEG压缩条纹，异常的肢体，水印，乱码，意义不明的字符"
+   }
+  },
+  "158": {
+   "class_type": "KSampler",
+   "inputs": {
+    "model": [
+     "161",
+     0
+    ],
+    "positive": [
+     "164",
+     0
+    ],
+    "negative": [
+     "140",
+     0
+    ],
+    "latent_image": [
+     "156",
+     0
+    ],
+    "seed": "{{seed}}",
+    "steps": "{{steps}}",
+    "cfg": "{{cfg}}",
+    "sampler_name": "{{sampler_name}}",
+    "scheduler": "{{scheduler}}",
+    "denoise": 1
+   }
+  },
+  "305": {
+   "class_type": "SaveImage",
+   "inputs": {
+    "images": [
+     "137",
+     0
+    ],
+    "filename_prefix": "Krea2/image"
+   }
+  },
+  "161": {
+   "class_type": "LoraLoaderModelOnly",
+   "inputs": {
+    "model": [
+     "168",
+     0
+    ],
+    "lora_name": "{{lora_name}}",
+    "strength_model": 1
+   }
+  },
+  "164": {
+   "class_type": "CLIPTextEncode",
+   "inputs": {
+    "clip": [
+     "166",
+     0
+    ],
+    "text": "{{positive_prompt}}"
+   }
+  },
+  "168": {
+   "class_type": "UNETLoader",
+   "inputs": {
+    "unet_name": "{{unet_name}}",
+    "weight_dtype": "default"
+   }
+  }
+ }
+}

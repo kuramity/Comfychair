@@ -1,0 +1,61 @@
+# Gradle files
+.gradle/
+build/
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Log/OS Files
+*.log
+
+# Android Studio generated files and folders
+captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+*.aab
+*.apk
+output-metadata.json
+
+# IntelliJ
+*.iml
+.idea/
+misc.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
+
+# Keystore files
+*.jks
+*.keystore
+
+# Google Services (e.g. APIs or Firebase)
+google-services.json
+
+# Android Profiling
+*.hprof
+
+# macOS files
+.DS_Store
+
+# Other
+.externalNativeBuild/
+
+# 标签库数据：db 与版本号是打包脚本生成的大文件（约 58MB），不入库；
+# 同义词表与繁简映射表体积小、且是构建必需输入，保留在版本控制里
+app/src/main/assets/databases/danbooru_tags.db.gz
+app/src/main/assets/databases/danbooru_tags.version
+
+# 工具临时目录
+.mimosa/
+.zcode/
+.zcodeignore
+
+# AI 助手的会话账本与开发过程记录（含本机路径，绝不入库）
+.superpowers/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# VSCodium
+.vscode/

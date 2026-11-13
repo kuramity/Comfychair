@@ -1,0 +1,249 @@
+{
+ "name": "文生视频·MiniMaxH3",
+ "description": "文生视频：纯文字描述生成视频（含画面与音效）。",
+ "workflow_type": "TTV",
+ "defaults": {
+  "vae_name": "",
+  "clip_name": "",
+  "unet_name": "",
+  "lora_name": "",
+  "positive_prompt": "",
+  "seed": 233,
+  "aspect_ratio": "9:16 (Portrait Widescreen)",
+  "megapixels": 0.5,
+  "speed_mode": "8-step LoRA",
+  "steps": 8,
+  "lora_strength": 1
+ },
+ "nodes": {
+  "197": {
+   "class_type": "KSamplerSelect",
+   "inputs": {
+    "sampler_name": "res_multistep"
+   }
+  },
+  "199": {
+   "class_type": "PrimitiveFloat",
+   "inputs": {
+    "value": 5
+   }
+  },
+  "203": {
+   "class_type": "VAELoader",
+   "inputs": {
+    "vae_name": "{{vae_name}}"
+   }
+  },
+  "206": {
+   "class_type": "RandomNoise",
+   "inputs": {
+    "noise_seed": "{{seed}}"
+   }
+  },
+  "215": {
+   "class_type": "VAELoader",
+   "inputs": {
+    "vae_name": "minimax_h3\\minimax_h3_video_vae_fp16.safetensors"
+   }
+  },
+  "195": {
+   "class_type": "SamplerCustomAdvanced",
+   "inputs": {
+    "noise": [
+     "206",
+     0
+    ],
+    "guider": [
+     "207",
+     0
+    ],
+    "sampler": [
+     "197",
+     0
+    ],
+    "sigmas": [
+     "196",
+     0
+    ],
+    "latent_image": [
+     "194",
+     1
+    ]
+   }
+  },
+  "198": {
+   "class_type": "ComfyMathExpression",
+   "inputs": {
+    "values.a": [
+     "199",
+     0
+    ],
+    "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"
+   }
+  },
+  "210": {
+   "class_type": "MiniMaxH3MemoryEfficientSageAttentionPatch",
+   "inputs": {
+    "model": [
+     "362",
+     0
+    ]
+   }
+  },
+  "362": {
+   "class_type": "TESpeedMiniMaxH3",
+   "inputs": {
+    "model": [
+     "214",
+     0
+    ],
+    "processing_control_value": 0.08,
+    "processing_percent_1": 0.1,
+    "processing_percent_2": 0.9,
+    "mcs": 2,
+    "device": "auto",
+    "mode": "{{speed_mode}}"
+   }
+  },
+  "194": {
+   "class_type": "MiniMaxH3ImageToVideo",
+   "inputs": {
+    "clip": [
+     "204",
+     0
+    ],
+    "vae": [
+     "215",
+     0
+    ],
+    "prompt": "{{positive_prompt}}",
+    "width": [
+     "200",
+     0
+    ],
+    "height": [
+     "200",
+     1
+    ],
+    "length": [
+     "198",
+     1
+    ]
+   }
+  },
+  "193": {
+   "class_type": "SaveVideo",
+   "inputs": {
+    "video": [
+     "209",
+     0
+    ],
+    "filename_prefix": "video/MiniMax_H3",
+    "format": "auto",
+    "format.codec": "auto",
+    "codec": "auto"
+   }
+  },
+  "213": {
+   "class_type": "VAEDecode",
+   "inputs": {
+    "samples": [
+     "195",
+     0
+    ],
+    "vae": [
+     "215",
+     0
+    ]
+   }
+  },
+  "208": {
+   "class_type": "VAEDecodeAudio",
+   "inputs": {
+    "samples": [
+     "195",
+     0
+    ],
+    "vae": [
+     "203",
+     0
+    ]
+   }
+  },
+  "207": {
+   "class_type": "BasicGuider",
+   "inputs": {
+    "model": [
+     "205",
+     0
+    ],
+    "conditioning": [
+     "194",
+     0
+    ]
+   }
+  },
+  "209": {
+   "class_type": "CreateVideo",
+   "inputs": {
+    "images": [
+     "213",
+     0
+    ],
+    "audio": [
+     "208",
+     0
+    ],
+    "fps": 24,
+    "bit_depth": 8,
+    "color_space": "sRGB"
+   }
+  },
+  "204": {
+   "class_type": "CLIPLoader",
+   "inputs": {
+    "clip_name": "{{clip_name}}",
+    "type": "minimax",
+    "device": "default"
+   }
+  },
+  "200": {
+   "class_type": "ResolutionSelector",
+   "inputs": {
+    "aspect_ratio": "{{aspect_ratio}}",
+    "megapixels": "{{megapixels}}",
+    "multiple": 32
+   }
+  },
+  "196": {
+   "class_type": "BasicScheduler",
+   "inputs": {
+    "model": [
+     "214",
+     0
+    ],
+    "scheduler": "simple",
+    "steps": "{{steps}}",
+    "denoise": 1
+   }
+  },
+  "205": {
+   "class_type": "LoraLoaderModelOnly",
+   "inputs": {
+    "model": [
+     "210",
+     0
+    ],
+    "lora_name": "{{lora_name}}",
+    "strength_model": "{{lora_strength}}"
+   }
+  },
+  "214": {
+   "class_type": "UNETLoader",
+   "inputs": {
+    "unet_name": "{{unet_name}}",
+    "weight_dtype": "default"
+   }
+  }
+ }
+}

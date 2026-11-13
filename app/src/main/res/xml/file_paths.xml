@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider paths configuration
+    Defines which directories can be shared via FileProvider
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Cache directory for temporary share files -->
+    <cache-path name="shared_images" path="." />
+    <!-- Files directory for saved videos and images -->
+    <files-path name="internal_files" path="." />
+    <!-- 内置更新模块（v4.6.0）：getExternalFilesDir/update/ 下的 update.apk 安装包 -->
+    <external-files-path name="update_files" path="update/" />
+</paths>
