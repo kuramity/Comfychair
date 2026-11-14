@@ -85,6 +85,15 @@
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustResize" />
 
+        <!-- 内置更新模块（v4.7.1）：WorkManager 前台服务承载长时间下载。
+             Android 14+ 要求显式声明 foregroundServiceType，且必须与
+             UpdateDownloadWorker.createForegroundInfo() 里传的类型一致（dataSync），
+             否则 startForeground 直接抛 MissingForegroundServiceTypeException。 -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+
         <!-- FileProvider for sharing images -->
         <provider
             android:name="androidx.core.content.FileProvider"

@@ -3,6 +3,7 @@ package sh.hnet.comfychair
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -34,6 +35,7 @@ import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.CredentialStorage
 import sh.hnet.comfychair.ui.components.ConnectionAlertDialog
 import sh.hnet.comfychair.ui.components.ParticleOverlay
+import sh.hnet.comfychair.ui.components.ParticleTouchRouter
 import sh.hnet.comfychair.ui.components.shared.ProvideFilamentEngine
 import sh.hnet.comfychair.ui.navigation.MainNavHost
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme
@@ -111,6 +113,27 @@ class MainContainerActivity : ComponentActivity() {
     }
 
     // Lifecycle methods
+
+    /**
+     * 点击特效的坐标来源（v4.8.0）。
+     *
+     * **这个方法必须 `return super`**：它只读一眼 ACTION_DOWN 的坐标交给特效池，
+     * 不消费、不拦截、不改写事件 —— Compose 的分发链与没有特效层时完全一致。
+     *
+     * v4.7.0 的写法是在全屏 Canvas 上挂 `pointerInput`：Compose 命中测试默认
+     * `sharePointerInputWithSiblings = false`，最上层指针节点命中后**下层兄弟节点不再被命中**，
+     * 于是按钮、下拉、输入框全部失灵。改到这一层读坐标就不会参与命中测试。
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            if (BuildConfig.DEBUG) {
+                android.util.Log.d("ParticleFx", "down ${ev.x},${ev.y}")
+            }
+            ParticleTouchRouter.dispatch(ev.x, ev.y)
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)

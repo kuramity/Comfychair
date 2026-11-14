@@ -93,6 +93,12 @@ object SkillTextResult {
      *
      * 认两种键（都是 TE_text_display 的输出形态），取第一个非空白值 ——
      * 普通出图流的 outputs 里只有 `images`，这里会安静地返回 null。
+     *
+     * **v4.8.2 修复**：保存类节点（`BatchImageSaverCN` / `SaveImage`）**同样**会在
+     * outputs 的 `text` 字段里返回一段话，内容是"已保存 N 张图片到：<路径>（共 X KB）"。
+     * 原实现只判"非空白"，于是这段保存信息被当成技能流提示词弹了出来 ——
+     * 弹窗标题写着"生成的提示词"，正文却是 `F:\ComfyUI\output\ComfyChair`（实测截图确认）。
+     * 现在先按内容特征把保存回执排除掉。
      */
     fun extract(outputs: JSONObject?): String? {
         if (outputs == null) return null
@@ -101,10 +107,21 @@ object SkillTextResult {
             for (key in TEXT_KEYS) {
                 val array = node.optJSONArray(key) ?: continue
                 val value = array.optString(0, "")
-                if (value.isNotBlank()) return value
+                if (value.isNotBlank() && !isSaveReceipt(value)) return value
             }
         }
         return null
+    }
+
+    /** 保存节点的回执文本（中/英两种形态），不是提示词，必须排除 */
+    internal fun isSaveReceipt(value: String): Boolean {
+        if (value.contains("张图片到")) return true          // 已保存 1 张图片到：…
+        if (value.contains("张图已保存")) return true
+        if (value.startsWith("已保存")) return true
+        val lower = value.lowercase()
+        if (lower.contains("saved") && lower.contains("image")) return true  // Saved N image(s) to …
+        if (lower.contains("image") && lower.contains("saved to")) return true
+        return false
     }
 
     private val TEXT_KEYS = listOf("text", "input_text")

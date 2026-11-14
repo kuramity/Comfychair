@@ -176,6 +176,16 @@ class GenerationViewModel : ViewModel() {
         private const val PREF_CONTENT_TYPE = "contentType"
         private const val COMPLETION_POLLING_INTERVAL_MS = 3000L
         private const val MAX_POLL_MISSES_WITHOUT_QUEUE = 40
+
+        /**
+         * 取消后与服务器对齐队列的延迟（v4.8.2）。
+         *
+         * 两个用途：
+         * 1. `/interrupt` 返回后 ComfyUI 会立刻抓起下一个 pending 任务，
+         *    稍等片刻再拉 `/queue` 才能看到真实状态；
+         * 2. 本地 executingPromptId 滞后时，先等这次同步回来再决定走中断还是清排队。
+         */
+        private const val QUEUE_SYNC_DELAY_MS = 500L
     }
 
     /**
@@ -488,12 +498,35 @@ class GenerationViewModel : ViewModel() {
      * If no handler is active OR handler doesn't match executing owner, buffer events.
      * Handler is invoked on the main thread to ensure proper UI state updates.
      */
+    /**
+     * 已经向界面发放过完成事件的 promptId（v4.8.2 去重）。
+     *
+     * 同一个任务有三条完成路径都会走到 [dispatchEvent]：
+     * 1. WS `executing` 事件里 `node == null`；
+     * 2. WS `execution_success`；
+     * 3. 断线/重启后的 `pollForCompletion` 轮询。
+     *
+     * 原实现每条路径都发一次 `ImageGenerated`，下游各 ViewModel 于是重复
+     * `fetchGeneratedImage`（`isFetching` 反复 true/false → 按钮在"获取中"与
+     * "添加到队列 (N)"之间跳变），`publishSkillText` 也重复拉 `/history` 并
+     * `SkillTextResult.publish`（→ "已保存 N 张图片到…"弹窗反复弹出、需要点两次才能关）。
+     * 同一个 promptId 的结果是唯一的，发一次就够。
+     */
+    private var lastImageGeneratedPromptId: String? = null
+
     private fun dispatchEvent(event: GenerationEvent) {
         // 技能流（提示词强化）不出图，结果是一段文本：在这里统一取回来发布给
         // SkillTextResultDialog。必须落在事件分发**之前** —— 两条完成路径（轮询 /
         // WebSocket 回调）都汇到这里，而各屏幕的处理器只认图片，技能流在那边是完全
         // 静默的（实测：服务器已产出 1860 字符提示词，界面上一片空白、用户以为没输出）。
         if (event is GenerationEvent.ImageGenerated) {
+            // v4.8.2：同一任务只处理一次，打断"多路径重复完成"引发的界面抖动
+            if (event.promptId == lastImageGeneratedPromptId) {
+                DebugLogger.d(TAG, "Skip duplicate ImageGenerated (${Obfuscator.promptId(event.promptId)})")
+                return
+            }
+            lastImageGeneratedPromptId = event.promptId
+
             publishSkillText(event.promptId)
             // 图生3D 的产物是 .glb：与技能流同理，两条完成路径都汇到这里，
             // 在分发前统一发布给 ThreeDResultHolder（常驻 3D 按钮的数据源）。
@@ -856,33 +889,152 @@ class GenerationViewModel : ViewModel() {
             return
         }
 
-        // 情形 3：自己没有在跑，但有排队任务 → 清空队列
-        // （ComfyUI 没有"按 promptId 删除单个排队任务"的接口，只有 /queue {"clear": true}；
-        //   单用户场景下清掉整个 pending 队列是可接受语义，但绝不发 /interrupt）
+        // 情形 3：本地指针说"没有在跑"，但排队集合里有任务
+        //
+        // v4.8.2：这里原先直接 clearQueue —— 但如果 executingPromptId 因为 WS 事件
+        // 丢包/重连而滞后，服务器其实正跑着我们的任务，此时 clearQueue **只清排队、
+        // 不停当前**，用户看到的就是"点了取消，电脑上任务照旧在跑"。
+        // 所以先向服务器对一次队列，再决定走中断还是清排队。
+        // （ComfyUI 没有"按 promptId 删除单个排队任务"的接口，只有 /queue {"clear": true}，
+        //   单用户场景下清掉整个 pending 队列是可接受语义，但绝不误发 /interrupt 打别人。）
         if (executingId == null) {
-            client.clearQueue { success ->
-                if (success) {
-                    ownPendingIds.forEach { JobRegistry.removeJob(it) }
-                    resetGenerationState()
-                    dispatchEvent(GenerationEvent.GenerationCancelled)
-                }
-                mainHandler.post { onResult(success) }
+            if (queue.totalQueueSize > 0) {
+                DebugLogger.i(TAG, "Cancel: executing pointer stale, syncing with server first")
+                ConnectionManager.pollQueueStatus()
+                mainHandler.postDelayed({
+                    val refreshed = JobRegistry.queueState.value
+                    val freshExecuting = refreshed.executingPromptId
+                    if (freshExecuting != null && refreshed.ownJobs.containsKey(freshExecuting)) {
+                        interruptOwnJob(client, freshExecuting, mainHandler, onResult)
+                    } else {
+                        clearPendingOnly(client, ownPendingIds, mainHandler, onResult)
+                    }
+                }, QUEUE_SYNC_DELAY_MS)
+            } else {
+                clearPendingOnly(client, ownPendingIds, mainHandler, onResult)
             }
             return
         }
 
         // 情形 4：自己的任务正在跑 → 中断，并同步注册表
+        interruptOwnJob(client, executingId, mainHandler, onResult)
+    }
+
+    /**
+     * 中断当前执行的任务（v4.8.2 抽出）。
+     *
+     * **关键修复**：原实现在 `interruptExecution` 返回 false 时**也**会 `resetGenerationState()`
+     * 并广播 `GenerationCancelled` —— 界面显示"已取消"，服务器上的任务却还在跑，
+     * 用户看到的就是"取消没生效、后端继续出图、最后只拿到一张半成品"。
+     * 现在失败时只提示，不动状态，让界面如实反映"取消失败"。
+     */
+    private fun interruptOwnJob(
+        client: ComfyUIClient,
+        executingId: String,
+        mainHandler: Handler,
+        onResult: (success: Boolean) -> Unit
+    ) {
         client.interruptExecution { success ->
             if (success) {
                 DebugLogger.i(TAG, "Generation cancelled successfully")
                 JobRegistry.markCancelled(executingId)
+                resetGenerationState()
+                dispatchEvent(GenerationEvent.GenerationCancelled)
+                // 主动与服务器对齐：/interrupt 之后 ComfyUI 会立刻抓起下一个 pending 任务，
+                // 只等 WS 的 status 事件会让队列角标滞后几百毫秒到几秒
+                mainHandler.postDelayed({ ConnectionManager.pollQueueStatus() }, QUEUE_SYNC_DELAY_MS)
             } else {
-                DebugLogger.w(TAG, "Failed to cancel generation")
+                DebugLogger.w(TAG, "Failed to cancel generation - state kept unchanged")
+                dispatchEvent(GenerationEvent.CancelRejected(R.string.generation_cancel_failed))
             }
-            resetGenerationState()
-            dispatchEvent(GenerationEvent.GenerationCancelled)
             mainHandler.post { onResult(success) }
         }
+    }
+
+    /** 只清掉自己排队中的任务（不动服务器上正在执行的那个） */
+    private fun clearPendingOnly(
+        client: ComfyUIClient,
+        ownPendingIds: Set<String>,
+        mainHandler: Handler,
+        onResult: (success: Boolean) -> Unit
+    ) {
+        client.clearQueue { success ->
+            if (success) {
+                ownPendingIds.forEach { JobRegistry.removeJob(it) }
+                resetGenerationState()
+                dispatchEvent(GenerationEvent.GenerationCancelled)
+                mainHandler.postDelayed({ ConnectionManager.pollQueueStatus() }, QUEUE_SYNC_DELAY_MS)
+            } else {
+                dispatchEvent(GenerationEvent.CancelRejected(R.string.generation_cancel_failed))
+            }
+            mainHandler.post { onResult(success) }
+        }
+    }
+
+    /**
+     * 「清空队列」的完整语义（v4.8.3）：**停掉正在执行的任务 + 清空所有排队任务**。
+     *
+     * 原实现只调 `client.clearQueue`，而 ComfyUI 的 `/queue {"clear":true}` **只清排队、
+     * 不动正在执行的那个** —— 用户点了"清空队列"，前两条排队没了、第一条照旧跑完，
+     * 界面上队列计数还停在 (3)（因为本地 `ownJobs` 里的 PENDING 从来没被移除）。
+     *
+     * **顺序必须是"先清排队、再中断"**：反过来的话 `/interrupt` 一返回，ComfyUI 会立刻
+     * 抓起下一个 pending 任务开始跑，等于永远停不干净。
+     *
+     * @param onResult true = 服务器已确认（清排队 + 需要时中断都成功）
+     */
+    fun clearQueueAndStopCurrent(onResult: (success: Boolean) -> Unit) {
+        val client = comfyUIClient ?: run {
+            onResult(false)
+            return
+        }
+        val mainHandler = Handler(Looper.getMainLooper())
+        val queue = JobRegistry.queueState.value
+        val executingId = queue.executingPromptId
+        val isOwnExecuting = executingId != null && queue.ownJobs.containsKey(executingId)
+
+        client.clearQueue { cleared ->
+            if (!cleared) {
+                DebugLogger.w(TAG, "clearQueueAndStopCurrent: server refused clear")
+                mainHandler.post { onResult(false) }
+                return@clearQueue
+            }
+
+            // 排队已清空，接下来停正在执行的那个（如果是我们自己的）
+            if (isOwnExecuting && executingId != null) {
+                client.interruptExecution { interrupted ->
+                    if (interrupted) {
+                        JobRegistry.markCancelled(executingId)
+                        DebugLogger.i(TAG, "clearQueueAndStopCurrent: interrupted own job")
+                    } else {
+                        DebugLogger.w(TAG, "clearQueueAndStopCurrent: interrupt failed")
+                    }
+                    purgeLocalPending()
+                    resetGenerationState()
+                    dispatchEvent(GenerationEvent.GenerationCancelled)
+                    mainHandler.postDelayed({ ConnectionManager.pollQueueStatus() }, QUEUE_SYNC_DELAY_MS)
+                    mainHandler.post { onResult(interrupted) }
+                }
+            } else {
+                purgeLocalPending()
+                mainHandler.postDelayed({ ConnectionManager.pollQueueStatus() }, QUEUE_SYNC_DELAY_MS)
+                mainHandler.post { onResult(true) }
+            }
+        }
+    }
+
+    /**
+     * 把本地登记里所有"排队中"的任务摘掉。
+     *
+     * 按钮文案由 `QueueState.activeCountFor(ownerId)` 派生，它统计的是 `ownJobs` 里
+     * PENDING/EXECUTING 的条数 —— 服务器队列清空了但这里不清，角标就会一直显示旧数字。
+     * 正在执行的那条不在这里移除（由 [JobRegistry.markCancelled] 单独处理）。
+     */
+    private fun purgeLocalPending() {
+        JobRegistry.queueState.value.ownJobs
+            .filterValues { it.status == JobStatus.PENDING }
+            .keys
+            .forEach { JobRegistry.removeJob(it) }
     }
 
     /**

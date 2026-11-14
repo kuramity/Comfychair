@@ -922,6 +922,17 @@
     <string name="update_action_retry">Retry</string>
     <string name="update_manual_check_failed">Check failed: %1$s</string>
     <string name="update_already_latest">Already on the latest version.</string>
+    <!-- v4.7.1 下载进度横幅与点击即安装 -->
+    <string name="update_channel_progress_name">Update download</string>
+    <string name="update_channel_progress_desc">Shows download progress in the notification shade</string>
+    <string name="update_progress_title">Downloading update %1$s</string>
+    <string name="update_progress_verifying_title">Verifying update package</string>
+    <string name="update_progress_text">%1$s / %2$s (%3$d%%)</string>
+    <string name="update_progress_meta">%1$s · %2$s left</string>
+    <string name="update_ready_install_text">Version %1$s downloaded. Tap to install.</string>
+    <string name="update_failed_title">Update download failed</string>
+    <!-- v4.8.2 取消失败不再假装成功 -->
+    <string name="generation_cancel_failed">Cancel failed: the server did not acknowledge. The task is still running.</string>
     <!-- v4.6.1 模块 A：取消归属校验提示 -->
     <string name="generation_cancel_not_owner">The running task was not started from this screen; cancel skipped</string>
     <string name="generation_cancel_no_active">No active task to cancel</string>

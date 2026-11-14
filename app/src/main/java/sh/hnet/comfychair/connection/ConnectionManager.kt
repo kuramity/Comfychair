@@ -554,7 +554,21 @@ object ConnectionManager {
 
         val sessionId = startNewReconnectionSession()  // Cancel any pending auto-reconnect
 
-        // Always verify with HTTP test - don't trust cached state
+        // v4.8.2（模块一·入队迟缓）：已连接且 WebSocket 在线时直接放行。
+        //
+        // 原来这里无条件走 client.testConnection（注释原文 "Always verify with HTTP test -
+        // don't trust cached state"）：每次点"生成"都要先打一次真实 HTTP 往返，弱网/隧道下
+        // 3–5 秒，而 JobRegistry.registerJob（按钮变"添加到队列 (N)"的触发点）在这之后 ——
+        // 用户看到的就是"点了生成先显示连接中、几秒后才排队"。
+        // 真断线由 WebSocket 状态与自动重连兜底；提交本身失败也会立刻回报，不会静默。
+        if (isWebSocketConnected) {
+            DebugLogger.d(TAG, "ensureConnection: WS online, skip HTTP probe")
+            _isConnecting.value = false
+            reportConnectivitySuccess()
+            onResult(true)
+            return
+        }
+
         client.testConnection { success, _, _, failureType ->
             scope.launch {
                 // Ignore stale callback if another reconnection started

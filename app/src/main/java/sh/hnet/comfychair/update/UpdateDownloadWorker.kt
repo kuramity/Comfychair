@@ -1,7 +1,9 @@
 package sh.hnet.comfychair.update
 
 import android.content.Context
+import android.content.pm.ServiceInfo
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import sh.hnet.comfychair.util.DebugLogger
@@ -60,6 +62,22 @@ class UpdateDownloadWorker(
         fun updateDir(context: Context): File =
             File(context.getExternalFilesDir(null), "update").apply { mkdirs() }
 
+        /**
+         * 应用级共享 OkHttp 客户端（v4.7.1）。
+         *
+         * 之前每个 Worker 实例各建一个客户端：WorkManager 重试（`Result.retry()`）
+         * 会新建 Worker → 新连接池 → 隧道场景下多一次 TLS + 多路复用握手。
+         * 放到 companion 的 lazy 里，全进程只有一个连接池。
+         */
+        internal val sharedClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                // readTimeout 管"两次读间隔"：只要数据在流动就不杀（隧道 9KB/s 也安全）；
+                // 45 秒彻底断流才交给 WorkManager 的重试
+                .readTimeout(45, TimeUnit.SECONDS)
+                .build()
+        }
+
         fun partFile(context: Context): File = File(updateDir(context), PART_FILE_NAME)
         fun finalFile(context: Context): File = File(updateDir(context), FINAL_FILE_NAME)
 
@@ -79,12 +97,9 @@ class UpdateDownloadWorker(
     }
 
     private val repository = UpdateRepository
-    private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        // readTimeout 管"两次读间隔"：只要数据在流动就不杀（隧道 9KB/s 也安全）；
-        // 45 秒彻底断流才交给 WorkManager 的重试
-        .readTimeout(45, TimeUnit.SECONDS)
-        .build()
+
+    /** 全进程共享客户端（见 [sharedClient]），Worker 实例只借用不新建 */
+    private val client: OkHttpClient get() = sharedClient
 
     // 速度滑动窗口：(时间戳, 累计字节) 采样
     private val speedSamples: Deque<Pair<Long, Long>> = ArrayDeque()
@@ -100,16 +115,29 @@ class UpdateDownloadWorker(
             return@withContext Result.failure()
         }
 
+        // v4.7.1：提升为前台服务 —— 退到后台/锁屏后不再被系统当普通后台任务挂起。
+        // Android 12+ 在后台启动前台服务可能被拒（ForegroundServiceStartNotAllowedException），
+        // 此时降级为普通后台任务 + 通知栏进度，下载本身不受影响。
+        try {
+            setForeground(createForegroundInfo(versionName))
+        } catch (e: Exception) {
+            DebugLogger.w(TAG, "promote to foreground failed: ${e.javaClass.simpleName} ${e.message}")
+        }
+        // 先发一次进度通知，避免"点了更新却看不到任何反馈"
+        UpdateNotifier.updateProgress(applicationContext, repository.state.value, versionName)
+
         try {
             val part = partFile(applicationContext)
             val resumeFrom = if (part.exists()) part.length() else 0L
-            val total = downloadWithResume(url, part, resumeFrom, expectedSize)
+            val total = downloadWithResume(url, part, resumeFrom, expectedSize, versionName)
             val downloaded = part.length()
 
             repository.publishProgress(downloaded, total, 0L, -1L)
 
             // SHA-256 流式校验（硬性约束 15：通过才允许变完整 APK）
             repository.publishPhase(UpdatePhase.VERIFYING)
+            // 进度条切成"校验中"的不确定态，用户不会误以为卡在 99%
+            UpdateNotifier.updateProgress(applicationContext, repository.state.value, versionName)
             val actualSha = sha256Of(part)
             if (expectedSha256.isNotEmpty() && !actualSha.equals(expectedSha256, ignoreCase = true)) {
                 part.delete()
@@ -130,15 +158,47 @@ class UpdateDownloadWorker(
             repository.publishReady(final.length())
             UpdateNotifier.notifyUpdateReady(applicationContext, versionName)
             Result.success(workDataOf("finalSize" to final.length()))
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // 任务被 WorkManager 取消（用户撤单/系统清理）：不是失败，不要发"下载失败"横幅
+            throw e
         } catch (e: IOException) {
             DebugLogger.w(TAG, "Download failed: ${e.message}")
             repository.publishFailed("下载中断（${e.javaClass.simpleName}），可重试续传")
+            UpdateNotifier.notifyFailed(
+                applicationContext,
+                repository.state.value.error ?: "下载中断，可重试续传"
+            )
             Result.retry()
         } catch (e: Exception) {
             DebugLogger.w(TAG, "Download error: ${e.message}")
             repository.publishFailed("下载出错：${e.message}")
+            UpdateNotifier.notifyFailed(
+                applicationContext,
+                repository.state.value.error ?: "下载出错"
+            )
             Result.failure()
         }
+    }
+
+    /**
+     * 前台服务通知（与进度通知**同一个 id、同一条 Notification**）：
+     * WorkManager 的 SystemForegroundService 接管这条通知后，后续只需要
+     * `NotificationManager.notify` 更新同 id 的内容，不会出现两条进度条。
+     *
+     * 类型固定 `dataSync`：Android 14+ 要求前台服务声明类型，
+     * 且 Manifest 里对应的 `SystemForegroundService` 也必须标 `dataSync`，两处必须一致。
+     */
+    private fun createForegroundInfo(versionName: String): ForegroundInfo {
+        val notification = UpdateNotifier.buildProgressNotification(
+            applicationContext,
+            repository.state.value,
+            versionName
+        )
+        return ForegroundInfo(
+            UpdateNotifier.PROGRESS_NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        )
     }
 
     /**
@@ -146,7 +206,13 @@ class UpdateDownloadWorker(
      *
      * @return 总字节数（206 时从 Content-Range 解析；200 全量时为本次 Content-Length）
      */
-    private fun downloadWithResume(url: String, part: File, resumeFrom: Long, expectedSize: Long): Long {
+    private fun downloadWithResume(
+        url: String,
+        part: File,
+        resumeFrom: Long,
+        expectedSize: Long,
+        versionName: String
+    ): Long {
         // .part 已超过预期大小（换版本了/文件坏了）：作废重下
         if (expectedSize > 0 && resumeFrom > expectedSize) {
             part.delete()
@@ -165,7 +231,7 @@ class UpdateDownloadWorker(
                     val contentRange = response.header("Content-Range")
                     val total = parseTotalFromContentRange(contentRange)
                         ?: (actualResume + (response.body?.contentLength() ?: 0L))
-                    writeBody(response, part, actualResume, total)
+                    writeBody(response, part, actualResume, total, versionName)
                     return total
                 }
                 response.isSuccessful -> {
@@ -175,7 +241,7 @@ class UpdateDownloadWorker(
                     val target = if (part.exists() && part.length() > 0) {
                         part.delete(); part
                     } else part
-                    writeBody(response, target, 0L, total)
+                    writeBody(response, target, 0L, total, versionName)
                     return if (total > 0) total else target.length()
                 }
                 else -> throw IOException("服务器返回 HTTP ${response.code}")
@@ -183,7 +249,13 @@ class UpdateDownloadWorker(
         }
     }
 
-    private fun writeBody(response: okhttp3.Response, part: File, resumeFrom: Long, total: Long) {
+    private fun writeBody(
+        response: okhttp3.Response,
+        part: File,
+        resumeFrom: Long,
+        total: Long,
+        versionName: String
+    ) {
         val body = response.body ?: throw IOException("响应体为空")
 
         // 存储空间预检（硬性约束 17 的"存储空间不足检查"）：
@@ -217,13 +289,23 @@ class UpdateDownloadWorker(
                         val now = System.currentTimeMillis()
                         val speed = computeSpeed(now, written)
                         val eta = if (speed > 0 && total > written) (total - written) / speed else -1L
-                        repository.publishProgress(written, total, speed, eta)
+                        // 与 UI 共用同一个 400ms 闸门：只有真的发射了才刷通知，
+                        // 否则会出现"通知刷得比 UI 还勤"的无谓开销
+                        if (repository.publishProgress(written, total, speed, eta)) {
+                            UpdateNotifier.updateProgress(
+                                applicationContext,
+                                repository.state.value,
+                                versionName
+                            )
+                        }
                     }
                 }
             }
             // 收尾再发一次（把最后一段补上，force 跳过节流）
             val speed = computeSpeed(System.currentTimeMillis(), written)
-            repository.publishProgress(written, total, speed, 0L, force = true)
+            if (repository.publishProgress(written, total, speed, 0L, force = true)) {
+                UpdateNotifier.updateProgress(applicationContext, repository.state.value, versionName)
+            }
         }
     }
 

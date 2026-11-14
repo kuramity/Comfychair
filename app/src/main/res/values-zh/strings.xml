@@ -836,6 +836,17 @@
     <string name="update_action_retry">重试</string>
     <string name="update_manual_check_failed">检查失败：%1$s</string>
     <string name="update_already_latest">已经是最新版本。</string>
+    <!-- v4.7.1 下载进度横幅与点击即安装 -->
+    <string name="update_channel_progress_name">更新下载</string>
+    <string name="update_channel_progress_desc">在通知栏显示下载进度</string>
+    <string name="update_progress_title">正在下载更新 %1$s</string>
+    <string name="update_progress_verifying_title">正在校验安装包</string>
+    <string name="update_progress_text">%1$s / %2$s（%3$d%%）</string>
+    <string name="update_progress_meta">%1$s · 剩余 %2$s</string>
+    <string name="update_ready_install_text">版本 %1$s 已下载，点击安装。</string>
+    <string name="update_failed_title">更新下载失败</string>
+    <!-- v4.8.2 取消失败不再假装成功 -->
+    <string name="generation_cancel_failed">取消失败：服务器未确认，任务仍在运行</string>
     <!-- v4.6.1 模块 A：取消归属校验提示 -->
     <string name="generation_cancel_not_owner">当前执行的任务不是本页面发起的，已跳过取消</string>
     <string name="generation_cancel_no_active">当前没有可取消的任务</string>

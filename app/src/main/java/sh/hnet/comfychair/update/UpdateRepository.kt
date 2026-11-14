@@ -63,12 +63,25 @@ object UpdateRepository {
 
     // ---------- Worker 侧 ----------
 
-    internal fun publishProgress(downloaded: Long, total: Long, speed: Long, eta: Long, force: Boolean = false) {
+    /**
+     * 发布下载进度。
+     *
+     * @return true 表示这次真的发射了（未被节流、阶段仍是 DOWNLOADING）——
+     *         Worker 据此决定要不要同步刷新通知栏，**通知与 UI 共用同一个 400ms 闸门**，
+     *         避免出现"UI 已更新、通知还是旧值"或"通知刷得比 UI 还勤"两种偏差。
+     */
+    internal fun publishProgress(
+        downloaded: Long,
+        total: Long,
+        speed: Long,
+        eta: Long,
+        force: Boolean = false
+    ): Boolean {
         val now = System.currentTimeMillis()
-        if (!force && now - lastPublishAt < PROGRESS_THROTTLE_MS) return
+        if (!force && now - lastPublishAt < PROGRESS_THROTTLE_MS) return false
         lastPublishAt = now
         val prev = _state.value
-        if (prev.phase != UpdatePhase.DOWNLOADING) return // 阶段已被切换，丢弃迟到进度
+        if (prev.phase != UpdatePhase.DOWNLOADING) return false // 阶段已被切换，丢弃迟到进度
         _state.value = UpdateState(
             phase = UpdatePhase.DOWNLOADING,
             downloadedBytes = downloaded,
@@ -76,6 +89,7 @@ object UpdateRepository {
             speedBytesPerSec = speed,
             etaSeconds = eta
         )
+        return true
     }
 
     internal fun publishPhase(phase: UpdatePhase) {

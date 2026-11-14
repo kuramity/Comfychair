@@ -54,6 +54,19 @@ data class QueueState(
     val ownActiveJobCount: Int get() = ownJobs.values.count {
         it.status == JobStatus.PENDING || it.status == JobStatus.EXECUTING
     }
+
+    /**
+     * 指定模式（ownerId）自己的活跃任务数（排队 + 执行中）。
+     *
+     * **为什么需要它**：按钮文案原先用 [totalQueueSize]（服务器上所有客户端的队列总数），
+     * 于是只要服务器有任务在跑，文生图/图生图/文生视频/图生视频四个模式的按钮会**同时**
+     * 变成「添加到队列 (N)」—— 即"跨模式状态污染"。文案必须按当前模式过滤。
+     *
+     * @param ownerId 由各 ViewModel 的 `OWNER_ID` 常量传入
+     */
+    fun activeCountFor(ownerId: String): Int = ownJobs.values.count {
+        it.ownerId == ownerId && (it.status == JobStatus.PENDING || it.status == JobStatus.EXECUTING)
+    }
 }
 
 /**

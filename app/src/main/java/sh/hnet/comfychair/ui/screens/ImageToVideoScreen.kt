@@ -572,7 +572,8 @@ fun ImageToVideoScreen(
                 .padding(bottom = 16.dp)
         ) {
             GenerationButton(
-                queueSize = queueState.totalQueueSize,
+                // v4.8.2（模块四）：只算本模式自己的活跃任务，避免四个模式一起显示队列数
+                queueSize = queueState.activeCountFor(ImageToVideoViewModel.OWNER_ID),
                 isExecuting = queueState.isExecuting,
                 // v4.6.1：只有本页面自己的任务才允许取消，避免跨模式误中断
                 canCancelCurrent = queueState.executingOwnerId == ImageToVideoViewModel.OWNER_ID ||
@@ -639,7 +640,8 @@ fun ImageToVideoScreen(
                     }
                 },
                 onClearQueue = {
-                    generationViewModel.getClient()?.clearQueue { success ->
+                    // v4.8.3：清空队列 = 先清排队再中断正在跑的，并同步本地计数
+                    generationViewModel.clearQueueAndStopCurrent { success ->
                         val messageRes = if (success) R.string.msg_queue_cleared_success
                                        else R.string.error_queue_clear
                         android.os.Handler(android.os.Looper.getMainLooper()).post {
