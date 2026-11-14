@@ -2,7 +2,7 @@
 
 An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 
-**Current version**: v4.7.0（二次开发版 / Community Edition）
+**Current version**: v4.13.0（二次开发版 / Community Edition）
 
 > **This project is a fork of [ComfyChair](https://github.com/legal-hkr/comfychair),
 > originally developed by Legal HKr, licensed under GPL-3.0.
@@ -34,6 +34,10 @@ ComfyChair provides a streamlined mobile interface for interacting with ComfyUI 
 
 ### General
 
+- **Built-in updater**: Check for updates in-app, download in the background via a foreground service with a progress notification, verify SHA-256, and tap-to-install — with a redesigned update dialog (full release notes, current-vs-new version comparison, scrollable). Ships empty (no update source) and can point at any manifest you host
+- **3D generation**: Text-to-3D and Image-to-3D with an interactive `.glb` viewer (Filament / SceneView) — orbit, pan, pinch-zoom, and gesture dismissal
+- **Danbooru tag library** (full APK): Offline tag database with search, simplified/traditional Chinese normalization, synonym suggestions and co-occurrence recommendations for prompt building
+- **Polished visuals**: Ripple + dot-burst effects on buttons, ambient particle overlay, adaptive accent colors (secondary = accent hue +35°), full Material 3 theming with custom color slots
 - **Multi-server support**: Save and manage multiple ComfyUI server connections with per-server settings and optional auto-login
 - **Server connection**: Connect to remote or local ComfyUI servers with automatic HTTP/HTTPS detection and self-signed certificate support
 - **Authentication**: HTTP Basic Auth and API key/Bearer token authentication for servers behind reverse proxies
@@ -271,9 +275,11 @@ To connect to your ComfyUI server, you'll need:
 - **Target SDK**: Android 15 (API 36)
 - **UI Framework**: Jetpack Compose with Material Design 3 (including Expressive components)
 - **Video Playback**: Media3 ExoPlayer
+- **3D Rendering**: Filament / SceneView (`.glb` preview)
 - **Architecture**: MVVM with ViewModels and StateFlow
 - **Navigation**: Jetpack Compose Navigation
 - **Build system**: Gradle with Kotlin DSL
+- **Testing**: 615+ JVM unit tests (pure-logic extraction keeps effects, gestures and download policy testable without a device)
 
 ## Contributing
 
@@ -282,6 +288,8 @@ This project follows standard Android development practices:
 - Jetpack Compose best practices
 - Material Design 3 guidelines
 - MVVM architecture pattern
+
+Issues and pull requests are welcome. For behavioral changes, please include a unit test where the logic can be expressed as a pure function (the codebase deliberately extracts effects/gesture/download logic into testable units).
 
 ## License
 
