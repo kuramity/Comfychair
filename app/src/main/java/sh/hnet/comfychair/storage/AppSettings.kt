@@ -18,6 +18,8 @@ object AppSettings {
     private const val KEY_EDGE_ROUTER = "edge_router"
     private const val DEFAULT_EDGE_ROUTER = "hermite"
     private const val KEY_PROMPT_SPELL_CHECK = "prompt_spell_check"
+    private const val KEY_PARTICLE_OVERLAY_ENABLED = "particle_overlay_enabled"
+    private const val KEY_RIPPLE_DOT_FEEDBACK_ENABLED = "ripple_dot_feedback_enabled"
 
     /**
      * Check if live preview is enabled.
@@ -205,6 +207,65 @@ object AppSettings {
             .apply()
     }
 
+    /**
+     * 全屏粒子特效覆盖层（v4.8.0 的 [sh.hnet.comfychair.ui.components.ParticleOverlay]）
+     * 是否挂载。默认 **false**：2026-11-14 起新验收标准禁止"全屏描边圆环 + 向外飞散的
+     * 实心粒子"，默认不组合、不转发触点；打开开关可一键回退旧特效。
+     */
+    fun isParticleOverlayEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_PARTICLE_OVERLAY_ENABLED, false)  // Default: false（按钮内 ripple 皮肤替代）
+    }
+
+    fun setParticleOverlayEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_PARTICLE_OVERLAY_ENABLED, enabled)
+            .apply()
+    }
+
+    /**
+     * 按钮内"水面波纹点阵"皮肤（v4.9.x 的 [sh.hnet.comfychair.ui.components.ripple.rippleFeedback]）
+     * 是否启用。默认 **true**；置 false 时各接入点以 `rippleFeedback(enabled = false)`
+     * 原样返回，按钮恢复无特效的原始形态。
+     */
+    fun isRippleDotFeedbackEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_RIPPLE_DOT_FEEDBACK_ENABLED, true)  // Default: true
+    }
+
+    fun setRippleDotFeedbackEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_RIPPLE_DOT_FEEDBACK_ENABLED, enabled)
+            .apply()
+    }
+
+    // ============================================================
+    // 按钮皮肤 v2 总回退开关
+    // ============================================================
+
+    private const val KEY_UI_SKIN_V2_ENABLED = "ui_skin_v2_enabled"
+
+    /**
+     * 按钮皮肤 v2（顶栏裸图标化 + 主按钮向下投影 + 齿轮浅底）是否启用，默认 **true**。
+     *
+     * 置 false 时的回退形态（逐项对照，全部用参数分支实现、没有复制两套 UI）：
+     * 顶栏图标回 48dp 圆形 + 白边 + 外辉光；主按钮白边回 50%；下拉按钮回 56×56；
+     * 齿轮回 `OutlinedIconButton`；间距回原值。波纹点阵不受本开关影响（另有总开关）。
+     */
+    fun isUiSkinV2Enabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_UI_SKIN_V2_ENABLED, true)  // Default: true
+    }
+
+    fun setUiSkinV2Enabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_UI_SKIN_V2_ENABLED, enabled)
+            .apply()
+    }
+
     private const val KEY_PROMPT_EXPAND = "prompt_expand"
 
     fun isPromptExpandEnabled(context: Context): Boolean {
@@ -216,6 +277,33 @@ object AppSettings {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_PROMPT_EXPAND, enabled)
+            .apply()
+    }
+
+    // ============================================================
+    // 更新下载回退开关（v4.12.0 安全阀）
+    // ============================================================
+
+    private const val KEY_UPDATE_DOWNLOAD_LEGACY_MODE = "update_download_legacy_mode"
+
+    /**
+     * 更新下载的回退开关（默认 false = 新逻辑）。
+     *
+     * 置 true 回退到 v4.11.0 之前的下载行为：
+     * 不修状态机（自动重试后进度不再恢复，会停摆）、
+     * 不判 416（续传起点越界时无限重试，.part 永不清理）、
+     * 不做异常分型（任何 IO 异常都无限重试，HTTP 4xx 也不失败）。
+     * 只影响 Worker 的下载策略，不影响通知与 UI 展示。
+     */
+    fun isUpdateDownloadLegacyMode(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_UPDATE_DOWNLOAD_LEGACY_MODE, false)  // Default: false (新逻辑)
+    }
+
+    fun setUpdateDownloadLegacyMode(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_UPDATE_DOWNLOAD_LEGACY_MODE, enabled)
             .apply()
     }
 

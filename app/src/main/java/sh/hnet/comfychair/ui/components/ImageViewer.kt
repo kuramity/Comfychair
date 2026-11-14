@@ -3,9 +3,9 @@ package sh.hnet.comfychair.ui.components
 import android.graphics.Bitmap
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.VectorConverter
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
@@ -26,13 +26,17 @@ import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /**
@@ -46,12 +50,34 @@ import kotlinx.coroutines.launch
 fun ImageViewer(
     bitmap: Bitmap,
     modifier: Modifier = Modifier,
-    onSingleTap: () -> Unit = {}
+    onSingleTap: () -> Unit = {},
+    // 下滑脱离关闭的回调；null = 不启用脱离手势（如缩略图槽位等无"关闭"语义的场景）
+    onClose: (() -> Unit)? = null
 ) {
     // Animatable values for smooth zoom transitions
     val scaleAnimatable = remember { Animatable(1f) }
     val offsetAnimatable = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
     val scope = rememberCoroutineScope()
+
+    // 下滑脱离拖动：手势中的实时位移（px，向下为正）；回位时由 Animatable 接管写值，
+    // isDismissSettling 是两者的数据源开关——graphicsLayer/drawBehind 里按它取值
+    var dismissDragY by remember { mutableFloatStateOf(0f) }
+    val dismissDragAnimatable = remember { Animatable(0f) }
+    var isDismissSettling by remember { mutableStateOf(false) }
+    var settleJob by remember { mutableStateOf<Job?>(null) }
+
+    // 未达关闭阈值时的弹簧回位（位移/缩放/透明度都会随位移归零而复原）
+    fun settleDismissBack() {
+        settleJob?.cancel()
+        settleJob = scope.launch {
+            // 先同步当前值再切数据源，避免切换瞬间渲染出一帧零位移
+            dismissDragAnimatable.snapTo(dismissDragY)
+            isDismissSettling = true
+            dismissDragY = 0f
+            dismissDragAnimatable.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 300f))
+            isDismissSettling = false
+        }
+    }
 
     // Current values (used during gestures for immediate feedback)
     var scale by remember { mutableFloatStateOf(1f) }
@@ -135,7 +161,19 @@ fun ImageViewer(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color.Black)
+            // 黑遮罩透明度随脱离拖动联动（与图片同一映射）。当前查看器是独立
+            // 不透明 Activity，外层还有黑背景，联动暂无可见效果——保留是为
+            // 未来改成透明容器时不用再动这里；现阶段视觉反馈来自图片本体淡出
+            .drawBehind {
+                val dismissY = if (isDismissSettling) dismissDragAnimatable.value else dismissDragY
+                drawRect(
+                    Color.Black.copy(
+                        alpha = ViewerDismissGesture.dismissTransform(
+                            dismissY, containerSize.height.toFloat()
+                        ).alpha
+                    )
+                )
+            }
             .onSizeChanged { containerSize = it },
         contentAlignment = Alignment.Center
     ) {
@@ -146,21 +184,50 @@ fun ImageViewer(
             filterQuality = FilterQuality.High,
             modifier = Modifier
                 .fillMaxSize()
-                .graphicsLayer(
-                    scaleX = if (isAnimating) scaleAnimatable.value else scale,
-                    scaleY = if (isAnimating) scaleAnimatable.value else scale,
-                    translationX = if (isAnimating) offsetAnimatable.value.x else offset.x,
-                    translationY = if (isAnimating) offsetAnimatable.value.y else offset.y
-                )
+                .graphicsLayer {
+                    // lambda 形式：状态变化只更新 layer 属性不走重组，拖动才能每帧跟手
+                    val dismissY = if (isDismissSettling) dismissDragAnimatable.value else dismissDragY
+                    val visuals = ViewerDismissGesture.dismissTransform(
+                        dismissY, containerSize.height.toFloat()
+                    )
+                    val currentScale = if (isAnimating) scaleAnimatable.value else scale
+                    val currentOffset = if (isAnimating) offsetAnimatable.value else offset
+                    scaleX = currentScale * visuals.scale
+                    scaleY = currentScale * visuals.scale
+                    translationX = currentOffset.x
+                    translationY = currentOffset.y + dismissY
+                    alpha = visuals.alpha
+                }
                 .pointerInput(Unit) {
                     awaitEachGesture {
                         val firstDown = awaitFirstDown(requireUnconsumed = false)
                         val firstDownTime = System.currentTimeMillis()
                         val firstDownPosition = firstDown.position
 
+                        // 新手势按下：若上一手势的回位动画还在跑，停掉并从当前动画值
+                        // 无缝接管位移，避免图片先跳回原点再跟手
+                        if (isDismissSettling) {
+                            settleJob?.cancel()
+                            isDismissSettling = false
+                            dismissDragY = dismissDragAnimatable.value
+                        }
+
                         var wasPanOrZoom = false
                         var pointerCount = 1
                         var totalMovement = 0f  // Track total finger movement
+
+                        // scale==1 时的方向锁定（见单指分支）：本手势内判定一次后不再翻转
+                        var lockedDirection = ViewerPanDirection.UNDECIDED
+                        var accumulatedDx = 0f
+                        var accumulatedDy = 0f
+                        val velocityTracker = VelocityTracker()
+                        val directionThresholdPx = ViewerDismissGesture.DIRECTION_LOCK_THRESHOLD_DP.dp.toPx()
+                        val velocityThresholdPx = ViewerDismissGesture.DISMISS_VELOCITY_DP_PER_SEC.dp.toPx()
+
+                        // 向下全量跟手；向上按阻尼轻微跟手（明确区别于"上滑关闭"，松手弹回）
+                        fun updateDismissDrag(totalDy: Float) {
+                            dismissDragY = if (totalDy > 0f) totalDy else totalDy * 0.2f
+                        }
 
                         do {
                             val event = awaitPointerEvent()
@@ -172,6 +239,11 @@ fun ImageViewer(
                             }
 
                             if (currentPointerCount >= 2) {
+                                // 捏合开始时脱离拖动还在进行：立即弹回，否则残留的
+                                // translationY 会叠在捏合的 offset 计算上产生跳变
+                                if (lockedDirection == ViewerPanDirection.VERTICAL && dismissDragY != 0f) {
+                                    settleDismissBack()
+                                }
                                 // Multi-touch: zoom and pan
                                 val zoom = event.calculateZoom()
                                 val pan = event.calculatePan()
@@ -214,10 +286,55 @@ fun ImageViewer(
                                             )
                                             change.consume()
                                         }
+                                    } else if (onClose != null) {
+                                        // scale==1 且查看器可关闭：方向锁定分流。
+                                        // 水平必须留给 Pager 翻页（翻页唯一入口），只有明显
+                                        // 垂直（|dy| > |dx|*1.2）的手势才归脱离拖动，斜向一律
+                                        // 算水平——宁可少触发关闭，绝不抢翻页
+                                        val pan = change.position - change.previousPosition
+                                        accumulatedDx += pan.x
+                                        accumulatedDy += pan.y
+                                        velocityTracker.addPosition(change.uptimeMillis, change.position)
+
+                                        if (lockedDirection == ViewerPanDirection.UNDECIDED) {
+                                            lockedDirection = ViewerDismissGesture.resolvePanDirection(
+                                                accumulatedDx, accumulatedDy, directionThresholdPx
+                                            )
+                                            if (lockedDirection == ViewerPanDirection.VERTICAL) {
+                                                // 锁定即脱离拖动：标记非 tap，位移由累计值驱动
+                                                wasPanOrZoom = true
+                                            }
+                                        }
+                                        if (lockedDirection == ViewerPanDirection.VERTICAL) {
+                                            // accumulatedDy 自按下累计（锁定帧已含本帧增量），
+                                            // 直接以累计值驱动位移，跟手无跳变
+                                            updateDismissDrag(accumulatedDy)
+                                            // 垂直手势归脱离拖动：consume 后 Pager 彻底收不到，
+                                            // 不会出现垂直拖动带着翻页面走
+                                            change.consume()
+                                        }
+                                        // HORIZONTAL / UNDECIDED：不 consume，事件继续流向 Pager
                                     }
                                 }
                             }
                         } while (event.changes.any { it.pressed })
+
+                        // 脱离拖动松手：位移或向下甩速达标 → 关闭查看器（复用 onClose）；
+                        // 否则弹簧回位
+                        if (lockedDirection == ViewerPanDirection.VERTICAL && onClose != null) {
+                            val velocity = velocityTracker.calculateVelocity()
+                            val shouldClose = ViewerDismissGesture.shouldDismiss(
+                                dy = dismissDragY,
+                                screenHeightPx = size.height.toFloat(),
+                                velocityYDownPxPerSec = velocity.y,
+                                velocityThresholdPxPerSec = velocityThresholdPx
+                            )
+                            if (shouldClose) {
+                                onClose()
+                            } else {
+                                settleDismissBack()
+                            }
+                        }
 
                         // Handle taps after gesture ends
                         val upTime = System.currentTimeMillis()

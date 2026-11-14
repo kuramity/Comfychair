@@ -183,6 +183,18 @@ object MediaCache {
         missingKeys.remove(key.keyString)
     }
 
+    /**
+     * 记录"服务器上已没有这个文件"（/view 404）。
+     *
+     * 只有 fetchImage 链路能把 404 单独分型出来（fetchVideo 不分），所以写入点都在图片链路上。
+     * 记下之后：① fetchThumbnail / fetchViewerImage 在 [isFileMissing] 上短路，不再白打这趟请求；
+     * ② 图库格子与查看器的"文件不存在"占位有了数据源。
+     * 清除途径：手动重试（[clearFileMissing]）与下拉刷新（[clearForRefresh]）。
+     */
+    private fun markFileMissing(key: MediaCacheKey) {
+        missingKeys.add(key.keyString)
+    }
+
     // Disk cache directory name
     private const val DISK_CACHE_DIR = "gallery_cache"
 
@@ -773,7 +785,10 @@ object MediaCache {
                         maxDimension = ComfyUIClient.THUMBNAIL_DECODE_DIMENSION,
                         preview = ComfyUIClient.LIST_THUMBNAIL_PREVIEW,
                         useThumbnailClient = true
-                    ) { result, _ ->
+                    ) { result, failureType ->
+                        if (result == null && failureType == ConnectionFailure.FILE_MISSING) {
+                            markFileMissing(key)
+                        }
                         if (cont.isActive) cont.resume(result)
                     }
                 }
@@ -850,6 +865,10 @@ object MediaCache {
             cacheFullBitmap(keyStr, bitmap)
             return ViewerImage(bitmap, false)
         }
+        if (failure == ConnectionFailure.FILE_MISSING) {
+            // 404 记档：之后缩略图/查看器不再白打这趟请求，UI 也能显示"文件不存在"
+            markFileMissing(key)
+        }
         if (failure != ConnectionFailure.FILE_TOO_LARGE) {
             return ViewerImage(null, false)
         }
@@ -877,7 +896,11 @@ object MediaCache {
                     type = type,
                     preview = ComfyUIClient.FALLBACK_PREVIEW,
                     useThumbnailClient = true
-                ) { result, _ ->
+                ) { result, failureType ->
+                    // 压缩版请求打的是同一个文件：它 404 等于文件真没了，一并记档
+                    if (result == null && failureType == ConnectionFailure.FILE_MISSING) {
+                        markFileMissing(key)
+                    }
                     if (cont.isActive) cont.resume(result)
                 }
             }
@@ -965,7 +988,10 @@ object MediaCache {
         priority: Int
     ): Bitmap? {
         val bitmap = suspendCancellableCoroutine { continuation ->
-            client.fetchImage(key.filename, subfolder, type) { bmp, _ ->
+            client.fetchImage(key.filename, subfolder, type) { bmp, failureType ->
+                if (bmp == null && failureType == ConnectionFailure.FILE_MISSING) {
+                    markFileMissing(key)
+                }
                 continuation.resume(bmp)
             }
         }
@@ -1028,7 +1054,10 @@ object MediaCache {
         context: Context
     ): Bitmap? {
         val bitmap = suspendCancellableCoroutine { continuation ->
-            client.fetchImage(key.filename, subfolder, type) { bmp, _ ->
+            client.fetchImage(key.filename, subfolder, type) { bmp, failureType ->
+                if (bmp == null && failureType == ConnectionFailure.FILE_MISSING) {
+                    markFileMissing(key)
+                }
                 continuation.resume(bmp)
             }
         }
@@ -1102,7 +1131,10 @@ object MediaCache {
 
             return withContext(Dispatchers.IO) {
                 val bitmap = suspendCancellableCoroutine { continuation ->
-                    client!!.fetchImage(key.filename, subfolder, type) { bmp, _ ->
+                    client!!.fetchImage(key.filename, subfolder, type) { bmp, failureType ->
+                        if (bmp == null && failureType == ConnectionFailure.FILE_MISSING) {
+                            markFileMissing(key)
+                        }
                         continuation.resume(bmp)
                     }
                 }
@@ -1126,7 +1158,10 @@ object MediaCache {
 
                 DebugLogger.d(TAG, "fetchImage: ${key.keyString} -> fetching from server")
                 val bitmap = suspendCancellableCoroutine { continuation ->
-                    client!!.fetchImage(key.filename, subfolder, type) { bmp, _ ->
+                    client!!.fetchImage(key.filename, subfolder, type) { bmp, failureType ->
+                        if (bmp == null && failureType == ConnectionFailure.FILE_MISSING) {
+                            markFileMissing(key)
+                        }
                         continuation.resume(bmp)
                     }
                 }
@@ -1559,6 +1594,17 @@ object MediaCache {
         bitmapCache.evictAll()
         videoCache.evictAll()
         videoDimensionsCache.clear()
+        // 下拉刷新 = "重新向服务器要一遍"，这三样是本次会话内学到的"知识"，刷新即过期（H4）：
+        // - thumbnailCache 不清 → 老缩略图直接命中内存，服务器上的变化永远看不见；
+        // - missingKeys 不清 → 已确认 404 的条目在 fetchThumbnail/fetchViewerImage 里被短路，
+        //   用户把文件放回服务器后下拉刷新也无法恢复；
+        // - oversizedKeys 不清 → 同理，"超过下载上限"的判定是按当时的原图算的，
+        //   服务器上换了文件之后旧判定不成立。
+        // 三样必须一起清：只清缩略图不清标记，404 条目刷新后依旧加载失败（只清标记不清
+        // 缩略图则更糟——内存里还有旧图可显示，用户会以为刷新根本没发生）。
+        thumbnailCache.evictAll()
+        missingKeys.clear()
+        oversizedKeys.clear()
         prefetchQueue.clear()
         inProgressKeys.clear()
         completionCallbacks.clear()

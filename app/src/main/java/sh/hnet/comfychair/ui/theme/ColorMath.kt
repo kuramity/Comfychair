@@ -200,6 +200,16 @@ object ColorMath {
         return fromHsl(hsl.copy(h = normalizeHue(hue)))
     }
 
+    /**
+     * HSV 口径的色相偏移：h + delta 后归一化，S/V 原样保留。
+     * 用 HSV 而不是 HSL 的原因：按钮渐变的辅色派生自"强调色色相 +35°"（决策 1），
+     * 要求的是纯色相旋转 —— HSV 的 S/V 与取色器口径一致，往返量化误差可被单测钉住。
+     */
+    fun shiftHueHsv(argb: Int, delta: Float): Int {
+        val hsv = toHsv(argb)
+        return fromHsv(hsv.copy(h = normalizeHue(hsv.h + delta)))
+    }
+
     fun shiftLightness(argb: Int, delta: Float, minL: Float = 0f, maxL: Float = 1f): Int {
         val hsl = toHsl(argb)
         return fromHsl(hsl.copy(l = (hsl.l + delta).coerceIn(minL, maxL)))

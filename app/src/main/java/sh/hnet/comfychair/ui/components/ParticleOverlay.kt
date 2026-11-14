@@ -28,6 +28,10 @@ import kotlin.random.Random
 /**
  * 全局点击反馈特效（v4.8.0：修复点击屏蔽 + 视觉升级为涟漪 / 辉光 / 微粒子三层）。
  *
+ * **2026-11-14 起默认不挂载**：新验收标准禁止全屏描边圆环 + 向外飞散的实心粒子，
+ * 点击效果改由按钮内的 ripple 点阵皮肤（`rippleFeedback`）承载。本文件保留不删，
+ * 通过 `AppSettings.isParticleOverlayEnabled`（默认 false）控制挂载，作为一键回退通道。
+ *
  * ## 一、修复：这一层绝不能挂触摸修饰符
  *
  * v4.7.0 在 `Canvas` 上挂了 `Modifier.pointerInput`，Compsoe 命中测试默认

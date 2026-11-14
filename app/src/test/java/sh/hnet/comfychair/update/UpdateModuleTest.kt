@@ -66,6 +66,50 @@ class UpdateModuleTest {
         assertEquals(-1L, info.apkSize)
         assertEquals("", info.sha256)
         assertFalse(info.force)
+        // v4.10.1：老清单没有 changelog / notes 也不能炸，弹窗那边按"空"处理
+        assertTrue(info.changelog.isEmpty())
+        assertEquals("", info.notes)
+    }
+
+    // ---------- v4.10.1：更新说明（notes + changelog） ----------
+
+    @Test
+    fun `parses notes and changelog array`() {
+        val info = UpdateInfo.fromJson(
+            """{"versionCode":118,"versionName":"v4.10.1",""" +
+                """"apkUrl":"https://updates.example.com/a.apk",""" +
+                """"notes":"第一段说明\n第二段说明",""" +
+                """"changelog":["修复 A","修复 B"]}"""
+        )
+        assertEquals("第一段说明\n第二段说明", info.notes)
+        assertEquals(listOf("修复 A", "修复 B"), info.changelog)
+    }
+
+    @Test
+    fun `changelog accepts a single string`() {
+        val info = UpdateInfo.fromJson(
+            """{"versionCode":118,"apkUrl":"https://updates.example.com/a.apk",""" +
+                """"changelog":"只有一句话"}"""
+        )
+        assertEquals(listOf("只有一句话"), info.changelog)
+    }
+
+    @Test
+    fun `changelog array drops blank entries`() {
+        val info = UpdateInfo.fromJson(
+            """{"versionCode":118,"apkUrl":"https://updates.example.com/a.apk",""" +
+                """"changelog":["有内容","   ",""]}"""
+        )
+        // 手工维护 json 时多打的逗号不该在弹窗里留空行
+        assertEquals(listOf("有内容"), info.changelog)
+    }
+
+    @Test
+    fun `blank notes falls back to empty string`() {
+        val info = UpdateInfo.fromJson(
+            """{"versionCode":118,"apkUrl":"https://updates.example.com/a.apk","notes":"   "}"""
+        )
+        assertEquals("", info.notes)
     }
 
     @Test(expected = IllegalArgumentException::class)

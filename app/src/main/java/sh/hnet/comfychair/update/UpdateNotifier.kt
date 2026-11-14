@@ -152,6 +152,30 @@ object UpdateNotifier {
         )
     }
 
+    /**
+     * 下载暂时失败、WorkManager 退避等待中（v4.12.0，A-R1 第 8 条）：
+     * 把进度通知切成"等待重试（第 N 次）"的明确文案，不留旧的百分比 ——
+     * 否则退避期间用户看到的是一条永远不动的旧进度条，误以为还在下载。
+     * 仓库状态此时保持 DOWNLOADING（FAILED 只留给最终失败）。
+     */
+    fun notifyWaitingRetry(context: Context, versionName: String, attempt: Int) {
+        if (!canPost(context)) return
+        ensureChannels(context)
+        val notification = NotificationCompat.Builder(context, PROGRESS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_comfychair_foreground)
+            .setContentTitle(context.getString(R.string.update_progress_title, versionName))
+            .setContentText(context.getString(R.string.update_progress_retrying, attempt))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setContentIntent(launchAppPendingIntent(context))
+            .build()
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(PROGRESS_NOTIFICATION_ID, notification)
+    }
+
     /** 撤掉进度通知（下载结束/失败/完成时调用；前台服务会把同 id 的通知一并撤掉） */
     fun cancelProgress(context: Context) {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

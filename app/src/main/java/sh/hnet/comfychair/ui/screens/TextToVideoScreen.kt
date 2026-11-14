@@ -3,7 +3,6 @@ package sh.hnet.comfychair.ui.screens
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExitTransition
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.foundation.Image
@@ -22,12 +21,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Save
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -55,7 +52,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -80,6 +76,7 @@ import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
 import sh.hnet.comfychair.ui.components.shared.FreeMemoryButton
+import sh.hnet.comfychair.ui.components.shared.SettingsGearButton
 import sh.hnet.comfychair.ui.components.shared.rememberSpellCheckVisualTransformation
 import sh.hnet.comfychair.ui.components.config.ConfigBottomSheetContent
 import sh.hnet.comfychair.ui.components.config.UnifiedCallbacks
@@ -254,20 +251,21 @@ fun TextToVideoScreen(
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
                 // v4.9.0：四段式顶栏（本页无输入类动作，直接是输出类 → 全局）
+                // v5：保存/分享常驻（修复"出图后出现、再生成闪没"），无结果时按钮禁用置灰
                 GenerationTopBarActions(
                     is3DWorkflow = false,
                     threeDResult = null,
-                    onSave = videoUri?.let {
-                        {
+                    hasResult = videoUri != null,
+                    // 产物 URI 非空才执行（按钮仅在 hasResult 时可点，恒定传回调不改变原行为）
+                    onSave = {
+                        videoUri?.let { uri ->
                             scope.launch {
-                                VideoUtils.saveVideoToGallery(context, it, VideoUtils.GalleryPrefix.TEXT_TO_VIDEO)
+                                VideoUtils.saveVideoToGallery(context, uri, VideoUtils.GalleryPrefix.TEXT_TO_VIDEO)
                             }
                         }
                     },
-                    onShare = videoUri?.let {
-                        {
-                            VideoUtils.shareVideo(context, it)
-                        }
+                    onShare = {
+                        videoUri?.let { uri -> VideoUtils.shareVideo(context, uri) }
                     },
                     onSettings = onNavigateToSettings,
                     onLogout = onLogout
@@ -464,24 +462,14 @@ fun TextToVideoScreen(
                 modifier = Modifier.weight(1f)
             )
 
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(10.dp))
 
-            // Animate gear icon rotation when options sheet is shown
-            val optionsIconRotation by animateFloatAsState(
-                targetValue = if (showOptionsSheet) 90f else 0f,
-                label = "options icon rotation"
-            )
-
-            OutlinedIconButton(
+            // v5：齿轮抽成共用 SettingsGearButton（v2 皮肤浅底圆形；打开态旋转动画收进组件），
+            // 与生成按钮组间距统一 10dp。
+            SettingsGearButton(
+                open = showOptionsSheet,
                 onClick = { showOptionsSheet = true },
-                modifier = Modifier.size(56.dp)
-            ) {
-                Icon(
-                    Icons.Default.Settings,
-                    contentDescription = stringResource(R.string.button_options),
-                    modifier = Modifier.rotate(optionsIconRotation)
-                )
-            }
+            )
         }
     } // End of outer Column
 

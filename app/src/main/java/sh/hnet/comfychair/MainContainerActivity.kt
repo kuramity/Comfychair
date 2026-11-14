@@ -115,7 +115,15 @@ class MainContainerActivity : ComponentActivity() {
     // Lifecycle methods
 
     /**
-     * 点击特效的坐标来源（v4.8.0）。
+     * 全屏粒子特效开关（v4.12.x）：默认 false 时既不组合 [ParticleOverlay]、
+     * 也不转发触点坐标 —— 全屏描边圆环 + 飞散粒子的特效形态已被 2026-11-14 的
+     * 新验收标准禁用，按钮内的 ripple 点阵皮肤（rippleFeedback）取而代之。
+     * onCreate 读一次存成员变量，避免每次触摸都查 SharedPreferences。
+     */
+    private var particleOverlayEnabled = false
+
+    /**
+     * 点击特效的坐标来源（v4.8.0；v4.12.x 起仅当粒子层开关打开时才转发）。
      *
      * **这个方法必须 `return super`**：它只读一眼 ACTION_DOWN 的坐标交给特效池，
      * 不消费、不拦截、不改写事件 —— Compose 的分发链与没有特效层时完全一致。
@@ -125,7 +133,7 @@ class MainContainerActivity : ComponentActivity() {
      * 于是按钮、下拉、输入框全部失灵。改到这一层读坐标就不会参与命中测试。
      */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+        if (particleOverlayEnabled && ev.actionMasked == MotionEvent.ACTION_DOWN) {
             if (BuildConfig.DEBUG) {
                 android.util.Log.d("ParticleFx", "down ${ev.x},${ev.y}")
             }
@@ -137,6 +145,9 @@ class MainContainerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+
+        // 全屏粒子特效回退开关（v4.12.x）：默认 false，读一次供 dispatchTouchEvent 与挂载点共用
+        particleOverlayEnabled = AppSettings.isParticleOverlayEnabled(this)
 
         // Guard check - redirect to login if not connected (unless in offline mode)
         // 离线态统一看连接状态：自动切换（网络断开）与强制离线都会置 OfflineConnected
@@ -215,9 +226,10 @@ class MainContainerActivity : ComponentActivity() {
                 val sessionExpired by ConnectionManager.sessionExpired.collectAsState()
 
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    // v4.6.1 模块 B：外面包一层 Box，把粒子覆盖层叠在导航内容之上。
-                    // ParticleOverlay 的 pointerInput 只在 Initial pass 观察、不消费事件，
-                    // 所以按钮/滑动手势照常工作；Dialog/BottomSheet 是独立 Window，天然更高。
+                    // v4.6.1 模块 B：外面包一层 Box，粒子覆盖层曾叠在导航内容之上。
+                    // v4.12.x 起默认不挂载（新验收标准禁止全屏描边圆环 + 飞散粒子，
+                    // 效果改由按钮内的 ripple 点阵皮肤承载）；开关打开时才组合旧特效层，
+                    // 作为一键回退通道。ParticleOverlay 本身零触摸修饰符，不参与命中测试。
                     Box(modifier = Modifier.fillMaxSize()) {
                         // 共享 Filament Engine（v4.5.0）：整个页面的 3D 内嵌预览与全屏查看器
                         // 共用一个引擎，避免"点全屏时两个引擎并存"和"反复进出反复重建"。
@@ -232,7 +244,9 @@ class MainContainerActivity : ComponentActivity() {
                                 startDestination = startDestination
                             )
                         }
-                        ParticleOverlay()
+                        if (particleOverlayEnabled) {
+                            ParticleOverlay()
+                        }
                     }
                 }
 
@@ -368,6 +382,12 @@ class MainContainerActivity : ComponentActivity() {
         // Check if there's a pending generation that may have completed while in background
         if (isGenerating) {
             generationViewModel.checkServerForCompletion()
+        }
+
+        // v4.9.2：回前台/重连后自动检查更新（内部 30 分钟节流、不打断下载中的流程）。
+        // 原先只有 onCreate 查一次，用户重连或长期挂后台回来都得手动去设置页点"检查更新"。
+        lifecycleScope.launch(Dispatchers.IO) {
+            UpdateRepository.autoCheckIfDue(BuildConfig.VERSION_CODE)
         }
     }
 

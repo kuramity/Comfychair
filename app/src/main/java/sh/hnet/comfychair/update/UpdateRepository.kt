@@ -20,7 +20,7 @@ import java.util.concurrent.TimeUnit
  * - **UI 只是观察者**：Dialog 的 onDismiss 只把 `showDialog=false`，不碰这里的任何方法 ——
  *   Worker 继续在 WorkManager 里跑，重新打开弹窗进度还在。
  * - **Worker 是唯一写入方**：只有 [UpdateDownloadWorker] 调 publish* 系列；
- *   [startDownload] 只负责入队（KEEP 策略防重复）。
+ *   [startDownload] 只负责入队（先取消旧任务再 REPLACE，保证手动重试必然真正开跑）。
  * - **重启恢复**：[restoreFromDisk] 在 App 冷启动时调用 —— 检查 .part 与 WorkManager
  *   队列，把状态恢复成"下载中（已续到 N 字节）"，绝不清文件、绝不从头下。
  *
@@ -29,8 +29,14 @@ import java.util.concurrent.TimeUnit
  */
 object UpdateRepository {
 
+    /** WorkManager 唯一任务名（入队 / 手动取消 / 冷启动恢复共用，必须一致） */
+    const val DOWNLOAD_WORK_NAME = "comfychair_update_download"
+
     /** 进度发射的最小间隔（硬性约束 13：300–500ms，取 400ms） */
     internal const val PROGRESS_THROTTLE_MS = 400L
+
+    /** 自动检查更新的最小间隔（v4.9.2：断线重连很频繁，不能每次都打请求） */
+    private const val AUTO_CHECK_INTERVAL_MS = 30 * 60 * 1000L
 
     private val _state = MutableStateFlow(UpdateState())
 
@@ -97,6 +103,16 @@ object UpdateRepository {
         _state.value = prev.copy(phase = phase)
     }
 
+    /**
+     * Worker 每次进入时把状态拉回 DOWNLOADING（A-R1 Critical-1 的状态机收敛）：
+     * 自动重试 / 进程重启后 phase 可能停在 FAILED，[publishProgress] 的 phase 闸门
+     * 会把后续所有进度丢掉 → 通知与 UI 永久停摆。带 .part 已有字节恢复，
+     * 用户看到的是"从上次的地方继续"而不是"从 0 开始"。
+     */
+    internal fun publishResuming(partBytes: Long, totalBytes: Long) {
+        _state.value = UpdateState.resuming(partBytes, totalBytes)
+    }
+
     internal fun publishReady(finalSize: Long) {
         _state.value = UpdateState(
             phase = UpdatePhase.READY_TO_INSTALL,
@@ -118,9 +134,13 @@ object UpdateRepository {
     // ---------- 入队与恢复 ----------
 
     /**
-     * 入队下载（用户点"立即更新"）。
-     * [ExistingWorkPolicy.KEEP]：已有同任务在跑/排队时**不重新入队** ——
-     * 双击按钮、弹窗重开都不会产生第二个下载。
+     * 入队下载（用户点"立即更新"或失败后点"重试"）。
+     *
+     * 手动触发必须**必然真正开始一次下载**（A-R1 Important-2）：原来的
+     * [ExistingWorkPolicy.KEEP] 在旧任务未 finished（比如上一轮正无限重试）时会
+     * **静默丢弃**新请求，但下面已经把 UI 置 DOWNLOADING(0) → 假的"下载中 0MB"。
+     * 改为先显式取消旧任务（.part 保留，可续传），再 REPLACE 入队；
+     * 双击按钮、弹窗重开产生的重复入队也只是重置同一个任务，不会出现两个下载并行。
      */
     fun startDownload(context: Context, info: UpdateInfo) {
         pendingUpdate = info
@@ -140,9 +160,11 @@ object UpdateRepository {
                 )
             )
             .build()
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            "comfychair_update_download",
-            ExistingWorkPolicy.KEEP,
+        val workManager = WorkManager.getInstance(context)
+        workManager.cancelUniqueWork(DOWNLOAD_WORK_NAME)
+        workManager.enqueueUniqueWork(
+            DOWNLOAD_WORK_NAME,
+            ExistingWorkPolicy.REPLACE,
             request
         )
         val total = if (info.apkSize > 0) info.apkSize else 0L
@@ -163,7 +185,7 @@ object UpdateRepository {
         val final = UpdateDownloadWorker.finalFile(context)
         val workInfo = try {
             WorkManager.getInstance(context)
-                .getWorkInfosForUniqueWork("comfychair_update_download").get()
+                .getWorkInfosForUniqueWork(DOWNLOAD_WORK_NAME).get()
         } catch (_: Exception) {
             null
         }
@@ -195,5 +217,44 @@ object UpdateRepository {
         UpdateDownloadWorker.partFile(context).delete()
         _state.value = UpdateState()
         pendingUpdate = null
+    }
+
+    // ---------- 自动检查（v4.9.2）----------
+
+    /** 上次自动检查的时间戳（毫秒）；0 = 本次进程还没查过 */
+    private var lastAutoCheckAt = 0L
+
+    /**
+     * 回前台 / 重连后自动检查更新（节流 30 分钟）。
+     *
+     * **为什么需要它**：原先只有 `MainContainerActivity.onCreate` 查一次 —— 用户重连、
+     * 长时间挂后台再回来，都不会重新检查，必须手动去设置页点"检查更新"才有反应。
+     *
+     * 三条约束：
+     * 1. **节流**：断线重连可能很频繁，不能每次都打请求（30 分钟内只查一次）；
+     * 2. **不打断进行中的流程**：正在下载/校验/已下好待安装时直接返回 ——
+     *    尤其 `READY_TO_INSTALL` 时再 publishAvailable 会把界面打回 AVAILABLE，
+     *    让用户以为要重下 150MB；
+     * 3. **阻塞调用**：内部走 `checkForUpdate` 同步网络请求，**必须在 IO 线程调用**。
+     *
+     * 发现新版本时只 `publishAvailable`（弹窗等用户确认），不自动下载。
+     */
+    fun autoCheckIfDue(currentVersionCode: Int) {
+        val now = System.currentTimeMillis()
+        if (now - lastAutoCheckAt < AUTO_CHECK_INTERVAL_MS) return
+
+        val phase = _state.value.phase
+        if (phase == UpdatePhase.DOWNLOADING ||
+            phase == UpdatePhase.VERIFYING ||
+            phase == UpdatePhase.READY_TO_INSTALL
+        ) {
+            return
+        }
+
+        lastAutoCheckAt = now
+        val info = UpdateChecker.checkForUpdate(currentVersionCode, manualCheck = false)
+        if (info != null) {
+            publishAvailable(info)
+        }
     }
 }

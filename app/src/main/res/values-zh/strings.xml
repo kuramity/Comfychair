@@ -741,6 +741,12 @@
     <string name="media_viewer_copy_link">复制下载链接</string>
     <string name="msg_download_link_copied">下载链接已复制，用浏览器打开即可下载原图</string>
 
+    <!-- 查看器加载失败占位（三档：重试是否有用各不相同） -->
+    <string name="viewer_load_failed_file_missing">文件不存在（可能已被服务器清理）</string>
+    <string name="viewer_load_failed_network">网络或服务器不可达，可重试</string>
+    <string name="viewer_load_failed_generic">加载失败</string>
+    <string name="viewer_retry">重试</string>
+
     <!-- 通用节点参数引擎（动态节点参数） -->
     <string name="title_node_params">节点参数</string>
     <string name="node_params_count">%1$d</string>
@@ -845,6 +851,25 @@
     <string name="update_progress_meta">%1$s · 剩余 %2$s</string>
     <string name="update_ready_install_text">版本 %1$s 已下载，点击安装。</string>
     <string name="update_failed_title">更新下载失败</string>
+    <string name="update_changelog_title">本次更新内容</string>
+    <!-- v4.10.1 更新说明：完整说明段落 + 当前版本对照 -->
+    <string name="update_notes_title">更新说明</string>
+    <string name="update_current_version_line">当前版本 %1$s</string>
+    <string name="update_changelog_empty">本次更新未提供详细说明。</string>
+    <!-- v4.12.0 失败分型：横幅要能区分是哪个阶段失败（A-B1） -->
+    <string name="update_error_connect">连接失败，请检查网络后重试。</string>
+    <string name="update_error_timeout">传输超时，将自动续传重试。</string>
+    <string name="update_error_server">服务端错误（HTTP %1$d）。</string>
+    <string name="update_error_http">服务端拒绝请求（HTTP %1$d）。</string>
+    <string name="update_error_verify">安装包校验失败（SHA-256 不匹配）。</string>
+    <string name="update_error_disk">磁盘空间不足（剩余 %1$s，需要约 %2$s）。</string>
+    <string name="update_error_retry_exhausted">已重试 %1$d 次仍失败，请检查网络后手动重试。</string>
+    <string name="update_error_unknown">下载中断，可重试续传。</string>
+    <string name="update_error_unexpected">下载出错：%1$s</string>
+    <string name="update_error_legacy_interrupted">下载中断（%1$s），可重试续传。</string>
+    <!-- v4.12.0 重试退避通知文案 + 总长未知时的进度降级行 -->
+    <string name="update_progress_retrying">等待重试（第 %1$d 次）</string>
+    <string name="update_progress_unknown_total">已下载 %1$s</string>
     <!-- v4.8.2 取消失败不再假装成功 -->
     <string name="generation_cancel_failed">取消失败：服务器未确认，任务仍在运行</string>
     <!-- v4.6.1 模块 A：取消归属校验提示 -->

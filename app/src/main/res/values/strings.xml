@@ -879,6 +879,12 @@
     <string name="media_viewer_copy_link">Copy download link</string>
     <string name="msg_download_link_copied">Download link copied — open it in a browser to get the original</string>
 
+    <!-- Viewer load failure placeholders (three tiers: retry usefulness differs) -->
+    <string name="viewer_load_failed_file_missing">File not on server (may have been cleaned up)</string>
+    <string name="viewer_load_failed_network">Network or server unreachable — retry may help</string>
+    <string name="viewer_load_failed_generic">Load failed</string>
+    <string name="viewer_retry">Retry</string>
+
     <!-- Dynamic node parameters (generic node parameter engine) -->
     <string name="title_node_params">Node parameters</string>
     <string name="node_params_count">%1$d</string>
@@ -931,6 +937,25 @@
     <string name="update_progress_meta">%1$s · %2$s left</string>
     <string name="update_ready_install_text">Version %1$s downloaded. Tap to install.</string>
     <string name="update_failed_title">Update download failed</string>
+    <string name="update_changelog_title">What\'s new</string>
+    <!-- v4.10.1 release notes: full paragraph notes + current version line -->
+    <string name="update_notes_title">Release notes</string>
+    <string name="update_current_version_line">Current version %1$s</string>
+    <string name="update_changelog_empty">No detailed notes were provided for this version.</string>
+    <!-- v4.12.0 download failure kinds: banner must tell which stage failed (A-B1) -->
+    <string name="update_error_connect">Connection failed. Check the network and try again.</string>
+    <string name="update_error_timeout">Transfer timed out. Will resume automatically.</string>
+    <string name="update_error_server">Server error (HTTP %1$d).</string>
+    <string name="update_error_http">Server rejected the request (HTTP %1$d).</string>
+    <string name="update_error_verify">Package verification failed (SHA-256 mismatch).</string>
+    <string name="update_error_disk">Not enough storage (free %1$s, need about %2$s).</string>
+    <string name="update_error_retry_exhausted">Failed after %1$d retries. Check the network and retry manually.</string>
+    <string name="update_error_unknown">Download interrupted. Resumable retry supported.</string>
+    <string name="update_error_unexpected">Download error: %1$s</string>
+    <string name="update_error_legacy_interrupted">Download interrupted (%1$s), resumable retry supported.</string>
+    <!-- v4.12.0: backoff notice on the progress notification + unknown-total fallback line -->
+    <string name="update_progress_retrying">Waiting to retry (attempt %1$d)</string>
+    <string name="update_progress_unknown_total">Downloaded %1$s</string>
     <!-- v4.8.2 取消失败不再假装成功 -->
     <string name="generation_cancel_failed">Cancel failed: the server did not acknowledge. The task is still running.</string>
     <!-- v4.6.1 模块 A：取消归属校验提示 -->

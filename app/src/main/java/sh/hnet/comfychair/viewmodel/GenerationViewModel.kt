@@ -22,6 +22,7 @@ import sh.hnet.comfychair.R
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.util.VideoUtils
 import sh.hnet.comfychair.connection.WebSocketMessage
 import sh.hnet.comfychair.connection.WebSocketState
@@ -84,6 +85,40 @@ sealed class GenerationEvent {
     data class CancelRejected(@StringRes val messageResId: Int) : GenerationEvent()
     data object ConnectionLostDuringGeneration : GenerationEvent()
     data object ClearPreviewForResume : GenerationEvent()
+}
+
+/**
+ * 生成完成后触发图库刷新的防抖阀（H5，纯逻辑抽出便于 JVM 单测）。
+ *
+ * 两条规则缺一不可：
+ * - **同一任务只算一次**：完成事件有多条路径（WS 双事件 + 断线轮询兜底）会重复到达；
+ * - **防抖窗口内合并**：批量出图时多个任务接连完成，每个都刷一遍等于对 /history 连发，
+ *   窗口内合并成一次即可（后一次刷新本来就会把前面的新条目一起带出来）。
+ */
+internal class GalleryRefreshThrottle(private val debounceMs: Long) {
+
+    private var lastPromptId: String? = null
+    private var lastFiredAtMs = 0L
+    private var hasFired = false
+
+    /** 返回 true 表示这次应该真的触发刷新 */
+    fun shouldFire(promptId: String, nowMs: Long): Boolean {
+        // 同一任务的重复完成事件：无论隔多久都只算一次
+        if (promptId == lastPromptId) return false
+        lastPromptId = promptId
+        // 首次触发没有"上次时间"可比，直接放行。
+        // 不能拿 Long.MIN_VALUE 当"久远的过去"：nowMs - Long.MIN_VALUE 会溢出成负数，
+        // 首次触发就永远被窗口拦下（单测抓过）
+        if (!hasFired) {
+            hasFired = true
+            lastFiredAtMs = nowMs
+            return true
+        }
+        // 防抖窗口内的不同任务：合并进上一次刷新
+        if (nowMs - lastFiredAtMs < debounceMs) return false
+        lastFiredAtMs = nowMs
+        return true
+    }
 }
 
 /**
@@ -186,6 +221,9 @@ class GenerationViewModel : ViewModel() {
          * 2. 本地 executingPromptId 滞后时，先等这次同步回来再决定走中断还是清排队。
          */
         private const val QUEUE_SYNC_DELAY_MS = 500L
+
+        /** 生成完成后触发图库刷新的防抖窗口（H5）：批量任务接连完成时合并为一次刷新 */
+        private const val GALLERY_REFRESH_DEBOUNCE_MS = 2000L
     }
 
     /**
@@ -514,6 +552,9 @@ class GenerationViewModel : ViewModel() {
      */
     private var lastImageGeneratedPromptId: String? = null
 
+    /** 生成完成后的图库刷新防抖阀（多条完成路径共用一把，规则见 [GalleryRefreshThrottle]） */
+    private val galleryRefreshThrottle = GalleryRefreshThrottle(GALLERY_REFRESH_DEBOUNCE_MS)
+
     private fun dispatchEvent(event: GenerationEvent) {
         // 技能流（提示词强化）不出图，结果是一段文本：在这里统一取回来发布给
         // SkillTextResultDialog。必须落在事件分发**之前** —— 两条完成路径（轮询 /
@@ -532,6 +573,17 @@ class GenerationViewModel : ViewModel() {
             // 在分发前统一发布给 ThreeDResultHolder（常驻 3D 按钮的数据源）。
             // 只挂兜底路径的话，前台正常生成（有 handler）时按钮永远不会出现。
             publishThreeD(event.promptId)
+        }
+
+        // 生成成功完成 → 触发图库刷新（H5）。失败（Error）与取消（GenerationCancelled）
+        // 不是这两类事件，天然不会走到这里；防抖与跨路径去重交给 [galleryRefreshThrottle]。
+        // 两个分支分开写：Kotlin 的合并分支（is A, is B ->）推不出公共的 promptId 属性
+        when (event) {
+            is GenerationEvent.ImageGenerated ->
+                maybeRefreshGalleryAfterGeneration(event.promptId)
+            is GenerationEvent.VideoGenerated ->
+                maybeRefreshGalleryAfterGeneration(event.promptId)
+            else -> {}
         }
 
         val handler = activeEventHandler
@@ -580,6 +632,22 @@ class GenerationViewModel : ViewModel() {
         }
         // Also emit to SharedFlow for backwards compatibility
         viewModelScope.launch { _events.emit(event) }
+    }
+
+    /**
+     * 生成成功完成后触发图库刷新（H5）。
+     *
+     * 以前图库只能靠 5 分钟一次的周期刷新看到新图 —— 用户生成完切到图库，
+     * 刚出的图最长要等 5 分钟才出现。用 [GalleryRepository.refresh]（后台静默）
+     * 而不是 manualRefresh()：新条目本来就不在任何媒体缓存里，不需要清缓存，
+     * 也不该让图库弹"手动下拉刷新"的指示器。refresh() 自带并发保护与"无客户端跳过"，
+     * 内部的 /history 拉取跑在 IO 线程，这里只是启动协程、不在主线程做 IO。
+     */
+    private fun maybeRefreshGalleryAfterGeneration(promptId: String) {
+        if (galleryRefreshThrottle.shouldFire(promptId, System.currentTimeMillis())) {
+            DebugLogger.d(TAG, "Refreshing gallery after generation (${Obfuscator.promptId(promptId)})")
+            GalleryRepository.getInstance().refresh()
+        }
     }
 
     /**

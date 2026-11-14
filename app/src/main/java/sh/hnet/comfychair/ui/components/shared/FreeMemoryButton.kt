@@ -15,9 +15,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.ui.components.ripple.RippleIconButton
 
 /**
  * 生成页顶部的"释放模型内存"按钮：确认后调用服务器 /free 卸载全部模型权重。
@@ -29,10 +33,13 @@ fun FreeMemoryButton() {
     var showConfirm by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
 
-    IconButton(onClick = { showConfirm = true }) {
+    // 波纹点阵反馈（v4.9.x）：包装层只观察指针（Initial pass、不 consume），确认弹窗与
+    // /free 请求逻辑完全不变；图标 22dp 对齐顶栏裸图标规格（v2 皮肤）
+    RippleIconButton(onClick = { showConfirm = true }) {
         Icon(
             Icons.Outlined.Eject,
-            contentDescription = context.getString(R.string.button_free_memory)
+            contentDescription = context.getString(R.string.button_free_memory),
+            modifier = Modifier.size(22.dp)
         )
     }
 

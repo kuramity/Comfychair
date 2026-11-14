@@ -5,7 +5,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExitTransition
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.foundation.Image
@@ -26,13 +25,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Save
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -63,7 +60,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -91,6 +87,7 @@ import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
 import sh.hnet.comfychair.ui.components.shared.FreeMemoryButton
+import sh.hnet.comfychair.ui.components.shared.SettingsGearButton
 import sh.hnet.comfychair.ui.components.shared.rememberSpellCheckVisualTransformation
 import sh.hnet.comfychair.ui.components.config.ConfigBottomSheetContent
 import sh.hnet.comfychair.ui.components.config.UnifiedCallbacks
@@ -275,23 +272,29 @@ fun ImageToVideoScreen(
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
                 // v4.9.0：四段式顶栏（加图 → 保存/分享 → 全局）
-                val canExport = videoUri != null && uiState.viewMode == ImageToVideoViewMode.PREVIEW
+                // v5：保存/分享常驻；原 canExport 的"非预览视图不给导出"改为编辑态
+                // isEditing（按钮禁用置灰而非隐藏，位置稳定）
                 GenerationTopBarActions(
                     is3DWorkflow = false,
                     threeDResult = null,
+                    hasResult = videoUri != null,
+                    isEditing = uiState.viewMode != ImageToVideoViewMode.PREVIEW,
                     // 导演台流不显示加图：那条流没有任何图片输入口，
                     // 选了图会被上传到服务器却无处注入 —— 用户以为照片是参考素材，实际零效果
                     onUploadImage = if (!uiState.isTimelineWorkflow) {
                         ({ imagePickerLauncher.launch("image/*") })
                     } else null,
-                    onSave = if (canExport) ({
-                        scope.launch {
-                            VideoUtils.saveVideoToGallery(context, videoUri, VideoUtils.GalleryPrefix.IMAGE_TO_VIDEO)
+                    // 产物 URI 非空才执行（按钮仅在 hasResult 且非编辑态时可点，恒定传回调不改变原行为）
+                    onSave = {
+                        videoUri?.let { uri ->
+                            scope.launch {
+                                VideoUtils.saveVideoToGallery(context, uri, VideoUtils.GalleryPrefix.IMAGE_TO_VIDEO)
+                            }
                         }
-                    }) else null,
-                    onShare = if (canExport) ({
-                        VideoUtils.shareVideo(context, videoUri)
-                    }) else null,
+                    },
+                    onShare = {
+                        videoUri?.let { uri -> VideoUtils.shareVideo(context, uri) }
+                    },
                     onSettings = onNavigateToSettings,
                     onLogout = onLogout
                 )
@@ -645,24 +648,14 @@ fun ImageToVideoScreen(
                 modifier = Modifier.weight(1f)
             )
 
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(10.dp))
 
-            // Animate gear icon rotation when options sheet is shown
-            val optionsIconRotation by animateFloatAsState(
-                targetValue = if (showOptionsSheet) 90f else 0f,
-                label = "options icon rotation"
-            )
-
-            OutlinedIconButton(
+            // v5：齿轮抽成共用 SettingsGearButton（v2 皮肤浅底圆形；打开态旋转动画收进组件），
+            // 与生成按钮组间距统一 10dp。
+            SettingsGearButton(
+                open = showOptionsSheet,
                 onClick = { showOptionsSheet = true },
-                modifier = Modifier.size(56.dp)
-            ) {
-                Icon(
-                    Icons.Default.Settings,
-                    contentDescription = stringResource(R.string.button_options),
-                    modifier = Modifier.rotate(optionsIconRotation)
-                )
-            }
+            )
         }
     } // End of outer Column
 

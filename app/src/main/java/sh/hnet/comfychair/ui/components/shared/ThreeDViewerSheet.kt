@@ -60,6 +60,7 @@ import sh.hnet.comfychair.model.AssetReleaseGate
 import sh.hnet.comfychair.model.ThreeDFraming
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.model.ThreeDVisibility
+import sh.hnet.comfychair.ui.components.ripple.RippleIconButton
 import java.io.File
 import kotlin.math.sqrt
 import kotlin.math.tan
@@ -306,9 +307,9 @@ fun ThreeDInlinePreview(
  * 3. **结果归属由调用方判定**：传进来的 [result] 已经是「属于当前工作流」的值
  *    （图生图页用 [ThreeDVisibility.visible] 过滤过），本组件不做二次归属判断。
  *
- * 视觉上把原来的 56dp 圆边框按钮换成顶栏标准的 [IconButton]（48dp 触控区、
- * 24dp 图标），这样才和旁边的内存释放 / 上传 / 菜单图标并排等齐 ——
- * 图标矢量本身没换，比例保持原样。
+ * 视觉上与顶栏其他图标走同一套皮肤：v5 起从裸 [IconButton] 换成 [RippleIconButton]
+ * （44dp 触控、圆角 12、点阵裁进圆角、图标 22dp）——它原先是无皮肤的裸按钮（C7），
+ * 在同一顶栏里观感脱节。点击行为、空状态 Toast 兜底完全不变。
  *
  * @param is3DWorkflow 当前选中的工作流是否为 3D 流（`capabilities.is3DWorkflow`）
  * @param result 当前工作流产出的 3D 结果；null 表示这次流还没生成过
@@ -330,7 +331,7 @@ fun ThreeDResultButton(
 
     if (!ThreeDVisibility.controlVisible(is3DWorkflow)) return
 
-    IconButton(
+    RippleIconButton(
         onClick = {
             if (ThreeDVisibility.opensViewer(result)) {
                 showSheet = true
@@ -347,7 +348,8 @@ fun ThreeDResultButton(
     ) {
         Icon(
             imageVector = Icons.Default.ViewInAr,
-            contentDescription = stringResource(R.string.three_d_viewer_title)
+            contentDescription = stringResource(R.string.three_d_viewer_title),
+            modifier = Modifier.size(22.dp)
         )
     }
 

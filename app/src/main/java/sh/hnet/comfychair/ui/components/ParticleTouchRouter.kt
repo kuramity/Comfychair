@@ -5,6 +5,11 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * 触摸坐标中转站（v4.8.0）。
  *
+ * **2026-11-14 起默认停用**：随全屏粒子层一起被新验收标准禁用（禁止描边圆环 +
+ * 飞散粒子），`MainContainerActivity.dispatchTouchEvent` 仅在
+ * `AppSettings.isParticleOverlayEnabled` 打开时才调用 [dispatch]。文件保留不删，
+ * 与 [ParticleOverlay] 一起作为一键回退通道。
+ *
  * **为什么需要它（v4.7.0 点击失效的真因）**
  *
  * `Modifier.pointerInput` 挂在全屏覆盖层上会参与 Compose 的命中测试，而命中测试默认

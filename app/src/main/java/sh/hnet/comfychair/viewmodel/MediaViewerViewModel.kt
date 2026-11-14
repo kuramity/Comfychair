@@ -25,6 +25,7 @@ import org.json.JSONObject
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheKey
+import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.util.GenerationMetadata
@@ -49,6 +50,70 @@ private const val METADATA_HEAD_BYTES = 64L * 1024
 enum class ViewerMode {
     GALLERY,  // Launched from gallery, supports navigation
     SINGLE    // Launched from generation screen, single item only
+}
+
+/**
+ * 查看器加载失败的三档文案档位（H6）。
+ *
+ * 只分三档是因为文案只需要回答一个问题：「重试有没有用」——
+ * 文件没了（重试没用）、网络不可达（重试可能有用）、其它（说不准）。
+ * UI 层按档位选 string 资源，映射关系见 [ViewerLoadPolicy.categorizeFailure]。
+ */
+enum class ViewerFailureCategory {
+    /** 服务器上已经没有这个文件（/view 404，典型场景是电脑端清理了 output） */
+    FILE_MISSING,
+    /** 网络或服务器不可达（离线 / 断线 / 传输停滞）—— 重试可能成功 */
+    NETWORK,
+    /** 其它失败（解码失败、写盘失败等），只给通用提示 */
+    GENERIC
+}
+
+/**
+ * 查看器单页内容的显示状态（H1-a/H1-b）。
+ */
+enum class ViewerShowState {
+    /** 内容已就位（图已解出 / 视频 URI 已就绪） */
+    CONTENT,
+    /** 内容缺失且正在加载 —— 转圈 */
+    LOADING,
+    /** 内容缺失且不在加载 —— 失败占位。修复前视频页走不到这里（无条件转圈）、图片页静默黑屏 */
+    FAILED
+}
+
+/**
+ * 查看器加载失败的纯判定逻辑。抽成 object 以便 JVM 单测直接覆盖，
+ * 不依赖 MediaCache / ConnectionManager 的运行时状态（与 GalleryHistoryParser 同一模式）。
+ */
+internal object ViewerLoadPolicy {
+
+    /**
+     * ComfyUIClient 的失败分型 → 文案档位。
+     *
+     * FILE_MISSING 与 NETWORK 必须分开：一个重试也不会好（文件没了），
+     * 一个重试可能好（网络恢复）—— 用户需要看出这两种失败不是一回事。
+     * STALLED（传输停滞）本质也是链路问题，归 NETWORK。
+     */
+    fun categorizeFailure(failure: ConnectionFailure): ViewerFailureCategory = when (failure) {
+        ConnectionFailure.FILE_MISSING -> ViewerFailureCategory.FILE_MISSING
+        ConnectionFailure.NETWORK, ConnectionFailure.STALLED -> ViewerFailureCategory.NETWORK
+        else -> ViewerFailureCategory.GENERIC
+    }
+
+    /**
+     * 「是否显示失败态」判定（H1-a/H1-b 的核心规则）。
+     *
+     * 内容缺失时只有"确定不在加载"才算失败：视频失败后 currentVideoUri 永远是 null，
+     * 原实现拿它当"还在加载"的信号，结果就是死转圈。
+     *
+     * @param isVideo 是否视频条目。判定结果与它无关（内容缺失 + 不在加载 = 失败，图视频同理），
+     *                保留在签名里是为了让调用处把"视频页无内容"也送进来判定——
+     *                修复前它根本进不了失败分支
+     */
+    fun resolveShowState(isVideo: Boolean, hasContent: Boolean, isLoading: Boolean): ViewerShowState = when {
+        hasContent -> ViewerShowState.CONTENT
+        isLoading -> ViewerShowState.LOADING
+        else -> ViewerShowState.FAILED
+    }
 }
 
 /**
@@ -124,7 +189,14 @@ data class MediaViewerUiState(
      * 只会在一种情况下为 true：原图超过下载上限（放大类工作流可能产出 200 MB 级的 PNG）。
      * 界面据此给出说明，并提供「复制下载链接」让用户去浏览器取原图。
      */
-    val compressedFallback: Boolean = false
+    val compressedFallback: Boolean = false,
+    /**
+     * 当前条目最近一次加载失败的原因档位（null = 没有待显示的失败）。
+     *
+     * 供失败占位（图标 + 文案 + 重试，H1-a/H1-b）选文案。成功加载、切换条目、
+     * 开始新的加载时都会清掉。
+     */
+    val loadFailure: ViewerFailureCategory? = null
 ) {
     val currentItem: MediaViewerItem?
         get() = items.getOrNull(currentIndex)
@@ -237,7 +309,8 @@ class MediaViewerViewModel : ViewModel() {
                 currentIndex = index,
                 currentBitmap = cachedBitmap,
                 currentVideoUri = null,
-                isLoading = false
+                isLoading = false,
+                loadFailure = null
             )
         } else if (item.isVideo && cachedVideoUri != null) {
             // Video is cached - show immediately
@@ -245,7 +318,8 @@ class MediaViewerViewModel : ViewModel() {
                 currentIndex = index,
                 currentBitmap = null,
                 currentVideoUri = cachedVideoUri,
-                isLoading = false
+                isLoading = false,
+                loadFailure = null
             )
         } else if (MediaCache.isPrefetchInProgress(key)) {
             // Prefetch is in progress - wait for it instead of starting new fetch
@@ -279,13 +353,15 @@ class MediaViewerViewModel : ViewModel() {
             val uri = MediaCache.getCachedVideoUri(key)
             _uiState.value = _uiState.value.copy(
                 currentVideoUri = uri,
-                isLoading = false
+                isLoading = false,
+                loadFailure = if (uri == null) inferLoadFailure(key) else null
             )
         } else {
             val bitmap = MediaCache.getBitmap(key)
             _uiState.value = _uiState.value.copy(
                 currentBitmap = bitmap,
-                isLoading = false
+                isLoading = false,
+                loadFailure = if (bitmap == null) inferLoadFailure(key) else null
             )
         }
     }
@@ -348,19 +424,27 @@ class MediaViewerViewModel : ViewModel() {
         // Check if already cached
         if (item.isVideo) {
             MediaCache.getCachedVideoUri(key)?.let { uri ->
-                _uiState.value = state.copy(currentVideoUri = uri, isLoading = false)
+                _uiState.value = state.copy(
+                    currentVideoUri = uri,
+                    isLoading = false,
+                    loadFailure = null
+                )
                 return
             }
         } else {
             MediaCache.getBitmap(key)?.let { bitmap ->
-                _uiState.value = state.copy(currentBitmap = bitmap, isLoading = false)
+                _uiState.value = state.copy(
+                    currentBitmap = bitmap,
+                    isLoading = false,
+                    loadFailure = null
+                )
                 return
             }
         }
 
-        // 换条目时先把降级标记清掉：新条目的结果出来之前，
-        // 上一张"压缩版"的提示不该挂在新图上
-        _uiState.value = state.copy(isLoading = true, compressedFallback = false)
+        // 换条目时先把降级标记与上一次的失败提示清掉：新条目的结果出来之前，
+        // 上一条目的"压缩版"/"加载失败"都不该挂在新条目上
+        _uiState.value = state.copy(isLoading = true, compressedFallback = false, loadFailure = null)
 
         viewModelScope.launch {
             if (item.isVideo) {
@@ -368,7 +452,10 @@ class MediaViewerViewModel : ViewModel() {
                 val uri = MediaCache.fetchVideoUri(key, item.subfolder, item.type, context)
                 _uiState.value = _uiState.value.copy(
                     currentVideoUri = uri,
-                    isLoading = false
+                    isLoading = false,
+                    // 失败必须留档（H1-a）：修复前这里只置 null，UI 拿"videoUri == null"
+                    // 当"还在加载"的信号，结果失败后永远转圈
+                    loadFailure = if (uri == null) inferLoadFailure(key) else null
                 )
             } else {
                 // 原图优先，超限时自动降级到服务端压缩版（见 MediaCache.fetchViewerImage）：
@@ -377,10 +464,38 @@ class MediaViewerViewModel : ViewModel() {
                 _uiState.value = _uiState.value.copy(
                     currentBitmap = viewerImage.bitmap,
                     compressedFallback = viewerImage.compressedFallback,
-                    isLoading = false
+                    isLoading = false,
+                    // 失败必须留档（H1-b）：修复前图片失败只走黑屏分支，无提示无重试
+                    loadFailure = if (viewerImage.bitmap == null) inferLoadFailure(key) else null
                 )
             }
         }
+    }
+
+    /**
+     * 依据缓存侧已有的标记推断这次失败的原因档位。
+     *
+     * 404 记在 MediaCache（[MediaCache.isFileMissing]），离线状态记在 ConnectionManager；
+     * 两处都查不到时给 GENERIC —— 宁可文案保守，也不能把可重试的失败说成"文件不存在"。
+     */
+    private fun inferLoadFailure(key: MediaCacheKey): ViewerFailureCategory = when {
+        MediaCache.isFileMissing(key) -> ViewerFailureCategory.FILE_MISSING
+        ConnectionManager.isOffline || ConnectionManager.clientOrNull == null ->
+            ViewerFailureCategory.NETWORK
+        else -> ViewerFailureCategory.GENERIC
+    }
+
+    /**
+     * 失败占位上的「重试」入口（H1-a/H1-b）。
+     *
+     * 必须先清 404 短路标记再重新加载 —— 不清的话缩略图/图片链路会在 missingKeys 上
+     * 直接短路返回 null，重试变成原地再失败一次。其余失败类型（断线、超时）
+     * 本身没有短路标记，直接重拉即可。
+     */
+    fun retryCurrentItem() {
+        val item = _uiState.value.currentItem ?: return
+        MediaCache.clearFileMissing(item.toCacheKey())
+        loadCurrentItem()
     }
 
     /**

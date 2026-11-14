@@ -3,7 +3,6 @@ package sh.hnet.comfychair.ui.screens
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExitTransition
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.foundation.Image
@@ -26,11 +25,9 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.filled.Save
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
@@ -54,7 +51,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -81,9 +77,9 @@ import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultButton
-import sh.hnet.comfychair.ui.components.shared.ThreeDResultButton
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultDialog
 import sh.hnet.comfychair.ui.components.shared.FreeMemoryButton
+import sh.hnet.comfychair.ui.components.shared.SettingsGearButton
 import sh.hnet.comfychair.ui.components.shared.rememberSpellCheckVisualTransformation
 import sh.hnet.comfychair.ui.theme.Dimensions
 import sh.hnet.comfychair.ui.components.config.ConfigBottomSheetContent
@@ -277,23 +273,23 @@ fun TextToImageScreen(
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
                 // v4.9.0：四个模式共用同一套顶栏图标组（四段式：模式入口→输入→输出→全局）
+                // v5：保存/分享常驻（修复"出图后出现、再生成闪没"），无结果时按钮禁用置灰
                 GenerationTopBarActions(
                     is3DWorkflow = uiState.capabilities.is3DWorkflow,
                     // 用 visible3D（已按归属过滤），不是全局 threeDResult
                     threeDResult = visible3D,
-                    onSave = uiState.previewBitmap?.let {
-                        {
-                            textToImageViewModel.saveToGallery { success ->
-                                val messageRes = if (success) R.string.msg_image_saved_to_gallery else R.string.error_save_image
-                                Toast.makeText(context, context.getString(messageRes), Toast.LENGTH_SHORT).show()
-                            }
+                    hasResult = uiState.previewBitmap != null,
+                    // saveToGallery/getShareIntent 内部对空预览位自兜底（onResult(false)/null），
+                    // 且按钮仅在 hasResult 时可点，恒定传回调不改变原行为
+                    onSave = {
+                        textToImageViewModel.saveToGallery { success ->
+                            val messageRes = if (success) R.string.msg_image_saved_to_gallery else R.string.error_save_image
+                            Toast.makeText(context, context.getString(messageRes), Toast.LENGTH_SHORT).show()
                         }
                     },
-                    onShare = uiState.previewBitmap?.let {
-                        {
-                            textToImageViewModel.getShareIntent()?.let { intent ->
-                                context.startActivity(android.content.Intent.createChooser(intent, context.getString(R.string.share_image)))
-                            }
+                    onShare = {
+                        textToImageViewModel.getShareIntent()?.let { intent ->
+                            context.startActivity(android.content.Intent.createChooser(intent, context.getString(R.string.share_image)))
                         }
                     },
                     onSettings = onNavigateToSettings,
@@ -515,26 +511,15 @@ fun TextToImageScreen(
                 modifier = Modifier.weight(1f)
             )
 
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(10.dp))
 
             // 文生3D 的入口已迁到顶部导航栏（v4.4.0），底部这里不再占位。
-
-            // Animate gear icon rotation when options sheet is shown
-            val optionsIconRotation by animateFloatAsState(
-                targetValue = if (showOptionsBottomSheet) 90f else 0f,
-                label = "options icon rotation"
-            )
-
-            OutlinedIconButton(
+            // v5：齿轮抽成共用 SettingsGearButton（v2 皮肤浅底圆形；打开态旋转动画收进组件），
+            // 与生成按钮组间距统一 10dp。
+            SettingsGearButton(
+                open = showOptionsBottomSheet,
                 onClick = { showOptionsBottomSheet = true },
-                modifier = Modifier.size(56.dp)
-            ) {
-                Icon(
-                    Icons.Default.Settings,
-                    contentDescription = stringResource(R.string.button_options),
-                    modifier = Modifier.rotate(optionsIconRotation)
-                )
-            }
+            )
         }
     } // End of outer Column
 

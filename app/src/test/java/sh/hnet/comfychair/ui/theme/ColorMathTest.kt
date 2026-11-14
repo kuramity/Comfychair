@@ -173,6 +173,27 @@ class ColorMathTest {
     }
 
     @Test
+    fun `HSV色相偏移加35度只动色相_保留饱和度与明度`() {
+        // 生成按钮渐变辅色的派生规则（决策 1）：强调色 #5B8CFF 色相 +35°，S/V 不变
+        val source = 0xFF5B8CFF.toInt()
+        val shifted = ColorMath.shiftHueHsv(source, 35f)
+        val before = ColorMath.toHsv(source)
+        val after = ColorMath.toHsv(shifted)
+
+        assertEquals("色相应恰好 +35°", (before.h + 35f) % 360f, after.h, 1f)
+        assertEquals("饱和度不该被改", before.s, after.s, 0.01f)
+        assertEquals("明度不该被改", before.v, after.v, 0.01f)
+    }
+
+    @Test
+    fun `HSV色相偏移负值环绕不越界`() {
+        // hue 0 的纯红 -10° 应环绕到 350 而不是负数
+        val shifted = ColorMath.toHsv(ColorMath.shiftHueHsv(0xFFFF0000.toInt(), -10f))
+        assertEquals("色相应环绕到 350", 350f, shifted.h, 1f)
+        assertEquals("环绕时饱和度不该被改", 1f, shifted.s, 0.01f)
+    }
+
+    @Test
     fun `色相环绕不越界`() {
         // 350 + 30 应回到 20 而不是 380
         val wrapped = ColorMath.toHsl(ColorMath.withHue(0xFFF87171.toInt(), 20f))
