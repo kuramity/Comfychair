@@ -79,6 +79,7 @@ import sh.hnet.comfychair.model.ScreenType
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
+import sh.hnet.comfychair.ui.components.GenerationTopBarActions
 import sh.hnet.comfychair.ui.components.AudioSlotArea
 import sh.hnet.comfychair.ui.theme.Dimensions
 import sh.hnet.comfychair.storage.AppSettings
@@ -273,32 +274,24 @@ fun ImageToVideoScreen(
             title = { Text(stringResource(R.string.title_image_to_video)) },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
-                FreeMemoryButton()
-                // Upload image button（导演台流不显示：那条流没有任何图片输入口，
-                // 选了图会被上传到服务器却无处注入 —— 用户以为照片是参考素材，实际零效果）
-                if (!uiState.isTimelineWorkflow) {
-                    IconButton(onClick = { imagePickerLauncher.launch("image/*") }) {
-                        Icon(Icons.Default.AddPhotoAlternate, contentDescription = stringResource(R.string.button_upload_source_image))
-                    }
-                }
-                // Save to gallery button (only when video exists)
-                if (videoUri != null && uiState.viewMode == ImageToVideoViewMode.PREVIEW) {
-                    IconButton(onClick = {
+                // v4.9.0：四段式顶栏（加图 → 保存/分享 → 全局）
+                val canExport = videoUri != null && uiState.viewMode == ImageToVideoViewMode.PREVIEW
+                GenerationTopBarActions(
+                    is3DWorkflow = false,
+                    threeDResult = null,
+                    // 导演台流不显示加图：那条流没有任何图片输入口，
+                    // 选了图会被上传到服务器却无处注入 —— 用户以为照片是参考素材，实际零效果
+                    onUploadImage = if (!uiState.isTimelineWorkflow) {
+                        ({ imagePickerLauncher.launch("image/*") })
+                    } else null,
+                    onSave = if (canExport) ({
                         scope.launch {
                             VideoUtils.saveVideoToGallery(context, videoUri, VideoUtils.GalleryPrefix.IMAGE_TO_VIDEO)
                         }
-                    }) {
-                        Icon(Icons.Default.Save, contentDescription = stringResource(R.string.button_save_to_gallery))
-                    }
-                    // Share button
-                    IconButton(onClick = {
+                    }) else null,
+                    onShare = if (canExport) ({
                         VideoUtils.shareVideo(context, videoUri)
-                    }) {
-                        Icon(Icons.Default.Share, contentDescription = stringResource(R.string.button_share))
-                    }
-                }
-                // Menu button
-                AppMenuDropdown(
+                    }) else null,
                     onSettings = onNavigateToSettings,
                     onLogout = onLogout
                 )

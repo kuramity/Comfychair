@@ -9,6 +9,12 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.net.Uri
+import android.content.ContentValues
+import android.content.Intent
+import android.provider.MediaStore
+import androidx.core.content.FileProvider
+import java.io.File
+import java.io.IOException
 import androidx.lifecycle.viewModelScope
 import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.Dispatchers
@@ -369,6 +375,68 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
                 }
             )
         )
+    }
+
+    // ---- 图库导出（v4.9.0）----
+    //
+    // 图生图此前是四个模式里唯一"出了图却导不出去"的：ViewModel 里连保存/分享方法都没有，
+    // 顶栏也就从来没出现过软盘和分享图标。这里照搬 TextToImageViewModel 的同一套实现
+    // （MediaStore 写入 Pictures/ComfyChair + FileProvider 分享），只是取图字段换成
+    // 本页的 previewImage。
+
+    /** 把当前预览图写入系统相册（Pictures/ComfyChair） */
+    fun saveToGallery(onResult: (success: Boolean) -> Unit) {
+        val ctx = applicationContext ?: run { onResult(false); return }
+        val bitmap = _uiState.value.previewImage ?: run { onResult(false); return }
+
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.png")
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/ComfyChair")
+        }
+
+        val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+        uri?.let {
+            try {
+                ctx.contentResolver.openOutputStream(it)?.use { outputStream ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+                }
+                DebugLogger.i(TAG, "saveToGallery: Image saved successfully")
+                onResult(true)
+            } catch (e: IOException) {
+                DebugLogger.e(TAG, "saveToGallery: Failed to save image - ${e.message}")
+                onResult(false)
+            }
+        } ?: run {
+            DebugLogger.e(TAG, "saveToGallery: Failed to create media URI")
+            onResult(false)
+        }
+    }
+
+    /** 分享当前预览图：先写进 cacheDir，再经 FileProvider 授时 URI 交给系统选择器 */
+    fun getShareIntent(): Intent? {
+        val ctx = applicationContext ?: return null
+        val bitmap = _uiState.value.previewImage ?: return null
+
+        val file = File(ctx.cacheDir, "share_image_${System.currentTimeMillis()}.png")
+        return try {
+            file.outputStream().use { outputStream ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+            }
+            val uri = FileProvider.getUriForFile(
+                ctx,
+                "${ctx.packageName}.fileprovider",
+                file
+            )
+            Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        } catch (e: IOException) {
+            DebugLogger.e(TAG, "getShareIntent failed: ${e.message}")
+            null
+        }
     }
 
     // Constants

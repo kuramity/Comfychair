@@ -1,3 +1,4 @@
+import java.io.File
 import java.util.Properties
 
 plugins {
@@ -23,6 +24,26 @@ android {
     namespace = "sh.hnet.comfychair"
     compileSdk = 36
 
+    // release 签名：从 local.properties 读（该文件已被 .gitignore 忽略，不会进仓库）。
+    // 四项齐全才创建正式签名配置，否则回退 debug —— 保证克隆源码的人没有 keystore 也能构建。
+    // keystore 与口令位置见 E:\Zcode\ZcodeProject\tools\comfychair\keys\README.md
+    val releaseStoreFile = localProperties.getProperty("comfychair.storeFile").orEmpty().trim()
+    val releaseKeyReady = releaseStoreFile.isNotEmpty() &&
+        File(releaseStoreFile).exists() &&
+        !localProperties.getProperty("comfychair.storePassword").isNullOrBlank() &&
+        !localProperties.getProperty("comfychair.keyAlias").isNullOrBlank()
+
+    signingConfigs {
+        if (releaseKeyReady) {
+            create("release") {
+                storeFile = File(releaseStoreFile)
+                storePassword = localProperties.getProperty("comfychair.storePassword")
+                keyAlias = localProperties.getProperty("comfychair.keyAlias")
+                keyPassword = localProperties.getProperty("comfychair.keyPassword")
+            }
+        }
+    }
+
     defaultConfig {
         applicationId = "sh.hnet.comfychair.plus"
         minSdk = 33
@@ -37,8 +58,8 @@ android {
         // versionCode 与版本名**解耦**：每次发版 +1，只保证单调递增（Android 的硬性要求）。
         // ⚠️ 发版前务必同时改这两行：只 cp 改文件名不改这里，会得到一个 versionCode
         //    与上一版完全相同的包（装不上也分不清，v0.9.33 踩过）。
-        versionCode = 114
-        versionName = "v4.8.3"
+        versionCode = 115
+        versionName = "v4.9.0"
 
         // 更新清单地址注入 BuildConfig（空字符串 = 未配置更新源）
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"$updateManifestUrl\"")
@@ -53,7 +74,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug")
+            // 有正式 keystore 就用它，否则回退 debug（克隆源码的人没 keystore 也能构建）
+            signingConfig = if (releaseKeyReady) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
     compileOptions {

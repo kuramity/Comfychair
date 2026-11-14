@@ -14,6 +14,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -84,6 +85,7 @@ import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.ScreenType
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
+import sh.hnet.comfychair.ui.components.GenerationTopBarActions
 import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
@@ -347,23 +349,15 @@ fun ImageToImageScreen(
             },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
-                // 3D 流专属入口（v4.4.0 从底部操作栏迁到标题右侧）。
-                // 显隐只看工作流类型：选中 3D 流立刻出现，切回普通出图流立刻消失。
-                // 搬家的原因：底部那一行原本挤着「生成按钮组 + 3D + 齿轮」，
-                // 生成按钮被压窄、两个圆形按钮贴边，观感非常拥挤。
-                // 没生成过时点击给 Toast 提示，不会崩（详见组件 KDoc）。
-                ThreeDResultButton(
+                // v4.9.0：四段式顶栏（模式入口→输入→输出→全局）。
+                // 本页原来缺保存/分享（四个模式里唯一"出了图导不出去"的），这轮补上。
+                val maskEditing = uiState.sourceImage != null &&
+                    uiState.mode == ImageToImageMode.INPAINTING
+                GenerationTopBarActions(
                     is3DWorkflow = uiState.capabilities.is3DWorkflow,
-                    result = visible3D
-                )
-                FreeMemoryButton()
-                // Upload image button
-                IconButton(onClick = { imagePickerLauncher.launch("image/*") }) {
-                    Icon(Icons.Default.AddPhotoAlternate, contentDescription = stringResource(R.string.button_upload_source_image))
-                }
-                // Edit mask button (only in inpainting mode when source image exists)
-                if (uiState.sourceImage != null && uiState.mode == ImageToImageMode.INPAINTING) {
-                    IconButton(onClick = {
+                    threeDResult = visible3D,
+                    onUploadImage = { imagePickerLauncher.launch("image/*") },
+                    onEditMask = if (maskEditing) ({
                         // Initialize state holder and launch mask editor activity
                         MaskEditorStateHolder.initialize(
                             sourceImage = uiState.sourceImage!!,
@@ -387,16 +381,25 @@ fun ImageToImageScreen(
                             onEraserModeChange = { imageToImageViewModel.onEraserModeChange(it) }
                         )
                         context.startActivity(MaskEditorActivity.createIntent(context))
-                    }) {
-                        Icon(Icons.Default.Brush, contentDescription = stringResource(R.string.button_edit_mask))
-                    }
-                    // Clear mask button
-                    IconButton(onClick = { imageToImageViewModel.clearMask() }) {
-                        Icon(Icons.Default.Clear, contentDescription = stringResource(R.string.button_clear_mask))
-                    }
-                }
-                // Menu button
-                AppMenuDropdown(
+                    }) else null,
+                    onClearMask = if (maskEditing) ({
+                        imageToImageViewModel.clearMask()
+                    }) else null,
+                    onSave = uiState.previewImage?.let {
+                        {
+                            imageToImageViewModel.saveToGallery { success ->
+                                val messageRes = if (success) R.string.msg_image_saved_to_gallery else R.string.error_save_image
+                                Toast.makeText(context, context.getString(messageRes), Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    onShare = uiState.previewImage?.let {
+                        {
+                            imageToImageViewModel.getShareIntent()?.let { intent ->
+                                context.startActivity(android.content.Intent.createChooser(intent, context.getString(R.string.share_image)))
+                            }
+                        }
+                    },
                     onSettings = onNavigateToSettings,
                     onLogout = onLogout
                 )
@@ -673,6 +676,15 @@ fun ImageToImageScreen(
             }
         }
 
+        // v4.9.0：提示词结果入口从底部操作行迁到这里（输入框上方、左对齐），
+        // 不再和生成按钮、齿轮挤在同一行；没有隐藏结果时按钮不渲染、不占位。
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Start
+        ) {
+            SkillTextResultButton(workflowName = uiState.selectedWorkflow)
+        }
+
         // Prompt Input — expands to fill screen above keyboard when focused
         OutlinedTextField(
             value = uiState.positivePrompt,
@@ -851,12 +863,6 @@ fun ImageToImageScreen(
             )
 
             Spacer(modifier = Modifier.width(8.dp))
-
-            // 技能流结果被收起来后的常驻入口：跟着工作流走，没有隐藏结果时零占位
-            SkillTextResultButton(
-                workflowName = uiState.selectedWorkflow,
-                modifier = Modifier.padding(end = 8.dp)
-            )
 
             // 图生3D 的入口已迁到顶部导航栏（v4.4.0），底部这里不再占位。
             // 搬走后底部一行只剩「生成按钮组 + [技能结果] + 齿轮」，

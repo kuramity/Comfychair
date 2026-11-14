@@ -71,6 +71,7 @@ import sh.hnet.comfychair.model.ScreenType
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
+import sh.hnet.comfychair.ui.components.GenerationTopBarActions
 import sh.hnet.comfychair.ui.theme.Dimensions
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.ui.components.GenerationButton
@@ -252,25 +253,22 @@ fun TextToVideoScreen(
             title = { Text(stringResource(R.string.title_text_to_video)) },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
-                FreeMemoryButton()
-                // Save to gallery button (only when video exists)
-                if (videoUri != null) {
-                    IconButton(onClick = {
-                        scope.launch {
-                            VideoUtils.saveVideoToGallery(context, videoUri, VideoUtils.GalleryPrefix.TEXT_TO_VIDEO)
+                // v4.9.0：四段式顶栏（本页无输入类动作，直接是输出类 → 全局）
+                GenerationTopBarActions(
+                    is3DWorkflow = false,
+                    threeDResult = null,
+                    onSave = videoUri?.let {
+                        {
+                            scope.launch {
+                                VideoUtils.saveVideoToGallery(context, it, VideoUtils.GalleryPrefix.TEXT_TO_VIDEO)
+                            }
                         }
-                    }) {
-                        Icon(Icons.Default.Save, contentDescription = stringResource(R.string.button_save_to_gallery))
-                    }
-                    // Share button
-                    IconButton(onClick = {
-                        VideoUtils.shareVideo(context, videoUri)
-                    }) {
-                        Icon(Icons.Default.Share, contentDescription = stringResource(R.string.button_share))
-                    }
-                }
-                // Menu button
-                AppMenuDropdown(
+                    },
+                    onShare = videoUri?.let {
+                        {
+                            VideoUtils.shareVideo(context, it)
+                        }
+                    },
                     onSettings = onNavigateToSettings,
                     onLogout = onLogout
                 )

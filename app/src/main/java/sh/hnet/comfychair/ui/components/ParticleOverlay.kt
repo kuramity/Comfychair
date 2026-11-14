@@ -64,13 +64,15 @@ private class Particle {
     var size = 0f
 }
 
-/** 涟漪：从触点向外扩散的圆环 */
+/** 涟漪：从触点向外扩散的圆环（v4.9.0 支持延迟启动，用来做"第二圈水波"） */
 private class Ripple {
     var active = false
     var x = 0f
     var y = 0f
     var life = 0f
     var maxLife = 0f
+    /** 启动前的等待时间（秒）；>0 时不推进 life、也不绘制 */
+    var delay = 0f
     var startRadius = 0f
     var endRadius = 0f
 }
@@ -114,42 +116,74 @@ internal class ParticleSystem(
     val activeCount: Int get() = active.size
 
     /**
-     * 在 (x, y) 处触发一次完整反馈：1 个辉光 + 1 个涟漪 + [count] 个粒子。
+     * 在 (x, y) 处触发一次完整反馈：1 个辉光 + **两圈错相水波** + 一圈整齐点阵。
+     *
+     * v4.9.0 重做：
+     * - 粒子不再是全向随机的"乱飞"，改成**两圈均匀排布的点阵**（内圈 5dp、外圈 14dp，
+     *   两圈角度错开半个间隔），视觉上是"点整齐地浮现"而不是"炸开"；
+     * - 水波从一圈变两圈、第二圈延迟 90ms 启动且扩得更远，形成"泛起"的层次感；
+     * - 运动只有极缓慢的径向漂移 + 轻微上浮，**不加重力**（重力会把点阵拽散）。
      *
      * 池满时**丢弃**而不是扩容，保证点击高峰不分配新对象。
      */
     fun emit(x: Float, y: Float, count: Int = maxPerTap) {
         spawnGlow(x, y)
-        spawnRipple(x, y)
+        spawnRipple(x, y, delayMs = 0L)
+        spawnRipple(x, y, delayMs = 90L)
 
         val n = count.coerceIn(0, maxPerTap)
-        repeat(n) {
-            val p = obtain() ?: return@repeat
+        if (n == 0) return
+        val innerCount = (n + 1) / 2
+        val outerCount = n - innerCount
+        placeRing(x, y, innerCount, radiusDp = 5f, angleOffset = 0f)
+        placeRing(
+            x, y, outerCount, radiusDp = 14f,
+            angleOffset = if (outerCount > 0) 0.5f / outerCount else 0f
+        )
+    }
+
+    /**
+     * 在半径 [radiusDp] 的圆环上均匀放置 [count] 个点。
+     *
+     * 每个点带 ±3° 的微抖动 —— 纯机械等分看起来像仪表盘，加一点随机才有呼吸感，
+     * 但抖动幅度远小于间隔，整体仍然"整齐"。
+     */
+    private fun placeRing(cx: Float, cy: Float, count: Int, radiusDp: Float, angleOffset: Float) {
+        if (count <= 0) return
+        val baseRadius = radiusDp * density
+        val twoPi = (PI * 2).toFloat()
+        val maxJitter = 6f * PI.toFloat() / 180f   // ±3°
+        for (i in 0 until count) {
+            val p = obtain() ?: return
+            val jitter = (Random.nextFloat() - 0.5f) * maxJitter
+            val angle = (i.toFloat() / count + angleOffset) * twoPi + jitter
+            val r = baseRadius + (Random.nextFloat() - 0.5f) * 1.5f * density
             p.active = true
-            p.x = x
-            p.y = y
-            val angle = Random.nextFloat() * (PI * 2).toFloat()
-            // 速度比 v4.7.0 收敛：粒子是点缀，不该"炸开"
-            val speed = (40f + Random.nextFloat() * 130f) * density
-            p.vx = cos(angle) * speed
-            p.vy = sin(angle) * speed - 40f * density // 略偏上，像被"点"起来
-            p.maxLife = 0.32f + Random.nextFloat() * 0.26f
+            p.x = cx + cos(angle) * r
+            p.y = cy + sin(angle) * r
+            // 缓慢向外漂一小段 + 极轻上浮；没有重力加速度
+            val drift = (10f + Random.nextFloat() * 14f) * density
+            p.vx = cos(angle) * drift
+            p.vy = sin(angle) * drift - 8f * density
+            p.maxLife = 0.72f + Random.nextFloat() * 0.18f   // 0.72–0.90s：缓缓消散
             p.life = p.maxLife
-            p.size = (0.7f + Random.nextFloat() * 1.3f) * density
+            p.size = (1.1f + Random.nextFloat() * 0.9f) * density
             active.add(p)
         }
     }
 
-    private fun spawnRipple(x: Float, y: Float) {
+    private fun spawnRipple(x: Float, y: Float, delayMs: Long = 0L) {
         val r = ripples[rippleCursor]
         rippleCursor = (rippleCursor + 1) % ripples.size
         r.active = true
         r.x = x
         r.y = y
-        r.maxLife = 0.46f
+        r.maxLife = 0.50f
         r.life = r.maxLife
-        r.startRadius = 6f * density
-        r.endRadius = 42f * density
+        r.delay = delayMs / 1000f
+        r.startRadius = 4f * density
+        // 第二圈（延迟那圈）扩得更远，形成"外扩余波"
+        r.endRadius = if (delayMs > 0L) 58f * density else 40f * density
     }
 
     private fun spawnGlow(x: Float, y: Float) {
@@ -188,9 +222,14 @@ internal class ParticleSystem(
             if (g.life <= 0f) g.active = false else alive = true
         }
 
-        // 涟漪
+        // 涟漪（延迟期间只消耗 delay，不推进寿命也算"还活着"，否则会被提前判空）
         for (r in ripples) {
             if (!r.active) continue
+            if (r.delay > 0f) {
+                r.delay -= dt
+                alive = true
+                continue
+            }
             r.life -= dt
             if (r.life <= 0f) r.active = false else alive = true
         }
@@ -207,9 +246,9 @@ internal class ParticleSystem(
                     active.removeAt(i)
                     continue
                 }
-                p.vy += 260f * density * dt                  // 重力：比 v4.7.0 轻，慢慢落
-                p.vx *= (1f - 3.6f * dt).coerceAtLeast(0f)   // 空气摩擦
-                p.vy *= (1f - 1.6f * dt).coerceAtLeast(0f)
+                // v4.9.0：去掉重力 —— 点阵要保持整齐，只做缓慢外扩与轻微上浮
+                p.vx *= (1f - 1.4f * dt).coerceAtLeast(0f)   // 轻微阻尼
+                p.vy *= (1f - 1.0f * dt).coerceAtLeast(0f)
                 p.x += p.vx * dt
                 p.y += p.vy * dt
                 i++
@@ -239,7 +278,7 @@ internal class ParticleSystem(
 
     private fun drawRipples(scope: DrawScope, color: Color) {
         for (r in ripples) {
-            if (!r.active) continue
+            if (!r.active || r.delay > 0f) continue
             val t = 1f - (r.life / r.maxLife).coerceIn(0f, 1f) // 0 → 1 扩散进度
             val radius = r.startRadius + (r.endRadius - r.startRadius) * easeOut(t)
             // 前段快速出现、后段柔和淡出
@@ -256,8 +295,14 @@ internal class ParticleSystem(
     private fun drawParticles(scope: DrawScope, color: Color) {
         for (p in active) {
             val t = (p.life / p.maxLife).coerceIn(0f, 1f)
-            val alpha = (t * t * 0.85f).coerceIn(0f, 1f) // 末段快速淡出，不留残影
-            val radius = p.size * (0.55f + 0.45f * t)    // 先胀开再收缩
+            // v4.9.0：先升后降 —— 前 18% 淡入（"浮现"），之后缓缓消散
+            val progress = 1f - t
+            val alpha = if (progress < 0.18f) {
+                progress / 0.18f * 0.9f
+            } else {
+                (1f - (progress - 0.18f) / 0.82f) * 0.9f
+            }.coerceIn(0f, 1f)
+            val radius = p.size * (0.7f + 0.3f * t)      // 轻微收缩，收尾干净
             scope.drawCircle(color.copy(alpha = alpha), radius, Offset(p.x, p.y))
         }
     }

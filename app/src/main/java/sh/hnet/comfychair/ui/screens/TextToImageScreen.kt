@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -75,6 +76,7 @@ import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.model.ThreeDVisibility
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
+import sh.hnet.comfychair.ui.components.GenerationTopBarActions
 import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
@@ -274,35 +276,26 @@ fun TextToImageScreen(
             },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
-                // 文生3D 入口（v4.4.0 从底部操作栏迁到标题右侧，与图生图页一致）：
-                // 显隐只看工作流类型，没生成过时点击给 Toast 提示。
-                ThreeDResultButton(
+                // v4.9.0：四个模式共用同一套顶栏图标组（四段式：模式入口→输入→输出→全局）
+                GenerationTopBarActions(
                     is3DWorkflow = uiState.capabilities.is3DWorkflow,
                     // 用 visible3D（已按归属过滤），不是全局 threeDResult
-                    result = visible3D
-                )
-                // Save to gallery button (only when image exists)
-                if (uiState.previewBitmap != null) {
-                    IconButton(onClick = {
-                        textToImageViewModel.saveToGallery { success ->
-                            val messageRes = if (success) R.string.msg_image_saved_to_gallery else R.string.error_save_image
-                            Toast.makeText(context, context.getString(messageRes), Toast.LENGTH_SHORT).show()
+                    threeDResult = visible3D,
+                    onSave = uiState.previewBitmap?.let {
+                        {
+                            textToImageViewModel.saveToGallery { success ->
+                                val messageRes = if (success) R.string.msg_image_saved_to_gallery else R.string.error_save_image
+                                Toast.makeText(context, context.getString(messageRes), Toast.LENGTH_SHORT).show()
+                            }
                         }
-                    }) {
-                        Icon(Icons.Default.Save, contentDescription = stringResource(R.string.button_save_to_gallery))
-                    }
-                    // Share button
-                    IconButton(onClick = {
-                        textToImageViewModel.getShareIntent()?.let { intent ->
-                            context.startActivity(android.content.Intent.createChooser(intent, context.getString(R.string.share_image)))
+                    },
+                    onShare = uiState.previewBitmap?.let {
+                        {
+                            textToImageViewModel.getShareIntent()?.let { intent ->
+                                context.startActivity(android.content.Intent.createChooser(intent, context.getString(R.string.share_image)))
+                            }
                         }
-                    }) {
-                        Icon(Icons.Default.Share, contentDescription = stringResource(R.string.button_share))
-                    }
-                }
-                FreeMemoryButton()
-                // Menu button
-                AppMenuDropdown(
+                    },
                     onSettings = onNavigateToSettings,
                     onLogout = onLogout
                 )
@@ -364,6 +357,15 @@ fun TextToImageScreen(
                     )
                 }
             }
+        }
+
+        // v4.9.0：提示词结果入口从底部操作行迁到这里（输入框上方、左对齐），
+        // 不再和生成按钮、齿轮挤在同一行；没有隐藏结果时按钮不渲染、不占位。
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Start
+        ) {
+            SkillTextResultButton(workflowName = uiState.selectedWorkflow)
         }
 
         // Prompt Input — expands to fill screen above keyboard when focused
@@ -514,12 +516,6 @@ fun TextToImageScreen(
             )
 
             Spacer(modifier = Modifier.width(8.dp))
-
-            // 技能流结果被收起来后的常驻入口：跟着工作流走，没有隐藏结果时零占位
-            SkillTextResultButton(
-                workflowName = uiState.selectedWorkflow,
-                modifier = Modifier.padding(end = 8.dp)
-            )
 
             // 文生3D 的入口已迁到顶部导航栏（v4.4.0），底部这里不再占位。
 
