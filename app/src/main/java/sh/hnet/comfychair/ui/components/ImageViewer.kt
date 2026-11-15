@@ -2,6 +2,7 @@ package sh.hnet.comfychair.ui.components
 
 import android.graphics.Bitmap
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
@@ -38,6 +39,12 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+
+/** 捏合关闭收尾（C2）：内容缩小到的目标缩放 */
+private const val PINCH_CLOSE_TARGET_SCALE = 0.86f
+
+/** 捏合关闭收尾时长（ms），与 Activity 过渡动画（viewer_fade_out_shrink）观感衔接 */
+private const val PINCH_CLOSE_DURATION_MS = 160
 
 /**
  * Image viewer with constrained pinch-to-zoom and pan.
@@ -76,6 +83,41 @@ fun ImageViewer(
             dismissDragY = 0f
             dismissDragAnimatable.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 300f))
             isDismissSettling = false
+        }
+    }
+
+    // 捏合关闭收尾（C2）：内容缩小淡出后再真正关闭。isPinchClosing 是防重入标志——
+    // 动画播放期间第二次捏合或下滑不再触发关闭（否则会叠加两层退出）
+    val pinchCloseScaleAnimatable = remember { Animatable(1f) }
+    val pinchCloseAlphaAnimatable = remember { Animatable(1f) }
+    var isPinchClosing by remember { mutableStateOf(false) }
+
+    fun playPinchCloseDismiss() {
+        if (isPinchClosing || onClose == null) return
+        isPinchClosing = true
+        scope.launch {
+            // 先同步基准值再启动，避免首帧跳变（与 settleDismissBack 同款处理）
+            pinchCloseScaleAnimatable.snapTo(1f)
+            pinchCloseAlphaAnimatable.snapTo(1f)
+            launch {
+                pinchCloseScaleAnimatable.animateTo(
+                    PINCH_CLOSE_TARGET_SCALE,
+                    tween(PINCH_CLOSE_DURATION_MS, easing = FastOutSlowInEasing)
+                )
+            }
+            launch {
+                pinchCloseAlphaAnimatable.animateTo(
+                    0f,
+                    tween(PINCH_CLOSE_DURATION_MS, easing = FastOutSlowInEasing)
+                )
+            }
+        }.invokeOnCompletion { cause ->
+            isPinchClosing = false
+            // cause 非空 = 协程被取消（如动画期间翻页导致本组件离开组合）：
+            // 只复位标志，不触发关闭——关闭必须由"动画正常播完"驱动
+            if (cause == null) {
+                onClose?.invoke()
+            }
         }
     }
 
@@ -192,11 +234,14 @@ fun ImageViewer(
                     )
                     val currentScale = if (isAnimating) scaleAnimatable.value else scale
                     val currentOffset = if (isAnimating) offsetAnimatable.value else offset
-                    scaleX = currentScale * visuals.scale
-                    scaleY = currentScale * visuals.scale
+                    // 捏合关闭收尾：整层缩小淡出（isPinchClosing 为 false 时因子恒 1，视觉零变化）
+                    val pinchScale = if (isPinchClosing) pinchCloseScaleAnimatable.value else 1f
+                    val pinchAlpha = if (isPinchClosing) pinchCloseAlphaAnimatable.value else 1f
+                    scaleX = currentScale * visuals.scale * pinchScale
+                    scaleY = currentScale * visuals.scale * pinchScale
                     translationX = currentOffset.x
                     translationY = currentOffset.y + dismissY
-                    alpha = visuals.alpha
+                    alpha = visuals.alpha * pinchAlpha
                 }
                 .pointerInput(Unit) {
                     awaitEachGesture {
@@ -224,6 +269,11 @@ fun ImageViewer(
                         val directionThresholdPx = ViewerDismissGesture.DIRECTION_LOCK_THRESHOLD_DP.dp.toPx()
                         val velocityThresholdPx = ViewerDismissGesture.DISMISS_VELOCITY_DP_PER_SEC.dp.toPx()
 
+                        // 捏合退出（C1）：本手势累计的双指缩小倍率（<1 为缩小）与退出意图。
+                        // 每帧重新判定而非 once-true 锁死——捏过头又张开时意图自动取消
+                        var pinchGestureScale = 1f
+                        var pinchDismissIntent = false
+
                         // 向下全量跟手；向上按阻尼轻微跟手（明确区别于"上滑关闭"，松手弹回）
                         fun updateDismissDrag(totalDy: Float) {
                             dismissDragY = if (totalDy > 0f) totalDy else totalDy * 0.2f
@@ -248,6 +298,8 @@ fun ImageViewer(
                                 val zoom = event.calculateZoom()
                                 val pan = event.calculatePan()
                                 val centroid = event.calculateCentroid()
+                                // 本帧更新前的缩放：捏合意图判定要用它区分"从放大缩回 1f 的最后一帧"
+                                val scaleBeforeZoom = scale
 
                                 if (zoom != 1f || pan != Offset.Zero) {
                                     wasPanOrZoom = true
@@ -263,6 +315,23 @@ fun ImageViewer(
 
                                     scale = newScale
                                     offset = constrainOffset(newOffset, newScale)
+
+                                    // 捏合退出意图（C1）：未放大态才累计缩小量；放大态交给既有
+                                    // "缩回 1f"路径并重置累计——否则缩回 1f 的最后一帧会被误记
+                                    // 成退出意图（那一帧 zoom 可远小于阈值）。onClose == null 时
+                                    // 不累计，行为与原来完全一致
+                                    if (onClose != null && !isPinchClosing) {
+                                        if (scaleBeforeZoom > ViewerDismissGesture.PINCH_ZOOMED_THRESHOLD) {
+                                            pinchGestureScale = 1f
+                                        } else {
+                                            pinchGestureScale *= zoom
+                                        }
+                                        pinchDismissIntent = ViewerDismissGesture.shouldDismissByPinch(
+                                            currentScale = scaleBeforeZoom,
+                                            gestureScale = pinchGestureScale,
+                                            pointerCount = pointerCount
+                                        )
+                                    }
                                 }
 
                                 event.changes.forEach { if (it.positionChanged()) it.consume() }
@@ -320,8 +389,8 @@ fun ImageViewer(
                         } while (event.changes.any { it.pressed })
 
                         // 脱离拖动松手：位移或向下甩速达标 → 关闭查看器（复用 onClose）；
-                        // 否则弹簧回位
-                        if (lockedDirection == ViewerPanDirection.VERTICAL && onClose != null) {
+                        // 否则弹簧回位。isPinchClosing 期间不再触发（捏合收尾动画还在播）
+                        if (lockedDirection == ViewerPanDirection.VERTICAL && onClose != null && !isPinchClosing) {
                             val velocity = velocityTracker.calculateVelocity()
                             val shouldClose = ViewerDismissGesture.shouldDismiss(
                                 dy = dismissDragY,
@@ -334,6 +403,10 @@ fun ImageViewer(
                             } else {
                                 settleDismissBack()
                             }
+                        } else if (pinchDismissIntent && onClose != null && !isPinchClosing) {
+                            // 捏合退出（C1）：走到这里必然是全部手指已抬起（do-while 退出条件），
+                            // 意图成立后先播收尾动画（C2），动画结束回调里才真正 onClose
+                            playPinchCloseDismiss()
                         }
 
                         // Handle taps after gesture ends

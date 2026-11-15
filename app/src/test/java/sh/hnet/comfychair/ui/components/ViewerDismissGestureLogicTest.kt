@@ -158,4 +158,114 @@ class ViewerDismissGestureLogicTest {
         assertEquals(1f, noSize.scale, 0.0001f)
         assertEquals(1f, noSize.alpha, 0.0001f)
     }
+
+    // ---------- 4. 捏合返回（C1） ----------
+
+    @Test
+    fun `单指捏合不触发退出`() {
+        // 单指一律交给既有方向锁定逻辑（水平让给 Pager、垂直走下滑脱离）
+        assertFalse(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1f,
+                gestureScale = 0.5f,
+                pointerCount = 1
+            )
+        )
+    }
+
+    @Test
+    fun `双指缩小过阈值触发退出`() {
+        // 未放大态双指捏合缩小到 0.92 以下：iOS 相册式的"捏合退出"
+        assertTrue(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1f,
+                gestureScale = 0.9f,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `双指放大不触发退出`() {
+        // 张开手指是放大意图，与退出无关
+        assertFalse(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1f,
+                gestureScale = 1.1f,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `已放大态捏合缩小不退出`() {
+        // scale 超过 1.05 门槛时捏合只负责"缩回 1f"（既有 coerceIn 语义），不退出
+        assertFalse(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1.1f,
+                gestureScale = 0.5f,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `恰好等于阈值触发退出`() {
+        // gestureScale == PINCH_DISMISS_SCALE 的边界：判定条件是"小于等于"
+        assertTrue(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1f,
+                gestureScale = ViewerDismissGesture.PINCH_DISMISS_SCALE,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `略大于阈值不退出`() {
+        // 缩小量没到 8%：不做退出，等手指继续捏
+        assertFalse(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1f,
+                gestureScale = 0.93f,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `三指捏合同样触发退出`() {
+        // pointerCount >= 2 都算捏合手势
+        assertTrue(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1f,
+                gestureScale = 0.8f,
+                pointerCount = 3
+            )
+        )
+    }
+
+    @Test
+    fun `恰好等于放大门槛仍视为未放大`() {
+        // currentScale == PINCH_ZOOMED_THRESHOLD 的边界：判定条件是"大于"，相等不算已放大
+        assertTrue(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = ViewerDismissGesture.PINCH_ZOOMED_THRESHOLD,
+                gestureScale = 0.5f,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `没有手指按下不触发退出`() {
+        // pointerCount < 2（含 0）一律 false，兜住异常输入
+        assertFalse(
+            ViewerDismissGesture.shouldDismissByPinch(
+                currentScale = 1f,
+                gestureScale = 0.5f,
+                pointerCount = 0
+            )
+        )
+    }
 }

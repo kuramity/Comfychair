@@ -79,6 +79,11 @@ class MediaViewerActivity : ComponentActivity() {
         // Result
         const val RESULT_ITEM_DELETED = "item_deleted"
 
+        // 回传给列表的"离开时正在看哪一张"稳定键（"${promptId}_${filename}"，
+        // 与 MediaViewerScreen 的 itemsKey / GalleryScreen 的 grid key 同格式）。
+        // 不回传裸索引：删除后 items 会变，索引会错位
+        const val EXTRA_CURRENT_ITEM_KEY = "current_item_key"
+
         /**
          * Create intent for gallery mode (swipe navigation between items)
          */
@@ -177,7 +182,6 @@ class MediaViewerActivity : ComponentActivity() {
 
         setContent {
             val uiState by viewModel.uiState.collectAsState()
-            val hasDeletedItems by viewModel.hasDeletedItems.collectAsState()
 
             // Control system bars based on UI visibility
             LaunchedEffect(uiState.isUiVisible) {
@@ -193,18 +197,34 @@ class MediaViewerActivity : ComponentActivity() {
                     MediaViewerScreen(
                         viewModel = viewModel,
                         onClose = {
-                            // Set result only if items were actually deleted
-                            if (hasDeletedItems) {
-                                setResult(Activity.RESULT_OK, Intent().apply {
-                                    putExtra(RESULT_ITEM_DELETED, true)
-                                })
-                            }
+                            // 结果（删除标记 + 当前位置键）统一在 finish() 里构造，
+                            // 捏合关闭/下滑关闭/返回键/FAB 全部汇聚到这一个出口
                             finish()
                         }
                     )
                 }
             }
         }
+    }
+
+    override fun finish() {
+        // 无论哪条路径退出（捏合、下滑、返回键、系统回收），都回传当前浏览位置：
+        // 列表侧据此把网格滚动到用户离开时正在看的那一张。
+        // currentItem 取自删除后已更新的 items（ViewModel 删除时会先移除再调 currentIndex），
+        // 所以这里不会回传刚被删除的项；全部删完时 currentItem 为 null，自然跳过
+        val resultIntent = Intent()
+        if (viewModel.hasDeletedItems.value) {
+            resultIntent.putExtra(RESULT_ITEM_DELETED, true)
+        }
+        viewModel.uiState.value.currentItem?.let { item ->
+            resultIntent.putExtra(EXTRA_CURRENT_ITEM_KEY, "${item.promptId}_${item.filename}")
+        }
+        setResult(Activity.RESULT_OK, resultIntent)
+        super.finish()
+
+        // 关闭过渡（C2）：列表侧保持不动，查看器内容缩小淡出。
+        // 按官方要求紧跟 finish() 之后调用
+        overridePendingTransition(R.anim.gallery_stay, R.anim.viewer_fade_out_shrink)
     }
 
     private fun initializeGalleryMode() {

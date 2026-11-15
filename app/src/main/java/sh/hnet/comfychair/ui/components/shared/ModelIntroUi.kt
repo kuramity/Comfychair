@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -18,13 +20,16 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.model.LoraEffectTable
 import sh.hnet.comfychair.model.ModelIntro
+import sh.hnet.comfychair.model.splitIntroText
 
 /**
  * 模型下拉项：路径一行，下面再挂一行"底模 · 类型 · 作者"的小字。
@@ -130,14 +135,26 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium
             )
 
-            // 「实际效果」排在推荐参数前面：用户最先想知道的是"加上会怎样"
-            intro.effect?.let {
+            // 分类：数据侧的中文枚举（大模型/扩散模型/LoRA/…），未知新类型原样显示，
+            // 空值整行不显示（kindLabel 返回 null）
+            intro.kindLabel()?.let {
+                Spacer(Modifier.height(12.dp))
+                SectionTitle(stringResource(R.string.model_intro_kind))
+                Text(it, style = MaterialTheme.typography.bodySmall)
+            }
+
+            // 「实际效果」排在推荐参数前面：用户最先想知道的是"加上会怎样"。
+            // 条目自身没有 effect 时退到独立维护的效果档案里兜底；两处都有值时以条目为准
+            // （数据构建链已把档案内容合并进 effect，兜底只服务没合并上的条目）
+            (intro.effect ?: LoraEffectTable.lookup(intro.file))?.let {
                 Spacer(Modifier.height(12.dp))
                 SectionTitle(stringResource(R.string.model_intro_effect))
                 Text(it, style = MaterialTheme.typography.bodyMedium)
             }
 
-            if (intro.params.isNotEmpty()) {
+            // 文件已移除的条目不再显示「实际使用参数」——那是指向一个已经删掉的模型的
+            // 幽灵推荐，照着配怎么都跑不通（下面的 usedIn 同理）
+            if (intro.params.isNotEmpty() && !intro.missing) {
                 Spacer(Modifier.height(12.dp))
                 SectionTitle(stringResource(R.string.model_intro_params))
                 KeyValueRows(intro.params)
@@ -159,7 +176,7 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
                 SectionTitle(stringResource(R.string.model_intro_tags))
                 Text(intro.tags.joinToString("、"), style = MaterialTheme.typography.bodySmall)
             }
-            if (intro.usedIn.isNotEmpty()) {
+            if (intro.usedIn.isNotEmpty() && !intro.missing) {
                 Spacer(Modifier.height(12.dp))
                 SectionTitle(stringResource(R.string.model_intro_used_in))
                 Text(intro.usedIn.joinToString("、"), style = MaterialTheme.typography.bodySmall)
@@ -183,12 +200,16 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            intro.introOriginal?.let {
+            intro.introOriginal?.let { original ->
                 Spacer(Modifier.height(12.dp))
                 SectionTitle(stringResource(R.string.model_intro_original))
                 // 独立滚动框：作者原文动辄几千字（抓取层已不再截断），跟整页一起滚会
-                // 把上面的参数区顶得老远。固定高度 + 自己的滚动条，页面永远只占一块；
-                // 外层 Column 也是 verticalScroll，内层有固定高度才滚得动。
+                // 把上面的参数区顶得老远。固定高度 + 自己的滚动，页面永远只占一块；
+                // 外层 Column 也是 verticalScroll，内层必须给固定高度——LazyColumn 拿到
+                // infinity 高度约束会直接抛异常。
+                // 整段塞给一个 Text 时最长 5 万多字符单次排版慢到肉眼可见，所以切成
+                // 小片段逐段排版（splitIntroText，拼接恒等于原文），首屏只排可见的那几段。
+                val chunks = remember(original) { splitIntroText(original) }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -199,14 +220,19 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
                             RoundedCornerShape(8.dp)
                         )
                 ) {
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    LazyColumn(
                         modifier = Modifier
-                            .verticalScroll(rememberScrollState())
+                            .fillMaxWidth()
                             .padding(12.dp)
-                    )
+                    ) {
+                        items(chunks) { chunk ->
+                            Text(
+                                text = chunk,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
             }
             intro.url?.let {

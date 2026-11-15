@@ -30,13 +30,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import sh.hnet.comfychair.R
@@ -47,6 +52,25 @@ import sh.hnet.comfychair.ui.theme.ColorMath
 
 /** 辅色派生规则（决策 1）：强调色色相 +35°，S/V 不变。 */
 private const val ACCENT_HUE_SHIFT_DEG = 35f
+
+/**
+ * 下拉按钮渐变向背景沉的权重（U3：下拉必须是次层级）：
+ * 主色 70% + 背景色 30% 混出的底再走色相偏移，亮度/饱和度都必须低于主按钮渐变。
+ */
+private const val TRAILING_SURFACE_MIX_FRACTION = 0.30f
+
+/** 测试定位 tag（Compose 惯例：仅测试可见的 tag 允许留在生产代码）。 */
+private const val TRAILING_BUTTON_TAG = "trailing-button"
+private const val TRAILING_ARROW_TAG = "trailing-arrow"
+
+/**
+ * 下拉按钮箭头图标的显式尺寸（B1：图标显式几何居中）。
+ * 24dp = Material Icons 默认尺寸，与同排齿轮/菜单图标同为 24dp 体系。
+ * 注意：M3 对 55dp+ trailing 按钮的图标 token 实为
+ * SplitButtonMediumTokens.TrailingIconSize = 26dp（material3 1.5.0-alpha11 反编译确认），
+ * 此处刻意不用 26dp —— 数值与改动前视觉一致，且保持与既有图标体系统一。
+ */
+private val TRAILING_ICON_SIZE = 24.dp
 
 /**
  * 渐变辅色：强调色在 HSV 口径上色相 +35°。
@@ -119,6 +143,9 @@ fun GenerationButton(
     // 皮肤 v2 总开关（回退阀）：主按钮白边 22%/1dp + 辉光改向下投影、下拉按钮 54×56/无辉光、
     // 主↔下拉间距 10dp。关闭时全部回 v4.12.x 形态（白边 50%、环形辉光、56×56、2dp 间距）。
     val skinV2 = remember(context) { AppSettings.isUiSkinV2Enabled(context) }
+    // 下拉图标显式居中开关（B1 回退阀）：开 = 图标外置到按钮容器上显式居中（轴心=按钮中心）；
+    // 关 = 图标留 M3 content 槽内、居中交给 ElevatedTrailingButton 内部排布（改动前原路径）。
+    val trailingIconCentered = remember(context) { AppSettings.isTrailingIconCentered(context) }
 
     // Button always uses primary color (no more red cancel state)
     val containerColor = MaterialTheme.colorScheme.primary
@@ -160,6 +187,10 @@ fun GenerationButton(
                 onGenerate()
             },
             enabled = leadingEnabled,
+            // U3：M3 自带 elevation 阴影去掉 —— SplitButton 默认 LeadingButtonShape 是
+            // "左圆右方"半胶囊，M3 阴影会在按钮尾部露出直角灰块（实测浅色主题可见），
+            // 且与皮肤层可控投影叠加后发脏。主按钮投影统一由 rippleFeedback 的 2 层投影承担。
+            elevation = null,
             colors = ButtonDefaults.elevatedButtonColors(
                 containerColor = when {
                     leadingSkinActive -> Color.Transparent
@@ -211,20 +242,30 @@ fun GenerationButton(
             label = "dropdown icon rotation"
         )
 
+        // 队列菜单标签（B1b）：两条路径共用同一字符串 —— 回退路径挂在槽内 Icon 的
+        // contentDescription，外置路径挂到按钮 merge 边界（见下方 trailing modifier）
+        val queueMenuLabel = stringResource(R.string.content_description_queue_menu)
+
         // Trailing button - disabled in offline mode (no queue operations available)
-        // 波纹点阵反馈（v4.12.x）；interactionSource 必须与按钮共享，按压回弹才收得到事件。
+        // interactionSource 必须与按钮共享，按压回弹才收得到事件。
         val trailingInteraction = remember { MutableInteractionSource() }
-        // 决策 2 原文把渐变范围定为「leading + trailing 小下拉」整组（基准 HTML 的方形版
-        // 56×56/18px 也是同款渐变 + 白边 + 辉光）；禁用态与总开关关闭的兜底逻辑同 leading。
-        // v2 皮肤：下拉降级为主按钮的次级元素 —— 54×56、无辉光无投影、白边 18%；
-        // 回退态恢复 56×56 + 环形辉光（层级：主 > 下拉，不得同重量）。
+        // 决策 2 原文把渐变范围定为「leading + trailing 小下拉」整组；禁用态与总开关关闭的
+        // 兜底逻辑同 leading。v2 皮肤：下拉降级为主按钮的次级元素 —— 54×56、无辉光无投影、
+        // 白边 18%、渐变亮度必须低于主按钮（U1：且不带点阵）；回退态恢复 56×56 + 环形辉光
+        // （层级：主 > 下拉，不得同重量）。
         val trailingEnabled = !isOffline
         val trailingSkinActive = trailingEnabled && dotFeedbackEnabled
+        // U3 次层级渐变：主色先向 surface 沉 30%（70% 主色 + 30% 背景）再走 +35° 色相偏移，
+        // 保证任何主题下都比主按钮渐变暗一档、不抢戏
+        val trailingGradientBase = lerp(accent, MaterialTheme.colorScheme.surface, TRAILING_SURFACE_MIX_FRACTION)
         Box(modifier = Modifier.wrapContentWidth(unbounded = true)) {
             SplitButtonDefaults.ElevatedTrailingButton(
                 checked = showMenu,
                 onCheckedChange = { showMenu = it },
                 enabled = trailingEnabled,
+                // U3：次级元素不带任何投影 —— M3 elevation 阴影会在半胶囊形状外露出
+                // 错形残边（同 leading），皮肤层白边 18% 已足够勾勒轮廓
+                elevation = null,
                 interactionSource = trailingInteraction,
                 colors = ButtonDefaults.elevatedButtonColors(
                     containerColor = when {
@@ -235,6 +276,22 @@ fun GenerationButton(
                     contentColor = contentColor
                 ),
                 modifier = Modifier
+                    .testTag(TRAILING_BUTTON_TAG)
+                    // B1b a11y：外置路径下 content 槽为空，M3 内部合并边界收不到任何标签，
+                    // TalkBack 焦点到按钮只读「未加标签」，而外置 Icon 自带 cd 会变成第二个
+                    // 冗余焦点节点。这里显式补一个 merge 边界 + contentDescription：按钮节点
+                    // 自带标签并吞并内部 toggleable 的点击动作，TalkBack 一次聚焦即可操作
+                    //（语义属性不参与测量/布局，两态几何不受影响）。回退路径不加 —— 槽内
+                    // Icon 的 cd 已随内部边界合并进按钮节点，再叠一层会把 cd 拼接读两遍。
+                    .then(
+                        if (trailingIconCentered) {
+                            Modifier.semantics(mergeDescendants = true) {
+                                contentDescription = queueMenuLabel
+                            }
+                        } else {
+                            Modifier
+                        }
+                    )
                     // v2 皮肤 54×56（下拉比主按钮窄一档）；回退态 56×56 方形
                     .size(width = if (skinV2) 54.dp else 56.dp, height = 56.dp)
                     .rippleFeedback(
@@ -246,8 +303,10 @@ fun GenerationButton(
                         borderAlphaOverride = if (skinV2) 0.18f else null,
                         // v2：无辉光无投影；回退态保留旧环形辉光
                         showHalo = !skinV2,
+                        // U1：下拉不带点阵（点阵只留在生成主按钮），皮肤其余结构保留
+                        showDots = false,
                         gradientColors = if (trailingSkinActive) {
-                            listOf(accent, accent.shiftAccentHue())
+                            listOf(trailingGradientBase, trailingGradientBase.shiftAccentHue())
                         } else {
                             null
                         },
@@ -255,10 +314,41 @@ fun GenerationButton(
                         dotColor = Color.White,
                     )
             ) {
+                if (!trailingIconCentered) {
+                    // 回退路径（开关关闭）：图标留在 M3 content 槽内，居中交给
+                    // ElevatedTrailingButton 内部排布 —— 与改动前逐像素一致的原路径。
+                    // cd 保留在 Icon 上，经内部合并边界汇入按钮节点（改动前 TalkBack 形态）
+                    Icon(
+                        Icons.Default.KeyboardArrowDown,
+                        contentDescription = queueMenuLabel,
+                        modifier = Modifier
+                            .rotate(iconRotation)
+                            .testTag(TRAILING_ARROW_TAG)
+                    )
+                }
+            }
+
+            if (trailingIconCentered) {
+                // B1 显式居中：图标外置到按钮容器上，align(Center) 让图标中心恒等于按钮
+                // 几何中心 —— 不依赖 M3 content 槽内部的 Row 排布与光学水平偏移
+                //（horizontalCenterOptically 按形状做光学补偿，收起/展开形状不同偏移也不同，
+                // 跨版本还可能变）。中心重合后，Modifier.rotate 的默认轴心（图标自身中心）
+                // 即按钮中心，两态共用同一个图标节点与同一条 modifier 链。
+                // tint 显式给 contentColor：外置后图标不再经过按钮 content 槽的
+                // ProvideContentColorTextStyle 作用域，默认取不到 onPrimary。
+                // contentDescription 必须为 null（B1b）：按钮标签已由上方的 merge 边界承担，
+                // 图标若再带 cd 会成为 TalkBack 树里第二个不可点的冗余焦点节点；置 null 后
+                // 图标纯装饰、不单独聚焦（也不能用 clearAndSetSemantics —— 会连 testTag
+                // 一起清掉，破坏 instrumented 测试的 trailing-arrow 定位）
                 Icon(
                     Icons.Default.KeyboardArrowDown,
-                    contentDescription = stringResource(R.string.content_description_queue_menu),
-                    modifier = Modifier.rotate(iconRotation)
+                    contentDescription = null,
+                    tint = contentColor,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(TRAILING_ICON_SIZE)
+                        .rotate(iconRotation)
+                        .testTag(TRAILING_ARROW_TAG)
                 )
             }
 

@@ -55,6 +55,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,6 +67,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import sh.hnet.comfychair.MediaViewerActivity
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
@@ -100,6 +102,11 @@ fun GalleryScreen(
     // 离线态从连接状态派生：强制离线与自动离线都要显示"未缓存"占位图标，且要实时刷新
     val isOffline = rememberIsOffline()
 
+    // Grid state for scroll tracking
+    // （声明提到 launcher 之前：回调里要按查看器回传的 key 定位滚动位置）
+    val gridState = rememberLazyGridState()
+    val scope = rememberCoroutineScope()
+
     // State and effects
     // Activity result launcher for MediaViewerActivity
     val mediaViewerLauncher = rememberLauncherForActivityResult(
@@ -113,6 +120,21 @@ fun GalleryScreen(
             val itemDeleted = result.data?.getBooleanExtra(MediaViewerActivity.RESULT_ITEM_DELETED, false) ?: false
             if (itemDeleted) {
                 galleryViewModel.refresh()
+            }
+
+            // 位置双向同步（C3）：查看器里翻到第 N 张后返回，列表自动滚到那一张。
+            // 回传的是稳定键（promptId_filename），在当前 items 里找索引——
+            // 该项可能已被删除：找不到就静默忽略，绝不滚动到错误位置
+            val currentKey = result.data?.getStringExtra(MediaViewerActivity.EXTRA_CURRENT_ITEM_KEY)
+            if (currentKey != null) {
+                val index = uiState.items.indexOfFirst {
+                    "${it.promptId}_${it.filename}" == currentKey
+                }
+                val isAlreadyVisible = gridState.layoutInfo.visibleItemsInfo.any { it.index == index }
+                if (index >= 0 && !isAlreadyVisible) {
+                    // non-animated：返回瞬间长距离滑动观感差，直接落位更稳
+                    scope.launch { gridState.scrollToItem(index) }
+                }
             }
         }
     }
@@ -178,10 +200,12 @@ fun GalleryScreen(
             initialIndex = clickedIndex
         )
         mediaViewerLauncher.launch(intent)
+        // 打开过渡（C2）：launch 内部同步发起 startActivityForResult，这里紧接着设置——
+        // 列表保持不动，查看器以缩小淡入进场（与关闭时的缩小淡出对称）
+        (context as? Activity)?.overridePendingTransition(
+            R.anim.viewer_fade_in_grow, R.anim.gallery_stay
+        )
     }
-
-    // Grid state for scroll tracking
-    val gridState = rememberLazyGridState()
 
     // 批量删除前的确认（一次删掉几十张不可撤销，必须拦一道）
     var showDeleteConfirm by remember { mutableStateOf(false) }

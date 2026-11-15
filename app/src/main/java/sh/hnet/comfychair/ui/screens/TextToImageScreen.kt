@@ -1,12 +1,12 @@
 package sh.hnet.comfychair.ui.screens
 
+import android.app.Activity
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -75,6 +75,7 @@ import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.GenerationTopBarActions
 import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
+import sh.hnet.comfychair.ui.components.shared.previewSurfaceBackground
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultButton
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultDialog
@@ -318,7 +319,8 @@ fun TextToImageScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .heightIn(min = 150.dp)
-                    .background(MaterialTheme.colorScheme.surfaceContainer)
+                    // 我推荐项：直角纯色 → 圆角 16 + 160° 渐变底（图片内容不受影响，见 helper 注释）
+                    .previewSurfaceBackground()
                     .clickable(enabled = uiState.previewBitmap != null && !isThisScreenExecuting) {
                         // Launch MediaViewer for single image
                         uiState.previewBitmap?.let { bitmap ->
@@ -332,6 +334,10 @@ fun TextToImageScreen(
                                 type = uiState.currentImageType
                             )
                             context.startActivity(intent)
+                            // 与图库页一致：打开时放大淡入，关闭时的缩小淡出在 MediaViewerActivity.finish() 里
+                            (context as? Activity)?.overridePendingTransition(
+                                R.anim.viewer_fade_in_grow, R.anim.gallery_stay
+                            )
                         }
                     },
                 contentAlignment = Alignment.Center
@@ -429,11 +435,13 @@ fun TextToImageScreen(
         )
 
         // Generate and Options buttons
+        // U3：三件套（主按钮组/齿轮）等高 56dp，显式声明垂直居中保持视觉对齐
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp)
-                .padding(bottom = 16.dp)
+                .padding(bottom = 16.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             GenerationButton(
                 // v4.8.2（模块四）：只算本模式自己的活跃任务，避免四个模式一起显示队列数

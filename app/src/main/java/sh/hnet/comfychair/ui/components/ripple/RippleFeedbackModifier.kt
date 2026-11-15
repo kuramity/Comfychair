@@ -62,6 +62,8 @@ internal const val DEFAULT_PRESS_SCALE = 0.96f
 internal const val DEFAULT_SHOW_BORDER = true
 internal const val DEFAULT_SHOW_HALO = true
 internal const val DEFAULT_SHOW_TOUCH_GLOW = true
+/** 点阵开关默认值：默认开（生成主按钮是唯一不传 false 的调用点，U1 收敛后的事实）。 */
+internal const val DEFAULT_SHOW_DOTS = true
 
 /**
  * 白边（基准 box-shadow 的内描边项）：贴内缘细描边，内缩 0.75dp 让线外缘正好贴住按钮边缘。
@@ -88,13 +90,15 @@ private val HALO_ALPHAS_LIGHT = floatArrayOf(0.20f, 0.08f, 0.03f)
 private const val HALO_STROKE_DP = 2f
 
 /**
- * 向下投影（v2 皮肤，主按钮）：不用 BlurMaskFilter，3 层与按钮同尺寸的圆角矩形
- * 向下偏移 2/4/6dp、alpha 递减，画在内容**之前**（渐变/按钮本体盖住上层重叠区，
+ * 向下投影（v2 皮肤，主按钮）：不用 BlurMaskFilter，2 层与按钮同尺寸的圆角矩形
+ * 向下偏移 2/4dp、alpha 递减，画在内容**之前**（渐变/按钮本体盖住上层重叠区，
  * 只有按钮下缘露出的条带可见 → 叠出向下渐弱的投影感）。颜色 = glowColor（主色）。
+ * 深浅主题两套 alpha（U3：深色下 6dp/0.22 首层会发脏，减到 2 层 0.16/0.08；浅色更轻 0.10/0.05）。
  * internal 供单测钉住规格。
  */
-internal val SHADOW_OFFSETS_DP = floatArrayOf(2f, 4f, 6f)
-internal val SHADOW_ALPHAS = floatArrayOf(0.22f, 0.12f, 0.06f)
+internal val SHADOW_OFFSETS_DP = floatArrayOf(2f, 4f)
+internal val SHADOW_ALPHAS_DARK = floatArrayOf(0.16f, 0.08f)
+internal val SHADOW_ALPHAS_LIGHT = floatArrayOf(0.10f, 0.05f)
 
 /** 触点辉光：触点处一小团柔光（实心圆，非描边环），峰值半径 8dp，随寿命淡出。 */
 private const val TOUCH_GLOW_RADIUS_DP = 8f
@@ -119,6 +123,20 @@ internal fun resolvePressScale(pressed: Boolean, pressScale: Float): Float =
  */
 internal fun resolveFeedbackShape(cornerRadius: Dp?, fallback: Shape): Shape =
     if (cornerRadius == null) fallback else RoundedCornerShape(cornerRadius)
+
+/**
+ * 点阵点是否绘制（纯函数，便于单测）：[showDots] 关闭时任何 boost 都不画 ——
+ * 「U1 收敛：点阵只留在生成主按钮」的零绘制契约钉在这里，绘制循环的 continue 判定走本函数。
+ */
+internal fun shouldDrawDot(showDots: Boolean, boost: Float): Boolean =
+    showDots && boost > 0f
+
+/**
+ * 触点辉光是否绘制（纯函数，便于单测）：辉光是点阵皮肤的一部分，[showDots] 关闭时
+ * 一并关闭（U1：顶栏按钮不得残留触点辉光），[showTouchGlow] 只在点阵开着时才有意义。
+ */
+internal fun shouldDrawTouchGlow(showDots: Boolean, showTouchGlow: Boolean): Boolean =
+    showDots && showTouchGlow
 
 /**
  * 按钮级「水面波纹点阵」点击反馈（v4.9.x，v5.x 皮肤对齐 HTML 观感基准）。
@@ -157,9 +175,11 @@ internal fun resolveFeedbackShape(cornerRadius: Dp?, fallback: Shape): Shape =
  * @param showBorder 是否画白边（v5.x 皮肤拆分开关，默认开；顶栏裸图标态传 false）
  * @param showHalo 是否画外辉光/投影（默认开；顶栏裸图标态与 v2 下拉按钮传 false）
  * @param showTouchGlow 是否画触点辉光（默认开；顶栏裸图标态传 false）
+ * @param showDots 是否画点阵（U1 收敛：只有生成主按钮保持默认 true；顶栏图标/下拉/齿轮
+ *   等传 false —— 不登记波纹、不画点阵与触点辉光，但按压回弹/渐变/白边等皮肤结构保留）
  * @param pressScale 按压缩放目标值（默认 0.96 完整皮肤；顶栏裸图标态 0.94）
  * @param cornerRadius 非 null 时裁剪形状改用该圆角矩形（顶栏裸图标态 12dp；null = 用 [shape]）
- * @param haloDownward true 时辉光改为向下投影（v2 主按钮：向下偏移 2/4/6dp 的递减层，
+ * @param haloDownward true 时辉光改为向下投影（v2 主按钮：向下偏移 2/4dp 的递减层，
  *   颜色 = glowColor）；false 保持旧版环形辉光
  * @param borderAlphaOverride 覆盖白边 alpha（v2 下拉按钮 0.18；null = 按主题默认值）
  */
@@ -179,6 +199,7 @@ fun Modifier.rippleFeedback(
     showBorder: Boolean = DEFAULT_SHOW_BORDER,
     showHalo: Boolean = DEFAULT_SHOW_HALO,
     showTouchGlow: Boolean = DEFAULT_SHOW_TOUCH_GLOW,
+    showDots: Boolean = DEFAULT_SHOW_DOTS,
     pressScale: Float = DEFAULT_PRESS_SCALE,
     cornerRadius: Dp? = null,
     haloDownward: Boolean = false,
@@ -218,6 +239,8 @@ fun Modifier.rippleFeedback(
     }
     val borderStrokeWidth = if (skinV2) BORDER_STROKE_DP_V2 else BORDER_STROKE_DP
     val haloAlphas = if (isDarkScheme) HALO_ALPHAS_DARK else HALO_ALPHAS_LIGHT
+    // 投影 alpha 同样深浅两套（U3：深色首层 0.22 发脏 → 0.16；浅色更轻）
+    val shadowAlphas = if (isDarkScheme) SHADOW_ALPHAS_DARK else SHADOW_ALPHAS_LIGHT
 
     // 低端机只在组合时判定一次，决定点阵间距是否加倍
     val isLowRamDevice = remember(context) {
@@ -284,20 +307,23 @@ fun Modifier.rippleFeedback(
         )
     }
 
-    // 帧驱动：没有活跃波纹时挂在 snapshotFlow 上休眠，不空转烧帧
-    LaunchedEffect(Unit) {
-        while (true) {
-            if (ripples.isEmpty()) {
-                snapshotFlow { ripples.size }.first { it > 0 }
-            }
-            withFrameNanos { /* 只对齐帧信号，时间取自单调时钟 */ }
-            val now = System.nanoTime() / NANOS_PER_SEC
-            val hadRipples = ripples.isNotEmpty()
-            ripples.removeAll { now - it.bornAtSec >= RippleDotGrid.RIPPLE_LIFE_SEC }
-            if (ripples.isNotEmpty() || hadRipples) {
-                // 全部过期后仍采样一帧（空列表 → 全 0），把上一帧的残影刷掉
-                grid.sample(ripples, now, sampleBuffer)
-                frameTick++
+    // 帧驱动：没有活跃波纹时挂在 snapshotFlow 上休眠，不空转烧帧；
+    // showDots=false（U1 收敛态）连这个协程都不挂 —— 无波纹来源，整条帧链没有存在意义
+    if (showDots) {
+        LaunchedEffect(Unit) {
+            while (true) {
+                if (ripples.isEmpty()) {
+                    snapshotFlow { ripples.size }.first { it > 0 }
+                }
+                withFrameNanos { /* 只对齐帧信号，时间取自单调时钟 */ }
+                val now = System.nanoTime() / NANOS_PER_SEC
+                val hadRipples = ripples.isNotEmpty()
+                ripples.removeAll { now - it.bornAtSec >= RippleDotGrid.RIPPLE_LIFE_SEC }
+                if (ripples.isNotEmpty() || hadRipples) {
+                    // 全部过期后仍采样一帧（空列表 → 全 0），把上一帧的残影刷掉
+                    grid.sample(ripples, now, sampleBuffer)
+                    frameTick++
+                }
             }
         }
     }
@@ -314,7 +340,7 @@ fun Modifier.rippleFeedback(
             @Suppress("UNUSED_VARIABLE")
             val frameSignal = frameTick
 
-            // 0) 向下投影（v2 主按钮）：3 层同尺寸圆角矩形向下偏移 2/4/6dp、alpha 递减，
+            // 0) 向下投影（v2 主按钮）：2 层同尺寸圆角矩形向下偏移 2/4dp、alpha 递减，
             //    画在**最底层** —— 渐变与按钮本体盖住上层重叠区，只有按钮下缘露出的
             //    条带可见，叠出向下渐弱的投影感。画在控件边界之外的溢出绘制，依赖父链无 clip
             //    （与旧外辉光同机制；旧辉光 6dp 全向溢出已长期在线上正常绘制）。
@@ -322,7 +348,7 @@ fun Modifier.rippleFeedback(
                 shadowOutline?.let { outline ->
                     SHADOW_OFFSETS_DP.forEachIndexed { idx, offDp ->
                         translate(0f, offDp.dp.toPx()) {
-                            drawOutline(outline = outline, color = glowColor, alpha = SHADOW_ALPHAS[idx])
+                            drawOutline(outline = outline, color = glowColor, alpha = shadowAlphas[idx])
                         }
                     }
                 }
@@ -381,35 +407,38 @@ fun Modifier.rippleFeedback(
 
             // 4) 触点辉光 + 点阵，全部裁进按钮形状，防止溢出圆角。
             //    涟漪完全由点阵的点亮 + 上凸体现；触点处保留一小团实心柔光（点，不是环）。
-            clipPath(clipPath) {
-                val now = System.nanoTime() / NANOS_PER_SEC
-                if (showTouchGlow) {
-                    for (ripple in ripples) {
-                        val age = ripple.ageAt(now)
-                        if (age <= 0.0 || age >= RippleDotGrid.RIPPLE_LIFE_SEC) continue
+            //    showDots=false 整层不画（U1 收敛：点阵只留在生成主按钮，其余按钮零残留）。
+            if (showDots) {
+                clipPath(clipPath) {
+                    val now = System.nanoTime() / NANOS_PER_SEC
+                    if (shouldDrawTouchGlow(showDots, showTouchGlow)) {
+                        for (ripple in ripples) {
+                            val age = ripple.ageAt(now)
+                            if (age <= 0.0 || age >= RippleDotGrid.RIPPLE_LIFE_SEC) continue
+                            drawCircle(
+                                color = rippleColor,
+                                radius = TOUCH_GLOW_RADIUS_DP.dp.toPx(),
+                                center = Offset(ripple.x.dp.toPx(), ripple.y.dp.toPx()),
+                                alpha = ripple.lifeFadeAt(now).toFloat() * TOUCH_GLOW_MAX_ALPHA,
+                            )
+                        }
+                    }
+                    for (i in 0 until grid.dotCount) {
+                        val base = i * RippleDotGrid.FLOATS_PER_DOT
+                        val boost = sampleBuffer[base + 2]
+                        if (!shouldDrawDot(showDots, boost)) continue
                         drawCircle(
-                            color = rippleColor,
-                            radius = TOUCH_GLOW_RADIUS_DP.dp.toPx(),
-                            center = Offset(ripple.x.dp.toPx(), ripple.y.dp.toPx()),
-                            alpha = ripple.lifeFadeAt(now).toFloat() * TOUCH_GLOW_MAX_ALPHA,
+                            color = dotColor,
+                            radius = (DOT_MIN_RADIUS_DP + DOT_BOOST_RADIUS_DP * boost).dp.toPx(),
+                            // 上凸（v5.x）：采样层直接给出按道累加后的 lift（总封顶 6dp），
+                            // 波前扫过的点抬升，波过随累加值回落
+                            center = Offset(
+                                sampleBuffer[base].dp.toPx(),
+                                sampleBuffer[base + 1].dp.toPx() - sampleBuffer[base + 3].dp.toPx(),
+                            ),
+                            alpha = DOT_MAX_ALPHA * boost,
                         )
                     }
-                }
-                for (i in 0 until grid.dotCount) {
-                    val base = i * RippleDotGrid.FLOATS_PER_DOT
-                    val boost = sampleBuffer[base + 2]
-                    if (boost <= 0f) continue
-                    drawCircle(
-                        color = dotColor,
-                        radius = (DOT_MIN_RADIUS_DP + DOT_BOOST_RADIUS_DP * boost).dp.toPx(),
-                        // 上凸（v5.x）：采样层直接给出按道累加后的 lift（总封顶 6dp），
-                        // 波前扫过的点抬升，波过随累加值回落
-                        center = Offset(
-                            sampleBuffer[base].dp.toPx(),
-                            sampleBuffer[base + 1].dp.toPx() - sampleBuffer[base + 3].dp.toPx(),
-                        ),
-                        alpha = DOT_MAX_ALPHA * boost,
-                    )
                 }
             }
         }
@@ -425,24 +454,32 @@ fun Modifier.rippleFeedback(
                 }
             }
         }
-        .pointerInput(grid) {
-            // Initial pass 只观察不消费：Press 时以触点为圆心登记一道波纹
-            awaitPointerEventScope {
-                while (true) {
-                    val event = awaitPointerEvent(PointerEventPass.Initial)
-                    if (event.type != PointerEventType.Press) continue
-                    val change = event.changes.firstOrNull() ?: continue
-                    if (!change.pressed) continue
-                    grid.pushRipple(
-                        centers = ripples,
-                        x = with(density) { change.position.x.toDp().value },
-                        y = with(density) { change.position.y.toDp().value },
-                        timeSec = System.nanoTime() / NANOS_PER_SEC,
-                    )
-                    frameTick++
+        .then(
+            // 波纹登记只在点阵开着时挂：showDots=false 的按钮连 Press 观察都不做，
+            // 保证零波纹（不登记 → ripples 恒空 → 帧循环休眠、无残影可画）。
+            if (showDots) {
+                Modifier.pointerInput(grid) {
+                    // Initial pass 只观察不消费：Press 时以触点为圆心登记一道波纹
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.type != PointerEventType.Press) continue
+                            val change = event.changes.firstOrNull() ?: continue
+                            if (!change.pressed) continue
+                            grid.pushRipple(
+                                centers = ripples,
+                                x = with(density) { change.position.x.toDp().value },
+                                y = with(density) { change.position.y.toDp().value },
+                                timeSec = System.nanoTime() / NANOS_PER_SEC,
+                            )
+                            frameTick++
+                        }
+                    }
                 }
+            } else {
+                Modifier
             }
-        }
+        )
 }
 
 /** v2 顶栏裸图标规格：44dp 触控区、圆角 12（不是圆形）、按压缩放 0.94。 */
@@ -463,9 +500,9 @@ private const val PRESS_BG_ALPHA_LIGHT_V2 = 0.06f
  * - IconButton 填满整个 Box。
  *
  * v2 皮肤（AppSettings.isUiSkinV2Enabled，默认开）：**裸图标化** —— 44×44 触控区、
- * 圆角 12 矩形（点阵裁进圆角）、无圆形底座 / 无白边 / 无外辉光 / 无触点辉光
- * （三个开关逐项关掉，点阵保留），按压缩放 0.94；按压底色 White 8%（浅色 Black 6%），
- * 动画过渡。图标 22dp 由调用方的 Icon 自己定尺寸。
+ * 圆角 12 矩形、无圆形底座 / 无白边 / 无外辉光 / 无触点辉光 / **无点阵**
+ * （U1 收敛：点阵只留在生成主按钮，顶栏图标一律 showDots=false），按压缩放 0.94；
+ * 按压底色 White 8%（浅色 Black 6%），动画过渡。图标 22dp 由调用方的 Icon 自己定尺寸。
  *
  * 回退态（开关关闭）：48dp 圆形 + 白边 + 外辉光 + 触点辉光 + 缩放 0.96（v4.12.x 形态），
  * 全部走同一套 Box 与参数分支，没有复制两套 UI。
@@ -510,12 +547,15 @@ internal fun RippleIconButton(
             .rippleFeedback(
                 interactionSource = interactionSource,
                 shape = CircleShape,
-                // v2：圆角 12 矩形裁点阵；回退：null → 沿用传入的 CircleShape
+                // v2：圆角 12 矩形（回退态 null → 沿用传入的 CircleShape）
                 cornerRadius = if (skinV2) ICON_CORNER_DP_V2 else null,
-                // v2：白边/辉光/触点辉光全部关掉（裸图标态），点阵保留
+                // v2：白边/辉光/触点辉光全部关掉（裸图标态）
                 showBorder = !skinV2,
                 showHalo = !skinV2,
                 showTouchGlow = !skinV2,
+                // U1 收敛：点阵只留在生成主按钮，经本包装的顶栏图标（含 3D/释放显存/菜单）
+                // 一律不带点阵；皮肤结构（触控区/圆角/按压底色/scale）原样保留
+                showDots = false,
                 pressScale = if (skinV2) ICON_PRESS_SCALE_V2 else DEFAULT_PRESS_SCALE,
                 enabled = enabled && dotFeedbackEnabled,
                 // 不传 gradientColors：顶栏图标不加渐变

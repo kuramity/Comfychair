@@ -778,6 +778,9 @@
     <string name="model_intro_source">Source</string>
     <string name="model_intro_missing_badge">File removed</string>
     <string name="model_intro_missing_notice">⚠ Local file removed — this model was deleted from the model library, so recommended settings and companion models are no longer shown. The description below is kept only so you can tell what it used to be.</string>
+    <string name="model_intro_kind">Category</string>
+    <string name="model_intro_effect_archive">LoRA effect archive (%1$d)</string>
+    <string name="model_intro_effect_archive_orphan_only">Only in the effect archive (no model info yet)</string>
     <string name="model_list_loading">Loading model list…</string>
     <string name="nav_model_intro">Model info</string>
     <string name="model_intro_screen_title">Model info</string>
@@ -967,4 +970,11 @@
     <!-- v4.6.1 模块 D：上传进度 -->
     <string name="button_uploading_progress">Uploading %1$d%%</string>
     <string name="button_uploading_progress_queue">Uploading %1$d%% · %2$d queued</string>
+
+    <!-- Changelog screen (offline, reads assets/CHANGELOG.md) -->
+    <string name="changelog_entry_title">Changelog</string>
+    <string name="changelog_entry_subtitle">Release notes for all versions</string>
+    <string name="changelog_screen_title">Changelog</string>
+    <string name="changelog_badge_current">Current</string>
+    <string name="changelog_empty">No changelog available</string>
 </resources>

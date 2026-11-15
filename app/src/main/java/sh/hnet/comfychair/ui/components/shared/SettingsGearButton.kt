@@ -29,16 +29,18 @@ import sh.hnet.comfychair.ui.components.ripple.rippleFeedback
 private const val GEAR_BASE_ALPHA = 0.05f
 private const val GEAR_PRESSED_ALPHA = 0.10f
 
-/** 齿轮白边 alpha：深色 White 22% / 浅色 Black 22%（颜色在 rippleFeedback 内按主题自适应）。 */
-private const val GEAR_BORDER_ALPHA = 0.22f
+/** 齿轮白边 alpha：深色 White 18% / 浅色 Black 18%（颜色在 rippleFeedback 内按主题自适应）。 */
+private const val GEAR_BORDER_ALPHA = 0.18f
 
 /**
  * 四个生成页底部操作行共用的「节点参数」齿轮按钮（v5 从四页内联的
  * `OutlinedIconButton(56dp)` + `Spacer(8dp)` 抽出，C6）。
  *
  * v2 皮肤（AppSettings.isUiSkinV2Enabled，默认开）：56×56 **圆形**、底 `White 5%`
- * （浅色主题 Black 5%）、描边 `White 22%` 1dp、图标 `onSurface`、无渐变无投影；
- * 按压 = 底色升到 10% + scale 0.94。层级定位：齿轮 < 下拉 < 主按钮（三者不同重量）。
+ * （浅色主题 Black 5%）、描边 `White 18%` 1dp、图标 `onSurfaceVariant`（U3：不比
+ * 下拉/主按钮抢眼，不用纯白/纯黑）、无渐变无投影、**无点阵**（U1：点阵只留在
+ * 生成主按钮）；按压 = 底色升到 10% + scale 0.94。
+ * 层级定位：齿轮 < 下拉 < 主按钮（三者不同重量）。
  *
  * 回退态：恢复旧版 `OutlinedIconButton`（56dp 描边圆），与四页原有形态一致。
  * 两条形态走同一组件的参数分支，不复制两套 UI。
@@ -93,10 +95,12 @@ fun SettingsGearButton(
             .rippleFeedback(
                 interactionSource = interactionSource,
                 shape = CircleShape,
-                // 白边 22%（颜色按主题自适应：深色 White / 浅色 Black），线宽随皮肤层走 1dp
+                // 白边 18%（颜色按主题自适应：深色 White / 浅色 Black），线宽随皮肤层走 1dp
                 borderAlphaOverride = GEAR_BORDER_ALPHA,
                 // 无渐变观感（纯色底）、无辉光无投影：层级最低的齿轮不发光
                 showHalo = false,
+                // U1 收敛：齿轮不带点阵（点阵只留在生成主按钮）
+                showDots = false,
                 // 按压缩放与顶栏裸图标一致（0.94），比主按钮族（0.96）轻一档
                 pressScale = 0.94f,
                 gradientColors = listOf(gearBg, gearBg),
@@ -108,8 +112,9 @@ fun SettingsGearButton(
         Icon(
             Icons.Default.Settings,
             contentDescription = stringResource(R.string.button_options),
-            // 图标 onSurface（规格）：比顶栏图标的 onSurfaceVariant 更实，区分"进面板"与"结果操作"
-            tint = MaterialTheme.colorScheme.onSurface,
+            // U3：图标降为 onSurfaceVariant —— 纯 onSurface（深色近白）在底部操作行里太跳，
+            // 齿轮必须是三者中最轻的
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.rotate(rotation)
         )
     }

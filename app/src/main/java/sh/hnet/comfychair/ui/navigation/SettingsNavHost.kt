@@ -31,6 +31,7 @@ import sh.hnet.comfychair.R
 import sh.hnet.comfychair.navigation.SettingsRoute
 import sh.hnet.comfychair.ui.screens.AboutSettingsScreen
 import sh.hnet.comfychair.ui.screens.AppearanceSettingsScreen
+import sh.hnet.comfychair.ui.screens.ChangelogScreen
 import sh.hnet.comfychair.ui.screens.ApplicationSettingsScreen
 import androidx.compose.material.icons.filled.MenuBook
 import sh.hnet.comfychair.ui.screens.ModelIntroScreen
@@ -188,8 +189,10 @@ fun SettingsNavHost(
                         }
                     }
 
-                    // About Settings
-                    if (currentRoute == SettingsRoute.About.route) {
+                    // About Settings（更新日志是它的二级页面，一并算选中，与「外观」同理）
+                    if (currentRoute == SettingsRoute.About.route ||
+                        currentRoute == SettingsRoute.Changelog.route
+                    ) {
                         FilledIconButton(
                             onClick = { },
                             colors = IconButtonDefaults.filledIconButtonColors(
@@ -288,8 +291,17 @@ fun SettingsNavHost(
             composable(SettingsRoute.About.route) {
                 AboutSettingsScreen(
                     onNavigateToGeneration = onNavigateToGeneration,
-                    onLogout = onLogout
+                    onLogout = onLogout,
+                    onNavigateToChangelog = {
+                        navController.navigate(SettingsRoute.Changelog.route) {
+                            launchSingleTop = true
+                        }
+                    }
                 )
+            }
+
+            composable(SettingsRoute.Changelog.route) {
+                ChangelogScreen(onBack = { navController.popBackStack() })
             }
         }
     }

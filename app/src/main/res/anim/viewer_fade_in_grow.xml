@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 查看器打开：内容从小到大淡入（与捏合关闭的缩小淡出互为对称，160ms 同款节奏） -->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:interpolator/fast_out_slow_in">
+    <alpha
+        android:fromAlpha="0.0"
+        android:toAlpha="1.0"
+        android:duration="160" />
+    <scale
+        android:fromXScale="0.86"
+        android:toXScale="1.0"
+        android:fromYScale="0.86"
+        android:toYScale="1.0"
+        android:pivotX="50%"
+        android:pivotY="50%"
+        android:duration="160" />
+</set>

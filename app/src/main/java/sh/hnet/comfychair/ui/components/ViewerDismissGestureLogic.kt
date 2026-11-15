@@ -28,6 +28,12 @@ object ViewerDismissGesture {
     /** 斜向偏置：只有 |dy| 明显大于 |dx|（>1.2 倍）才算垂直，斜向一律让给 Pager 翻页 */
     const val VERTICAL_BIAS = 1.2f
 
+    /** 捏合返回：未放大态下双指缩小到该比例以下即视为"想退出" */
+    const val PINCH_DISMISS_SCALE = 0.92f
+
+    /** 已放大门槛：页面缩放超过它时捏合只负责"缩回 1f"（既有 coerceIn 路径），不触发退出 */
+    const val PINCH_ZOOMED_THRESHOLD = 1.05f
+
     /** 脱离拖动最多缩小 35%（下限 0.65） */
     private const val DISMISS_MAX_SCALE_REDUCTION = 0.35f
     private const val MIN_DISMISS_SCALE = 0.65f
@@ -88,5 +94,19 @@ object ViewerDismissGesture {
         val scale = (1f - progress * DISMISS_MAX_SCALE_REDUCTION).coerceAtLeast(MIN_DISMISS_SCALE)
         val alpha = (1f - progress * DISMISS_MAX_ALPHA_REDUCTION).coerceAtLeast(MIN_DISMISS_ALPHA)
         return DismissVisuals(scale, alpha)
+    }
+
+    /**
+     * 捏合是否触发返回。
+     * @param currentScale 当前页面缩放（1f = 未放大）
+     * @param gestureScale 本次手势累计的缩放倍率（<1 为缩小）
+     * @param pointerCount 当前按下的手指数
+     */
+    fun shouldDismissByPinch(currentScale: Float, gestureScale: Float, pointerCount: Int): Boolean {
+        // 单指一律交给既有方向锁定逻辑（水平让给 Pager、垂直走下滑脱离）
+        if (pointerCount < 2) return false
+        // 已放大时捏合只做"回到 1f"，不退出，保持既有 coerceIn 语义
+        if (currentScale > PINCH_ZOOMED_THRESHOLD) return false
+        return gestureScale <= PINCH_DISMISS_SCALE
     }
 }

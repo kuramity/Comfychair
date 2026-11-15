@@ -58,8 +58,8 @@ android {
         // versionCode 与版本名**解耦**：每次发版 +1，只保证单调递增（Android 的硬性要求）。
         // ⚠️ 发版前务必同时改这两行：只 cp 改文件名不改这里，会得到一个 versionCode
         //    与上一版完全相同的包（装不上也分不清，v0.9.33 踩过）。
-        versionCode = 121
-        versionName = "v4.13.0"
+        versionCode = 123
+        versionName = "v4.15.0"
 
         // 更新清单地址注入 BuildConfig（空字符串 = 未配置更新源）
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"$updateManifestUrl\"")

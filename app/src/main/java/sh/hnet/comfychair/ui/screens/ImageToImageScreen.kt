@@ -1,6 +1,7 @@
 package sh.hnet.comfychair.ui.screens
 
 import android.widget.Toast
+import android.app.Activity
 import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.animation.AnimatedVisibility
@@ -9,7 +10,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -84,6 +84,7 @@ import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.GenerationTopBarActions
 import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
+import sh.hnet.comfychair.ui.components.shared.previewSurfaceBackground
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultButton
 import sh.hnet.comfychair.ui.components.shared.ThreeDInlinePreview
@@ -451,7 +452,8 @@ fun ImageToImageScreen(
                         .fillMaxWidth()
                         .weight(1f)
                         .heightIn(min = 150.dp)
-                        .background(MaterialTheme.colorScheme.surfaceContainer)
+                        // 我推荐项：直角纯色 → 圆角 16 + 160° 渐变底（图片内容不受影响，见 helper 注释）
+                        .previewSurfaceBackground()
                         .clickable(
                             // 图位区自己处理点击（点空位选图 / 点已填位放大）；整块区域的点击留给预览模式
                             // （修复模式下主图区仍是画布，点击照旧打开大图）
@@ -480,6 +482,10 @@ fun ImageToImageScreen(
                                                 type = uiState.previewImageType
                                             )
                                             context.startActivity(intent)
+                                            // 与图库页一致：打开时放大淡入，关闭时的缩小淡出在 MediaViewerActivity.finish() 里
+                                            (context as? Activity)?.overridePendingTransition(
+                                                R.anim.viewer_fade_in_grow, R.anim.gallery_stay
+                                            )
                                         }
                                     }
                                     ImageToImageViewMode.SOURCE -> {
@@ -487,6 +493,10 @@ fun ImageToImageScreen(
                                         uiState.sourceImage?.let { bitmap ->
                                             val intent = MediaViewerActivity.createSingleImageIntent(context, bitmap)
                                             context.startActivity(intent)
+                                            // 与图库页一致：打开时放大淡入，关闭时的缩小淡出在 MediaViewerActivity.finish() 里
+                                            (context as? Activity)?.overridePendingTransition(
+                                                R.anim.viewer_fade_in_grow, R.anim.gallery_stay
+                                            )
                                         }
                                     }
                                 }
@@ -753,11 +763,13 @@ fun ImageToImageScreen(
         )
 
         // Generate and Options buttons
+        // U3：三件套（主按钮组/齿轮）等高 56dp，显式声明垂直居中保持视觉对齐
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp)
-                .padding(bottom = 16.dp)
+                .padding(bottom = 16.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             GenerationButton(
                 // v4.8.2（模块四）：只算本模式自己的活跃任务，避免四个模式一起显示队列数

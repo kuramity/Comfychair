@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -15,6 +16,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -38,6 +41,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.model.LoraEffectTable
 import sh.hnet.comfychair.model.ModelIntro
 import sh.hnet.comfychair.model.ModelIntroTable
 import sh.hnet.comfychair.ui.components.shared.ModelIntroSheet
@@ -77,9 +81,27 @@ fun ModelIntroScreen(onBack: () -> Unit) {
     var expanded by remember { mutableStateOf(emptySet<String>()) }
     var detail by remember { mutableStateOf<ModelIntro?>(null) }
 
+    // 「LoRA 效果档案」分区：孤儿条目（介绍表里没有的）在前，其余条目在后
+    var archiveExpanded by remember { mutableStateOf(false) }
+    var orphanOpenKeys by remember { mutableStateOf(emptySet<String>()) }
+    var archiveOrphans by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+    var archiveJoined by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+
     LaunchedEffect(Unit) {
         ModelIntroTable.ensureLoaded(context)
         entries = ModelIntroTable.all()
+        // 效果档案在介绍表之后装载：orphans 的判定要先拿到介绍表收录的文件名集合
+        LoraEffectTable.ensureLoaded(context)
+        val effects = LoraEffectTable.all()
+        if (effects.isNotEmpty()) {
+            val known = entries.map { it.file.lowercase() }.toSet()
+            val orphans = LoraEffectTable.orphans(known)
+            val orphanKeys = orphans.map { it.first }.toSet()
+            archiveOrphans = orphans
+            archiveJoined = effects.map { it.key to it.value }
+                .filter { it.first !in orphanKeys }
+                .sortedBy { it.first }
+        }
     }
 
     // 行列表：目录（含中间层）+ 它下面的模型；只渲染"所有祖先都已展开"的行
@@ -127,12 +149,42 @@ fun ModelIntroScreen(onBack: () -> Unit) {
             return@Scaffold
         }
 
+        // 展开时先列孤儿条目（介绍表里没有的），再列其余条目——顺序在数据准备时已排好
+        val archiveItems = if (archiveExpanded) archiveOrphans + archiveJoined else emptyList()
+        val hasArchive = archiveOrphans.isNotEmpty() || archiveJoined.isNotEmpty()
+
         LazyColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
         ) {
+            // 「LoRA 效果档案」分区固定在目录树之前；key 用 "a:" 前缀，
+            // 与目录树行的 "d:"/"m:" 前缀互不冲突，不影响既有行的 key 稳定性
+            if (hasArchive) {
+                item(key = "a:header") {
+                    ArchiveHeaderRow(
+                        expanded = archiveExpanded,
+                        count = archiveOrphans.size + archiveJoined.size,
+                        onToggle = { archiveExpanded = !archiveExpanded }
+                    )
+                }
+                items(archiveItems, key = { "a:${it.first}" }) { (fileName, effect) ->
+                    ArchiveEntryRow(
+                        fileName = fileName,
+                        effect = effect,
+                        isOpen = fileName in orphanOpenKeys,
+                        onToggleOrphan = {
+                            orphanOpenKeys = if (fileName in orphanOpenKeys) {
+                                orphanOpenKeys - fileName
+                            } else {
+                                orphanOpenKeys + fileName
+                            }
+                        },
+                        onOpenDetail = { intro -> detail = intro }
+                    )
+                }
+            }
             items(rows, key = { it.key }) { row ->
                 when (row) {
                     is IntroRow.Folder -> FolderRow(
@@ -210,6 +262,89 @@ private fun buildVisibleRows(entries: List<ModelIntro>, expanded: Set<String>): 
         }
     }
     return rows
+}
+
+/**
+ * 「LoRA 效果档案」分区的折叠头：默认收起，标题带条目数（有值条目数）。
+ */
+@Composable
+private fun ArchiveHeaderRow(expanded: Boolean, count: Int, onToggle: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .padding(start = 12.dp, end = 16.dp, top = 10.dp, bottom = 10.dp)
+    ) {
+        Icon(
+            imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = stringResource(R.string.model_intro_effect_archive, count),
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+/**
+ * 效果档案的一条：能按文件名 join 到介绍表的条目点击打开详情抽屉；
+ * join 不到的（档案里先记了效果、模型还没进全量溯源的孤儿条目）就地展开/收起
+ * 显示效果全文，不新开路由。
+ */
+@Composable
+private fun ArchiveEntryRow(
+    fileName: String,
+    effect: String,
+    isOpen: Boolean,
+    onToggleOrphan: () -> Unit,
+    onOpenDetail: (ModelIntro) -> Unit,
+) {
+    val intro = ModelIntroTable.lookup(fileName)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable {
+                if (intro != null) onOpenDetail(intro) else onToggleOrphan()
+            }
+            .padding(start = 44.dp, end = 16.dp, top = 6.dp, bottom = 6.dp)
+    ) {
+        Text(
+            text = intro?.name ?: fileName,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        if (intro == null) {
+            // 孤儿条目：介绍表里没有对应模型，标出来让用户知道它点不开详情
+            Text(
+                text = stringResource(R.string.model_intro_effect_archive_orphan_only),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            Text(
+                text = fileName,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        if (isOpen && intro == null) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = effect,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
 }
 
 @Composable

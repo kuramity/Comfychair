@@ -14,7 +14,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
@@ -26,8 +25,13 @@ import sh.hnet.comfychair.ui.components.shared.ThreeDResultButton
 /** 顶栏图标统一尺寸（v2 裸图标规格，44dp 触控区里的图标约 22dp）。 */
 private val TOP_BAR_ICON_SIZE = 22.dp
 
-/** 保存/分享禁用态的图标不透明度（规格建议值 0.38，与 M3 IconButton 禁用内容 alpha 同值）。 */
-private const val DISABLED_ICON_ALPHA = 0.38f
+/**
+ * 保存/分享禁用态的图标不透明度（U2 实测：0.38 在深色主题下几乎看不见）。
+ * 不用 `colorScheme.outline` 做禁用色：本项目自定义调色盘的 outline 槽位本身是
+ * 低对比描边色（深色 #3A4553，比 0.38 混色还暗），用它会比现状更看不清；
+ * onSurfaceVariant@0.55 深浅主题都能看清、又明显弱于 enabled 态。
+ */
+private const val DISABLED_ICON_ALPHA = 0.55f
 
 /**
  * 保存/分享的可用性判定（纯函数，便于单测钉住 4 种组合）。
@@ -143,12 +147,13 @@ fun GenerationTopBarActions(
         }
 
         // ---- 第三段：输出类（保存 → 分享，常驻）----
-        // v5：按钮恒定渲染，无结果/编辑态时只降 enabled + 图标 38% 不透明度；
-        // enabled 恒为 true 时 Icon 的 tint 走 Color.Unspecified（沿用顶栏 LocalContentColor，
-        // 与其他图标同色），禁用时显式给 onSurfaceVariant@0.38（规格建议值）。
+        // v5：按钮恒定渲染，无结果/编辑态时只降 enabled + 图标透明度（U2：0.38 → 0.55，
+        // 深色主题下 0.38 实测几乎纯黑）；
+        // enabled 时显式给 onSurfaceVariant（正常灰，U2 规格），禁用时同色但 alpha 0.55 ——
+        // 同一色相靠透明度拉开"能点/不能点"的差距，深浅主题下都成立。
         val canExport = saveShareEnabled(hasResult, isEditing)
         val saveShareIconTint = if (canExport) {
-            Color.Unspecified
+            MaterialTheme.colorScheme.onSurfaceVariant
         } else {
             MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = DISABLED_ICON_ALPHA)
         }

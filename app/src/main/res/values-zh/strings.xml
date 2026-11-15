@@ -804,6 +804,9 @@
     <string name="model_intro_source">数据来源</string>
     <string name="model_intro_missing_badge">文件已移除</string>
     <string name="model_intro_missing_notice">⚠ 本地文件已移除 —— 该模型已从模型库删除，因此不再提供推荐参数与搭配建议。下面的介绍仅供辨认它曾经是什么。</string>
+    <string name="model_intro_kind">分类</string>
+    <string name="model_intro_effect_archive">LoRA 效果档案（%1$d 条）</string>
+    <string name="model_intro_effect_archive_orphan_only">仅效果档案收录</string>
     <string name="model_list_loading">正在加载模型列表…</string>
     <string name="nav_model_intro">模型介绍</string>
     <string name="model_intro_screen_title">模型介绍</string>
@@ -881,4 +884,11 @@
     <!-- v4.6.1 模块 D：上传进度 -->
     <string name="button_uploading_progress">上传中 %1$d%%</string>
     <string name="button_uploading_progress_queue">上传中 %1$d%% · 队列 %2$d</string>
+
+    <!-- 更新日志页（离线，读 assets/CHANGELOG.md） -->
+    <string name="changelog_entry_title">更新日志</string>
+    <string name="changelog_entry_subtitle">查看历史版本说明</string>
+    <string name="changelog_screen_title">更新日志</string>
+    <string name="changelog_badge_current">当前版本</string>
+    <string name="changelog_empty">暂无可显示的内容</string>
 </resources>

@@ -8,6 +8,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -33,6 +34,8 @@ class RippleFeedbackSkinTest {
         assertTrue(DEFAULT_SHOW_BORDER)
         assertTrue(DEFAULT_SHOW_HALO)
         assertTrue(DEFAULT_SHOW_TOUCH_GLOW)
+        // U1 收敛后点阵开关默认仍为 true（生成主按钮不传即拿到点阵）
+        assertTrue(DEFAULT_SHOW_DOTS)
     }
 
     @Test
@@ -84,15 +87,39 @@ class RippleFeedbackSkinTest {
     }
 
     @Test
-    fun `向下投影规格_偏移2_4_6dp且alpha递减22_12_06`() {
-        // v2 主按钮投影：三层向下偏移与递减透明度（C4 规格）
-        assertEquals(3, SHADOW_OFFSETS_DP.size)
-        assertEquals(3, SHADOW_ALPHAS.size)
+    fun `向下投影规格_两层偏移2_4dp且深浅两套alpha`() {
+        // v2 主按钮投影（U3 减档）：三层减成两层（去掉 6dp 外沿），深色 0.16/0.08、浅色更轻 0.10/0.05
+        assertEquals(2, SHADOW_OFFSETS_DP.size)
+        assertEquals(2, SHADOW_ALPHAS_DARK.size)
+        assertEquals(2, SHADOW_ALPHAS_LIGHT.size)
         assertEquals(2f, SHADOW_OFFSETS_DP[0])
         assertEquals(4f, SHADOW_OFFSETS_DP[1])
-        assertEquals(6f, SHADOW_OFFSETS_DP[2])
-        assertEquals(0.22f, SHADOW_ALPHAS[0])
-        assertEquals(0.12f, SHADOW_ALPHAS[1])
-        assertEquals(0.06f, SHADOW_ALPHAS[2])
+        assertEquals(0.16f, SHADOW_ALPHAS_DARK[0])
+        assertEquals(0.08f, SHADOW_ALPHAS_DARK[1])
+        assertEquals(0.10f, SHADOW_ALPHAS_LIGHT[0])
+        assertEquals(0.05f, SHADOW_ALPHAS_LIGHT[1])
+    }
+
+    // ---- 4. 点阵收敛开关（U1）：showDots=false 必须零绘制 ----
+
+    @Test
+    fun `showDots关闭时任何boost都不画点`() {
+        // 点阵层关闭：无论采样出的 boost 是多少（包括波前正扫过的 1.0），点都不画
+        assertFalse(shouldDrawDot(showDots = false, boost = 0f))
+        assertFalse(shouldDrawDot(showDots = false, boost = 0.5f))
+        assertFalse(shouldDrawDot(showDots = false, boost = 1f))
+        // 开启时行为不变：boost > 0 才画
+        assertTrue(shouldDrawDot(showDots = true, boost = 0.01f))
+        assertFalse(shouldDrawDot(showDots = true, boost = 0f))
+    }
+
+    @Test
+    fun `showDots关闭时触点辉光一并关闭`() {
+        // 触点辉光属于点阵皮肤的一部分：showDots=false 时即使 showTouchGlow=true 也不画
+        assertFalse(shouldDrawTouchGlow(showDots = false, showTouchGlow = true))
+        assertFalse(shouldDrawTouchGlow(showDots = false, showTouchGlow = false))
+        // 开启时由 showTouchGlow 决定
+        assertTrue(shouldDrawTouchGlow(showDots = true, showTouchGlow = true))
+        assertFalse(shouldDrawTouchGlow(showDots = true, showTouchGlow = false))
     }
 }

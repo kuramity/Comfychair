@@ -207,4 +207,241 @@ class ModelIntroTableTest {
         val hit = ModelIntroTable.lookup("y.safetensors")!!
         assertEquals("28 步 · CFG 1 · euler", hit.params["说明"])
     }
+
+    // ---------------- 2026-11-15 全量接入（18 字段 / by_rel / removed）----------------
+
+    @Test
+    fun `全部字段都能映射进数据类_含新增的kind`() {
+        ModelIntroTable.setTableJsonForTest(
+            """
+            {"version":2,"generated_at":"2026-11-15 00:00:00","models":{"full.safetensors":{
+              "file":"Full.safetensors",
+              "rel":"loras/image/krea2/full.safetensors",
+              "kind":"LoRA",
+              "source":"civitai",
+              "name":"Full Model",
+              "type":"LoRA（LoCon）",
+              "base":"Krea 2",
+              "author":"someone",
+              "version":"v2.0",
+              "tags":["tag1"],
+              "summary":"「Full」是 Krea 2 底模的 LoRA…",
+              "intro_original":"作者原文……",
+              "author_params":{"CFG":"1"},
+              "params":{"步数":"8"},
+              "companions":"搭配 VAE：x.safetensors",
+              "effect":"效果：……",
+              "used_in":["竖叉"],
+              "url":"https://civitai.com/models/1"
+            }}}
+            """.trimIndent()
+        )
+        val hit = ModelIntroTable.lookup("full.safetensors")!!
+        assertEquals("Full.safetensors", hit.file)
+        assertEquals("loras/image/krea2/full.safetensors", hit.rel)
+        assertEquals("LoRA", hit.kind)
+        assertEquals("civitai", hit.source)
+        assertEquals("Full Model", hit.name)
+        assertEquals("LoRA（LoCon）", hit.type)
+        assertEquals("Krea 2", hit.base)
+        assertEquals("someone", hit.author)
+        assertEquals("v2.0", hit.version)
+        assertEquals(listOf("tag1"), hit.tags)
+        assertEquals(mapOf("CFG" to "1"), hit.authorParams)
+        assertEquals(mapOf("步数" to "8"), hit.params)
+        assertEquals("搭配 VAE：x.safetensors", hit.companions)
+        assertEquals("效果：……", hit.effect)
+        assertEquals(listOf("竖叉"), hit.usedIn)
+        assertEquals("https://civitai.com/models/1", hit.url)
+        assertEquals("作者原文……", hit.introOriginal)
+    }
+
+    @Test
+    fun `removed键读到missing属性`() {
+        // 数据侧 2026-11-15 起改用 removed，App 端属性名保持 missing 不变
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"r.safetensors":{"file":"r.safetensors","removed":true}}}"""
+        )
+        assertEquals(true, ModelIntroTable.lookup("r.safetensors")!!.missing)
+    }
+
+    @Test
+    fun `旧键名missing也兼容`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"r.safetensors":{"file":"r.safetensors","missing":true}}}"""
+        )
+        assertEquals(true, ModelIntroTable.lookup("r.safetensors")!!.missing)
+    }
+
+    @Test
+    fun `removed与missing都没有时为false`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"r.safetensors":{"file":"r.safetensors"}}}"""
+        )
+        assertEquals(false, ModelIntroTable.lookup("r.safetensors")!!.missing)
+    }
+
+    // ---------------- lenientBoolean：布尔字段的类型宽容 ----------------
+
+    @Test
+    fun `removed为字符串true也读到missing`() {
+        // org.json 的 optBoolean 只认 boolean，字符串 "true" 会被当成 false；
+        // 数据链路是脚本生成的，类型漂移不该让"已删除"被静默当成"未删除"
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"r.safetensors":{"file":"r.safetensors","removed":"true"}}}"""
+        )
+        assertEquals(true, ModelIntroTable.lookup("r.safetensors")!!.missing)
+    }
+
+    @Test
+    fun `removed字符串TRUE带空白也读到true`() {
+        // 忽略大小写与首尾空白
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"r.safetensors":{"file":"r.safetensors","removed":" TRUE "}}}"""
+        )
+        assertEquals(true, ModelIntroTable.lookup("r.safetensors")!!.missing)
+    }
+
+    @Test
+    fun `removed为数字1也读到true`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"r.safetensors":{"file":"r.safetensors","removed":1}}}"""
+        )
+        assertEquals(true, ModelIntroTable.lookup("r.safetensors")!!.missing)
+    }
+
+    @Test
+    fun `removed字符串false或数字0读到false`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"a.safetensors":{"file":"a.safetensors","removed":"false"},"b.safetensors":{"file":"b.safetensors","removed":0}}}"""
+        )
+        assertEquals(false, ModelIntroTable.lookup("a.safetensors")!!.missing)
+        assertEquals(false, ModelIntroTable.lookup("b.safetensors")!!.missing)
+    }
+
+    @Test
+    fun `removed为布尔true的既有行为回归保护`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"r.safetensors":{"file":"r.safetensors","removed":true}}}"""
+        )
+        assertEquals(true, ModelIntroTable.lookup("r.safetensors")!!.missing)
+    }
+
+    @Test
+    fun `lookupByRel按相对路径精确命中`() {
+        // 顶层 by_rel 的键是小写 rel；传入原始大小写也要能命中
+        val hit = ModelIntroTable.lookupByRel("checkpoints/SD1.5/anime/AWPainting_v1.2.safetensors")
+        assertNotNull(hit)
+        assertEquals("AWPainting", hit!!.name)
+    }
+
+    @Test
+    fun `lookupByRel大小写与反斜杠变体也命中`() {
+        assertNotNull(
+            ModelIntroTable.lookupByRel("Checkpoints\\SD1.5\\Anime\\AWPainting_v1.2.SAFETENSORS")
+        )
+    }
+
+    @Test
+    fun `lookupByRel多带models前缀也能命中`() {
+        assertNotNull(
+            ModelIntroTable.lookupByRel("models/checkpoints/sd1.5/anime/awpainting_v1.2.safetensors")
+        )
+    }
+
+    @Test
+    fun `lookup与lookupByRel命中同一条目`() {
+        val path = "checkpoints/SD1.5/anime/AWPainting_v1.2.safetensors"
+        val byName = ModelIntroTable.lookup(path)
+        val byRel = ModelIntroTable.lookupByRel(path)
+        assertNotNull(byName)
+        assertNotNull(byRel)
+        assertEquals(byName, byRel)
+    }
+
+    @Test
+    fun `lookupByRel未收录或空参返回null`() {
+        assertNull(ModelIntroTable.lookupByRel("loras/not_in_table.safetensors"))
+        assertNull(ModelIntroTable.lookupByRel(null))
+        assertNull(ModelIntroTable.lookupByRel(""))
+        assertNull(ModelIntroTable.lookupByRel("   "))
+    }
+
+    @Test
+    fun `by_rel悬空值跳过_不崩且返回null`() {
+        ModelIntroTable.setTableJsonForTest(
+            """
+            {"version":1,"models":{"x.safetensors":{"file":"x.safetensors"}},
+             "by_rel":{"loras/ghost.safetensors":"ghost.safetensors"}}
+            """.trimIndent()
+        )
+        // 指向 models 里没有的键（悬空值）直接跳过，不影响其余条目
+        assertNull(ModelIntroTable.lookupByRel("loras/ghost.safetensors"))
+        assertNotNull(ModelIntroTable.lookup("x.safetensors"))
+    }
+
+    @Test
+    fun `kind八个枚举值都原样保留`() {
+        val kinds = listOf(
+            "大模型", "扩散模型", "LoRA", "放大模型", "VAE", "图像编码器", "几何估计", "背景去除"
+        )
+        kinds.forEachIndexed { index, k ->
+            ModelIntroTable.setTableJsonForTest(
+                """{"version":1,"models":{"k$index.safetensors":{"file":"k$index.safetensors","kind":"$k"}}}"""
+            )
+            assertEquals(k, ModelIntroTable.lookup("k$index.safetensors")!!.kindLabel())
+        }
+    }
+
+    @Test
+    fun `kind未知新类型原样显示不丢成null`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"n.safetensors":{"file":"n.safetensors","kind":"未来新类型"}}}"""
+        )
+        assertEquals("未来新类型", ModelIntroTable.lookup("n.safetensors")!!.kindLabel())
+    }
+
+    @Test
+    fun `kind空值或空白或缺省返回null_整行不显示`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"e.safetensors":{"file":"e.safetensors","kind":""}}}"""
+        )
+        assertNull(ModelIntroTable.lookup("e.safetensors")!!.kindLabel())
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"e.safetensors":{"file":"e.safetensors","kind":"   "}}}"""
+        )
+        assertNull(ModelIntroTable.lookup("e.safetensors")!!.kindLabel())
+        ModelIntroTable.setTableJsonForTest(
+            """{"version":1,"models":{"e.safetensors":{"file":"e.safetensors"}}}"""
+        )
+        assertNull(ModelIntroTable.lookup("e.safetensors")!!.kindLabel())
+    }
+
+    @Test
+    fun `空对象条目null安全_不抛异常`() {
+        ModelIntroTable.setTableJsonForTest("""{"models":{"a.safetensors":{}}}""")
+        val all = ModelIntroTable.all()
+        assertEquals(1, all.size)
+        val hit = all[0]
+        // file 缺省用键名兜底，其余可空字段全 null、集合字段全空
+        assertEquals("a.safetensors", hit.file)
+        assertNull(hit.rel)
+        assertNull(hit.kind)
+        assertNull(hit.name)
+        assertNull(hit.type)
+        assertNull(hit.base)
+        assertNull(hit.author)
+        assertNull(hit.version)
+        assertNull(hit.summary)
+        assertNull(hit.effect)
+        assertNull(hit.companions)
+        assertNull(hit.url)
+        assertNull(hit.introOriginal)
+        assertNull(hit.source)
+        assertEquals(false, hit.missing)
+        org.junit.Assert.assertTrue(hit.params.isEmpty())
+        org.junit.Assert.assertTrue(hit.authorParams.isEmpty())
+        org.junit.Assert.assertTrue(hit.tags.isEmpty())
+        org.junit.Assert.assertTrue(hit.usedIn.isEmpty())
+    }
 }

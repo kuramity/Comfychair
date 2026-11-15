@@ -16,6 +16,8 @@ data class ModelIntro(
     val file: String,
     /** 相对 `models/` 的路径（正斜杠），同名文件消歧用 */
     val rel: String? = null,
+    /** 分类（数据侧的中文枚举：`大模型`/`扩散模型`/`LoRA`/…），未知新类型原样显示 */
+    val kind: String? = null,
     /** 模型名（Civitai 上的标题） */
     val name: String? = null,
     /** 中文类型，如「大模型（Checkpoint）」 */
@@ -78,6 +80,14 @@ data class ModelIntro(
     val folder: String
         get() = rel?.substringBeforeLast('/', "") ?: ""
 
+    /**
+     * 分类的展示值：空值/空白返回 null（界面整行不显示），非空返回原值。
+     *
+     * kind 本身就是中文（`大模型`/`扩散模型`/…），不需要映射表；数据侧以后扩充的新类型
+     * 也直接显示原值——宁可让用户看到一个没见过的分类名，也不能把它丢成「未知」占位符。
+     */
+    fun kindLabel(): String? = kind?.trim()?.takeIf { it.isNotEmpty() }
+
     val hasContent: Boolean
         get() = !name.isNullOrBlank() || !base.isNullOrBlank() || !author.isNullOrBlank() ||
                 params.isNotEmpty() || !companions.isNullOrBlank()
@@ -120,6 +130,10 @@ object ModelIntroTable {
 
     @Volatile
     private var byFile: Map<String, ModelIntro> = emptyMap()
+
+    /** 顶层 `by_rel` 反查索引（rel 小写 → 条目），`lookupByRel` 专用，与 [byFile] 互不掺和。 */
+    @Volatile
+    private var byRel: Map<String, ModelIntro> = emptyMap()
 
     @Volatile
     private var tableVersion: Int = 0
@@ -220,6 +234,24 @@ object ModelIntroTable {
     }
 
     /**
+     * 按相对路径（`models/` 之后的部分）查介绍——顶层 `by_rel` 反查索引的公开入口。
+     *
+     * 与 [lookup] 的分工：[lookup] 以**文件名**为准（路径只是同名消歧的兜底），而同名文件
+     * 只有数据侧各自出了独立介绍时才能各查到各的；当前数据里 `ae.safetensors` 两个位置
+     * （vae/flux、vae/Z-Image）共用一条介绍，两条 rel 会返回同一条目。
+     * 正反斜杠都接受、大小写不敏感；调用方多带了 `models/` 前缀也顺手剥掉。
+     *
+     * @return 命中返回条目；未收录、入参为空、表未加载都返回 null
+     */
+    fun lookupByRel(relPath: String?): ModelIntro? {
+        if (relPath.isNullOrBlank()) return null
+        val normalized = relPath.replace('\\', '/').trim().lowercase()
+        if (normalized.isEmpty()) return null
+        val withoutPrefix = normalized.removePrefix("models/")
+        return byRel[withoutPrefix] ?: byRel[normalized]
+    }
+
+    /**
      * 全部条目，按「目录 → 文件名」排好序（供「模型介绍」浏览页整页展示）。
      *
      * 内部索引同时键了文件名和相对路径（同一个模型会命中两次），这里按文件名去重。
@@ -232,6 +264,7 @@ object ModelIntroTable {
     fun clear() {
         synchronized(this) {
             byFile = emptyMap()
+            byRel = emptyMap()
             tableVersion = 0
             tableGeneratedAt = null
         }
@@ -272,23 +305,33 @@ object ModelIntroTable {
         if (parsed == null) {
             if (force) {
                 byFile = emptyMap()
+                byRel = emptyMap()
                 tableVersion = 0
                 tableGeneratedAt = null
             }
             return false
         }
-        byFile = parsed.first
-        tableVersion = parsed.second
-        tableGeneratedAt = parsed.third
+        byFile = parsed.byFile
+        byRel = parsed.byRel
+        tableVersion = parsed.version
+        tableGeneratedAt = parsed.generatedAt
         return true
     }
+
+    /** [parse] 的产物：文件名 / 相对路径两套索引 + 表头信息。 */
+    private data class ParsedTable(
+        val byFile: Map<String, ModelIntro>,
+        val byRel: Map<String, ModelIntro>,
+        val version: Int,
+        val generatedAt: String?,
+    )
 
     /**
      * 解析整张表。
      *
      * @return models 为空或结构不对时返回 null（调用方据此判断"这份数据不能用"）
      */
-    private fun parse(json: String): Triple<Map<String, ModelIntro>, Int, String?>? {
+    private fun parse(json: String): ParsedTable? {
         val root = JSONObject(json)
         val models = root.optJSONObject("models") ?: return null
         val out = HashMap<String, ModelIntro>(models.length() * 2)
@@ -299,6 +342,7 @@ object ModelIntroTable {
             val intro = ModelIntro(
                 file = o.strOrNull("file") ?: key,
                 rel = o.strOrNull("rel"),
+                kind = o.strOrNull("kind"),
                 name = o.strOrNull("name"),
                 type = o.strOrNull("type"),
                 base = o.strOrNull("base"),
@@ -314,16 +358,48 @@ object ModelIntroTable {
                 url = o.strOrNull("url"),
                 introOriginal = o.strOrNull("intro_original"),
                 source = o.strOrNull("source"),
-                missing = o.optBoolean("missing", false),
+                // 数据侧 2026-11-15 起改用 removed（missing 是旧键名，兼容读一轮）
+                missing = o.lenientBoolean("removed") || o.lenientBoolean("missing"),
             )
             out[key.lowercase()] = intro
             // 相对路径也建一份索引，供同名文件消歧
             intro.rel?.takeIf { it.isNotBlank() }?.let { out[it.lowercase()] = intro }
         }
         if (out.isEmpty()) return null
+        // 顶层 by_rel（rel → 小写文件名）是独立的反查索引：同名文件各占一条，
+        // lookupByRel 按完整路径精确匹配。指到 models 里没有的键（悬空值）直接跳过
+        val relIndex = HashMap<String, ModelIntro>()
+        root.optJSONObject("by_rel")?.let { relObj ->
+            val relKeys = relObj.keys()
+            while (relKeys.hasNext()) {
+                val rel = relKeys.next()
+                out[relObj.optString(rel, "").lowercase()]?.let { relIndex[rel.lowercase()] = it }
+            }
+        }
         val version = if (root.has("version")) root.optInt("version", 0) else 0
         val generatedAt = root.strOrNull("generated_at")
-        return Triple(out, version, generatedAt)
+        return ParsedTable(out, relIndex, version, generatedAt)
+    }
+
+    /**
+     * 布尔字段的类型宽容读取。[org.json.JSONObject.optBoolean] 只认 JSON boolean，
+     * 遇到字符串 `"true"`、数字 `1` 一律返回默认值 false——数据链路是脚本生成的，
+     * 类型漂移不该让条目被静默当成"未删除"。
+     *
+     * 兼容：布尔 `true`/`false`、字符串（忽略大小写与首尾空白，`"true"`/`"1"` 为真）、
+     * 数字 `1`；其余一律 false。不抛异常。
+     */
+    private fun JSONObject.lenientBoolean(key: String): Boolean {
+        if (!has(key) || isNull(key)) return false
+        return when (val v = opt(key)) {
+            is Boolean -> v
+            is Number -> v.toInt() == 1
+            is String -> when (v.trim().lowercase()) {
+                "true", "1" -> true
+                else -> false
+            }
+            else -> false
+        }
     }
 
     private fun JSONObject.strOrNull(key: String): String? {

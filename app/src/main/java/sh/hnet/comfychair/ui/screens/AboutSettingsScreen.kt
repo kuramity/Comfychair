@@ -13,7 +13,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -41,7 +43,8 @@ import sh.hnet.comfychair.update.UpdateRepository
 @Composable
 fun AboutSettingsScreen(
     onNavigateToGeneration: () -> Unit,
-    onLogout: () -> Unit
+    onLogout: () -> Unit,
+    onNavigateToChangelog: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -137,6 +140,45 @@ fun AboutSettingsScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
+            // 更新日志入口：离线读 assets/CHANGELOG.md，能看全部历史版本的说明
+            // （更新弹窗只能显示"这一版"的内容，旧客户端永远看不到新 UI 的说明）
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .clickable { onNavigateToChangelog() }
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.History,
+                        contentDescription = null
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = stringResource(R.string.changelog_entry_title),
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            text = stringResource(R.string.changelog_entry_subtitle),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = null
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
             // License Card
             Card(
                 modifier = Modifier
@@ -170,7 +212,7 @@ fun AboutSettingsScreen(
                     .clickable {
                         val intent = Intent(
                             Intent.ACTION_VIEW,
-                            Uri.parse("https://github.com/legal-hkr/comfychair")
+                            Uri.parse("https://github.com/kuramity/Comfychair")
                         )
                         context.startActivity(intent)
                     }
@@ -192,7 +234,7 @@ fun AboutSettingsScreen(
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            text = "github.com/legal-hkr/comfychair",
+                            text = "github.com/kuramity/Comfychair",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

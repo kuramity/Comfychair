@@ -51,4 +51,12 @@ sealed class SettingsRoute(val route: String) {
      * 不是某个设置项的子页面，所以按上面那条原则它该有自己的一格。
      */
     data object ModelIntro : SettingsRoute("model_intro_settings")
+
+    /**
+     * 更新日志（离线只读 assets/CHANGELOG.md）。
+     *
+     * 二级页面：从「关于」页的更新日志卡片进入，不进底部导航 ——
+     * 它是关于页的一个信息入口，不是内容分区，与「外观」同理。
+     */
+    data object Changelog : SettingsRoute("changelog_settings")
 }

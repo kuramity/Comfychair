@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 列表侧保持不动：查看器打开/关闭时列表不参与位移，过渡全部由查看器内容层承担 -->
+<set xmlns:android="http://schemas.android.com/apk/res/android" />

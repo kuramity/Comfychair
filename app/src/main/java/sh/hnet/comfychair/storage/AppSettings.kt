@@ -266,6 +266,35 @@ object AppSettings {
             .apply()
     }
 
+    // ============================================================
+    // 下拉按钮图标显式居中开关（v4.15.x 安全阀）
+    // ============================================================
+
+    private const val KEY_TRAILING_ICON_CENTERED = "trailing_icon_centered"
+
+    /**
+     * 下拉按钮（队列菜单）箭头图标的显式几何居中是否启用，默认 **true**。
+     *
+     * 启用：图标从 `SplitButtonDefaults.ElevatedTrailingButton` 的 content 槽里外置到按钮
+     * 容器上，用 `Modifier.align(Alignment.Center)` 显式居中 —— 图标中心恒等于按钮几何
+     * 中心，`Modifier.rotate` 的轴心随之落在按钮中心，收起/展开两态一致。
+     *
+     * 置 false 时回退到改动前路径：图标留在 M3 content 槽内，居中交给
+     * `ElevatedTrailingButton` 内部排布（含 M3 的光学水平偏移），旋转仍挂在
+     * `Modifier.rotate` 上 —— 与旧版逐像素一致。
+     */
+    fun isTrailingIconCentered(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_TRAILING_ICON_CENTERED, true)  // Default: true
+    }
+
+    fun setTrailingIconCentered(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_TRAILING_ICON_CENTERED, enabled)
+            .apply()
+    }
+
     private const val KEY_PROMPT_EXPAND = "prompt_expand"
 
     fun isPromptExpandEnabled(context: Context): Boolean {
