@@ -12,6 +12,11 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sh.hnet.comfychair.ui.components.TRAILING_BORDER_OPEN_ALPHA
+import sh.hnet.comfychair.ui.components.TRAILING_GRADIENT_MIDPOINT_FRACTION
+import sh.hnet.comfychair.ui.components.shared.GEAR_OPEN_BG_ALPHA
+import sh.hnet.comfychair.ui.components.shared.GEAR_PRESSED_ALPHA_UNIFIED_DARK
+import sh.hnet.comfychair.ui.components.shared.GEAR_PRESSED_ALPHA_UNIFIED_LIGHT
 
 /**
  * 皮肤层参数化（v5 拆分开关）的视觉契约测试。
@@ -121,5 +126,36 @@ class RippleFeedbackSkinTest {
         // 开启时由 showTouchGlow 决定
         assertTrue(shouldDrawTouchGlow(showDots = true, showTouchGlow = true))
         assertFalse(shouldDrawTouchGlow(showDots = true, showTouchGlow = false))
+    }
+
+    // ---- 5. 模块 2（B2）：按压统一档 / 齿轮打开态 / 下拉同色度规格常量 ----
+
+    @Test
+    fun `按压底色统一档深13浅15_percent且回退档保留旧值`() {
+        // 统一档（模块 2/D2 + B2b 拆深浅）：顶栏图标/导航 tab/齿轮三处按压终值同源 ——
+        // 深色 White 13% ≈1.45:1（实测 1.435）、浅色 Black 15% ≈1.41:1（实测 1.409；
+        // 13% 的数学天花板 1.343 过不了 1.35 判据，浅色提档）
+        assertEquals(0.13f, PRESS_BG_ALPHA_V2_DARK)
+        assertEquals(0.15f, PRESS_BG_ALPHA_V2_LIGHT)
+        // 回退档（安全阀关闭）：改动前的深色 8% / 浅色 6%
+        assertEquals(0.08f, PRESS_BG_ALPHA_DARK_V2_LEGACY)
+        assertEquals(0.06f, PRESS_BG_ALPHA_LIGHT_V2_LEGACY)
+    }
+
+    @Test
+    fun `齿轮按压统一档与打开态底色规格`() {
+        // 按压终值统一档：编译期引用顶栏/导航同源常量（深 13% / 浅 15%，常驻 5% 底保留）
+        assertEquals(0.13f, GEAR_PRESSED_ALPHA_UNIFIED_DARK)
+        assertEquals(0.15f, GEAR_PRESSED_ALPHA_UNIFIED_LIGHT)
+        // 打开态（模块 2/S1）：底色替换为 primary@0.18（与导航选中态同语言）
+        assertEquals(0.18f, GEAR_OPEN_BG_ALPHA)
+    }
+
+    @Test
+    fun `下拉中点色与打开态白边规格`() {
+        // C1（模块 2）：下拉基色 = 主按钮渐变（accent → +35°）的中点，纯色填充
+        assertEquals(0.5f, TRAILING_GRADIENT_MIDPOINT_FRACTION)
+        // S2：打开态白边提亮到 32%（静置走主按钮同源默认 22%/12%，不在此钉）
+        assertEquals(0.32f, TRAILING_BORDER_OPEN_ALPHA)
     }
 }

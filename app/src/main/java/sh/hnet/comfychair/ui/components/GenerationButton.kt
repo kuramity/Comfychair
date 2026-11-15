@@ -42,6 +42,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.activity.compose.BackHandler
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import sh.hnet.comfychair.R
@@ -56,8 +57,18 @@ private const val ACCENT_HUE_SHIFT_DEG = 35f
 /**
  * 下拉按钮渐变向背景沉的权重（U3：下拉必须是次层级）：
  * 主色 70% + 背景色 30% 混出的底再走色相偏移，亮度/饱和度都必须低于主按钮渐变。
+ * （模块 2 安全阀关闭时的回退规格；开启时下拉基色走主按钮渐变中点色，见下。）
  */
 private const val TRAILING_SURFACE_MIX_FRACTION = 0.30f
+
+/** 下拉基色 = 主按钮渐变（accent → +35°）的中点（模块 2/C1，internal 供单测钉规格）。 */
+internal const val TRAILING_GRADIENT_MIDPOINT_FRACTION = 0.5f
+
+/**
+ * 下拉打开态白边 alpha（模块 2/S2，internal 供单测钉规格）：
+ * 静置走主按钮同源默认（深色 22% / 浅色 12%），打开提亮到 32%。
+ */
+internal const val TRAILING_BORDER_OPEN_ALPHA = 0.32f
 
 /** 测试定位 tag（Compose 惯例：仅测试可见的 tag 允许留在生产代码）。 */
 private const val TRAILING_BUTTON_TAG = "trailing-button"
@@ -132,6 +143,16 @@ fun GenerationButton(
     val focusManager = LocalFocusManager.current
     var showMenu by remember { mutableStateOf(false) }
 
+    // B2b（问题 3 兜底）：showMenu 在菜单因任何原因关闭后必须复位 false —— 状态一旦
+    // 卡在 true，下一次点击只会把它翻成 false，表现为"下拉永久打不开"。正常路径
+    // DropdownMenu 的 onDismissRequest 已覆盖 BACK 关闭与点击外部关闭（M3
+    // DefaultMenuProperties：focusable=true / dismissOnBackPress=true /
+    // dismissOnClickOutside=true），菜单项点击各自显式置 false；本回调只兜异常路径 ——
+    // popup 因焦点异常没消费 BACK 时，BACK 会直接把页面退回连接界面且状态卡 true
+    //（只能 force-stop 恢复），由这里先复位状态并消费 BACK，行为与 popup 正常关闭一致。
+    // 正常路径 BACK 在 popup 窗口层就被消费，本回调不触发，零行为变化。
+    BackHandler(enabled = showMenu) { showMenu = false }
+
     // 离线态（强制离线与自动离线一视同仁）：生成与队列操作全部禁用
     val isOffline = rememberIsOffline()
 
@@ -146,6 +167,9 @@ fun GenerationButton(
     // 下拉图标显式居中开关（B1 回退阀）：开 = 图标外置到按钮容器上显式居中（轴心=按钮中心）；
     // 关 = 图标留 M3 content 槽内、居中交给 ElevatedTrailingButton 内部排布（改动前原路径）。
     val trailingIconCentered = remember(context) { AppSettings.isTrailingIconCentered(context) }
+    // 模块 2 安全阀（组合时读一次）：开 = 下拉中点色纯色 + 白边与主按钮同源 + 打开态提亮；
+    // 关 = 改动前形态（0.30 混合渐变 + 0.18 白边恒定）
+    val pressUnified = remember(context) { AppSettings.isPressFeedbackUnified(context) }
 
     // Button always uses primary color (no more red cancel state)
     val containerColor = MaterialTheme.colorScheme.primary
@@ -251,13 +275,20 @@ fun GenerationButton(
         val trailingInteraction = remember { MutableInteractionSource() }
         // 决策 2 原文把渐变范围定为「leading + trailing 小下拉」整组；禁用态与总开关关闭的
         // 兜底逻辑同 leading。v2 皮肤：下拉降级为主按钮的次级元素 —— 54×56、无辉光无投影、
-        // 白边 18%、渐变亮度必须低于主按钮（U1：且不带点阵）；回退态恢复 56×56 + 环形辉光
-        // （层级：主 > 下拉，不得同重量）。
+        // 白边与主按钮同源 + 打开态提亮 32%（模块 2）、基色走主按钮渐变中点色（U1：且不带
+        // 点阵）；回退态恢复 56×56 + 环形辉光（层级：主 > 下拉，不得同重量）。
         val trailingEnabled = !isOffline
         val trailingSkinActive = trailingEnabled && dotFeedbackEnabled
-        // U3 次层级渐变：主色先向 surface 沉 30%（70% 主色 + 30% 背景）再走 +35° 色相偏移，
-        // 保证任何主题下都比主按钮渐变暗一档、不抢戏
-        val trailingGradientBase = lerp(accent, MaterialTheme.colorScheme.surface, TRAILING_SURFACE_MIX_FRACTION)
+        // C1（模块 2）：下拉基色改为主按钮渐变（accent → +35°）的**中点色**，且下拉内部
+        // 不再做渐变（纯色填充）—— 54dp 窄条上铺 accent→+35° 渐变时左端（亮）占比大，
+        // 整体偏亮；中点色纯色的平均亮度与主按钮（158dp 上铺开同一渐变）最接近，
+        // 两主题都成立（基色不含 surface 混合，不存在"往亮里混"的问题）。
+        // 开关关闭回 U3 旧规格：主色先向 surface 沉 30%（70% 主色 + 30% 背景）再走 +35° 色相偏移。
+        val trailingGradientBase = if (pressUnified) {
+            lerp(accent, accent.shiftAccentHue(), TRAILING_GRADIENT_MIDPOINT_FRACTION)
+        } else {
+            lerp(accent, MaterialTheme.colorScheme.surface, TRAILING_SURFACE_MIX_FRACTION)
+        }
         Box(modifier = Modifier.wrapContentWidth(unbounded = true)) {
             SplitButtonDefaults.ElevatedTrailingButton(
                 checked = showMenu,
@@ -299,14 +330,26 @@ fun GenerationButton(
                         // 决策 8：方形按钮圆角 18dp（对齐基准方形版），不再是胶囊的 28dp
                         shape = RoundedCornerShape(18.dp),
                         enabled = trailingEnabled && dotFeedbackEnabled,
-                        // v2：白边 18%（层级降档）；null = 回退态走皮肤层默认（深色 50%）
-                        borderAlphaOverride = if (skinV2) 0.18f else null,
+                        // C2（模块 2）：静置白边与主按钮同源（不传 override 走皮肤层默认
+                        // 深色 22% / 浅色 12%）；S2：打开态提亮到 32%。开关关闭回 v2 旧规格
+                        // 18%（打开不提亮）；回退态（!skinV2）走皮肤层默认（深色 50%）
+                        borderAlphaOverride = when {
+                            !skinV2 -> null
+                            !pressUnified -> 0.18f
+                            showMenu -> TRAILING_BORDER_OPEN_ALPHA
+                            else -> null
+                        },
                         // v2：无辉光无投影；回退态保留旧环形辉光
                         showHalo = !skinV2,
                         // U1：下拉不带点阵（点阵只留在生成主按钮），皮肤其余结构保留
                         showDots = false,
                         gradientColors = if (trailingSkinActive) {
-                            listOf(trailingGradientBase, trailingGradientBase.shiftAccentHue())
+                            if (pressUnified) {
+                                // C1：中点色纯色填充（同色"渐变" = 无渐变观感）
+                                listOf(trailingGradientBase, trailingGradientBase)
+                            } else {
+                                listOf(trailingGradientBase, trailingGradientBase.shiftAccentHue())
+                            }
                         } else {
                             null
                         },

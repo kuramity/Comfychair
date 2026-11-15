@@ -3,6 +3,7 @@ package sh.hnet.comfychair.ui.components.ripple
 import android.app.ActivityManager
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
@@ -22,6 +23,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
@@ -487,9 +489,19 @@ private val ICON_TOUCH_SIZE_DP_V2 = 44.dp
 private val ICON_CORNER_DP_V2 = 12.dp
 private const val ICON_PRESS_SCALE_V2 = 0.94f
 
-/** v2 按压底色：深色 White 8% / 浅色 Black 6%（模板规格）；回退态不用（无底座）。 */
-private const val PRESS_BG_ALPHA_DARK_V2 = 0.08f
-private const val PRESS_BG_ALPHA_LIGHT_V2 = 0.06f
+/**
+ * v2 按压底色统一档（模块 2/D2，B2b 拆深浅）：按压覆盖层与页面底色的 WCAG 对比度
+ * 按深浅分别钉档 —— 深色 White 13% ≈ 1.45:1（实测 1.435），浅色 Black 15% ≈ 1.41:1
+ *（实测 1.409；Black 13% 的数学天花板只有 1.343，到不了 1.35 判据，B2b 提档）。
+ * 顶栏图标 / 导航 tab / 齿轮三处按压终值共用本组常量。回退态不用（无底座）。
+ * internal 供单测钉住规格。
+ */
+internal const val PRESS_BG_ALPHA_V2_DARK = 0.13f
+internal const val PRESS_BG_ALPHA_V2_LIGHT = 0.15f
+
+/** 回退档（[AppSettings.isPressFeedbackUnified] 关闭）：改动前的深色 8% / 浅色 6%。 */
+internal const val PRESS_BG_ALPHA_DARK_V2_LEGACY = 0.08f
+internal const val PRESS_BG_ALPHA_LIGHT_V2_LEGACY = 0.06f
 
 /**
  * 带波纹点阵反馈的图标按钮包装（顶栏图标用）。
@@ -502,7 +514,10 @@ private const val PRESS_BG_ALPHA_LIGHT_V2 = 0.06f
  * v2 皮肤（AppSettings.isUiSkinV2Enabled，默认开）：**裸图标化** —— 44×44 触控区、
  * 圆角 12 矩形、无圆形底座 / 无白边 / 无外辉光 / 无触点辉光 / **无点阵**
  * （U1 收敛：点阵只留在生成主按钮，顶栏图标一律 showDots=false），按压缩放 0.94；
- * 按压底色 White 8%（浅色 Black 6%），动画过渡。图标 22dp 由调用方的 Icon 自己定尺寸。
+ * 按压 = 圆角矩形底色（统一档：深色 White 13% / 浅色 Black 15%，模块 2 安全阀关闭
+ * 回 8%/6%）+ scale 动画过渡，**无 M3 圆形 ripple**（自绘 clickable(indication = null)，
+ * 见下方实现注释）。
+ * 图标 22dp 由调用方的 Icon 自己定尺寸。
  *
  * 回退态（开关关闭）：48dp 圆形 + 白边 + 外辉光 + 触点辉光 + 缩放 0.96（v4.12.x 形态），
  * 全部走同一套 Box 与参数分支，没有复制两套 UI。
@@ -525,60 +540,97 @@ internal fun RippleIconButton(
         AppSettings.isRippleDotFeedbackEnabled(context)
     }
     val skinV2 = remember(context) { AppSettings.isUiSkinV2Enabled(context) }
+    // 模块 2 安全阀（组合时读一次）：开 = 去圆形 ripple + 按压底色统一 13%；关 = 改动前形态
+    val pressUnified = remember(context) { AppSettings.isPressFeedbackUnified(context) }
     // 深浅判断与 rippleFeedback 同口径：按页面底色亮度（不用 isSystemInDarkTheme，见其 KDoc）
     val isDarkScheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
 
     // v2 按压底色（模板规格：按压反馈只有"底色 + scale"两样）：走动画过渡，松手淡回透明。
-    // 反馈总开关关闭时不画（裸 IconButton 由 M3 自带 ripple 给反馈）。
+    // 统一档（模块 2/D2，B2b 拆深浅）：深色 White 13% / 浅色 Black 15%（实测对比度
+    // ≈1.45 / ≈1.41）；开关关闭回 8%/6% 旧档。反馈总开关关闭时不画（裸 IconButton 由
+    // M3 自带 ripple 给反馈）。
     val pressed by interactionSource.collectIsPressedAsState()
     val pressBgTarget = if (skinV2 && dotFeedbackEnabled && enabled && pressed) {
-        if (isDarkScheme) {
-            Color.White.copy(alpha = PRESS_BG_ALPHA_DARK_V2)
+        val pressAlpha = if (pressUnified) {
+            if (isDarkScheme) PRESS_BG_ALPHA_V2_DARK else PRESS_BG_ALPHA_V2_LIGHT
+        } else if (isDarkScheme) {
+            PRESS_BG_ALPHA_DARK_V2_LEGACY
         } else {
-            Color.Black.copy(alpha = PRESS_BG_ALPHA_LIGHT_V2)
+            PRESS_BG_ALPHA_LIGHT_V2_LEGACY
+        }
+        if (isDarkScheme) {
+            Color.White.copy(alpha = pressAlpha)
+        } else {
+            Color.Black.copy(alpha = pressAlpha)
         }
     } else {
         Color.Transparent
     }
     val pressBg by animateColorAsState(pressBgTarget, label = "rippleIconPressBg")
 
-    Box(
-        modifier = modifier
-            .rippleFeedback(
-                interactionSource = interactionSource,
-                shape = CircleShape,
-                // v2：圆角 12 矩形（回退态 null → 沿用传入的 CircleShape）
-                cornerRadius = if (skinV2) ICON_CORNER_DP_V2 else null,
-                // v2：白边/辉光/触点辉光全部关掉（裸图标态）
-                showBorder = !skinV2,
-                showHalo = !skinV2,
-                showTouchGlow = !skinV2,
-                // U1 收敛：点阵只留在生成主按钮，经本包装的顶栏图标（含 3D/释放显存/菜单）
-                // 一律不带点阵；皮肤结构（触控区/圆角/按压底色/scale）原样保留
-                showDots = false,
-                pressScale = if (skinV2) ICON_PRESS_SCALE_V2 else DEFAULT_PRESS_SCALE,
-                enabled = enabled && dotFeedbackEnabled,
-                // 不传 gradientColors：顶栏图标不加渐变
-                // 点阵用 primary：透明底（浅色主题下=页面近白底色）上白点会消失，必须跟强调色走
-                dotColor = MaterialTheme.colorScheme.primary,
-            )
-            .size(if (skinV2) ICON_TOUCH_SIZE_DP_V2 else 48.dp)
-            // v2 按压底色：drawBehind 属于 rippleFeedback 的 content，点阵在其后的
-            // drawWithContent 里叠加 → 底色在图标之下、点阵之下。回退态颜色恒透明（不画）。
-            .drawBehind {
-                drawRoundRect(
-                    color = pressBg,
-                    cornerRadius = CornerRadius(ICON_CORNER_DP_V2.toPx()),
-                )
-            }
-    ) {
-        IconButton(
-            onClick = onClick,
-            enabled = enabled,
+    // 皮肤结构层（v2/回退两分支共用）：反馈 → 尺寸 → 按压底色。
+    // v2 按压底色：drawBehind 属于 rippleFeedback 的 content，点阵在其后的
+    // drawWithContent 里叠加 → 底色在图标之下、点阵之下。回退态颜色恒透明（不画）。
+    val feedbackModifier = modifier
+        .rippleFeedback(
             interactionSource = interactionSource,
-            modifier = Modifier.fillMaxSize(),
+            shape = CircleShape,
+            // v2：圆角 12 矩形（回退态 null → 沿用传入的 CircleShape）
+            cornerRadius = if (skinV2) ICON_CORNER_DP_V2 else null,
+            // v2：白边/辉光/触点辉光全部关掉（裸图标态）
+            showBorder = !skinV2,
+            showHalo = !skinV2,
+            showTouchGlow = !skinV2,
+            // U1 收敛：点阵只留在生成主按钮，经本包装的顶栏图标（含 3D/释放显存/菜单）
+            // 一律不带点阵；皮肤结构（触控区/圆角/按压底色/scale）原样保留
+            showDots = false,
+            pressScale = if (skinV2) ICON_PRESS_SCALE_V2 else DEFAULT_PRESS_SCALE,
+            enabled = enabled && dotFeedbackEnabled,
+            // 不传 gradientColors：顶栏图标不加渐变
+            // 点阵用 primary：透明底（浅色主题下=页面近白底色）上白点会消失，必须跟强调色走
+            dotColor = MaterialTheme.colorScheme.primary,
+        )
+        .size(if (skinV2) ICON_TOUCH_SIZE_DP_V2 else 48.dp)
+        .drawBehind {
+            drawRoundRect(
+                color = pressBg,
+                cornerRadius = CornerRadius(ICON_CORNER_DP_V2.toPx()),
+            )
+        }
+
+    if (skinV2 && dotFeedbackEnabled && pressUnified) {
+        // v2 + 反馈开启 + 模块 2 开关开启：自绘 Box + clickable(indication = null) 替代
+        // M3 IconButton。为什么不能用 CompositionLocal：M3 1.5.0-alpha11 的 IconButton →
+        // Surface(onClick) → clickable 链路里 indication 是硬编码的 material3.ripple()
+        //（SurfaceKt 反编译确认 LocalIndication 引用数为 0），IconButton 签名也不暴露
+        // indication 参数，CompositionLocalProvider(LocalIndication provides ...) 覆盖无效
+        // —— 只能像 MainNavigationBar.NavBarTab 一样自己画。语义/行为保持：clickable 自带
+        // mergeDescendants=true 的合并边界（content 图标的 contentDescription 照常并入）、
+        // 不传 role（与 M3 内部 Surface→clickable 一致）、触控区 = Box 的 44dp 规格。
+        Box(
+            modifier = feedbackModifier.clickable(
+                interactionSource = interactionSource,
+                // 按压反馈由上面的底色 + scale 承担，不再叠加 M3 圆形 ripple（双层反馈打架）
+                indication = null,
+                onClick = onClick,
+                enabled = enabled,
+            ),
+            contentAlignment = Alignment.Center,
         ) {
             content()
+        }
+    } else {
+        // 回退态（或皮肤关闭，或模块 2 开关关闭）：保留 M3 IconButton
+        //（自带圆形 ripple 与最小触控区扩展 —— 开关关闭时 ripple 必须回归）
+        Box(modifier = feedbackModifier) {
+            IconButton(
+                onClick = onClick,
+                enabled = enabled,
+                interactionSource = interactionSource,
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                content()
+            }
         }
     }
 }

@@ -33,6 +33,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.navigation.NavController
@@ -41,6 +42,11 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.navigation.MainRoute
 import sh.hnet.comfychair.repository.GalleryRepository
+import sh.hnet.comfychair.storage.AppSettings
+import sh.hnet.comfychair.ui.components.ripple.PRESS_BG_ALPHA_DARK_V2_LEGACY
+import sh.hnet.comfychair.ui.components.ripple.PRESS_BG_ALPHA_LIGHT_V2_LEGACY
+import sh.hnet.comfychair.ui.components.ripple.PRESS_BG_ALPHA_V2_DARK
+import sh.hnet.comfychair.ui.components.ripple.PRESS_BG_ALPHA_V2_LIGHT
 
 /**
  * Main navigation bar for the app with 4 destinations:
@@ -186,7 +192,8 @@ fun MainNavigationBar(
  * - 选中态：40×40、圆角 12、`primary@18%` 底 + 图标 `primary`（替代原 FilledIconButton
  *   的圆形 + secondaryContainer —— 与预览区圆角/顶栏圆角 12 同一套圆角语言）；
  * - 未选中态：图标 `onSurfaceVariant`，点击时自带"轻底色"按压反馈
- *   （深色 White 8% / 浅色 Black 6%，与顶栏裸图标按压底色同规格），替代 M3 默认 ripple。
+ *   （统一档：深色 White 13% / 浅色 Black 15%，与顶栏裸图标/齿轮按压终值同源常量），
+ *   替代 M3 默认 ripple。
  *
  * 原实现选中态用 FilledIconButton、未选中态用 IconButton，两套组件的形状/底色语义
  * 互相对不上；统一为一个 Box + drawBehind 后，两种状态共用同一几何（40×40 圆角 12）。
@@ -205,12 +212,24 @@ private fun NavBarTab(
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
+    // 模块 2 安全阀（组合时读一次）：开 = 按压终值统一档（深 13% / 浅 15%，与顶栏图标/齿轮同源常量）
+    val context = LocalContext.current
+    val pressUnified = remember(context) { AppSettings.isPressFeedbackUnified(context) }
     // 深浅判断与皮肤层同口径：按页面底色亮度（不用 isSystemInDarkTheme，App 有独立主题模式）
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    // 未选中按压反馈：轻底色动画过渡，松手淡回透明；选中态不可点，恒透明
+    // 未选中按压反馈：轻底色动画过渡，松手淡回透明；选中态不可点，恒透明。
+    // 统一档（B2b 拆深浅，与皮肤层注释同口径）：深色 White 13% ≈1.45:1 /
+    // 浅色 Black 15% ≈1.41:1（实测）；开关关闭回 8%/6% 旧档
     val pressBg by animateColorAsState(
         targetValue = if (pressed && !selected) {
-            (if (isDark) Color.White else Color.Black).copy(alpha = if (isDark) 0.08f else 0.06f)
+            val pressAlpha = if (pressUnified) {
+                if (isDark) PRESS_BG_ALPHA_V2_DARK else PRESS_BG_ALPHA_V2_LIGHT
+            } else if (isDark) {
+                PRESS_BG_ALPHA_DARK_V2_LEGACY
+            } else {
+                PRESS_BG_ALPHA_LIGHT_V2_LEGACY
+            }
+            (if (isDark) Color.White else Color.Black).copy(alpha = pressAlpha)
         } else {
             Color.Transparent
         },

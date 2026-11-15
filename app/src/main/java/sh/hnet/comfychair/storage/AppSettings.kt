@@ -295,6 +295,35 @@ object AppSettings {
             .apply()
     }
 
+    // ============================================================
+    // 按压反馈与选中态统一开关（模块 2 安全阀）
+    // ============================================================
+
+    private const val KEY_PRESS_FEEDBACK_UNIFIED = "press_feedback_unified"
+
+    /**
+     * 按压反馈统一 + 选中态联动 + 下拉同色度（模块 2）是否启用，默认 **true**。
+     *
+     * 启用时的规格（逐项对照）：
+     * 顶栏图标按压去 M3 圆形 ripple（只剩圆角矩形底色 + scale）、按压底色统一 13%
+     * （顶栏 / 导航 tab / 齿轮三处终值同源）、齿轮打开态 primary@0.18 底 + primary 图标、
+     * 下拉打开态白边提亮到 32%、下拉基色改主按钮渐变中点色（纯色）且白边与主按钮同源。
+     *
+     * 置 false 时**完全回到本模块改动前**的状态：pressBg 0.08/0.06、M3 圆形 ripple 保留、
+     * 齿轮打开只旋转无底色、下拉 0.30 混合渐变 + 0.18 白边（静置/打开同值）。
+     */
+    fun isPressFeedbackUnified(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_PRESS_FEEDBACK_UNIFIED, true)  // Default: true
+    }
+
+    fun setPressFeedbackUnified(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_PRESS_FEEDBACK_UNIFIED, enabled)
+            .apply()
+    }
+
     private const val KEY_PROMPT_EXPAND = "prompt_expand"
 
     fun isPromptExpandEnabled(context: Context): Boolean {
