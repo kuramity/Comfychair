@@ -112,9 +112,6 @@ class LiteGraphConverter(
         // Reroute node types that should be skipped
         private val REROUTE_NODE_TYPES = setOf("Reroute", "ReroutePrimitive")
 
-        // Bypass mode value in LiteGraph
-        private const val MODE_BYPASS = 4
-
         // Control widget values (frontend-only, appear after seed inputs in widgets_values)
         // These are not in server's /object_info and must be detected by value
         private val CONTROL_WIDGET_VALUES = setOf("fixed", "increment", "decrement", "randomize")

@@ -23,9 +23,11 @@ import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.WorkflowManager
 import sh.hnet.comfychair.cache.MediaCache
+import sh.hnet.comfychair.cache.MediaCacheCleanupPolicy
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.storage.AppSettings
+import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.storage.BackupManager
 import sh.hnet.comfychair.storage.RestoreResult
 import sh.hnet.comfychair.storage.CredentialStorage
@@ -315,7 +317,17 @@ class SettingsViewModel : ViewModel() {
 
     fun clearCache(context: Context) {
         viewModelScope.launch {
+            var workflowsBefore = 0
+            var galleryCountBefore = 0
             withContext(Dispatchers.IO) {
+                // 清前采样：工作流总数 + 图库索引条数（v4.16.4 起的完整性校验基线）
+                WorkflowManager.ensureInitialized(context)
+                workflowsBefore = WorkflowManager.getAllWorkflows().size
+                val serverId = ConnectionManager.currentServerId
+                galleryCountBefore = serverId?.let {
+                    GalleryMetadataCache.loadMetadata(context, it)?.size ?: 0
+                } ?: 0
+
                 // Clear preview files (handles serverId-prefixed filenames)
                 MediaStateHolder.clearDiskCache(context)
 
@@ -333,16 +345,45 @@ class SettingsViewModel : ViewModel() {
                     }
                 }
 
-                // Clear user-uploaded workflows
-                WorkflowManager.ensureInitialized(context)
-                WorkflowManager.clearAllUserWorkflows()
+                // v4.16.4 起不再调用 WorkflowManager.clearAllUserWorkflows()：
+                // 它会把 user_workflows 连同提示词一起删（见其 Kdoc）；
+                // 工作流删除只能走用户主动删除单个工作流的入口
             }
 
-            // Clear in-memory media caches
-            MediaCache.clearAll()
+            // v4.16.4 起：filesDir 下目录级清理先过保护清单（防复发护栏）。
+            // 目录删除由 MediaCache.clearAll 执行（gallery_store / gallery_thumbs，
+            // 与 MediaCacheCleanupPolicy.deletableDataDirs 一一对应）；命中保护清单
+            // 就跳过目录级清理并记 Error，不中断其余清理（内存与 cacheDir 清理照常）。
+            val blockedDirs = MediaCacheCleanupPolicy.deletableDataDirs
+                .filter { MediaCacheCleanupPolicy.isProtectedDataDir(it) }
+            if (blockedDirs.isEmpty()) {
+                // Clear in-memory media caches（含 gallery_store / gallery_thumbs 磁盘目录）
+                MediaCache.clearAll()
+            } else {
+                DebugLogger.e(TAG, "clearCache: protected dirs inside deletable whitelist, dir-level cleanup skipped: $blockedDirs")
+            }
             MediaStateHolder.clearAll()
 
-            _events.emit(SettingsEvent.ShowToast(sh.hnet.comfychair.R.string.msg_cache_cleared_success))
+            // 清后复采同一组值：工作流总数/图库索引条数必须相等（硬断言，无容忍窗口）。
+            // 任一变化即视为清理链路越界，记 Error（带前后数值）
+            val integrityOk = withContext(Dispatchers.IO) {
+                val workflowsAfter = WorkflowManager.getAllWorkflows().size
+                val serverId = ConnectionManager.currentServerId
+                val galleryCountAfter = serverId?.let {
+                    GalleryMetadataCache.loadMetadata(context, it)?.size ?: 0
+                } ?: 0
+                val ok = workflowsAfter == workflowsBefore && galleryCountAfter == galleryCountBefore
+                if (!ok) {
+                    DebugLogger.e(TAG, "clearCache INTEGRITY VIOLATION - workflows: $workflowsBefore -> $workflowsAfter, gallery entries: $galleryCountBefore -> $galleryCountAfter")
+                }
+                ok
+            }
+
+            if (integrityOk) {
+                _events.emit(SettingsEvent.ShowToast(sh.hnet.comfychair.R.string.msg_cache_cleared_success))
+            }
+            // 校验失败时不发"清理成功"提示：现有 SettingsEvent.ShowToast 只接受 resId，
+            // 不能为此新增字符串资源或事件体系，失败详情走上面的 Error 日志
             _events.emit(SettingsEvent.RefreshNeeded)
         }
     }
@@ -461,15 +502,14 @@ class SettingsViewModel : ViewModel() {
 
     /**
      * Set whether media cache should be disabled.
-     * When enabled, clears the cache first and prevents future disk persistence.
-     * Only applicable in memory-first mode.
+     * v4.16.4 起：纯粹是"以后要不要落盘"的开关，只写布尔值 —— 不再触发任何清理
+     * （旧实现会先跑一遍完整的清缓存，连工作流一起删）。清缓存走独立按钮 [clearCache]。
+     * 只 applicable in memory-first mode；切到 disk-first 时会被强制置回 false（见
+     * [setMemoryFirstCache]）。不 emit RefreshNeeded：开关不影响任何内存态，
+     * 内存里已显示的媒体照常保留，只是此后不再写盘（见 MediaStateHolder 的落盘检查）。
      */
     fun setMediaCacheDisabled(context: Context, disabled: Boolean) {
         viewModelScope.launch {
-            if (disabled) {
-                // Clear cache first when disabling media cache
-                clearCache(context)
-            }
             AppSettings.setMediaCacheDisabled(context, disabled)
             _isMediaCacheDisabled.value = disabled
         }

@@ -68,6 +68,7 @@ import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.GenerationTopBarActions
+import sh.hnet.comfychair.ui.components.GenerationTopBarTitle
 import sh.hnet.comfychair.ui.theme.Dimensions
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.ui.components.GenerationButton
@@ -248,7 +249,9 @@ fun TextToVideoScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         // Top App Bar with save/share actions
         TopAppBar(
-            title = { Text(stringResource(R.string.title_text_to_video)) },
+            // v4.16.6（Q6）：标题缺 maxLines 是文生/图生视频两页标题换行的根因之一；
+            // 四屏统一走 GenerationTopBarTitle（单行 + 窄屏降字号，完整显示不省略）
+            title = { GenerationTopBarTitle(text = stringResource(R.string.title_text_to_video)) },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
                 // v4.9.0：四段式顶栏（本页无输入类动作，直接是输出类 → 全局）

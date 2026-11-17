@@ -24,9 +24,6 @@ object TimelineSlotDetector {
     /** 承载整份时间线的输入名 */
     private const val TIMELINE_FIELD = "timeline_data"
 
-    /** 生成时长输入名（与 `selection.duration` 双向同步） */
-    private const val GENERATION_SECONDS_FIELD = "generation_seconds"
-
     /** App 注入用的占位符（工作流里写这个，由 [WorkflowManager] 替换成序列化结果） */
     const val TIMELINE_PLACEHOLDER = "{{timeline_data}}"
 

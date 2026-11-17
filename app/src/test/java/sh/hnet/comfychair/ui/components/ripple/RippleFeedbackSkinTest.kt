@@ -158,4 +158,34 @@ class RippleFeedbackSkinTest {
         // S2：打开态白边提亮到 32%（静置走主按钮同源默认 22%/12%，不在此钉）
         assertEquals(0.32f, TRAILING_BORDER_OPEN_ALPHA)
     }
+
+    // ---- 6. Q2（v4.16.6）：禁用态白边降档规格 ----
+
+    @Test
+    fun `禁用态白边降档约为启用档一半`() {
+        // v2 皮肤深色启用 0.22 → 禁用 0.10（≈一半；叠禁用容器对比 1.37:1、叠背景 1.85:1，
+        // 禁用灰块的胶囊轮廓可辨）
+        assertEquals(0.10f, BORDER_ALPHA_DARK_V2_DISABLED)
+        // 浅色启用 0.12 → 禁用 0.08（规格建议 6% 实测对比只有 1.14:1 糊进灰块，提一档到 1.19:1）
+        assertEquals(0.08f, BORDER_ALPHA_LIGHT_DISABLED)
+        // 回退态深色启用 0.50 → 禁用 0.25
+        assertEquals(0.25f, BORDER_ALPHA_DARK_DISABLED)
+    }
+
+    // ---- 7. S1（v4.16.6）：禁用态按压底色半强度 ----
+
+    @Test
+    fun `禁用态按压底色强度等于启用乘0_5`() {
+        // 派工单判据：禁用强度 = 启用 × 0.5（允许 ±0.01）——深色统一档 13% → 6.5%、
+        // 浅色统一档 15% → 7.5%、回退档 8% → 4% / 6% → 3%
+        assertEquals(0.13f * PRESS_BG_DISABLED_FACTOR, resolvePressBgAlpha(false, 0.13f), 0.01f)
+        assertEquals(0.15f * PRESS_BG_DISABLED_FACTOR, resolvePressBgAlpha(false, 0.15f), 0.01f)
+        assertEquals(0.08f * PRESS_BG_DISABLED_FACTOR, resolvePressBgAlpha(false, 0.08f), 0.01f)
+        assertEquals(0.06f * PRESS_BG_DISABLED_FACTOR, resolvePressBgAlpha(false, 0.06f), 0.01f)
+        // 启用态取满强度、不受系数影响
+        assertEquals(0.13f, resolvePressBgAlpha(true, 0.13f), 0.0001f)
+        assertEquals(0.15f, resolvePressBgAlpha(true, 0.15f), 0.0001f)
+        // 系数本身钉住 0.5（internal 常量供 instrumented 测试复用）
+        assertEquals(0.5f, PRESS_BG_DISABLED_FACTOR)
+    }
 }

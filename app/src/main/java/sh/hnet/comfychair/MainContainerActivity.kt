@@ -373,8 +373,21 @@ class MainContainerActivity : ComponentActivity() {
 
             // v4.6.1（模块 A4）：后台期间 object_info 可能从未拉成功（或首次连接就被挂起），
             // 回前台时模型列表为空 → 生成时 VAE/CLIP/UNET 被写成空串 → 服务端 400。
-            // 这里补一次主动拉取；内部有 isLoading 保护，不会并发堆请求。
-            if (ConnectionManager.isConnected && !cache.isLoaded && !cache.isLoading) {
+            // 这里补一次主动拉取。Q3-2/Q3-4（v4.16.5）：① 触发条件放宽——不只
+            // "从未加载成功"，"已加载但列表为空"（如后台返回时恰逢请求失败）同样补拉，
+            // 避免"WebSocket 断但 HTTP 在"的中间态什么都不做；② 并发保护是
+            // fetchServerData 内真正的 SingleFlight 闸门（同一时刻至多一个 /object_info
+            // 在飞，失败后可重试），不再依赖旧注释里并不存在的 isLoading 保护。
+            // 断网 / 请求失败不会清空已加载列表（失败回调只置 lastError），已加载的
+            // 非空列表不会反复触发补拉（cacheEmpty 条件拦住）
+            val cacheEmpty = cache.checkpoints.isEmpty() &&
+                cache.unets.isEmpty() &&
+                cache.vaes.isEmpty() &&
+                cache.clips.isEmpty()
+            if (ConnectionManager.isConnected &&
+                !cache.isLoading &&
+                (!cache.isLoaded || cacheEmpty)
+            ) {
                 ConnectionManager.refreshServerData()
             }
         }

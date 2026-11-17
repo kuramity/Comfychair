@@ -82,8 +82,21 @@ data class NodeTypeInfo(
  * Used to resolve slot types for edge coloring and input definitions for editing.
  */
 class NodeTypeRegistry {
-    private val nodeTypes = mutableMapOf<String, NodeTypeInfo>()
-    private val nodeDefinitions = mutableMapOf<String, NodeTypeDefinition>()
+    // Q3-1（v4.16.5）并发修复：两张表从可变 Map 改为 @Volatile 不可变 Map。
+    //
+    // 背景：parseObjectInfo 会被两个线程并发调用（磁盘缓存预填的 IO 协程与
+    // /object_info 网络回调）。旧实现开头先 clear 再逐个 put 到**同一份**可变表，
+    // 两个 parse 交错时互相清空对方刚写入的节点 → 表残缺 → 「UNET 下拉空、
+    // VAE/CLIP 有值」（UNET 来源节点只有两三个，丢一个就全空）。
+    //
+    // 现在的写法：parse 在**局部** map 上构建完整数据，构建完成后一次性替换引用。
+    // 读方（getOptionsForField 等 UI 直接调用的方法）拿到的是某一**完整代次**的
+    // 快照——要么旧的、要么新的，绝无"半个表"。@Volatile 保证替换后的引用对
+    // 读线程立即可见；两张表内容各自不可变，读方无需加锁。
+    @Volatile
+    private var nodeTypes: Map<String, NodeTypeInfo> = emptyMap()
+    @Volatile
+    private var nodeDefinitions: Map<String, NodeTypeDefinition> = emptyMap()
 
     /**
      * [getNodeTypesByCategory] 的结果缓存。
@@ -100,11 +113,14 @@ class NodeTypeRegistry {
 
     /**
      * Parse /object_info response and populate the registry.
+     *
+     * Q3-1（v4.16.5）：解析全程在局部 map 上进行，结束时一次性替换两张表引用。
+     * 多线程并发调用时各自构建各自的局部表、谁后完成谁生效，表本身永远完整
+     * （旧实现先 clear 后逐 put 的共享可变表，并发交错会互相清空节点）。
      */
     fun parseObjectInfo(objectInfoJson: JSONObject) {
-        nodeTypes.clear()
-        nodeDefinitions.clear()
-        categoryCache = null
+        val newTypes = mutableMapOf<String, NodeTypeInfo>()
+        val newDefinitions = mutableMapOf<String, NodeTypeDefinition>()
 
         val keys = objectInfoJson.keys()
         while (keys.hasNext()) {
@@ -137,7 +153,7 @@ class NodeTypeRegistry {
                 }
             }
 
-            nodeTypes[classType] = NodeTypeInfo(
+            newTypes[classType] = NodeTypeInfo(
                 classType = classType,
                 inputTypes = inputTypes,
                 outputTypes = outputTypes,
@@ -156,7 +172,7 @@ class NodeTypeRegistry {
             val deprecated = nodeInfo.optBoolean("deprecated", false)
             val experimental = nodeInfo.optBoolean("experimental", false)
 
-            nodeDefinitions[classType] = NodeTypeDefinition(
+            newDefinitions[classType] = NodeTypeDefinition(
                 classType = classType,
                 category = category,
                 inputs = inputDefinitions,
@@ -168,7 +184,13 @@ class NodeTypeRegistry {
             )
         }
 
-        DebugLogger.i(TAG, "NodeTypeRegistry populated: ${nodeDefinitions.size} node types parsed")
+        // 原子替换（引用赋值）：读方从此刻起看到的是本次解析的完整快照。
+        // categoryCache 随之失效
+        nodeTypes = newTypes
+        nodeDefinitions = newDefinitions
+        categoryCache = null
+
+        DebugLogger.i(TAG, "NodeTypeRegistry populated: ${newDefinitions.size} node types parsed")
     }
 
     private fun parseInputTypes(inputsJson: JSONObject?, result: MutableMap<String, String>) {
@@ -426,8 +448,8 @@ class NodeTypeRegistry {
      * Clear the registry.
      */
     fun clear() {
-        nodeTypes.clear()
-        nodeDefinitions.clear()
+        nodeTypes = emptyMap()
+        nodeDefinitions = emptyMap()
         categoryCache = null
     }
 }

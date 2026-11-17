@@ -1,12 +1,21 @@
 package sh.hnet.comfychair.ui.screens
 
 import android.app.Activity
+import android.app.ActivityManager
+import android.content.Context
+import android.graphics.Bitmap
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.tween
+import androidx.core.view.drawToBitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -53,24 +62,38 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
+import sh.hnet.comfychair.BitmapCache
 import sh.hnet.comfychair.MediaViewerActivity
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
+import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
 import sh.hnet.comfychair.cache.ActiveView
 import sh.hnet.comfychair.cache.MediaCache
@@ -107,6 +130,101 @@ fun GalleryScreen(
     val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
 
+    // ============================================================
+    // 网格捏合改列数（C1~C3，v4.16.2）
+    // ============================================================
+    // 开关关闭 → 恒 2 列、不挂捏合手势，完全回到旧行为（AppSettings 组合期读一次）
+    val pinchColumnsEnabled = remember { AppSettings.isGalleryPinchColumnsEnabled(context) }
+    // 低端机降级（C3）：捏合过程不逐帧跟手，松手一次性换列。
+    // 用 isLowRamDevice 而不是运行期掉帧检测 —— 判定稳定可复现，也不会因为
+    // 一次瞬时卡顿把普通设备永久降级
+    val isLowRamDevice = remember {
+        (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)
+            ?.isLowRamDevice == true
+    }
+    // 已提交列数（2/3/4）：rememberSaveable 让旋转/重建后保持用户选定的档位
+    var columns by rememberSaveable { mutableStateOf<Int>(GALLERY_MIN_COLUMNS) }
+    // 捏合跟手用的容器级缩放（1f = 原尺寸）。挂在 graphicsLayer 上读，
+    // 捏合每帧只更新 layer 属性、不触发网格与卡片重组
+    var pinchScale by remember { mutableFloatStateOf(1f) }
+    // 本次手势的起始列数（手势只上报"自起点累计的缩放倍率"，起点必须自己记）
+    var gestureBaseColumns by remember { mutableFloatStateOf(GALLERY_MIN_COLUMNS.toFloat()) }
+    var columnJob by remember { mutableStateOf<Job?>(null) }
+    // 换列后的锚定索引（C3"改列不跳图"）：由 settleColumns 在提交新列数前写入，
+    // 由下面的 LaunchedEffect(columns) 在新列布局生效后再真正滚过去
+    var settleAnchor by remember { mutableStateOf<Int?>(null) }
+
+    // B-23b 第三批：grid 节点在 window 中的位置。截图（decorView 全屏像素）与
+    // 格子矩形必须同一坐标系——visibleItemsInfo.offset 是相对 grid viewport 的，
+    // 加上这个 origin 才是与截图同基准的 window 坐标
+    var gridOriginInWindow by remember { mutableStateOf(Offset.Zero) }
+
+    // 锚定落点必须在"新列数已经排版完成"之后执行。
+    // 若在提交列数的同一帧调 requestScrollToItem，那条请求会被旧列数的 measure 吃掉；
+    // 换列后 LazyGrid 按**像素偏移**重排，落点就偏到别的行去了。改由
+    // LaunchedEffect(columns) 驱动，此时新列数已经参与排版，scrollToItem 落点确定。
+    //
+    // 注意"锚点未必能贴顶"：列数变多时内容变矮，网格会滚到最大值（clamp），锚点项
+    // 停在屏幕中部而不是顶部 —— 这是 LazyGrid 的物理限制，不是锚定失效。判据是
+    // "锚点仍在可见区"（实测 2→3 列：锚点项仍可见，改列前可见的 6 张全部仍可见）。
+    LaunchedEffect(columns) {
+        val anchor = settleAnchor ?: return@LaunchedEffect
+        settleAnchor = null
+        gridState.scrollToItem(anchor)
+    }
+
+    // 开关关掉时强制回到 2 列：rememberSaveable 可能存着上次捏出来的 3/4 列，
+    // 只"不挂手势"是不够的 —— "关闭 = 固定 2 列"是回退契约的一部分
+    LaunchedEffect(pinchColumnsEnabled) {
+        if (!pinchColumnsEnabled) {
+            columns = GALLERY_MIN_COLUMNS
+            pinchScale = 1f
+        }
+    }
+
+    /**
+     * 捏合松手：吸附到最近档位。
+     *
+     * 跟手期间网格仍按"已提交列数"排版（LazyVerticalGrid 不支持分数列），视觉上的
+     * 连续缩放来自容器 graphicsLayer。所以换列必须分两步走才不会闪：
+     * ① 先把缩放补间到"目标档位的真实格子尺寸"（视觉尺寸连续）
+     * ② 同一帧内提交列数并把缩放复位 1 —— 排版换成新列数，视觉尺寸不变
+     *
+     * 参数是**手势自起点累计的缩放倍率**（不是连续列数）：换算成档位必须经过
+     * [galleryTargetColumns]，把起点列数一起带进去。早期版本在这里直接拿倍率当列数
+     * 吸附（倍率 0.66 会被 roundToInt 成 1 再钳回 2），结果是捏合永远只停在 2 列。
+     */
+    fun settleColumns(baseColumns: Float, gestureScale: Float) {
+        columnJob?.cancel()
+        val target = galleryTargetColumns(baseColumns, gestureScale)
+        // 锚定：换列前记下当前第一项，换列后把它锚回可见区顶部，用户正在看的那张不会被挤走
+        val anchor = gridState.firstVisibleItemIndex
+        if (isLowRamDevice || !pinchColumnsEnabled) {
+            // 低端机（C3）：过程不跟手，直接一次到位
+            pinchScale = 1f
+            if (target != columns) {
+                settleAnchor = anchor
+                columns = target
+            }
+            return
+        }
+        val targetScale = galleryPinchScaleForColumns(columns, target.toFloat())
+        columnJob = scope.launch {
+            animate(
+                initialValue = pinchScale,
+                targetValue = targetScale,
+                animationSpec = tween(COLUMN_SETTLE_MS)
+            ) { value, _ -> pinchScale = value }
+            // 以下三行必须写在同一次快照里（中间没有挂起点）→ 同一帧生效，不会闪。
+            // 锚定只写 settleAnchor：真正的滚动由 LaunchedEffect(columns) 在新布局上执行
+            pinchScale = 1f
+            if (target != columns) {
+                settleAnchor = anchor
+                columns = target
+            }
+        }
+    }
+
     // State and effects
     // Activity result launcher for MediaViewerActivity
     val mediaViewerLauncher = rememberLauncherForActivityResult(
@@ -114,6 +232,10 @@ fun GalleryScreen(
     ) { result ->
         // Restore active view to Gallery
         MediaCache.setActiveView(ActiveView.GALLERY)
+
+        // B-23b 第三批：查看器已关闭，释放透出用的图库截图（下次打开会被整体覆盖，
+        // 这里主动清掉省一份位图内存）
+        BitmapCache.clearGallerySnapshot()
 
         // Refresh gallery if item was deleted (silent refresh, no spinner)
         if (result.resultCode == Activity.RESULT_OK) {
@@ -199,6 +321,40 @@ fun GalleryScreen(
             items = viewerItems,
             initialIndex = clickedIndex
         )
+
+        // ============================================================
+        // B-23b 第三批（E1~E2）：截图与格子矩形——必须在 launch 之前同步截取
+        // ============================================================
+        // View.draw 是同步的：这一刻图库还在前台，截到的才是图库画面；
+        // launch 之后查看器窗口盖上来，再截就是查看器自己。
+        // 捏合改列动画进行中（pinchScale != 1）时格子矩形是布局坐标、与视觉位置
+        // 错位，按"无截图"处理回退纯黑，绝不透出错位的画面
+        var revealSnapshot: Bitmap? = null
+        var revealCellRect: ViewerRect? = null
+        if (AppSettings.isGalleryDismissRevealEnabled(context) && pinchScale == 1f) {
+            try {
+                revealSnapshot = (context as? Activity)?.window?.decorView?.drawToBitmap()
+                // 目标格子矩形（window 坐标）：visibleItemsInfo.offset 是相对 grid
+                // viewport 的，加上 grid 节点的 window 位置才与截图同基准。
+                // 本函数在点击回调里执行，被点格子必然在可见区（不可见点不到）
+                val itemInfo = gridState.layoutInfo.visibleItemsInfo
+                    .firstOrNull { it.index == clickedIndex }
+                if (itemInfo != null) {
+                    revealCellRect = ViewerRect(
+                        left = gridOriginInWindow.x + itemInfo.offset.x,
+                        top = gridOriginInWindow.y + itemInfo.offset.y,
+                        width = itemInfo.size.width.toFloat(),
+                        height = itemInfo.size.height.toFloat()
+                    )
+                }
+            } catch (_: Exception) {
+                // 截图失败（窗口未就绪等）：按"无截图"处理，查看器回退纯黑，不许崩
+                revealSnapshot = null
+                revealCellRect = null
+            }
+        }
+        BitmapCache.putGallerySnapshot(revealSnapshot, revealCellRect)
+
         mediaViewerLauncher.launch(intent)
         // 打开过渡（C2）：launch 内部同步发起 startActivityForResult，这里紧接着设置——
         // 列表保持不动，查看器以缩小淡入进场（与关闭时的缩小淡出对称）
@@ -224,7 +380,12 @@ fun GalleryScreen(
 
     // Track scroll position and update cache priorities with debounce
     // Only update when Gallery is the active view (not when MediaViewer is animating closed)
-    LaunchedEffect(gridState.firstVisibleItemIndex, gridState.layoutInfo.visibleItemsInfo.size) {
+    // columns 进依赖：捏合换列后可见项数量与优先级区间都会变，必须重新上报
+    LaunchedEffect(
+        gridState.firstVisibleItemIndex,
+        gridState.layoutInfo.visibleItemsInfo.size,
+        columns
+    ) {
         if (prefetchItems.isNotEmpty() && MediaCache.isActiveView(ActiveView.GALLERY)) {
             // Debounce scroll updates to avoid excessive calls during fast scrolling
             kotlinx.coroutines.delay(100)
@@ -232,7 +393,8 @@ fun GalleryScreen(
                 firstVisibleIndex = gridState.firstVisibleItemIndex,
                 visibleItemCount = gridState.layoutInfo.visibleItemsInfo.size,
                 allItems = prefetchItems,
-                columnsInGrid = 2
+                // 预取优先级要按真实列数算（一行几列直接决定"附近几张"）
+                columnsInGrid = columns
             )
         }
     }
@@ -341,16 +503,61 @@ fun GalleryScreen(
             // Always use LazyVerticalGrid for consistent nested scroll behavior with pull-to-refresh
             NoOverscrollContainer(modifier = Modifier.fillMaxSize()) {
                 LazyVerticalGrid(
-                    columns = GridCells.Fixed(2),
+                    // 列数由捏合手势决定（2/3/4，C1）；开关关闭时恒为 2
+                    columns = GridCells.Fixed(columns),
                     state = gridState,
                     contentPadding = PaddingValues(8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier
+                        .fillMaxSize()
+                        // B-23b 第三批：记录 grid 在 window 中的位置（透出截图与格子
+                        // 矩形的坐标系基准，见 launchMediaViewer）
+                        .onGloballyPositioned { gridOriginInWindow = it.positionInWindow() }
+                        // 捏合跟手的容器级缩放：clip 在 layer 外层，放大时内容被视口裁掉，
+                        // 不会溢到顶栏/刷新指示器上
+                        .clipToBounds()
+                        .graphicsLayer {
+                            scaleX = pinchScale
+                            scaleY = pinchScale
+                        }
+                        // 双指捏合改列数（C1~C3）；单指事件一律不消费，滚动与点击不受影响
+                        .then(
+                            if (pinchColumnsEnabled) {
+                                Modifier.pointerInput(Unit) {
+                                    detectGalleryColumnPinch(
+                                        onPinchStart = {
+                                            columnJob?.cancel()
+                                            gestureBaseColumns = columns.toFloat()
+                                            pinchScale = 1f
+                                        },
+                                        onPinchZoom = { accumulated ->
+                                            // C3 低端机降级：捏合过程不跟手，松手才一次换列
+                                            if (!isLowRamDevice) {
+                                                columnJob?.cancel()
+                                                val continuous = galleryColumnsForGesture(
+                                                    gestureBaseColumns, accumulated
+                                                )
+                                                pinchScale = galleryPinchScaleForColumns(
+                                                    columns, continuous
+                                                )
+                                            }
+                                        },
+                                        onPinchEnd = { accumulated ->
+                                            // 松手结算也要经过同一套换算：起点列数 + 累计倍率
+                                            settleColumns(gestureBaseColumns, accumulated)
+                                        }
+                                    )
+                                }
+                            } else {
+                                Modifier
+                            }
+                        )
                 ) {
                 if (uiState.isLoading && uiState.items.isEmpty()) {
                     // Loading state - show as full-span item
-                    item(span = { GridItemSpan(2) }) {
+                    // 全宽占位项跟随列数（maxLineSpan = 当前一行几列），否则 3/4 列时会错位
+                    item(span = { GridItemSpan(maxLineSpan) }) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -362,7 +569,7 @@ fun GalleryScreen(
                     }
                 } else if (uiState.items.isEmpty()) {
                     // Empty state - show as full-span item
-                    item(span = { GridItemSpan(2) }) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -654,5 +861,150 @@ private fun GalleryItemCard(
                 }
             }
         }
+    }
+}
+
+/**
+ * 图库格子显示的降采样倍率（纯函数，便于单测）。
+ *
+ * 统一档落盘是长边 720（见 [sh.hnet.comfychair.cache.MediaCache.GALLERY_DECODE_DIMENSION]），
+ * 显示时按列数缩：2 列直接用；3 列约 480（720×2/3）；4 列约 360（720×1/2）。
+ * 返回显示位图相对统一档的比例（1f = 原样用、不复制）。
+ *
+ * 也是"捏合改列数"（v4.16.2，C1~C3）的格子尺寸档位表：格子宽度与列数成反比，
+ * 所以两档之间的尺寸比正好等于本函数两极之比 —— [galleryPinchScaleForColumns]
+ * 直接用它算跟手系数，换列时视觉尺寸严格连续。
+ */
+internal fun galleryDisplayScaleForColumns(columns: Int): Float = when {
+    columns <= 2 -> 1f
+    columns == 3 -> 2f / 3f
+    else -> 1f / 2f
+}
+
+// ============================================================
+// 网格捏合改列数（C1~C3，v4.16.2）的纯逻辑 —— 全部可在 JVM 单测里精确覆盖边界
+// ============================================================
+
+/** 列数下限（C1：2/3/4 三档） */
+internal const val GALLERY_MIN_COLUMNS = 2
+
+/** 列数上限 */
+internal const val GALLERY_MAX_COLUMNS = 4
+
+/** 换列吸附动画时长（ms）。与查看器并排吸附同量级，快而不生硬 */
+internal const val COLUMN_SETTLE_MS = 220
+
+/**
+ * 捏合手势 → 连续列数。
+ *
+ * 手指张开（gestureScale > 1）= 想把格子放大 = 列数变少，故取倒数式除法；
+ * 结果钳在 [2, 4]，超出档位区间时格子尺寸停在端点（不会出现 1 列或 6 列）。
+ *
+ * @param baseColumns 本次手势起始的列数
+ * @param gestureScale 本次手势累计缩放倍率（>1 张开 / <1 合拢）
+ */
+internal fun galleryColumnsForGesture(baseColumns: Float, gestureScale: Float): Float {
+    val base = baseColumns.coerceIn(
+        GALLERY_MIN_COLUMNS.toFloat(), GALLERY_MAX_COLUMNS.toFloat()
+    )
+    // 手势倍率异常（0 / 负数 / NaN / 无穷）一律视为"没捏"，返回起始列数兜底
+    if (!gestureScale.isFinite() || gestureScale <= 0f) return base
+    return (base / gestureScale).coerceIn(
+        GALLERY_MIN_COLUMNS.toFloat(), GALLERY_MAX_COLUMNS.toFloat()
+    )
+}
+
+/**
+ * 松手吸附：连续列数 → 最近档位（2 / 3 / 4）。
+ *
+ * 四舍五入即可覆盖全部分界：2.49 → 2、2.5 → 3、3.49 → 3、3.5 → 4；
+ * 越界值与异常值一律钳到档位区间端点。
+ */
+internal fun galleryColumnsSnap(continuousColumns: Float): Int {
+    if (!continuousColumns.isFinite()) return GALLERY_MIN_COLUMNS
+    return continuousColumns.roundToInt().coerceIn(GALLERY_MIN_COLUMNS, GALLERY_MAX_COLUMNS)
+}
+
+/**
+ * 松手吸附的**唯一正确入口**：起点列数 + 本次手势累计倍率 → 目标档位（2 / 3 / 4）。
+ *
+ * 存在的意义是把"倍率 → 连续列数 → 吸附档位"这两步锁在一个函数里。手势回调给的是
+ * 倍率，吸附要的是列数，中间少走一步就会变成"倍率直接 roundToInt"——0.66 倍会被
+ * 舍成 1 再钳回 2，表现为捏合永远只停在 2 列。调用方一律只传倍率进来。
+ */
+internal fun galleryTargetColumns(baseColumns: Float, gestureScale: Float): Int =
+    galleryColumnsSnap(galleryColumnsForGesture(baseColumns, gestureScale))
+
+/**
+ * 连续列数 → 格子尺寸系数（2 列 1f、3 列 2/3、4 列 1/2，与整数版严格一致）。
+ *
+ * 整数档位上与 [galleryDisplayScaleForColumns] 完全同值，中间值线性插值，
+ * 供捏合跟手期间逐帧取用。
+ */
+internal fun galleryDisplayScaleForColumnCount(columns: Float): Float {
+    if (!columns.isFinite() || columns <= 0f) return 1f
+    return (2f / columns).coerceIn(
+        galleryDisplayScaleForColumns(GALLERY_MAX_COLUMNS),
+        galleryDisplayScaleForColumns(GALLERY_MIN_COLUMNS)
+    )
+}
+
+/**
+ * 捏合过程中的容器缩放系数：把"已提交列数"的格子尺寸换算成"目标连续列数"的尺寸。
+ *
+ * 例：已提交 2 列（格子系数 1f）、手指捏到连续 2.67 列（系数 0.75）→ 返回 0.75，
+ * 即格子显示为 3 列时的尺寸；已提交 4 列捏到 2 列 → 返回 2f（格子放大一倍）。
+ * 松手时同一函数也给出"目标档位相对当前档位"的补间终值，换列瞬间尺寸不跳。
+ */
+internal fun galleryPinchScaleForColumns(committedColumns: Int, continuousColumns: Float): Float {
+    val from = galleryDisplayScaleForColumns(committedColumns)
+    if (from <= 0f) return 1f
+    return galleryDisplayScaleForColumnCount(continuousColumns) / from
+}
+
+/**
+ * 图库网格的双指捏合检测（C1~C3）。
+ *
+ * 关键点在 [PointerEventPass.Initial] + 双指期间消费：
+ * - 单指事件一律不吃 → 网格滚动、卡片点击、下拉刷新全部照旧；
+ * - 两指按下后消费全部位置变化 → 网格不会在捏合的同时被滚动，下拉刷新也不会被
+ *   两指的上下漂移误触发。
+ *
+ * 手势结束有两种走法，都要结算：手指数从 2 掉到 1（用户抬手顺序不定，先抬一根
+ * 即视为捏合结束），或全部抬起。
+ */
+private suspend fun PointerInputScope.detectGalleryColumnPinch(
+    onPinchStart: () -> Unit,
+    onPinchZoom: (accumulatedScale: Float) -> Unit,
+    onPinchEnd: (accumulatedScale: Float) -> Unit
+) {
+    awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+        var accumulated = 1f
+        var started = false
+        var finished = false
+        while (!finished) {
+            val event = awaitPointerEvent(PointerEventPass.Initial)
+            val pressedCount = event.changes.count { it.pressed }
+            if (pressedCount >= 2) {
+                // 双指期间全消费：屏蔽网格滚动与下拉刷新
+                event.changes.forEach { if (it.pressed) it.consume() }
+                val zoom = event.calculateZoom()
+                if (zoom != 1f) {
+                    if (!started) {
+                        started = true
+                        onPinchStart()
+                    }
+                    // 累计倍率钳在 0.25~4：极端手势不会把连续列数换算推到溢出
+                    accumulated = (accumulated * zoom).coerceIn(0.25f, 4f)
+                    onPinchZoom(accumulated)
+                }
+            } else if (started) {
+                // 手指数掉到 1：捏合结束（不等全部抬起，避免用户留一根手指时无响应）
+                finished = true
+            }
+            if (event.changes.none { it.pressed }) finished = true
+        }
+        if (started) onPinchEnd(accumulated)
     }
 }

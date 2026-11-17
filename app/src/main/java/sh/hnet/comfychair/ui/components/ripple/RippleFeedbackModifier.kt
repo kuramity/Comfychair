@@ -1,9 +1,14 @@
 package sh.hnet.comfychair.ui.components.ripple
 
 import android.app.ActivityManager
-import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
@@ -15,6 +20,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -40,6 +46,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -51,6 +58,9 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.lerp as lerpFloat
+import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import sh.hnet.comfychair.storage.AppSettings
 
@@ -59,6 +69,69 @@ private const val NANOS_PER_SEC = 1_000_000_000.0
 
 /** 按压回弹的缩放默认值（完整皮肤形态）；顶栏裸图标态单独传 0.94f。 */
 internal const val DEFAULT_PRESS_SCALE = 0.96f
+
+// ============================================================
+// 顶栏按压时序（v4.16.1，规格 A1/A2）：快进 → 定格 → 慢出
+// ============================================================
+
+/**
+ * 顶栏按压覆盖层的时序规格（v4.16.1）：三段直给动画。
+ *
+ * 现状问题（R-A1 取证）：pressBg / pressScale 走 animateColorAsState / animateFloatAsState
+ * **未传 spec = 默认 spring（带惯性）**，快速点击（<0.1 秒）时动画还没爬到峰值就反向，
+ * 视觉上像"白框迟到冒出来"。改为三段：
+ * - 快进 [PRESS_FEEDBACK_IN_MS]：按下后 ≤60ms 到满强度；
+ * - 定格 [PRESS_FEEDBACK_HOLD_MS]：松手后保持满强度 150ms（这是"定格"，不是淡出的一部分）；
+ * - 慢出 [PRESS_FEEDBACK_OUT_MS]：之后 150ms 淡回静置。
+ * 全程 tween（无惯性无过冲），禁用 spring。internal 供单测钉住规格。
+ */
+internal const val PRESS_FEEDBACK_IN_MS = 60
+internal const val PRESS_FEEDBACK_HOLD_MS = 150
+internal const val PRESS_FEEDBACK_OUT_MS = 150
+
+/**
+ * 按压时序的归一化进度（0 = 静置，1 = 满强度）——"快进 → 定格 → 慢出"的唯一驱动源。
+ *
+ * 时序（规格 A1/A2）：
+ * - 按下：[PRESS_FEEDBACK_IN_MS] 内从 0 快进到 1；
+ * - 松手：先把可能未走完的快进段补完（快击 <60ms 松手时白框也必须出现——
+ *   这是修复"快击迟到"的关键），再满强度定格 [PRESS_FEEDBACK_HOLD_MS]，
+ *   然后 [PRESS_FEEDBACK_OUT_MS] 淡回 0（慢出）；
+ * - 淡出中途再按（快击连点）：LaunchedEffect 重启，进度从当前值重新快进到 1，直给不打折。
+ *
+ * 只输出进度、不做插值：调用方对各自的目标值 lerp（pressBg 用 Color lerp、
+ * pressScale 用 Float lerp），时序逻辑全 App 只此一份。禁用带惯性的 spring。
+ *
+ * B-A1b 加固：补完段的时长不再用 System.nanoTime（真实时钟）倒推剩余时间——
+ * 真机掉帧/页面繁忙时动画帧钟（Choreographer）会滞后于真实时钟，把"剩余时间"
+ * 算成 0 而跳过补完，定格强度不满（白框半亮就定格）。改为直接读进度值本身：
+ * 快进没走完（value<1）就按剩余进度比例给时长补到 1（恒 ≤60ms），松手后的
+ * 时间线恒定为"补完 ≤60ms + 定格 150ms + 慢出 150ms"，与时钟源无关。
+ */
+@Composable
+internal fun rememberPressTimelineProgress(pressed: Boolean): Animatable<Float, AnimationVector1D> {
+    val progress = remember { Animatable(0f) }
+    LaunchedEffect(pressed) {
+        if (pressed) {
+            progress.animateTo(1f, tween(PRESS_FEEDBACK_IN_MS))
+        } else {
+            if (progress.value <= 0f) return@LaunchedEffect  // 首组合（从未按下过），无序列可跑
+            // 补完快进段：快击松手时快进可能只走了一部分（value<1），按剩余进度比例
+            // 给时长补到满强度（直给契约：白框必须出现并定格，时长恒 ≤60ms）
+            if (progress.value < 1f) {
+                progress.animateTo(
+                    1f,
+                    tween(((1f - progress.value) * PRESS_FEEDBACK_IN_MS).roundToInt()),
+                )
+            }
+            // 定格：松手后保持满强度 150ms（这是"定格"，不是淡出的一部分）
+            delay(PRESS_FEEDBACK_HOLD_MS.toLong())
+            // 慢出：150ms 淡回静置
+            progress.animateTo(0f, tween(PRESS_FEEDBACK_OUT_MS))
+        }
+    }
+    return progress
+}
 
 /** 皮肤视觉要素开关默认值：默认全开 = 旧版完整皮肤（白边 + 辉光 + 触点辉光）。 */
 internal const val DEFAULT_SHOW_BORDER = true
@@ -80,6 +153,16 @@ internal const val BORDER_ALPHA_DARK = 0.5f
 internal const val BORDER_ALPHA_DARK_V2 = 0.22f
 private const val BORDER_ALPHA_LIGHT = 0.12f
 private const val BORDER_PRESS_BOOST = 1.25f
+
+// v4.16.6（Q2）禁用降档白边：禁用态皮肤只保留这一项（渐变/辉光投影/点阵/按压回弹仍关），
+// alpha 约为启用档一半，让禁用灰块的胶囊轮廓可辨（修复"禁用后形状看起来变了"）。
+// 深色 White 10% 叠禁用容器（onSurface@12% 合成 RGB(41,46,51)）对比 1.37:1、叠背景 1.85:1；
+// 浅色 Black 8% 叠禁用容器（合成 RGB(211,216,223)）对比 1.19:1 —— 规格建议的 6% 实测只有
+// 1.14:1，糊进灰块轮廓仍不可辨，按对比度实测提一档。回退态深色启用 50% → 禁用 25%。
+// internal 供单测钉住规格。
+internal const val BORDER_ALPHA_DARK_V2_DISABLED = 0.10f
+internal const val BORDER_ALPHA_LIGHT_DISABLED = 0.08f
+internal const val BORDER_ALPHA_DARK_DISABLED = 0.25f
 
 /**
  * 外辉光（基准 box-shadow 的 16px color-a 辉光项）：不用 BlurMaskFilter（硬件层会忽略），
@@ -169,7 +252,9 @@ internal fun shouldDrawTouchGlow(showDots: Boolean, showTouchGlow: Boolean): Boo
  *
  * @param interactionSource 与被包裹按钮共享的交互源（观察按压态）
  * @param shape 裁剪形状：波纹/点阵被裁进该形状，防止溢出圆角
- * @param enabled false 时整条 modifier 原样返回，一行关掉全部反馈（含渐变）
+ * @param enabled false 时皮肤**降级**而非整条关闭（v4.16.6 Q2）：渐变/辉光投影/点阵/
+ *   按压回弹全部关闭，但保留一圈**降档白边**（约启用档一半 alpha）勾出禁用灰块的
+ *   轮廓——深色底上半透明灰块没白边勾勒时边缘糊化，用户感知为"按钮形状变了"
  * @param gradientColors 双色渐变（null = 不画；disabled 态必须传 null）
  * @param glowColor 外辉光/投影颜色（accent，跟随调色盘）
  * @param rippleColor 触点辉光颜色（触点处一小团实心柔光，随寿命淡出）
@@ -180,6 +265,10 @@ internal fun shouldDrawTouchGlow(showDots: Boolean, showTouchGlow: Boolean): Boo
  * @param showDots 是否画点阵（U1 收敛：只有生成主按钮保持默认 true；顶栏图标/下拉/齿轮
  *   等传 false —— 不登记波纹、不画点阵与触点辉光，但按压回弹/渐变/白边等皮肤结构保留）
  * @param pressScale 按压缩放目标值（默认 0.96 完整皮肤；顶栏裸图标态 0.94）
+ * @param quickPressTimeline true 时按压缩放走"快进 60ms → 定格 150ms → 慢出 150ms"时序
+ *   （v4.16.1 规格 A1/A2，修复快击时 spring 惯性导致的"白框迟到"；见
+ *   [rememberPressTimelineProgress]）。只有顶栏图标（RippleIconButton）传 true；
+ *   生成主按钮 / 齿轮等不传 → 默认 spring，手感不变（波及范围严格控制）
  * @param cornerRadius 非 null 时裁剪形状改用该圆角矩形（顶栏裸图标态 12dp；null = 用 [shape]）
  * @param haloDownward true 时辉光改为向下投影（v2 主按钮：向下偏移 2/4dp 的递减层，
  *   颜色 = glowColor）；false 保持旧版环形辉光
@@ -203,18 +292,34 @@ fun Modifier.rippleFeedback(
     showTouchGlow: Boolean = DEFAULT_SHOW_TOUCH_GLOW,
     showDots: Boolean = DEFAULT_SHOW_DOTS,
     pressScale: Float = DEFAULT_PRESS_SCALE,
+    quickPressTimeline: Boolean = false,
     cornerRadius: Dp? = null,
     haloDownward: Boolean = false,
     borderAlphaOverride: Float? = null,
 ): Modifier {
-    if (!enabled) return this
-
+    // v4.16.6（Q2）：禁用不再整条 return —— 皮肤降级：白边保留但降档（禁用灰块轮廓可辨），
+    // 渐变/辉光投影/点阵/按压回弹仍然关闭。禁用按钮收不到 PressInteraction（clickable
+    // enabled=false），下面的 pressed 已按 enabled 门控 → scale 与白边增压恒为静置值，
+    // 即使调用方在禁用瞬间残留按压态也不会闪出回弹。
     val source = interactionSource ?: remember { MutableInteractionSource() }
-    val pressed by source.collectIsPressedAsState()
-    val pressScaleAnim by animateFloatAsState(
-        targetValue = resolvePressScale(pressed, pressScale),
-        label = "rippleFeedbackPressScale",
-    )
+    val sourcePressed by source.collectIsPressedAsState()
+    val pressed = sourcePressed && enabled
+    // v4.16.1（A2）：quickPressTimeline=true（顶栏图标）的按压缩放走"快进→定格→慢出"时序
+    // （graphicsLayer 里按进度 lerp 出 scale）；其余调用点（生成主按钮 / 齿轮）不传该参数
+    // → 保持默认 spring（现状手感不变，波及范围严格控制，见派工单块 2.3）
+    val pressProgress = if (quickPressTimeline) {
+        rememberPressTimelineProgress(pressed)
+    } else {
+        null
+    }
+    val pressScaleAnim: State<Float> = if (quickPressTimeline) {
+        remember { mutableStateOf(1f) }  // 时序态不消费 spring 值：占位保持组合树稳定
+    } else {
+        animateFloatAsState(
+            targetValue = resolvePressScale(pressed, pressScale),
+            label = "rippleFeedbackPressScale",
+        )
+    }
 
     // 按压时白边 alpha ×1.25（基准里的按压反馈只调 scale，这里是皮肤层的轻量增强）；
     // 走动画过渡而不是硬切，松手后沿同一条曲线淡回
@@ -234,15 +339,30 @@ fun Modifier.rippleFeedback(
     // 1.5dp / 50% 旧观感。视觉常量归皮肤层内部读取，调用方只管结构（尺寸/间距/投影模式）。
     val context = LocalContext.current
     val skinV2 = remember(context) { AppSettings.isUiSkinV2Enabled(context) }
-    val borderAlpha = borderAlphaOverride ?: if (isDarkScheme) {
-        if (skinV2) BORDER_ALPHA_DARK_V2 else BORDER_ALPHA_DARK
+    // Q2 禁用降档：白边是禁用态唯一保留的皮肤要素，alpha 换禁用档；忽略 override
+    //（override 的三个场景——下拉打开提亮 32% / 回退 18% / 齿轮 18%——都只在启用态有意义，
+    // 禁用按钮打不开菜单、齿轮恒启用，不存在"禁用还要 override"的调用点）
+    val borderAlpha = if (!enabled) {
+        if (isDarkScheme) {
+            if (skinV2) BORDER_ALPHA_DARK_V2_DISABLED else BORDER_ALPHA_DARK_DISABLED
+        } else {
+            BORDER_ALPHA_LIGHT_DISABLED
+        }
     } else {
-        BORDER_ALPHA_LIGHT
+        borderAlphaOverride ?: if (isDarkScheme) {
+            if (skinV2) BORDER_ALPHA_DARK_V2 else BORDER_ALPHA_DARK
+        } else {
+            BORDER_ALPHA_LIGHT
+        }
     }
     val borderStrokeWidth = if (skinV2) BORDER_STROKE_DP_V2 else BORDER_STROKE_DP
     val haloAlphas = if (isDarkScheme) HALO_ALPHAS_DARK else HALO_ALPHAS_LIGHT
     // 投影 alpha 同样深浅两套（U3：深色首层 0.22 发脏 → 0.16；浅色更轻）
     val shadowAlphas = if (isDarkScheme) SHADOW_ALPHAS_DARK else SHADOW_ALPHAS_LIGHT
+
+    // Q2：点阵禁用即关（禁用不该有点阵，与按压回弹同批关闭）——帧循环/绘制/波纹登记
+    // 三处以本开关为准，禁用时整条点阵链（协程 + 指针监听）都不挂
+    val dotsActive = showDots && enabled
 
     // 低端机只在组合时判定一次，决定点阵间距是否加倍
     val isLowRamDevice = remember(context) {
@@ -310,8 +430,8 @@ fun Modifier.rippleFeedback(
     }
 
     // 帧驱动：没有活跃波纹时挂在 snapshotFlow 上休眠，不空转烧帧；
-    // showDots=false（U1 收敛态）连这个协程都不挂 —— 无波纹来源，整条帧链没有存在意义
-    if (showDots) {
+    // showDots=false（U1 收敛态）或禁用态（Q2）连这个协程都不挂 —— 无波纹来源，整条帧链没有存在意义
+    if (dotsActive) {
         LaunchedEffect(Unit) {
             while (true) {
                 if (ripples.isEmpty()) {
@@ -332,8 +452,14 @@ fun Modifier.rippleFeedback(
 
     return this
         .graphicsLayer {
-            scaleX = pressScaleAnim
-            scaleY = pressScaleAnim
+            // v4.16.1：顶栏图标按时序进度 lerp 出 scale（快进/定格/慢出），其余调用点 spring 值直用
+            val scale = if (pressProgress != null) {
+                lerpFloat(1f, resolvePressScale(pressed, pressScale), pressProgress.value)
+            } else {
+                pressScaleAnim.value
+            }
+            scaleX = scale
+            scaleY = scale
         }
         .drawWithContent {
             // 订阅帧计数：帧循环每推进一帧就 ++ 它，draw 阶段**必须读一次**才会在下一帧
@@ -346,7 +472,9 @@ fun Modifier.rippleFeedback(
             //    画在**最底层** —— 渐变与按钮本体盖住上层重叠区，只有按钮下缘露出的
             //    条带可见，叠出向下渐弱的投影感。画在控件边界之外的溢出绘制，依赖父链无 clip
             //    （与旧外辉光同机制；旧辉光 6dp 全向溢出已长期在线上正常绘制）。
-            if (showHalo && haloDownward) {
+            // Q2：禁用态投影不画（皮肤降级只保留白边；渐变调用方传 null 时本就不画，
+            // 这里再按 enabled 门控一道，防御"禁用还传渐变"的调用点）
+            if (showHalo && haloDownward && enabled) {
                 shadowOutline?.let { outline ->
                     SHADOW_OFFSETS_DP.forEachIndexed { idx, offDp ->
                         translate(0f, offDp.dp.toPx()) {
@@ -360,7 +488,7 @@ fun Modifier.rippleFeedback(
             //    可见性机制：enabled 时调用方把 M3 容器色设为透明，渐变从下层露出；
             //    不缓存 Brush —— 每帧从参数现取，accent 切换后下一帧立即换色。
             val colors = gradientColors
-            if (colors != null && colors.size >= 2) {
+            if (colors != null && colors.size >= 2 && enabled) {
                 val gradient = Brush.linearGradient(
                     colors = colors,
                     start = Offset.Zero,
@@ -376,8 +504,8 @@ fun Modifier.rippleFeedback(
 
             // 2) 外辉光：3 层外扩描边模拟柔光，画在控件边界之外（父链无 clip 时可见）。
             //    静置常显（基准 box-shadow 本来就是静置属性，不是按压特效）。
-            //    v2 的向下投影已在第 0 层画过，这里只走旧环形辉光。
-            if (showHalo && !haloDownward) {
+            //    v2 的向下投影已在第 0 层画过，这里只走旧环形辉光。Q2：禁用态不画。
+            if (showHalo && !haloDownward && enabled) {
                 haloOutlines?.let { outlines ->
                     outlines.forEachIndexed { idx, outline ->
                         val expandPx = HALO_EXPAND_DP[idx].dp.toPx()
@@ -394,7 +522,8 @@ fun Modifier.rippleFeedback(
             }
 
             // 3) 白边：贴内缘的细描边（旧版 1.5dp / v2 皮肤 1dp），**必须画在 drawContent 之后**
-            //    （渐变态下按钮容器透明，白边压在渐变上沿内缘一圈）。
+            //    （渐变态下按钮容器透明，白边压在渐变上沿内缘一圈）。Q2：禁用态也画
+            //    （alpha 走禁用降档档位）——这是禁用灰块唯一的轮廓来源。
             if (showBorder && borderOutline != null) {
                 val insetPx = BORDER_INSET_DP.dp.toPx()
                 translate(insetPx, insetPx) {
@@ -409,8 +538,8 @@ fun Modifier.rippleFeedback(
 
             // 4) 触点辉光 + 点阵，全部裁进按钮形状，防止溢出圆角。
             //    涟漪完全由点阵的点亮 + 上凸体现；触点处保留一小团实心柔光（点，不是环）。
-            //    showDots=false 整层不画（U1 收敛：点阵只留在生成主按钮，其余按钮零残留）。
-            if (showDots) {
+            //    showDots=false 或禁用态（Q2）整层不画（U1 收敛：点阵只留在生成主按钮，其余按钮零残留）。
+            if (dotsActive) {
                 clipPath(clipPath) {
                     val now = System.nanoTime() / NANOS_PER_SEC
                     if (shouldDrawTouchGlow(showDots, showTouchGlow)) {
@@ -457,9 +586,9 @@ fun Modifier.rippleFeedback(
             }
         }
         .then(
-            // 波纹登记只在点阵开着时挂：showDots=false 的按钮连 Press 观察都不做，
+            // 波纹登记只在点阵开着且启用时挂：showDots=false 或禁用态的按钮连 Press 观察都不做，
             // 保证零波纹（不登记 → ripples 恒空 → 帧循环休眠、无残影可画）。
-            if (showDots) {
+            if (dotsActive) {
                 Modifier.pointerInput(grid) {
                     // Initial pass 只观察不消费：Press 时以触点为圆心登记一道波纹
                     awaitPointerEventScope {
@@ -504,6 +633,22 @@ internal const val PRESS_BG_ALPHA_DARK_V2_LEGACY = 0.08f
 internal const val PRESS_BG_ALPHA_LIGHT_V2_LEGACY = 0.06f
 
 /**
+ * 禁用态按压底色的强度系数（v4.16.6 S1）：禁用**仍画底色但减半**（深 13%→6.5%、
+ * 浅 15%→7.5%；回退档 8%→4%、6%→3%）——四个顶栏按钮在任意状态下按下去都有可见
+ * 反馈，强弱差异仍能一眼区分"能点/不能点"。缩放不跟随：禁用态 scale 恒 1（缩放会
+ * 给"能点"的错觉，由 interactionSource 收不到禁用按压自动保证，见 RippleIconButton）。
+ * internal 供单测钉住规格。
+ */
+internal const val PRESS_BG_DISABLED_FACTOR = 0.5f
+
+/**
+ * 按压底色强度解析（纯函数，供 JVM 单测）：启用取满强度，禁用乘 [PRESS_BG_DISABLED_FACTOR]
+ * 减半。派工单判据：禁用强度 = 启用 × 0.5（允许 ±0.01）。
+ */
+internal fun resolvePressBgAlpha(enabled: Boolean, fullAlpha: Float): Float =
+    if (enabled) fullAlpha else fullAlpha * PRESS_BG_DISABLED_FACTOR
+
+/**
  * 带波纹点阵反馈的图标按钮包装（顶栏图标用）。
  *
  * 结构固定为 `Box(rippleFeedback, shape, size) { IconButton(fillMaxSize) }`：
@@ -545,19 +690,41 @@ internal fun RippleIconButton(
     // 深浅判断与 rippleFeedback 同口径：按页面底色亮度（不用 isSystemInDarkTheme，见其 KDoc）
     val isDarkScheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
 
-    // v2 按压底色（模板规格：按压反馈只有"底色 + scale"两样）：走动画过渡，松手淡回透明。
+    // v2 按压底色（模板规格：按压反馈只有"底色 + scale"两样）。
+    // v4.16.1（A1/A2）：从"默认 spring 的 animateColorAsState"改为"快进→定格→慢出"时序进度
+    // lerp。spring 的惯性是"快击时白框迟到冒出来"的根源：动画还没爬到峰值就被松手反向。
+    // 新时序（rememberPressTimelineProgress）：按下 ≤60ms 到满强度、松手补完快进段并定格
+    // 150ms、再 150ms 淡出 —— 直给，无惯性。
     // 统一档（模块 2/D2，B2b 拆深浅）：深色 White 13% / 浅色 Black 15%（实测对比度
-    // ≈1.45 / ≈1.41）；开关关闭回 8%/6% 旧档。反馈总开关关闭时不画（裸 IconButton 由
-    // M3 自带 ripple 给反馈）。
+    // ≈1.45 / ≈1.41）；模块 2 开关关闭回 8%/6% 旧档。
+    // v4.16.6（S1）：pressFeedbackOn 不再要求 enabled —— 禁用时仍画底色但**减半**
+    //（resolvePressBgAlpha，深 13%→6.5% / 浅 15%→7.5%），保存/分享在无生成结果时按下去
+    // 也有可见响应（半强度弱反馈），强弱差异仍能区分"能点/不能点"；缩放不跟随（禁用
+    // 态 interactionSource 收不到按压 → scale 恒 1，缩放会给"能点"的错觉）。
+    // 禁用态按压检测：clickable(enabled=false) 不产生 PressInteraction，interactionSource
+    // 收不到按压 —— 由 Initial pass 的指针观察者驱动（只观察、绝不 consume，与
+    // rippleFeedback 的波纹登记同一纪律）。
+    var disabledPressed by remember { mutableStateOf(false) }
     val pressed by interactionSource.collectIsPressedAsState()
-    val pressBgTarget = if (skinV2 && dotFeedbackEnabled && enabled && pressed) {
-        val pressAlpha = if (pressUnified) {
-            if (isDarkScheme) PRESS_BG_ALPHA_V2_DARK else PRESS_BG_ALPHA_V2_LIGHT
-        } else if (isDarkScheme) {
-            PRESS_BG_ALPHA_DARK_V2_LEGACY
-        } else {
-            PRESS_BG_ALPHA_LIGHT_V2_LEGACY
-        }
+    val quickPress = skinV2 && dotFeedbackEnabled
+    val pressFeedbackOn = quickPress
+    // 启用态按压走 interactionSource（clickable 的 PressInteraction）；禁用态 clickable
+    // 不发任何交互事件，只能靠下面的指针观察者驱动半强度底色
+    val pressDriver = if (enabled) pressed else disabledPressed
+    val pressProgress = rememberPressTimelineProgress(pressDriver && pressFeedbackOn)
+    // 禁用态底色减半（S1）：深 13%→6.5% / 浅 15%→7.5%（回退档同比例）
+    val pressAlphaFactor = if (enabled) 1f else PRESS_BG_DISABLED_FACTOR
+    val pressBgActive = if (pressFeedbackOn) {
+        val pressAlpha = resolvePressBgAlpha(
+            enabled = true,
+            fullAlpha = if (pressUnified) {
+                if (isDarkScheme) PRESS_BG_ALPHA_V2_DARK else PRESS_BG_ALPHA_V2_LIGHT
+            } else if (isDarkScheme) {
+                PRESS_BG_ALPHA_DARK_V2_LEGACY
+            } else {
+                PRESS_BG_ALPHA_LIGHT_V2_LEGACY
+            },
+        ) * pressAlphaFactor
         if (isDarkScheme) {
             Color.White.copy(alpha = pressAlpha)
         } else {
@@ -566,11 +733,25 @@ internal fun RippleIconButton(
     } else {
         Color.Transparent
     }
-    val pressBg by animateColorAsState(pressBgTarget, label = "rippleIconPressBg")
 
     // 皮肤结构层（v2/回退两分支共用）：反馈 → 尺寸 → 按压底色。
     // v2 按压底色：drawBehind 属于 rippleFeedback 的 content，点阵在其后的
     // drawWithContent 里叠加 → 底色在图标之下、点阵之下。回退态颜色恒透明（不画）。
+    // v4.16.6（S1）：禁用按压观察者只挂在自绘分支（M3 IconButton 回退态保持旧形态、
+    // 禁用零反馈）——clickable(enabled=false) 不消费事件，Initial pass 仍能观察到按下/抬起。
+    val disabledPressObserver = if (!enabled && pressFeedbackOn) {
+        Modifier.pointerInput(Unit) {
+            awaitEachGesture {
+                awaitFirstDown(pass = PointerEventPass.Initial)
+                disabledPressed = true
+                // 抬起或手势被取消（移出边界）都复位：取消时 waitForUpOrCancellation 返回 null
+                waitForUpOrCancellation(pass = PointerEventPass.Initial)
+                disabledPressed = false
+            }
+        }
+    } else {
+        Modifier
+    }
     val feedbackModifier = modifier
         .rippleFeedback(
             interactionSource = interactionSource,
@@ -585,6 +766,8 @@ internal fun RippleIconButton(
             // 一律不带点阵；皮肤结构（触控区/圆角/按压底色/scale）原样保留
             showDots = false,
             pressScale = if (skinV2) ICON_PRESS_SCALE_V2 else DEFAULT_PRESS_SCALE,
+            // v4.16.1：v2 皮肤生效时按压缩放走"快进→定格→慢出"时序（回退态保持旧 spring 手感）
+            quickPressTimeline = quickPress,
             enabled = enabled && dotFeedbackEnabled,
             // 不传 gradientColors：顶栏图标不加渐变
             // 点阵用 primary：透明底（浅色主题下=页面近白底色）上白点会消失，必须跟强调色走
@@ -592,8 +775,9 @@ internal fun RippleIconButton(
         )
         .size(if (skinV2) ICON_TOUCH_SIZE_DP_V2 else 48.dp)
         .drawBehind {
+            // 按压底色按时序进度插值：0=透明（静置）→ 1=满强度（快进/定格）→ 0（慢出）
             drawRoundRect(
-                color = pressBg,
+                color = lerp(Color.Transparent, pressBgActive, pressProgress.value),
                 cornerRadius = CornerRadius(ICON_CORNER_DP_V2.toPx()),
             )
         }
@@ -608,13 +792,15 @@ internal fun RippleIconButton(
         // mergeDescendants=true 的合并边界（content 图标的 contentDescription 照常并入）、
         // 不传 role（与 M3 内部 Surface→clickable 一致）、触控区 = Box 的 44dp 规格。
         Box(
-            modifier = feedbackModifier.clickable(
-                interactionSource = interactionSource,
-                // 按压反馈由上面的底色 + scale 承担，不再叠加 M3 圆形 ripple（双层反馈打架）
-                indication = null,
-                onClick = onClick,
-                enabled = enabled,
-            ),
+            modifier = feedbackModifier
+                .clickable(
+                    interactionSource = interactionSource,
+                    // 按压反馈由上面的底色 + scale 承担，不再叠加 M3 圆形 ripple（双层反馈打架）
+                    indication = null,
+                    onClick = onClick,
+                    enabled = enabled,
+                )
+                .then(disabledPressObserver),
             contentAlignment = Alignment.Center,
         ) {
             content()

@@ -19,6 +19,7 @@ import kotlinx.coroutines.withContext
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
 import java.io.File
 import java.io.FileOutputStream
@@ -209,6 +210,43 @@ object MediaCache {
      * 到顶后按最后修改时间删最旧的（列表最上面的是最近生成/看过的，先删老的）。
      */
     private const val MAX_THUMB_DISK_BYTES = 128L * 1024 * 1024
+
+    // ============================================================
+    // 图库持久化缓存（v4.16.1，filesDir 双目录）
+    // ============================================================
+
+    /**
+     * 图片统一档的磁盘缓存目录（`filesDir/gallery_store`）。
+     *
+     * **为什么不用 cacheDir**：cacheDir 在系统存储紧张时会被 Android 自动清空，
+     * 这正是"重开 App 进图库、看过的图又从糊变清"的根因之一；filesDir 属于应用
+     * 私有数据目录，系统不做自动清理，重开 App 直接命中、立刻清晰。
+     * 与旧 cacheDir 两处目录（gallery_cache / gallery_thumb）完全分开：
+     * 旧目录保留不动、不迁移、不删除（readCachedBytes / listCachedKeys 依赖旧路径推断），
+     * 新逻辑只读写新目录。
+     */
+    private const val PERSIST_STORE_DIR = "gallery_store"
+
+    /** 视频首帧缩略图的磁盘缓存目录（`filesDir/gallery_thumbs`；视频没有"统一档"概念，只有首帧） */
+    private const val PERSIST_THUMB_DIR = "gallery_thumbs"
+
+    /**
+     * 图库统一档的解码长边上限（720）。
+     *
+     * 服务端 /view 不支持尺寸参数（实测六种参数全被忽略），只能客户端缩放：
+     * 统一拉 `preview=jpeg;75`（同分辨率压缩，传输体积约为 PNG 的 1/7），
+     * 客户端采样到长边 720、JPEG80 落盘。**只存一份 720**，不按列数存多档 ——
+     * 2 列格子直接用、3/4 列显示时再降采样（见 galleryDisplayScaleForColumns），
+     * 省磁盘且 4 列时底层数据仍优于 360 档。
+     */
+    const val GALLERY_DECODE_DIMENSION = 720
+
+    /**
+     * 图库持久化缓存的总量上限（512 MB，gallery_store 与 gallery_thumbs 合计）。
+     *
+     * 到顶后按最后修改时间删最旧的（与 trimThumbDisk 同思路，作用在新目录）。
+     */
+    private const val MAX_PERSIST_DISK_BYTES = 512L * 1024 * 1024
 
     /**
      * Set the caching mode.
@@ -743,6 +781,14 @@ object MediaCache {
         subfolder: String,
         type: String
     ): Bitmap? {
+        // v4.16.1 分流：持久化开关开启 → 走 filesDir 统一档链路（720 档 + 落盘 + 重开立即清晰）；
+        // 关闭 → 走下方原逻辑（cacheDir + 512 档），两套互不读写对方目录。
+        // 开关每次调用读一次（SharedPreferences 有内存缓存，读取极快）：设置变化即时生效。
+        val appContext = applicationContext
+        if (appContext != null && AppSettings.isGalleryPersistentCacheEnabled(appContext)) {
+            return fetchThumbnailPersistent(key, isVideo, subfolder, type, appContext)
+        }
+
         val keyStr = key.keyString
         thumbnailCache.get(keyStr)?.let { return it }
 
@@ -802,6 +848,120 @@ object MediaCache {
             DebugLogger.i(TAG, "fetchThumbnail: $keyStr marked missing (404)")
         }
         return bitmap
+    }
+
+    /**
+     * 图库列表缩略图的**持久化链路**（v4.16.1，[AppSettings.isGalleryPersistentCacheEnabled]
+     * 开启时接管 [fetchThumbnail]）。
+     *
+     * 与旧链路（cacheDir + 512 档）的三点区别：
+     * 1. 磁盘在 `filesDir/gallery_store`（图片统一档）与 `filesDir/gallery_thumbs`（视频首帧）
+     *    —— 系统不做自动清理，重开 App 直接命中、立刻清晰；
+     * 2. 图片统一档长边 720（[GALLERY_DECODE_DIMENSION]）：服务端 `/view` 不支持尺寸参数，
+     *    客户端拉 `preview=jpeg;75` 后采样落盘；**只存一份**，显示时按列数降采样
+     *    （2 列直接用，3/4 列走 galleryDisplayScaleForColumns）；
+     * 3. **无条件落盘**：不再受「内存优先」开关控制（该开关保留原语义只管旧路径，
+     *    见本类顶部 isMemoryFirstMode 的说明）。
+     */
+    private suspend fun fetchThumbnailPersistent(
+        key: MediaCacheKey,
+        isVideo: Boolean,
+        subfolder: String,
+        type: String,
+        context: Context
+    ): Bitmap? {
+        val keyStr = key.keyString
+        thumbnailCache.get(keyStr)?.let { return it }
+
+        // 已确认服务器上没有的条目不再打网络（重试也是 404，与旧链路同一份 missingKeys）
+        if (isFileMissing(key)) {
+            DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr known missing -> skip")
+            return null
+        }
+
+        // 磁盘层（filesDir 新目录）：图片读统一档，视频读首帧
+        val diskFile = if (isVideo) persistThumbFile(context, key) else persistStoreFile(context, key)
+        val cached = withContext(Dispatchers.IO) { readPersistBitmap(context, diskFile) }
+        if (cached != null) {
+            thumbnailCache.put(keyStr, cached)
+            DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr disk -> HIT")
+            return cached
+        }
+
+        // 离线（强制 / 自动）：持久化目录就是离线缩略图的数据源，不联网
+        val client = comfyUIClient
+        if (client == null || ConnectionManager.isOffline) {
+            DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr -> offline, MISS")
+            return null
+        }
+
+        if (isVideo) {
+            // 视频没有"服务端压缩预览"概念：复用 fetchBitmap 的视频链路（拉字节 → 提取首帧），
+            // 首帧等比缩到统一档长边后落盘 gallery_thumbs
+            val frame = fetchBitmap(key, true, subfolder, type) ?: return null
+            val scaled = withContext(Dispatchers.IO) {
+                scaleBitmapToLongest(frame, GALLERY_DECODE_DIMENSION)
+            }
+            withContext(Dispatchers.IO) {
+                persistBitmapToDisk(persistThumbFile(context, key), scaled)
+                trimPersistDisk(context)
+            }
+            thumbnailCache.put(keyStr, scaled)
+            return scaled
+        }
+
+        DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr -> fetching compressed preview")
+        val bitmap = withContext(Dispatchers.IO) {
+            // 并发门与旧链路共用（同为"服务端现场压缩"段，见 thumbnailFetchPermits 的注释）
+            thumbnailFetchPermits.withPermit {
+                suspendCancellableCoroutine { cont ->
+                    client.fetchImage(
+                        filename = key.filename,
+                        subfolder = subfolder,
+                        type = type,
+                        maxDimension = GALLERY_DECODE_DIMENSION,
+                        preview = ComfyUIClient.LIST_THUMBNAIL_PREVIEW,
+                        useThumbnailClient = true
+                    ) { result, failureType ->
+                        if (result == null && failureType == ConnectionFailure.FILE_MISSING) {
+                            markFileMissing(key)
+                        }
+                        if (cont.isActive) cont.resume(result)
+                    }
+                }
+            }
+        }
+        if (bitmap != null) {
+            thumbnailCache.put(keyStr, bitmap)
+            withContext(Dispatchers.IO) {
+                persistBitmapToDisk(persistStoreFile(context, key), bitmap)
+                trimPersistDisk(context)
+            }
+        } else if (isFileMissing(key)) {
+            DebugLogger.i(TAG, "fetchThumbnail(persist): $keyStr marked missing (404)")
+        }
+        return bitmap
+    }
+
+    /** 等比缩放到长边不超过 [maxLongest]（已在上限内时原样返回，不复制） */
+    private fun scaleBitmapToLongest(bitmap: Bitmap, maxLongest: Int): Bitmap {
+        val longest = maxOf(bitmap.width, bitmap.height)
+        if (longest <= maxLongest || longest == 0) return bitmap
+        val scale = maxLongest.toFloat() / longest
+        val width = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val height = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, width, height, true)
+    }
+
+    /** 统一档落盘：JPEG 质量 80（与旧缩略图落盘同质量档；失败不影响本次显示，下次重拉） */
+    private fun persistBitmapToDisk(file: File, bitmap: Bitmap) {
+        try {
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+            }
+        } catch (_: Exception) {
+            // 忽略写失败
+        }
     }
 
     /**
@@ -977,6 +1137,104 @@ object MediaCache {
             getThumbDir(context).deleteRecursively()
         } catch (_: Exception) {
             // 忽略
+        }
+    }
+
+    // ============================================================
+    // 图库持久化缓存（filesDir 双目录，v4.16.1）
+    // ============================================================
+
+    /**
+     * 淘汰候选的纯函数（便于单测）：文件按最后修改时间从旧到新排序，
+     * 总量超过 [limitBytes] 时依次选最旧的删，直到回到上限以内。
+     *
+     * @param files (文件名, 大小字节) 候选列表（调用方先按 lastModified 升序排好）
+     * @param totalBytes 当前总占用
+     * @return 应删除的文件名（保持传入顺序 = 从最旧开始）
+     */
+    internal fun pickEvictionCandidates(
+        files: List<Pair<String, Long>>,
+        totalBytes: Long,
+        limitBytes: Long
+    ): List<String> {
+        if (totalBytes <= limitBytes) return emptyList()
+        val picked = mutableListOf<String>()
+        var remaining = totalBytes
+        for ((name, size) in files) {
+            if (remaining <= limitBytes) break
+            picked.add(name)
+            remaining -= size
+        }
+        return picked
+    }
+
+    /** 图片统一档（720 长边 JPEG）的持久化目录与文件 */
+    private fun persistStoreFile(context: Context, key: MediaCacheKey): File =
+        File(File(context.filesDir, PERSIST_STORE_DIR).apply { mkdirs() }, "${key.keyString}.jpg")
+
+    /** 视频首帧缩略图的持久化目录与文件 */
+    private fun persistThumbFile(context: Context, key: MediaCacheKey): File =
+        File(File(context.filesDir, PERSIST_THUMB_DIR).apply { mkdirs() }, "${key.keyString}.jpg")
+
+    /**
+     * 读持久化目录里的统一档位图，**带降采样防御**。
+     *
+     * 落盘前已采样到长边 720，正常文件解码后约 2 MB；但防御目录里出现异常大文件
+     * （例如旧版本数据或手改），仍按 bounds 检查 + 采样解码，与 readThumbFromDisk 同模式。
+     */
+    private fun readPersistBitmap(context: Context, file: File): Bitmap? = try {
+        if (file.isFile && file.length() > 0) {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            val longest = maxOf(bounds.outWidth, bounds.outHeight)
+            if (longest <= 0) {
+                null
+            } else {
+                val options = BitmapFactory.Options().apply {
+                    inSampleSize = ComfyUIClient.computeSampleSize(longest, GALLERY_DECODE_DIMENSION)
+                }
+                BitmapFactory.decodeFile(file.absolutePath, options)
+            }
+        } else null
+    } catch (_: Exception) {
+        null
+    } catch (_: OutOfMemoryError) {
+        null
+    }
+
+    /**
+     * 持久化目录（双目录合计）到顶后删最旧的，见 [MAX_PERSIST_DISK_BYTES]。
+     */
+    private fun trimPersistDisk(context: Context) {
+        try {
+            val storeDir = File(context.filesDir, PERSIST_STORE_DIR)
+            val thumbDir = File(context.filesDir, PERSIST_THUMB_DIR)
+            val allFiles = (storeDir.listFiles()?.map { it } ?: emptyList()) +
+                (thumbDir.listFiles()?.map { it } ?: emptyList())
+            if (allFiles.isEmpty()) return
+            val total = allFiles.sumOf { it.length() }
+            if (total <= MAX_PERSIST_DISK_BYTES) return
+            // 按 lastModified 升序（最旧在前）交给纯函数挑选，再逐个删
+            val ordered = allFiles.sortedBy { it.lastModified() }
+                .map { it.name to it.length() }
+            val toDelete = pickEvictionCandidates(ordered, total, MAX_PERSIST_DISK_BYTES)
+            val deleted = allFiles.filter { it.name in toDelete.toSet() }.count { it.delete() }
+            DebugLogger.d(TAG, "Persistent gallery cache trimmed: deleted $deleted files")
+        } catch (_: Exception) {
+            // 清理失败不影响使用
+        }
+    }
+
+    /**
+     * 删掉某个键在两个持久化目录里的全部档位文件（图片统一档 + 视频首帧）。
+     * 删图连带清缓存（规格 B3）的磁盘部分；**只删新目录，旧 cacheDir 保持现状**。
+     */
+    private fun deletePersistFiles(context: Context, key: MediaCacheKey) {
+        try {
+            persistStoreFile(context, key).delete()
+            persistThumbFile(context, key).delete()
+        } catch (_: Exception) {
+            // 忽略删除失败
         }
     }
 
@@ -1550,6 +1808,11 @@ object MediaCache {
         videoUriCache.remove(keyStr)
         videoDimensionsCache.remove(keyStr)
 
+        // v4.16.1 删图连带清（规格 B3）：缩略图内存缓存此前永不清（删图后列表缩略图仍挂着），
+        // 与 filesDir 新目录里的统一档/首帧文件一起清掉。**旧 cacheDir 维持原状**（见下方注释）
+        thumbnailCache.remove(keyStr)
+        applicationContext?.let { context -> deletePersistFiles(context, key) }
+
         // In disk-first mode, also remove from disk
         if (!isMemoryFirstMode) {
             applicationContext?.let { context ->
@@ -1574,6 +1837,19 @@ object MediaCache {
         prefetchQueue.clear()
         inProgressKeys.clear()
         completionCallbacks.clear()
+
+        // v4.16.1：缩略图内存缓存一并清（磁盘清了内存还挂着旧图，用户会以为"清缓存无效"）。
+        // filesDir 新目录也一起清 —— 它与 gallery_cache 同属"图库媒体缓存"，用户在设置页
+        // 点"清缓存"的预期就是全部重拉；旧 gallery_thumb 维持现状不清（历史行为，不动）
+        thumbnailCache.evictAll()
+        applicationContext?.let { context ->
+            try {
+                File(context.filesDir, PERSIST_STORE_DIR).deleteRecursively()
+                File(context.filesDir, PERSIST_THUMB_DIR).deleteRecursively()
+            } catch (_: Exception) {
+                // Ignore deletion failures
+            }
+        }
 
         // Also clear disk cache
         applicationContext?.let { context ->
@@ -1670,20 +1946,24 @@ object MediaCache {
         @Suppress("DEPRECATION")
         val uniqueId = "${keyStr.hashCode()}_${Thread.currentThread().id}"
         val tempFile = File(context.cacheDir, "temp_meta_$uniqueId.mp4")
+        var retriever: MediaMetadataRetriever? = null
         return try {
             tempFile.writeBytes(videoBytes)
-            val retriever = MediaMetadataRetriever()
-            retriever.setDataSource(tempFile.absolutePath)
-            val thumbnail = retriever.getFrameAtTime(0)
-            val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+            val r = MediaMetadataRetriever()
+            retriever = r
+            r.setDataSource(tempFile.absolutePath)
+            val thumbnail = r.getFrameAtTime(0)
+            val width = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
                 ?: thumbnail?.width ?: 0
-            val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+            val height = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
                 ?: thumbnail?.height ?: 0
-            retriever.release()
             Pair(VideoDimensions(width, height), thumbnail)
         } catch (_: Exception) {
             Pair(null, null)
         } finally {
+            // native 资源必须在 finally 释放：setDataSource / getFrameAtTime / extractMetadata
+            // 抛异常（下载字节被截断或损坏）时也要走这里，否则 retriever 泄漏
+            runCatching { retriever?.release() }
             tempFile.delete()
         }
     }

@@ -16,6 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.VideoUtils
 import java.io.File
@@ -297,6 +298,11 @@ object MediaStateHolder {
             DebugLogger.d(TAG, "putBitmap: stored in memory, marked dirty (dirty count: ${dirtyBitmaps.size})")
         } else {
             // Disk-first: write to disk immediately, don't store in memory
+            // 「禁用媒体缓存」打开：写前跳过（不落盘、不写临时文件），内存与调用方持有的原图不受影响
+            if (context != null && AppSettings.isMediaCacheDisabled(context)) {
+                DebugLogger.d(TAG, "putBitmap: media cache disabled, disk write SKIPPED (key: ${key.baseFilename})")
+                return
+            }
             context?.let { ctx ->
                 try {
                     // 落盘前缩到预览尺寸：原尺寸存下来会让每次冷启动都多解码几十 MB（见 previewMaxDimension）
@@ -395,6 +401,11 @@ object MediaStateHolder {
             context?.let { schedulePersist(it) }
         } else {
             // Disk-first: write to disk immediately, don't store in memory
+            // 「禁用媒体缓存」打开：写前跳过（与 putBitmap 的磁盘优先路径同一约定）
+            if (context != null && AppSettings.isMediaCacheDisabled(context)) {
+                DebugLogger.d(TAG, "putVideoBytes: media cache disabled, disk write SKIPPED (key: ${key.baseFilename})")
+                return
+            }
             context?.let { ctx ->
                 try {
                     File(ctx.filesDir, key.filename(serverId)).writeBytes(bytes)
@@ -479,6 +490,11 @@ object MediaStateHolder {
      * onStop 的兜底调用通常已无脏数据（几乎不耗时），"进程被杀前已落盘"的语义保持不变。
      */
     private fun schedulePersist(context: Context) {
+        // 「禁用媒体缓存」打开：不启动防抖落盘（写前检查，脏数据留在内存，用户当场仍能看到）
+        if (AppSettings.isMediaCacheDisabled(context)) {
+            DebugLogger.d(TAG, "schedulePersist: media cache disabled, persist SKIPPED (dirty: ${dirtyBitmaps.size} bitmaps, ${dirtyVideos.size} videos)")
+            return
+        }
         if (persistJob?.isActive == true) return
         persistJob = persistScope.launch {
             delay(PERSIST_DEBOUNCE_MS)

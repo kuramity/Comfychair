@@ -10,8 +10,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.screens.MediaViewerScreen
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme
 import sh.hnet.comfychair.viewmodel.MediaViewerItem
@@ -31,6 +32,12 @@ import sh.hnet.comfychair.viewmodel.ViewerMode
 object BitmapCache {
     private var cachedBitmap: Bitmap? = null
 
+    // B-23b 第三批（E1~E5）并行字段：图库整屏截图 + 目标格子矩形（window px）。
+    // 与 cachedBitmap 语义隔离：单图模式只读写字段一，下拉透出只读写字段二，
+    // 互不清理对方的值（单图模式的取出即清不会误伤透出截图）
+    private var gallerySnapshotBitmap: Bitmap? = null
+    private var galleryCellRect: ViewerRect? = null
+
     fun put(bitmap: Bitmap) {
         cachedBitmap = bitmap
     }
@@ -41,6 +48,32 @@ object BitmapCache {
 
     fun clear() {
         cachedBitmap = null
+    }
+
+    /**
+     * 存入图库截图与目标格子矩形（launch 查看器之前同步调用，见 GalleryScreen）。
+     * bitmap 传 null = 明确禁用透出（开关关闭 / 截图失败），查看器回退纯黑。
+     */
+    fun putGallerySnapshot(bitmap: Bitmap?, cellRect: ViewerRect?) {
+        gallerySnapshotBitmap = bitmap
+        galleryCellRect = cellRect
+    }
+
+    fun getGallerySnapshot(): Bitmap? {
+        return gallerySnapshotBitmap
+    }
+
+    fun getGalleryCellRect(): ViewerRect? {
+        return galleryCellRect
+    }
+
+    /**
+     * 释放透出截图。查看器关闭后由 GalleryScreen 的 launcher 回调调用；
+     * 即便漏调也不会累积——下次 putGallerySnapshot 会整体覆盖。
+     */
+    fun clearGallerySnapshot() {
+        gallerySnapshotBitmap = null
+        galleryCellRect = null
     }
 }
 
@@ -54,6 +87,11 @@ class MediaViewerActivity : ComponentActivity() {
 
     private val viewModel: MediaViewerViewModel by viewModels()
     private lateinit var insetsController: WindowInsetsControllerCompat
+
+    // B-23b 第三批（E1~E5）：图库整屏截图与目标格子矩形（window px）。
+    // 仅 GALLERY 模式从 BitmapCache 取；SINGLE 模式保持 null，E1~E5 整体禁用
+    private var gallerySnapshot: Bitmap? = null
+    private var galleryCellRect: ViewerRect? = null
 
     companion object {
         // Intent extras
@@ -83,6 +121,12 @@ class MediaViewerActivity : ComponentActivity() {
         // 与 MediaViewerScreen 的 itemsKey / GalleryScreen 的 grid key 同格式）。
         // 不回传裸索引：删除后 items 会变，索引会错位
         const val EXTRA_CURRENT_ITEM_KEY = "current_item_key"
+
+        // B-23b 第三批（E4）：飞回动画已无缝落到格子上时置位，finish() 据此跳过
+        // Activity 层的缩小淡出过渡——飞回后再整体缩小淡出会破坏"图片已落在格子上"
+        // 的衔接。静态标志由 MediaViewerScreen 的 onFlyBackCompleted 置位、finish 时消费复位
+        @JvmStatic
+        internal var suppressNextExitTransition = false
 
         /**
          * Create intent for gallery mode (swipe navigation between items)
@@ -193,9 +237,14 @@ class MediaViewerActivity : ComponentActivity() {
             }
 
             ComfyChairTheme(forceDarkStatusBar = true) {
-                Surface(modifier = Modifier.fillMaxSize()) {
+                // B-23b 第三批：Surface 换成无背景 Box —— Surface 默认铺不透明的
+                // 主题近黑底，会把透出用的图库截图整层盖住；黑底职责已由
+                // MediaViewerScreen 根容器承担，这里保持透明让背景层能露出来
+                Box(modifier = Modifier.fillMaxSize()) {
                     MediaViewerScreen(
                         viewModel = viewModel,
+                        gallerySnapshot = gallerySnapshot,
+                        galleryCellRect = galleryCellRect,
                         onClose = {
                             // 结果（删除标记 + 当前位置键）统一在 finish() 里构造，
                             // 捏合关闭/下滑关闭/返回键/FAB 全部汇聚到这一个出口
@@ -222,9 +271,16 @@ class MediaViewerActivity : ComponentActivity() {
         setResult(Activity.RESULT_OK, resultIntent)
         super.finish()
 
-        // 关闭过渡（C2）：列表侧保持不动，查看器内容缩小淡出。
-        // 按官方要求紧跟 finish() 之后调用
-        overridePendingTransition(R.anim.gallery_stay, R.anim.viewer_fade_out_shrink)
+        if (suppressNextExitTransition) {
+            // B-23b 第三批（E4）：飞回动画已把图片无缝落到格子上（尺寸位置与缩略图
+            // 一致），Activity 层再整体缩小淡出会破坏衔接——直接切回图库
+            suppressNextExitTransition = false
+            overridePendingTransition(0, 0)
+        } else {
+            // 关闭过渡（C2）：列表侧保持不动，查看器内容缩小淡出。
+            // 按官方要求紧跟 finish() 之后调用
+            overridePendingTransition(R.anim.gallery_stay, R.anim.viewer_fade_out_shrink)
+        }
     }
 
     private fun initializeGalleryMode() {
@@ -232,6 +288,11 @@ class MediaViewerActivity : ComponentActivity() {
         val port = intent.getIntExtra(EXTRA_PORT, 8188)
         val itemsJson = intent.getStringExtra(EXTRA_GALLERY_ITEMS_JSON) ?: "[]"
         val initialIndex = intent.getIntExtra(EXTRA_INITIAL_INDEX, 0)
+
+        // B-23b 第三批（E1~E5）：取出图库截图与格子矩形。这里不清缓存——旋转重建时
+        // 还能取到同一份（clearGallerySnapshot 由 GalleryScreen 在查看器关闭后调用）
+        gallerySnapshot = BitmapCache.getGallerySnapshot()
+        galleryCellRect = BitmapCache.getGalleryCellRect()
 
         val items = MediaViewerItem.listFromJson(itemsJson)
 

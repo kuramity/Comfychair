@@ -65,7 +65,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -82,6 +81,7 @@ import sh.hnet.comfychair.model.ScreenType
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.GenerationTopBarActions
+import sh.hnet.comfychair.ui.components.GenerationTopBarTitle
 import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.previewSurfaceBackground
@@ -336,14 +336,10 @@ fun ImageToImageScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         // Top App Bar with image options
         TopAppBar(
-            // 标题不换行：顶栏多了一个 3D 入口后，窄屏（或英文长标题）会把
-            // "Image to Image" 挤成两行、把顶栏撑高。截断比换行干净。
+            // v4.16.6（Q6）：四屏标题统一走 GenerationTopBarTitle —— 单行硬约束 +
+            // 窄屏自动降字号（顶栏多了 3D 入口后，窄屏或英文长标题会把标题挤成两行）
             title = {
-                Text(
-                    text = stringResource(R.string.title_image_to_image),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                GenerationTopBarTitle(text = stringResource(R.string.title_image_to_image))
             },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {

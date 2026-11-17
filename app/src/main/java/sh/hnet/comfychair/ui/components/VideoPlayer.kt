@@ -187,13 +187,16 @@ fun VideoPlayer(
             // Only fall back to MediaMetadataRetriever if cache didn't have dimensions
             if (videoWidth == 0 || videoHeight == 0) {
                 withContext(Dispatchers.IO) {
+                    // retriever 在外层声明，finally 里统一释放：
+                    // setDataSource / getFrameAtTime / extractMetadata 抛异常时也要释放 native 资源
+                    var retriever: MediaMetadataRetriever? = null
                     try {
-                        val retriever = MediaMetadataRetriever()
-                        retriever.setDataSource(context, videoUri)
-                        val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                        val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: frame?.width ?: 0
-                        val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: frame?.height ?: 0
-                        retriever.release()
+                        val r = MediaMetadataRetriever()
+                        retriever = r
+                        r.setDataSource(context, videoUri)
+                        val frame = r.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        val width = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: frame?.width ?: 0
+                        val height = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: frame?.height ?: 0
                         if (thumbnail == null) {
                             thumbnail = frame
                         }
@@ -201,6 +204,8 @@ fun VideoPlayer(
                         videoHeight = height
                     } catch (e: Exception) {
                         // Keep any existing values
+                    } finally {
+                        runCatching { retriever?.release() }
                     }
                 }
             }
@@ -673,17 +678,21 @@ fun FullscreenVideoPlayer(
     LaunchedEffect(videoUri) {
         if (videoUri != null) {
             withContext(Dispatchers.IO) {
+                // retriever 在外层声明，finally 里统一释放（异常路径同样不泄漏 native 资源）
+                var retriever: MediaMetadataRetriever? = null
                 try {
-                    val retriever = MediaMetadataRetriever()
-                    retriever.setDataSource(context, videoUri)
-                    val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-                    val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-                    retriever.release()
+                    val r = MediaMetadataRetriever()
+                    retriever = r
+                    r.setDataSource(context, videoUri)
+                    val width = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                    val height = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
                     videoWidth = width
                     videoHeight = height
                 } catch (e: Exception) {
                     videoWidth = 0
                     videoHeight = 0
+                } finally {
+                    runCatching { retriever?.release() }
                 }
             }
         } else {

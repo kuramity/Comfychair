@@ -29,8 +29,8 @@ object GraphViewportCalculator {
     /** Maximum scale for fit operations (prevents over-zooming on small graphs) */
     const val MAX_FIT_SCALE = 1.5f
 
-    /** Standard zoom step (20% per zoom in/out) */
-    const val ZOOM_STEP = 1.2f
+    // 缩放步进不在这里定义：按钮缩放把 1.2 / (1/1.2) 直接作为 zoomFactor 传给 [zoomTowardPoint]，
+    // 捏合手势由手势比例决定，本类只负责「围绕某点缩放」的变换计算。
 
     /**
      * Zoom by a factor while keeping a point stationary (typically the canvas center).

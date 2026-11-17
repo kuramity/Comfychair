@@ -70,13 +70,31 @@ class FeatureWiringContractTest {
         // 需求 0 的唯一触发路径：连接成功与用户手点刷新都汇到 fetchServerData。
         // 删掉这一行 = 热更新形同不存在（用户新下载的模型永远看不到介绍），
         // 而既有的 ModelIntroFetchTest / ModelIntroSyncTest 全是纯逻辑测试，一条都不会红。
-        val body = bodyOf(source(connectionManagerPath), "private fun fetchServerData()")
+        val sourceText = source(connectionManagerPath)
+        val body = bodyOf(sourceText, "private fun fetchServerData()")
         assertTrue(
             "fetchServerData 里必须有一条 syncModelIntros() 语句（终审反证 B3：删掉它，全量测试仍全绿）",
             hasStatement(body, "syncModelIntros()")
         )
-        // 该调用必须排在模型列表装配之前：它要用「刚装好的本地表」做比对基准
-        assertTrue("fetchServerData 里仍要有模型列表装配", hasStatement(body, "val models = extractModelLists()"))
+        // 该调用必须排在模型列表装配之前：它要用「刚装好的本地表」做比对基准。
+        // Q3-1（v4.16.5）演进：parse + 就绪信号 + extract 收进了 applyObjectInfo
+        // 原子段（与磁盘预填链路共用一把锁，消除并发解析竞态），fetchServerData
+        // 里改为接线该原子段——列表装配本身仍必须存在（钉在原子段内部）。
+        // 旧断言字面（"val models = extractModelLists()" 在 fetchServerData 里）
+        // 随实现演进同步更新，钉子意图不变：列表装配不许被删
+        assertTrue(
+            "fetchServerData 里必须接线 applyObjectInfo 原子段（Q3-1）",
+            hasStatement(body, "val models = applyObjectInfo(objectInfo)")
+        )
+        val applyBody = bodyOf(sourceText, "private fun applyObjectInfo(")
+        assertTrue(
+            "applyObjectInfo 原子段内仍要做模型列表装配",
+            hasStatement(applyBody, "return extractModelLists()")
+        )
+        assertTrue(
+            "applyObjectInfo 原子段内仍要写注册表就绪信号",
+            hasStatement(applyBody, "_nodeTypeRegistryReady.value = nodeTypeRegistry.isPopulated()")
+        )
     }
 
     @Test

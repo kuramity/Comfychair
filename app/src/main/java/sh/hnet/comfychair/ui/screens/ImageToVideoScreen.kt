@@ -76,6 +76,7 @@ import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.GenerationTopBarActions
+import sh.hnet.comfychair.ui.components.GenerationTopBarTitle
 import sh.hnet.comfychair.ui.components.AudioSlotArea
 import sh.hnet.comfychair.ui.theme.Dimensions
 import sh.hnet.comfychair.storage.AppSettings
@@ -269,7 +270,9 @@ fun ImageToVideoScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         // Top App Bar with upload and save/share actions
         TopAppBar(
-            title = { Text(stringResource(R.string.title_image_to_video)) },
+            // v4.16.6（Q6）：360dp 屏本页 5 控件占 276dp、标题槽只剩 84dp，22sp 四个汉字
+            // 必换行（截图折成「图生视 / 频」）——统一走 GenerationTopBarTitle（单行 + 降字号）
+            title = { GenerationTopBarTitle(text = stringResource(R.string.title_image_to_video)) },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
                 // v4.9.0：四段式顶栏（加图 → 保存/分享 → 全局）

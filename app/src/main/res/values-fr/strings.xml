@@ -282,7 +282,6 @@
     <string name="label_sampler">Sampler</string>
     <string name="label_scheduler">Scheduler</string>
     <string name="label_seed">Seed</string>
-    <string name="label_random_seed">Seed aléatoire</string>
     <string name="label_randomize_seed">Aléatoire</string>
     <string name="label_denoise">Débruitage</string>
     <string name="label_batch_size">Taille du lot</string>
@@ -382,8 +381,6 @@
     <string name="media_viewer_delete">Supprimer</string>
     <string name="media_viewer_save">Enregistrer</string>
     <string name="media_viewer_share">Partager</string>
-    <string name="media_viewer_previous">Précédent</string>
-    <string name="media_viewer_next">Suivant</string>
 
     <!-- Workflow editor strings -->
     <string name="workflow_editor_zoom_in">Zoom avant</string>
@@ -656,7 +653,6 @@
     <string name="update_verifying">Verification du paquet...</string>
     <string name="update_ready_dialog_line">Telechargement termine. Pret a installer.</string>
     <string name="update_ready_title">Mise a jour prete</string>
-    <string name="update_ready_text">Version %1$s telechargee. Touchez pour installer.</string>
     <string name="update_failed_generic">Echec de la mise a jour.</string>
     <string name="update_action_now">Mettre a jour</string>
     <string name="update_action_later">Plus tard</string>
@@ -673,4 +669,7 @@
     <!-- v4.6.1 Module D : progression de l envoi -->
     <string name="button_uploading_progress">Envoi %1$d%%</string>
     <string name="button_uploading_progress_queue">Envoi %1$d%% · %2$d en file</string>
+    <!-- Q3-3 (v4.16.5) : menu de modèles quatre états — échec (réessayable) vs. réellement vide -->
+    <string name="model_list_load_failed">Impossible de charger la liste des modèles — toucher pour réessayer</string>
+    <string name="model_list_empty">Aucun modèle disponible sur le serveur</string>
 </resources>

@@ -282,7 +282,6 @@
     <string name="label_sampler">Sampler</string>
     <string name="label_scheduler">Scheduler</string>
     <string name="label_seed">Seed</string>
-    <string name="label_random_seed">Losowy seed</string>
     <string name="label_randomize_seed">Losuj</string>
     <string name="label_denoise">Odszumianie</string>
     <string name="label_batch_size">Rozmiar partii</string>
@@ -382,8 +381,6 @@
     <string name="media_viewer_delete">Usuń</string>
     <string name="media_viewer_save">Zapisz</string>
     <string name="media_viewer_share">Udostępnij</string>
-    <string name="media_viewer_previous">Poprzedni</string>
-    <string name="media_viewer_next">Następny</string>
 
     <!-- Workflow editor strings -->
     <string name="workflow_editor_zoom_in">Powiększ</string>
@@ -656,7 +653,6 @@
     <string name="update_verifying">Weryfikacja pakietu...</string>
     <string name="update_ready_dialog_line">Pobieranie zakonczone. Gotowe do instalacji.</string>
     <string name="update_ready_title">Aktualizacja gotowa</string>
-    <string name="update_ready_text">Wersja %1$s pobrana. Dotknij, aby zainstalowac.</string>
     <string name="update_failed_generic">Aktualizacja nie powiodla sie.</string>
     <string name="update_action_now">Aktualizuj teraz</string>
     <string name="update_action_later">Pozniej</string>
@@ -673,4 +669,7 @@
     <!-- v4.6.1 Modul D: postep wysylania -->
     <string name="button_uploading_progress">Wysylanie %1$d%%</string>
     <string name="button_uploading_progress_queue">Wysylanie %1$d%% · %2$d w kolejce</string>
+    <!-- Q3-3 (v4.16.5): lista modeli cztery stany — niepowodzenie (mozna ponowic) vs. faktycznie pusta -->
+    <string name="model_list_load_failed">Nie udało się wczytać listy modeli — dotknij, aby spróbować ponownie</string>
+    <string name="model_list_empty">Brak dostępnych modeli na serwerze</string>
 </resources>

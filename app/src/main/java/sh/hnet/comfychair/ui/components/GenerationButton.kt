@@ -1,5 +1,7 @@
 package sh.hnet.comfychair.ui.components
 
+import android.os.SystemClock
+import android.util.Log
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -33,11 +35,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -45,6 +51,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.activity.compose.BackHandler
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.connection.rememberIsOffline
 import sh.hnet.comfychair.storage.AppSettings
@@ -143,6 +150,12 @@ fun GenerationButton(
     val focusManager = LocalFocusManager.current
     var showMenu by remember { mutableStateOf(false) }
 
+    // S2Probe（v4.16.7 取证）：主按钮窗口坐标时间线。onGloballyPositioned 每次布局
+    // 摆放都会回写最新 bounds，onClick 里取到的就是"点击瞬间"按钮在窗口里的位置，
+    // 用来对照"DOWN 时按钮在哪 / UP 时按钮在哪"（imePadding 位移验证）。
+    // 仅 debug 包输出（BuildConfig.DEBUG 门控），release 无任何日志开销。
+    var latestBounds by remember { mutableStateOf<Rect?>(null) }
+
     // B2b（问题 3 兜底）：showMenu 在菜单因任何原因关闭后必须复位 false —— 状态一旦
     // 卡在 true，下一次点击只会把它翻成 false，表现为"下拉永久打不开"。正常路径
     // DropdownMenu 的 onDismissRequest 已覆盖 BACK 关闭与点击外部关闭（M3
@@ -170,6 +183,10 @@ fun GenerationButton(
     // 模块 2 安全阀（组合时读一次）：开 = 下拉中点色纯色 + 白边与主按钮同源 + 打开态提亮；
     // 关 = 改动前形态（0.30 混合渐变 + 0.18 白边恒定）
     val pressUnified = remember(context) { AppSettings.isPressFeedbackUnified(context) }
+    // S2 修复开关（v4.16.7 安全阀，组合时读一次）：开 = onGenerate 先行、clearFocus 推后
+    // 一帧；关 = 改动前顺序（clearFocus 立即执行）。用途见 onClick 内注释。
+    val imeClickFix = remember(context) { AppSettings.isGenerateClickImeFixEnabled(context) }
+    val view = LocalView.current
 
     // Button always uses primary color (no more red cancel state)
     val containerColor = MaterialTheme.colorScheme.primary
@@ -207,8 +224,28 @@ fun GenerationButton(
         val accent = MaterialTheme.colorScheme.primary
         SplitButtonDefaults.ElevatedLeadingButton(
             onClick = {
-                focusManager.clearFocus()
-                onGenerate()
+                // S2Probe（v4.16.7 取证）：onClick 是否到达。R4 判据是"焦点没被清除 =
+                // onClick 没执行"，这条日志一锤定音（必须在 clearFocus 之前打，
+                // clearFocus 是同步的，执行了必清焦点）。
+                if (BuildConfig.DEBUG) {
+                    Log.d(
+                        "S2Probe",
+                        "onClick enabled=$leadingEnabled offline=$isOffline " +
+                            "ts=${SystemClock.uptimeMillis()} bounds=$latestBounds"
+                    )
+                }
+                if (imeClickFix) {
+                    // S2 修复（v4.16.7 方向 A1）：先同步提交生成，clearFocus 推后一帧。
+                    // 键盘收起会触发 imePadding 逐帧重排、按钮在窗口里位移 246px（R4
+                    // 取证）；把"收键盘"从点击处理路径里挪出去，点击后按钮不再立即跳动，
+                    // 连点时第二击仍落在按钮停留过的位置上。
+                    onGenerate()
+                    view.post { focusManager.clearFocus() }
+                } else {
+                    // 回退开关关闭：改动前顺序（clearFocus 立即执行）
+                    focusManager.clearFocus()
+                    onGenerate()
+                }
             },
             enabled = leadingEnabled,
             // U3：M3 自带 elevation 阴影去掉 —— SplitButton 默认 LeadingButtonShape 是
@@ -216,17 +253,21 @@ fun GenerationButton(
             // 且与皮肤层可控投影叠加后发脏。主按钮投影统一由 rippleFeedback 的 2 层投影承担。
             elevation = null,
             colors = ButtonDefaults.elevatedButtonColors(
-                containerColor = when {
-                    leadingSkinActive -> Color.Transparent
-                    leadingEnabled -> containerColor
-                    else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
-                },
+                // v4.16.6（Q2）：原 `else -> onSurface@12%` 是死分支 —— material3 1.5.0-alpha11 的
+                // ButtonColors.containerColor(enabled) 在 disabled 时读 disabledContainerColor 槽位、
+                // 不读 containerColor，数值恰与 M3 token 默认一致所以视觉没露馅。现在把禁用色
+                // 显式写进 disabled 槽位（意图与行为对齐）；禁用文字色不传 disabledContentColor，
+                // 保持 M3 默认 onSurface@0.38（写成 onPrimary 会在灰底上看不清）。
+                containerColor = if (leadingSkinActive) Color.Transparent else containerColor,
+                disabledContainerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
                 contentColor = contentColor
             ),
             interactionSource = leadingInteraction,
             modifier = Modifier
                 .weight(1f)
                 .height(56.dp)
+                // S2Probe（v4.16.7 取证）：布局摆放回写按钮窗口坐标（见 latestBounds 注释）
+                .onGloballyPositioned { latestBounds = it.boundsInWindow() }
                 .rippleFeedback(
                     interactionSource = leadingInteraction,
                     // 56dp 高的胶囊按钮：圆角半径必须取**高度一半（28dp）**才是真胶囊。
@@ -299,11 +340,9 @@ fun GenerationButton(
                 elevation = null,
                 interactionSource = trailingInteraction,
                 colors = ButtonDefaults.elevatedButtonColors(
-                    containerColor = when {
-                        trailingSkinActive -> Color.Transparent
-                        trailingEnabled -> containerColor
-                        else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
-                    },
+                    // 同 leading（Q2）：禁用色显式写进 disabled 槽位，删掉不可达的 else 分支
+                    containerColor = if (trailingSkinActive) Color.Transparent else containerColor,
+                    disabledContainerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
                     contentColor = contentColor
                 ),
                 modifier = Modifier

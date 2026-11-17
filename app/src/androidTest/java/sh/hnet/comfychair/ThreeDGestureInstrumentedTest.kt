@@ -105,6 +105,27 @@ class ThreeDGestureInstrumentedTest {
 
     private var sceneView: io.github.sceneview.SceneView? = null
 
+    /**
+     * 等待探针出现以 [prefix] 开头的事件（方案 A，v4.16.7）：
+     * 3D 初始化的完成信号本来就存在（`framing:dist=...` 在取景计算完打点，
+     * `scale:`/`scroll:` 在手势识别回调里打点），probe 链见
+     * ThreeDViewerSheet.kt:469→526→543→551→580。这里轮询 [events] 直到命中，
+     * 替代"固定 sleep 2.6s"的盲等 —— 慢设备上 2.6s 可能不够（flaky 根源），
+     * 快设备上又白等。
+     *
+     * 超时**必须抛断言失败**（不许静默继续），附最后几条事件便于定位卡在哪一环。
+     */
+    private fun awaitProbeEvent(prefix: String, timeoutMs: Long = 10_000): String {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            val hit = synchronized(events) { events.firstOrNull { it.startsWith(prefix) } }
+            if (hit != null) return hit
+            SystemClock.sleep(100)
+        }
+        val last = synchronized(events) { events.takeLast(5) }
+        throw AssertionError("3D 初始化未在 ${timeoutMs}ms 内出现 '$prefix' 事件，最后事件：$last")
+    }
+
     /** 等到 SceneView 出现在 View 树里（首帧后才会有） */
     private fun awaitSceneView(timeoutMs: Long = 8000): io.github.sceneview.SceneView? {
         val deadline = SystemClock.uptimeMillis() + timeoutMs
@@ -166,7 +187,9 @@ class ThreeDGestureInstrumentedTest {
             )
         }
         composeRule.waitForIdle()
-        SystemClock.sleep(2600) // 等 Filament 首帧与 framing
+        // 等 Filament 首帧与 framing（v4.16.7 方案 A：信号等待替代固定 2.6s 盲等，
+        // 超时 10s 抛断言失败）
+        awaitProbeEvent("framing:")
         Log.w(tag, "probe before gestures: " + synchronized(events) { events.toList() })
         val view = awaitSceneView()
         assertTrue(
@@ -178,7 +201,9 @@ class ThreeDGestureInstrumentedTest {
         Log.w(tag, "pinch at ($cx,$cy)")
         pinchOut(cx, cy)
         composeRule.waitForIdle()
-        SystemClock.sleep(900)
+        // 手势注入是同步派发（view.onTouchEvent → GestureDetector 回调同步打点），
+        // 等 scale:* 事件到达即可断言，不再固定等 900ms
+        awaitProbeEvent("scale:")
 
         val snapshot = synchronized(events) { events.toList() }
         Log.w(tag, "probe events: $snapshot")
@@ -210,7 +235,8 @@ class ThreeDGestureInstrumentedTest {
             )
         }
         composeRule.waitForIdle()
-        SystemClock.sleep(2600)
+        // 等 Filament 首帧与 framing（同上：信号等待替代固定盲等）
+        awaitProbeEvent("framing:")
         Log.w(tag, "probe before gestures: " + synchronized(events) { events.toList() })
         val view = awaitSceneView()
         assertTrue(
@@ -235,7 +261,8 @@ class ThreeDGestureInstrumentedTest {
         }
         inject(single(cx - 100f, MotionEvent.ACTION_UP, 480))
         composeRule.waitForIdle()
-        SystemClock.sleep(900)
+        // 同 pinch：scroll:* 事件在同步派发中已打点，等它到达即可（不再固定等 900ms）
+        awaitProbeEvent("scroll:")
 
         val snapshot = synchronized(events) { events.toList() }
         Log.w(tag, "scroll probe: $snapshot")

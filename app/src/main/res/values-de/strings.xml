@@ -297,7 +297,6 @@
     <string name="label_sampler">Sampler</string>
     <string name="label_scheduler">Scheduler</string>
     <string name="label_seed">Seed</string>
-    <string name="label_random_seed">Zufälliger Seed</string>
     <string name="label_randomize_seed">Zufällig</string>
     <string name="label_denoise">Entrauschen</string>
     <string name="label_batch_size">Stapelgröße</string>
@@ -397,8 +396,6 @@
     <string name="media_viewer_delete">Löschen</string>
     <string name="media_viewer_save">Speichern</string>
     <string name="media_viewer_share">Teilen</string>
-    <string name="media_viewer_previous">Zurück</string>
-    <string name="media_viewer_next">Weiter</string>
 
     <!-- Workflow editor strings -->
     <string name="workflow_editor_zoom_in">Vergrößern</string>
@@ -654,7 +651,6 @@
     <string name="update_verifying">Paket wird ueberprueft...</string>
     <string name="update_ready_dialog_line">Download abgeschlossen. Bereit zur Installation.</string>
     <string name="update_ready_title">Update bereit</string>
-    <string name="update_ready_text">Version %1$s geladen. Zum Installieren tippen.</string>
     <string name="update_failed_generic">Update fehlgeschlagen.</string>
     <string name="update_action_now">Jetzt aktualisieren</string>
     <string name="update_action_later">Spaeter</string>
@@ -671,4 +667,7 @@
     <!-- v4.6.1 Modul D: Upload-Fortschritt -->
     <string name="button_uploading_progress">Hochladen %1$d%%</string>
     <string name="button_uploading_progress_queue">Hochladen %1$d%% · %2$d in Warteschlange</string>
+    <!-- Q3-3 (v4.16.5): Modell-Dropdown vier Zustände — fehlgeschlagen (wiederholbar) vs. wirklich leer -->
+    <string name="model_list_load_failed">Modellliste konnte nicht geladen werden – zum Wiederholen tippen</string>
+    <string name="model_list_empty">Keine Modelle auf dem Server verfügbar</string>
 </resources>

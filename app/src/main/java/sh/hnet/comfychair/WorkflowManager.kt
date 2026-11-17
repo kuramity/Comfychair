@@ -1277,29 +1277,16 @@ object WorkflowManager {
 
     /**
      * Clear all user-uploaded workflows
+     *
+     * **禁止调用（v4.16.4 起）**：本函数会删掉整个 `user_workflows` 目录并清空
+     * `UserWorkflowsPrefs` 的 metadata，丢失 metadata 后 seedPrebuiltWorkflows 会给
+     * 每个预置流重新分配随机 id，`WorkflowValuesPrefs` 里 `{serverId}_{旧id}` 的提示词
+     * 全部孤儿化 —— 这正是「点一次清空缓存、提示词全变内置词」的根因。
+     * 清缓存禁止使用；工作流删除只能走用户主动删除单个工作流的入口（[deleteUserWorkflow]）。
      */
     fun clearAllUserWorkflows(): Boolean {
-        try {
-            // Remove all user workflows from the list
-            workflows.removeAll { !it.isBuiltIn }
-
-            // Delete all files in user workflows directory
-            val dir = File(applicationContext.filesDir, USER_WORKFLOWS_DIR)
-            if (dir.exists()) {
-                dir.listFiles()?.forEach { file ->
-                    file.delete()
-                }
-            }
-
-            // Clear preferences
-            val prefs = applicationContext.getSharedPreferences(USER_WORKFLOWS_PREFS, Context.MODE_PRIVATE)
-            prefs.edit().remove(USER_WORKFLOWS_KEY).apply()
-
-            _workflowsVersion.value++
-            return true
-        } catch (e: Exception) {
-            return false
-        }
+        DebugLogger.e(TAG, "clearAllUserWorkflows is FORBIDDEN: it deletes user workflows and orphanizes saved prompts. Cache cleanup must not touch user data; delete workflows only via deleteUserWorkflow()")
+        return false
     }
 
     /**

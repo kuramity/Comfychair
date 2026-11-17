@@ -166,7 +166,7 @@ class ViewerDismissGestureLogicTest {
         // 单指一律交给既有方向锁定逻辑（水平让给 Pager、垂直走下滑脱离）
         assertFalse(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1f,
+                scaleAtGestureStart = 1f,
                 gestureScale = 0.5f,
                 pointerCount = 1
             )
@@ -174,11 +174,12 @@ class ViewerDismissGestureLogicTest {
     }
 
     @Test
-    fun `双指缩小过阈值触发退出`() {
-        // 未放大态双指捏合缩小到 0.92 以下：iOS 相册式的"捏合退出"
+    fun `起手未放大双指捏过阈值触发退出`() {
+        // 起手未放大（≤1.05）+ 累计缩小越过 0.92：iOS 相册式的"捏合退出"。
+        // v4.15.x 既有语义保持——起点锁定只拦"起手已放大"的手势
         assertTrue(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1f,
+                scaleAtGestureStart = 1f,
                 gestureScale = 0.9f,
                 pointerCount = 2
             )
@@ -190,7 +191,7 @@ class ViewerDismissGestureLogicTest {
         // 张开手指是放大意图，与退出无关
         assertFalse(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1f,
+                scaleAtGestureStart = 1f,
                 gestureScale = 1.1f,
                 pointerCount = 2
             )
@@ -198,12 +199,38 @@ class ViewerDismissGestureLogicTest {
     }
 
     @Test
-    fun `已放大态捏合缩小不退出`() {
-        // scale 超过 1.05 门槛时捏合只负责"缩回 1f"（既有 coerceIn 语义），不退出
+    fun `起手已放大捏合缩小不退出`() {
+        // R-B23a2 核心场景：按下瞬间已放大（> 1.05）→ 整段手势只做"缩回 1f"，
+        // 即使累计倍率已越过 0.92 退出阈值也绝不触发关闭（起手 1.1 模拟双击放大态）
         assertFalse(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1.1f,
+                scaleAtGestureStart = 1.1f,
                 gestureScale = 0.5f,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `起手已放大累积极小也不退出`() {
+        // 起手 2x（双击放大后的典型值）+ 手势累计只缩了一点点：放大态捏合从源头被锁死
+        assertFalse(
+            ViewerDismissGesture.shouldDismissByPinch(
+                scaleAtGestureStart = 2f,
+                gestureScale = 0.99f,
+                pointerCount = 2
+            )
+        )
+    }
+
+    @Test
+    fun `起手已放大一口气捏过阈值仍不退出`() {
+        // R-B23a2 回归场景：双击放大到 2x 后一口气捏到 0.45——缩回 1f 之后多余的
+        // zoom 帧继续累计越过了 0.92，但起点锁定要求整段手势不触发关闭，只停回 Fit
+        assertFalse(
+            ViewerDismissGesture.shouldDismissByPinch(
+                scaleAtGestureStart = 2f,
+                gestureScale = 0.45f,
                 pointerCount = 2
             )
         )
@@ -214,7 +241,7 @@ class ViewerDismissGestureLogicTest {
         // gestureScale == PINCH_DISMISS_SCALE 的边界：判定条件是"小于等于"
         assertTrue(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1f,
+                scaleAtGestureStart = 1f,
                 gestureScale = ViewerDismissGesture.PINCH_DISMISS_SCALE,
                 pointerCount = 2
             )
@@ -226,7 +253,7 @@ class ViewerDismissGestureLogicTest {
         // 缩小量没到 8%：不做退出，等手指继续捏
         assertFalse(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1f,
+                scaleAtGestureStart = 1f,
                 gestureScale = 0.93f,
                 pointerCount = 2
             )
@@ -238,7 +265,7 @@ class ViewerDismissGestureLogicTest {
         // pointerCount >= 2 都算捏合手势
         assertTrue(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1f,
+                scaleAtGestureStart = 1f,
                 gestureScale = 0.8f,
                 pointerCount = 3
             )
@@ -246,11 +273,12 @@ class ViewerDismissGestureLogicTest {
     }
 
     @Test
-    fun `恰好等于放大门槛仍视为未放大`() {
-        // currentScale == PINCH_ZOOMED_THRESHOLD 的边界：判定条件是"大于"，相等不算已放大
+    fun `起手恰好等于放大门槛仍视为未放大`() {
+        // scaleAtGestureStart == PINCH_ZOOMED_THRESHOLD 的边界：判定条件是"大于"，
+        // 起手恰好 1.05 不算已放大，捏合关闭语义照常生效
         assertTrue(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = ViewerDismissGesture.PINCH_ZOOMED_THRESHOLD,
+                scaleAtGestureStart = ViewerDismissGesture.PINCH_ZOOMED_THRESHOLD,
                 gestureScale = 0.5f,
                 pointerCount = 2
             )
@@ -262,10 +290,601 @@ class ViewerDismissGestureLogicTest {
         // pointerCount < 2（含 0）一律 false，兜住异常输入
         assertFalse(
             ViewerDismissGesture.shouldDismissByPinch(
-                currentScale = 1f,
+                scaleAtGestureStart = 1f,
                 gestureScale = 0.5f,
                 pointerCount = 0
             )
         )
+    }
+
+    // ---------- 5. 并排预览三级手势（D1~D5） ----------
+
+    /** 视口宽 1000px，便于换算露边边界 */
+    private val viewport = 1000f
+
+    @Test
+    fun `并排进度与露边比例的映射`() {
+        // 全屏 / 并排标准档 / 临时缩小档 三个关键点
+        assertEquals(0f, ViewerSideBySide.edgeFraction(0f), 0.0001f)
+        assertEquals(0.15f, ViewerSideBySide.edgeFraction(1f), 0.0001f)
+        assertEquals(0.225f, ViewerSideBySide.edgeFraction(ViewerSideBySide.MAX_PROGRESS), 0.0001f)
+        // 中间页宽度与露边互补：70% / 55%
+        assertEquals(ViewerSideBySide.PAGE_FRACTION, ViewerSideBySide.pageFraction(1f), 0.0001f)
+        assertEquals(0.55f, ViewerSideBySide.pageFraction(1.5f), 0.0001f)
+        assertEquals(1f, ViewerSideBySide.pageFraction(0f), 0.0001f)
+    }
+
+    @Test
+    fun `并排进度越界被钳制`() {
+        // 负进度（向上方向异常值）与超上限都 clamp 在 [0, 1.5]
+        assertEquals(0f, ViewerSideBySide.edgeFraction(-0.5f), 0.0001f)
+        assertEquals(
+            ViewerSideBySide.edgeFraction(ViewerSideBySide.MAX_PROGRESS),
+            ViewerSideBySide.edgeFraction(99f),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `未放大态合拢到7成恰好走满并排进度`() {
+        // 手感设计：合拢 30% = 并排档，跟手期间视觉缩放 ≈ 手指缩放
+        assertEquals(1f, ViewerSideBySide.progressFromGesture(0f, 0.7f), 0.0001f)
+        // 半程：合拢 15% → 进度 0.5（吸附分界）
+        assertEquals(0.5f, ViewerSideBySide.progressFromGesture(0f, 0.85f), 0.0001f)
+        // 没捏（scale=1）进度不动
+        assertEquals(0f, ViewerSideBySide.progressFromGesture(0f, 1f), 0.0001f)
+    }
+
+    @Test
+    fun `并排态继续合拢进入临时缩小档`() {
+        // 基线 1（并排）再合拢 15% → 进度 1.5（页宽 55%），与规格第 ③ 步对应
+        assertEquals(
+            ViewerSideBySide.MAX_PROGRESS,
+            ViewerSideBySide.progressFromGesture(1f, 0.85f),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `并排态张开手指回退到全屏`() {
+        // 张开 30% → 进度恰好归 0（回全屏，状态机第 ④ 步）
+        assertEquals(0f, ViewerSideBySide.progressFromGesture(1f, 1.3f), 0.0001f)
+        // 张开一半 → 进度 0.5（吸回并排）
+        assertEquals(0.5f, ViewerSideBySide.progressFromGesture(1f, 1.15f), 0.0001f)
+    }
+
+    @Test
+    fun `捏合进度换算两端钳制`() {
+        // 手势倍率超出累计上限时进度封顶 1.5 / 破底 0
+        assertEquals(
+            ViewerSideBySide.MAX_PROGRESS,
+            ViewerSideBySide.progressFromGesture(1f, ViewerSideBySide.GESTURE_SCALE_MIN),
+            0.0001f
+        )
+        assertEquals(0f, ViewerSideBySide.progressFromGesture(0f, 99f), 0.0001f)
+    }
+
+    @Test
+    fun `松手吸附过半进并排`() {
+        // 规格第 ② 步：捏过半（进度 ≥ 0.5）松手吸附并排
+        assertEquals(1f, ViewerSideBySide.settleProgress(0.5f), 0.0001f)
+        assertEquals(1f, ViewerSideBySide.settleProgress(0.51f), 0.0001f)
+        assertEquals(1f, ViewerSideBySide.settleProgress(ViewerSideBySide.MAX_PROGRESS), 0.0001f)
+    }
+
+    @Test
+    fun `松手吸附不过半回全屏`() {
+        assertEquals(0f, ViewerSideBySide.settleProgress(0f), 0.0001f)
+        assertEquals(0f, ViewerSideBySide.settleProgress(0.49f), 0.0001f)
+        assertEquals(0f, ViewerSideBySide.settleProgress(-1f), 0.0001f)
+    }
+
+    @Test
+    fun `并排态继续合拢松手必弹回并排不回图库`() {
+        // 规格强调：第 ③ 步临时缩小（进度 1.5）松手 → 吸附 1.0（并排），绝不能判定成回图库
+        assertEquals(1f, ViewerSideBySide.settleProgress(1.5f), 0.0001f)
+    }
+
+    @Test
+    fun `并排态点击命中分区`() {
+        // 并排态（进度 1）：露边各 15% → 左区 [0, 150)、右区 (850, 1000]
+        assertEquals(-1, ViewerSideBySide.tapZone(100f, viewport, 1f))
+        assertEquals(0, ViewerSideBySide.tapZone(500f, viewport, 1f))
+        assertEquals(1, ViewerSideBySide.tapZone(900f, viewport, 1f))
+        // 边界：恰在露边边界上算居中（严格小于才判露边）
+        assertEquals(0, ViewerSideBySide.tapZone(150f, viewport, 1f))
+        assertEquals(0, ViewerSideBySide.tapZone(850f, viewport, 1f))
+        assertEquals(-1, ViewerSideBySide.tapZone(149.9f, viewport, 1f))
+        assertEquals(1, ViewerSideBySide.tapZone(850.1f, viewport, 1f))
+    }
+
+    @Test
+    fun `全屏进度下点击一律判居中`() {
+        // 进度 0（全屏）无露边区，任何位置都是居中页
+        assertEquals(0, ViewerSideBySide.tapZone(10f, viewport, 0f))
+        assertEquals(0, ViewerSideBySide.tapZone(990f, viewport, 0f))
+    }
+
+    @Test
+    fun `视口宽度无效时点击兜底居中`() {
+        // 宽度未测得（0/负）时不判露边，避免误触发翻页
+        assertEquals(0, ViewerSideBySide.tapZone(10f, 0f, 1f))
+        assertEquals(0, ViewerSideBySide.tapZone(10f, -100f, 1f))
+    }
+
+    @Test
+    fun `临时缩小档点击命中分区随进度收窄`() {
+        // 进度 1.5：露边 22.5% → 左区 [0, 225)
+        assertEquals(-1, ViewerSideBySide.tapZone(200f, viewport, 1.5f))
+        assertEquals(0, ViewerSideBySide.tapZone(300f, viewport, 1.5f))
+    }
+
+    @Test
+    fun `异常手势倍率不污染并排进度`() {
+        // 0 / 负数 / NaN / 无穷：一律视为"没捏"，返回起点进度（NaN 进 graphicsLayer 会让整层消失）
+        assertEquals(1f, ViewerSideBySide.progressFromGesture(1f, 0f), 0.0001f)
+        assertEquals(1f, ViewerSideBySide.progressFromGesture(1f, -2f), 0.0001f)
+        assertEquals(0f, ViewerSideBySide.progressFromGesture(0f, Float.NaN), 0.0001f)
+        assertEquals(1f, ViewerSideBySide.progressFromGesture(1f, Float.POSITIVE_INFINITY), 0.0001f)
+    }
+
+    @Test
+    fun `起点进度异常按全屏兜底`() {
+        assertEquals(0f, ViewerSideBySide.progressFromGesture(Float.NaN, 1f), 0.0001f)
+        // 起点越界先钳进 [0, 1.5] 再换算
+        assertEquals(0f, ViewerSideBySide.progressFromGesture(-9f, 1f), 0.0001f)
+        assertEquals(
+            ViewerSideBySide.MAX_PROGRESS,
+            ViewerSideBySide.progressFromGesture(9f, 1f),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `异常进度不产生NaN露边`() {
+        assertEquals(0f, ViewerSideBySide.edgeFraction(Float.NaN), 0.0001f)
+        assertEquals(1f, ViewerSideBySide.pageFraction(Float.NaN), 0.0001f)
+        assertEquals(0f, ViewerSideBySide.edgeFraction(Float.POSITIVE_INFINITY), 0.0001f)
+    }
+
+    // ---------- 点击坐标反算（设备实测数值，回归护栏） ----------
+    //
+    // 真机实测数据（模拟器 320x640，并排进度 1.0）：
+    //   在屏幕 x=300 点右露边 → ImageViewer 上报层内坐标 40，页距 +1
+    //   旧实现只加"页位移"、没还原 70% 缩放 → 换算出 264 → 判成"点了中间图"，
+    //   表现为"点露边页只放大不翻页"。下面用这组实测值钉住换算公式。
+
+    @Test
+    fun `层内坐标经缩放与页位移还原为视口坐标`() {
+        // 实测：屏幕 300 上的点击，在右邻页（页距 +1）里上报为 40
+        assertEquals(
+            300f,
+            ViewerSideBySide.viewportXFromImageLocal(
+                imageLocalX = 40f, viewportWidth = 320f, fraction = 0.7f, pageDistance = 1f
+            ),
+            0.01f
+        )
+        // 当前页（页距 0）：层内 40 → 视口 (40-160)*0.7+160 = 76
+        assertEquals(
+            76f,
+            ViewerSideBySide.viewportXFromImageLocal(
+                imageLocalX = 40f, viewportWidth = 320f, fraction = 0.7f, pageDistance = 0f
+            ),
+            0.01f
+        )
+        // 当前页中心点在任何档位下都落在视口中心（缩放以中心为锚点）
+        assertEquals(
+            160f,
+            ViewerSideBySide.viewportXFromImageLocal(
+                imageLocalX = 160f, viewportWidth = 320f, fraction = 0.55f, pageDistance = 0f
+            ),
+            0.01f
+        )
+    }
+
+    @Test
+    fun `露边点击换算后落进对应分区`() {
+        // 左露边：屏幕上点 x=20，当前页层内上报 (20-160)/0.7+160 = -40 → 换算回 20 → 左区
+        val localLeft = (20f - 160f) / 0.7f + 160f
+        val xLeft = ViewerSideBySide.viewportXFromImageLocal(localLeft, 320f, 0.7f, 0f)
+        assertEquals(20f, xLeft, 0.01f)
+        assertEquals(-1, ViewerSideBySide.tapZone(xLeft, 320f, 1f))
+
+        // 右露边：屏幕上点 x=300 由右邻页（页距 +1）接收，层内 40 → 换算回 300 → 右区
+        val xRight = ViewerSideBySide.viewportXFromImageLocal(40f, 320f, 0.7f, 1f)
+        assertEquals(300f, xRight, 0.01f)
+        assertEquals(1, ViewerSideBySide.tapZone(xRight, 320f, 1f))
+    }
+
+    @Test
+    fun `全屏档位下坐标换算为恒等变换`() {
+        // fraction=1（全屏）+ 页距 0：层内坐标 == 视口坐标
+        for (x in listOf(0f, 40f, 160f, 300f, 319f)) {
+            assertEquals(
+                x,
+                ViewerSideBySide.viewportXFromImageLocal(x, 320f, 1f, 0f),
+                0.01f
+            )
+        }
+    }
+
+    @Test
+    fun `坐标换算对异常输入兜底`() {
+        // 视口宽 0：返回 0（调用方随后会被 tapZone 判为居中）
+        assertEquals(
+            0f,
+            ViewerSideBySide.viewportXFromImageLocal(40f, 0f, 0.7f, 1f),
+            0.0001f
+        )
+        // fraction 为 NaN / 非正 → 按全屏 1 处理，绝不产出 NaN
+        assertEquals(
+            40f,
+            ViewerSideBySide.viewportXFromImageLocal(40f, 320f, Float.NaN, 0f),
+            0.01f
+        )
+        assertEquals(
+            40f,
+            ViewerSideBySide.viewportXFromImageLocal(40f, 320f, -1f, 0f),
+            0.01f
+        )
+        // 页距 NaN → 按 0 处理
+        assertEquals(
+            76f,
+            ViewerSideBySide.viewportXFromImageLocal(40f, 320f, 0.7f, Float.NaN),
+            0.01f
+        )
+    }
+
+    // ---------- 手势起点语义锁定（D3） ----------
+
+    @Test    fun `未放大态手势允许进并排`() {
+        assertTrue(ViewerSideBySide.canEngageFromStart(1f))
+        assertTrue(ViewerSideBySide.canEngageFromStart(1.04f))
+        // 恰好等于放大门槛仍算未放大（与 shouldDismissByPinch 的门槛口径一致）
+        assertTrue(ViewerSideBySide.canEngageFromStart(ViewerDismissGesture.PINCH_ZOOMED_THRESHOLD))
+    }
+
+    @Test
+    fun `已放大态手势整段只做zoom不进并排`() {
+        // 双击放大到 crop（实测 cropScale=2）后合拢：整个手势都不该切成并排
+        assertFalse(ViewerSideBySide.canEngageFromStart(1.06f))
+        assertFalse(ViewerSideBySide.canEngageFromStart(2f))
+        assertFalse(ViewerSideBySide.canEngageFromStart(5f))
+    }
+
+    @Test
+    fun `起点缩放异常按允许处理`() {
+        // NaN/无穷不会有合法的放大含义，按未放大处理（避免手势彻底失灵）
+        assertTrue(ViewerSideBySide.canEngageFromStart(Float.NaN))
+        assertTrue(ViewerSideBySide.canEngageFromStart(Float.POSITIVE_INFINITY))
+    }
+
+    // ---------- 双指意图锁定（Q1-2，v4.16.5） ----------
+    //
+    // 规格：一段手势第一帧产生非恒等 zoom 时定一次意图，整段手势不翻转——
+    // 全屏 + 张开 → 放大（恢复被 v4.16.2 吞掉的行为）；全屏 + 合拢 → 并排；
+    // 起点已在并排进度上 → 整段交并排换算（张开 = 回全屏的合法输入）。
+
+    @Test
+    fun `全屏起点张开判为放大`() {
+        // v4.16.2~v4.16.4 的回归根因：全屏态双指张开被当成并排进度上报
+        //（zoom>1 算出负进度钳回 0 且事件被 consume），双指放大从此不可达
+        assertEquals(
+            ViewerSideBySide.PinchIntent.ZOOM_IN,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 0f, zoom = 1.08f,
+                currentIntent = ViewerSideBySide.PinchIntent.UNDECIDED
+            )
+        )
+    }
+
+    @Test
+    fun `全屏起点合拢判为并排`() {
+        assertEquals(
+            ViewerSideBySide.PinchIntent.SIDE_BY_SIDE,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 0f, zoom = 0.92f,
+                currentIntent = ViewerSideBySide.PinchIntent.UNDECIDED
+            )
+        )
+    }
+
+    @Test
+    fun `并排态起点整段交并排换算`() {
+        // 并排态（progress=1）张开：是"从并排回全屏"的合法输入，不走放大路径——
+        // 沿用 progressFromGesture 现有语义（baseProgress=1 + zoom>1 → 进度下降）
+        assertEquals(
+            ViewerSideBySide.PinchIntent.SIDE_BY_SIDE,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 1f, zoom = 1.15f,
+                currentIntent = ViewerSideBySide.PinchIntent.UNDECIDED
+            )
+        )
+        // 并排态继续合拢：临时缩小档（progress → 1.5，松手弹回 1.0）
+        assertEquals(
+            ViewerSideBySide.PinchIntent.SIDE_BY_SIDE,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 1f, zoom = 0.9f,
+                currentIntent = ViewerSideBySide.PinchIntent.UNDECIDED
+            )
+        )
+        // 吸附动画中途按下（中间进度）同样交并排换算
+        assertEquals(
+            ViewerSideBySide.PinchIntent.SIDE_BY_SIDE,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 0.3f, zoom = 1.2f,
+                currentIntent = ViewerSideBySide.PinchIntent.UNDECIDED
+            )
+        )
+    }
+
+    @Test
+    fun `意图锁定后整段手势不翻转`() {
+        // 先张开锁定放大：后续帧的合拢 zoom 不允许把意图改成并排（逐帧切换会抖）
+        assertEquals(
+            ViewerSideBySide.PinchIntent.ZOOM_IN,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 0f, zoom = 0.85f,
+                currentIntent = ViewerSideBySide.PinchIntent.ZOOM_IN
+            )
+        )
+        // 先合拢锁定并排：后续张开帧也不翻转
+        assertEquals(
+            ViewerSideBySide.PinchIntent.SIDE_BY_SIDE,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 0f, zoom = 1.3f,
+                currentIntent = ViewerSideBySide.PinchIntent.SIDE_BY_SIDE
+            )
+        )
+    }
+
+    @Test
+    fun `无方向信号保持未决`() {
+        // zoom 恰为 1（只有双指平移）与异常值都不产生意图
+        assertEquals(
+            ViewerSideBySide.PinchIntent.UNDECIDED,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 0f, zoom = 1f,
+                currentIntent = ViewerSideBySide.PinchIntent.UNDECIDED
+            )
+        )
+        assertEquals(
+            ViewerSideBySide.PinchIntent.UNDECIDED,
+            ViewerSideBySide.resolvePinchIntent(
+                progressAtStart = 0f, zoom = Float.NaN,
+                currentIntent = ViewerSideBySide.PinchIntent.UNDECIDED
+            )
+        )
+    }
+
+    @Test
+    fun `档位比例反解进度与正向换算互逆`() {
+        // pageFraction(progress) 的逆运算：全屏 1 → 0，并排 0.7 → 1，临时档 0.55 → 1.5
+        assertEquals(
+            0f,
+            ViewerSideBySide.progressFromPageFraction(ViewerSideBySide.pageFraction(0f)),
+            0.0001f
+        )
+        assertEquals(
+            1f,
+            ViewerSideBySide.progressFromPageFraction(ViewerSideBySide.pageFraction(1f)),
+            0.0001f
+        )
+        assertEquals(
+            ViewerSideBySide.MAX_PROGRESS,
+            ViewerSideBySide.progressFromPageFraction(ViewerSideBySide.pageFraction(1.5f)),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `档位反解对异常输入按全屏兜底`() {
+        // NaN / ≥1 一律按全屏 0 处理——宁可少进并排，不误判方向
+        assertEquals(0f, ViewerSideBySide.progressFromPageFraction(Float.NaN), 0.0001f)
+        assertEquals(0f, ViewerSideBySide.progressFromPageFraction(1f), 0.0001f)
+        assertEquals(0f, ViewerSideBySide.progressFromPageFraction(1.2f), 0.0001f)
+    }
+
+    // ---------- 6. 下拉透出遮罩分段映射（E2，B-23b 第三批） ----------
+
+    @Test
+    fun `拖动9个百分点仍保持纯黑`() {
+        // 边界左端：进度 < 10% → alpha 1.0（E1 全屏态背景纯黑）
+        assertEquals(
+            1f,
+            ViewerDismissGesture.dismissMaskTargetAlpha(screenHeight * 0.09f, screenHeight),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `拖动恰好10个百分点目标透出`() {
+        // 边界点：判定条件是"≥"，恰好 10% 就翻到透出目标 0.2（图库透出约 80%）
+        assertEquals(
+            ViewerDismissGesture.REVEAL_MASK_ALPHA,
+            ViewerDismissGesture.dismissMaskTargetAlpha(
+                screenHeight * ViewerDismissGesture.REVEAL_PROGRESS_RATIO, screenHeight
+            ),
+            0.0001f
+        )
+        assertEquals(
+            ViewerDismissGesture.REVEAL_MASK_ALPHA,
+            ViewerDismissGesture.dismissMaskTargetAlpha(screenHeight * 0.11f, screenHeight),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `零位移与向上拖都不透出`() {
+        // 0 与负值（向上拖）都算没进透出段
+        assertEquals(1f, ViewerDismissGesture.dismissMaskTargetAlpha(0f, screenHeight), 0.0001f)
+        assertEquals(1f, ViewerDismissGesture.dismissMaskTargetAlpha(-100f, screenHeight), 0.0001f)
+    }
+
+    @Test
+    fun `异常输入遮罩兜底纯黑`() {
+        // NaN / 屏高未测得（0 / 负 / NaN）：宁可黑也不透出错帧
+        assertEquals(1f, ViewerDismissGesture.dismissMaskTargetAlpha(Float.NaN, screenHeight), 0.0001f)
+        assertEquals(1f, ViewerDismissGesture.dismissMaskTargetAlpha(100f, 0f), 0.0001f)
+        assertEquals(1f, ViewerDismissGesture.dismissMaskTargetAlpha(100f, -1f), 0.0001f)
+        assertEquals(1f, ViewerDismissGesture.dismissMaskTargetAlpha(100f, Float.NaN), 0.0001f)
+    }
+
+    // ---------- 7. 位置飞回几何（E4，B-23b 第三批） ----------
+
+    /** 便于换算：容器 320x640（模拟器实测），Fit 内容矩形 320x320，目标格子 80x80 */
+    private val containerW = 320f
+    private val containerH = 640f
+
+    @Test
+    fun `飞回目标因子按宽高各自对齐格子`() {
+        val target = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 320f,
+            contentHeight = 320f,
+            cellRect = ViewerRect(left = 120f, top = 280f, width = 80f, height = 80f)
+        )
+        // scale = 格子边 / 内容边；X/Y 各自算（格子是正方形、内容不一定，允许轻微变形
+        // 与缩略图 Crop 语义一致）
+        assertEquals(0.25f, target.scaleX, 0.0001f)
+        assertEquals(0.25f, target.scaleY, 0.0001f)
+        // 平移 = 格子中心 - 容器中心：(160, 320) - (160, 320) = 0
+        assertEquals(0f, target.translationX, 0.0001f)
+        assertEquals(0f, target.translationY, 0.0001f)
+        assertEquals(1f, target.alpha, 0.0001f)
+    }
+
+    @Test
+    fun `飞回目标因子平移对准偏离中心的格子`() {
+        // 格子中心 (40, 140) → 平移 = (40-160, 140-320) = (-120, -180)
+        val target = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 320f,
+            contentHeight = 640f,
+            cellRect = ViewerRect(left = 0f, top = 100f, width = 80f, height = 80f)
+        )
+        assertEquals(-120f, target.translationX, 0.0001f)
+        assertEquals(-180f, target.translationY, 0.0001f)
+        // 内容是全屏比例 320x640 → X/Y 缩放不同（等边格子把内容拉成方形）
+        assertEquals(0.25f, target.scaleX, 0.0001f)
+        assertEquals(0.125f, target.scaleY, 0.0001f)
+    }
+
+    @Test
+    fun `飞回目标因子异常尺寸返回恒等`() {
+        // 内容 / 格子任一尺寸无效（0 / 负 / NaN）都不算数，返回恒等因子兜底
+        val identity = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 0f,
+            contentHeight = 320f,
+            cellRect = ViewerRect(0f, 0f, 80f, 80f)
+        )
+        assertEquals(1f, identity.scaleX, 0.0001f)
+        assertEquals(1f, identity.scaleY, 0.0001f)
+        assertEquals(0f, identity.translationX, 0.0001f)
+        assertEquals(0f, identity.translationY, 0.0001f)
+        assertEquals(1f, identity.alpha, 0.0001f)
+
+        val identity2 = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 320f,
+            contentHeight = 320f,
+            cellRect = ViewerRect(0f, 0f, Float.NaN, 80f)
+        )
+        assertEquals(1f, identity2.scaleX, 0.0001f)
+    }
+
+    @Test
+    fun `飞回插值端点`() {
+        // t=0 → 起始快照原样；t=1 → 目标因子（alpha 恢复到 1，飞回途中图片可见）
+        val start = FlyBackStartFactors(
+            scaleX = 0.9f, scaleY = 0.9f, translationX = 0f, translationY = 140f, alpha = 0.8f
+        )
+        val target = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 320f,
+            contentHeight = 320f,
+            cellRect = ViewerRect(120f, 280f, 80f, 80f)
+        )
+        val atStart = ViewerDismissGesture.flyBackFactors(start, target, 0f)
+        assertEquals(0.9f, atStart.scaleX, 0.0001f)
+        assertEquals(140f, atStart.translationY, 0.0001f)
+        assertEquals(0.8f, atStart.alpha, 0.0001f)
+
+        val atEnd = ViewerDismissGesture.flyBackFactors(start, target, 1f)
+        assertEquals(target.scaleX, atEnd.scaleX, 0.0001f)
+        assertEquals(target.scaleY, atEnd.scaleY, 0.0001f)
+        assertEquals(target.translationX, atEnd.translationX, 0.0001f)
+        assertEquals(target.translationY, atEnd.translationY, 0.0001f)
+        assertEquals(1f, atEnd.alpha, 0.0001f)
+    }
+
+    @Test
+    fun `飞回插值中点是线性中值`() {
+        val start = FlyBackStartFactors(
+            scaleX = 1f, scaleY = 1f, translationX = 0f, translationY = 128f, alpha = 1f
+        )
+        val target = FlyBackFactors(
+            scaleX = 0.5f, scaleY = 0.5f, translationX = -100f, translationY = -256f, alpha = 1f
+        )
+        val mid = ViewerDismissGesture.flyBackFactors(start, target, 0.5f)
+        assertEquals(0.75f, mid.scaleX, 0.0001f)
+        assertEquals(0.75f, mid.scaleY, 0.0001f)
+        assertEquals(-50f, mid.translationX, 0.0001f)
+        assertEquals(-64f, mid.translationY, 0.0001f)
+        assertEquals(1f, mid.alpha, 0.0001f)
+    }
+
+    @Test
+    fun `飞回插值t越界钳制且异常t兜底`() {
+        val start = FlyBackStartFactors(1f, 1f, 0f, 0f, 1f)
+        val target = FlyBackFactors(0.5f, 0.5f, -100f, -200f, 1f)
+        // t > 1 / t < 0 都 clamp 到端点，不许过冲
+        assertEquals(
+            target.scaleX,
+            ViewerDismissGesture.flyBackFactors(start, target, 1.5f).scaleX,
+            0.0001f
+        )
+        assertEquals(
+            start.scaleX,
+            ViewerDismissGesture.flyBackFactors(start, target, -0.5f).scaleX,
+            0.0001f
+        )
+        // NaN t 按"动画结束"处理（t=1）
+        assertEquals(
+            target.scaleX,
+            ViewerDismissGesture.flyBackFactors(start, target, Float.NaN).scaleX,
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `飞回插值NaN因子不穿透`() {
+        // 起始因子里混入 NaN（屏高未测得等异常路径）也不许把 NaN 带进 graphicsLayer
+        val start = FlyBackStartFactors(
+            scaleX = Float.NaN, scaleY = 1f, translationX = 0f,
+            translationY = Float.POSITIVE_INFINITY, alpha = Float.NaN
+        )
+        val target = FlyBackFactors(0.5f, 0.5f, -100f, -200f, 1f)
+        val mid = ViewerDismissGesture.flyBackFactors(start, target, 0.5f)
+        assertEquals(0.75f, mid.scaleX, 0.0001f)   // NaN → 兜底 1f
+        assertEquals(0.75f, mid.scaleY, 0.0001f)
+        assertEquals(-100f, mid.translationY, 0.0001f) // 无穷 → 兜底 0f
+        assertEquals(1f, mid.alpha, 0.0001f)       // NaN → 兜底 1f
+    }
+
+    @Test
+    fun `飞回起点就是目标时全程定格`() {
+        // 松手位置恰好已经在格子上（理论边界）：插值全程与目标重合
+        val target = FlyBackFactors(0.5f, 0.5f, -100f, -200f, 1f)
+        val start = FlyBackStartFactors(0.5f, 0.5f, -100f, -200f, 1f)
+        val mid = ViewerDismissGesture.flyBackFactors(start, target, 0.5f)
+        assertEquals(target.scaleX, mid.scaleX, 0.0001f)
+        assertEquals(target.translationY, mid.translationY, 0.0001f)
     }
 }

@@ -1,15 +1,22 @@
 package sh.hnet.comfychair.ui.screens
 
+import android.graphics.Bitmap
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -23,9 +30,6 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Image
@@ -37,8 +41,6 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.FilledTonalIconButton
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.FloatingToolbarColors
 import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
@@ -52,8 +54,10 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,18 +66,30 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import sh.hnet.comfychair.MediaViewerActivity
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.ui.components.ImageViewer
 import sh.hnet.comfychair.ui.components.MetadataBottomSheet
 import sh.hnet.comfychair.ui.components.VideoPlayer
+import sh.hnet.comfychair.ui.components.ViewerRect
+import sh.hnet.comfychair.ui.components.ViewerSideBySide
 import sh.hnet.comfychair.ui.components.rememberLazyBitmap
 import sh.hnet.comfychair.ui.components.VideoScaleMode
 import sh.hnet.comfychair.viewmodel.MediaViewerEvent
@@ -82,6 +98,15 @@ import sh.hnet.comfychair.viewmodel.ViewerFailureCategory
 import sh.hnet.comfychair.viewmodel.ViewerLoadPolicy
 import sh.hnet.comfychair.viewmodel.ViewerMode
 import sh.hnet.comfychair.viewmodel.ViewerShowState
+
+/**
+ * 并排进度吸附时长（ms，v4.16.2）。
+ *
+ * 松手后的档位吸附要"干脆"：太快（<180ms）显得生硬、看不清，太慢（>400ms）会拖
+ * 出"松手还黏着手指"的滞后感。280ms + FastOutSlowIn 与顶栏按压反馈的直给手感和
+ * 查看器翻页动画（Pager 默认 ~400ms 的短路版本）都合拍。
+ */
+private const val PROGRESS_SETTLE_MS = 280
 
 /**
  * 把下载链接写进系统剪贴板，返回是否成功。
@@ -127,6 +152,11 @@ private fun failureMessageRes(category: ViewerFailureCategory): Int = when (cate
 fun MediaViewerScreen(
     viewModel: MediaViewerViewModel,
     onClose: () -> Unit,
+    // B-23b 第三批（E1~E2）：图库整屏截图与目标格子矩形（window px）。
+    // 由 GalleryScreen 在 launch 之前截好、经 BitmapCache 并行字段传到这里；
+    // null = 单图模式 / 截图失败 / 开关关闭，E1~E5 全部禁用（纯黑 + 现有下滑关闭）
+    gallerySnapshot: Bitmap? = null,
+    galleryCellRect: ViewerRect? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -138,7 +168,14 @@ fun MediaViewerScreen(
 
     // Layout constants - 8dp because navigationBarsPadding() adds ~24dp, totaling ~32dp like Workflow Editor
     val toolbarBottomPadding = 8.dp
-    val fabBottomPadding = toolbarBottomPadding + 4.dp
+
+    // 并排预览三级手势开关（v4.16.2，总体计划 D1~D5）：组合期读一次，置 false 完全回到
+    // v4.15.x 的旧行为（未放大态捏合 = 缩小淡出关闭查看器）
+    val threeLevelEnabled = remember { AppSettings.isGalleryThreeLevelEnabled(context) }
+
+    // 下拉透出 + 飞回开关（v4.16.3，总体计划 E1~E5）：组合期读一次，置 false 完全回到
+    // 纯黑背景 + 现有下滑关闭（无截图透出、无飞回）
+    val dismissRevealEnabled = remember { AppSettings.isGalleryDismissRevealEnabled(context) }
 
     // Metadata bottom sheet state
     var showMetadataSheet by remember { mutableStateOf(false) }
@@ -184,11 +221,53 @@ fun MediaViewerScreen(
                     // Key the pager by items list identity to force recreation on deletion
                     val itemsKey = uiState.items.map { "${it.promptId}_${it.filename}" }.joinToString(",")
 
+                    // B-23b 第三批：进入时的初始页。刻意放在 key(itemsKey) 之外——删除
+                    // 条目会改变 itemsKey 并销毁内部作用域，initialPage 若放在里面会被
+                    // 重置成删除后的 currentIndex，"进入那一刻的页"语义就丢了
+                    val initialPage = remember {
+                        uiState.currentIndex.coerceIn(0, uiState.items.size - 1)
+                    }
+
                     key(itemsKey) {
                         val pagerState = rememberPagerState(
-                            initialPage = uiState.currentIndex.coerceIn(0, uiState.items.size - 1),
+                            initialPage = initialPage,
                             pageCount = { uiState.items.size }
                         )
+
+                        // ============================================================
+                        // 下拉透出图库 + 位置飞回（B-23b 第三批，E1~E5）
+                        // ============================================================
+                        // 截图是"进入那一刻"的静态画面（客户已知情接受该局限），所以
+                        // 透出只在"停留在进入时的那一页"时启用——翻页后截图与真实图库
+                        // 脱节，回退纯黑 + 现有下滑关闭。视频页同样不启用（VideoPlayer
+                        // 无分段遮罩链路，且初始页若是视频，透出会从播放器背后漏截图）
+                        val revealItem = uiState.items.getOrNull(pagerState.currentPage)
+                        val revealActive = dismissRevealEnabled &&
+                            gallerySnapshot != null && galleryCellRect != null &&
+                            pagerState.currentPage == initialPage &&
+                            revealItem?.isVideo == false
+
+                        // E1/E2 背景截图层：铺满屏幕、1:1 对齐进查看器那一刻的屏幕像素
+                        //（截图本身就是全屏，不缩放不裁剪）。初始态页内黑底遮罩
+                        //（ImageViewer drawBehind）alpha=1 把它盖成纯黑（E1）；
+                        // 下拉偏离原位约 10% 后遮罩快速淡到 0.2，图库从背后透出（E2）
+                        if (revealActive && gallerySnapshot != null && galleryCellRect != null) {
+                            Image(
+                                bitmap = gallerySnapshot.asImageBitmap(),
+                                contentDescription = null,
+                                contentScale = ContentScale.FillBounds,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            // E3：目标格子挖黑占位——画在截图之上，无论遮罩 alpha 是多少
+                            // 格子区域恒为纯黑，飞回的图落在它上面不会与截图里的缩略图重叠
+                            Canvas(Modifier.fillMaxSize()) {
+                                drawRect(
+                                    color = Color.Black,
+                                    topLeft = Offset(galleryCellRect.left, galleryCellRect.top),
+                                    size = Size(galleryCellRect.width, galleryCellRect.height)
+                                )
+                            }
+                        }
 
                         // Sync pager state with ViewModel (user swipes)
                         LaunchedEffect(pagerState) {
@@ -206,9 +285,122 @@ fun MediaViewerScreen(
                                 }
                         }
 
+                        // ============================================================
+                        // 并排预览三级手势（D1~D5，v4.16.2）
+                        // ============================================================
+                        // 进度语义见 ViewerSideBySide：0 = 全屏；1 = 并排（当前页占视口 70%、
+                        // 两侧各露 15%）；1.5 = 临时缩小档（55%）。捏合期间直接写值跟手，
+                        // 松手由 animateProgressTo 做档位吸附。
+                        var sideProgress by remember { mutableFloatStateOf(0f) }
+                        // 本次捏合的起始进度：ImageViewer 只上报"自手势起点累计的缩放倍率"，
+                        // 换算成绝对进度必须知道起点（全屏 0 / 并排 1 / 吸附动画被打断的中间值）
+                        var gestureBaseProgress by remember { mutableFloatStateOf(0f) }
+                        var progressJob by remember { mutableStateOf<Job?>(null) }
+                        var pagerSize by remember { mutableStateOf(IntSize.Zero) }
+
+                        // 布尔派生：只有"越过 0.5"时才让分页内容重组，捏合中的每帧 Float 变化不穿透
+                        val sideBySideActive by remember {
+                            derivedStateOf { sideProgress > ViewerSideBySide.SETTLE_THRESHOLD }
+                        }
+
+                        fun cancelProgressJob() {
+                            progressJob?.cancel()
+                            progressJob = null
+                        }
+
+                        // 档位吸附 / 回全屏的统一动画出口
+                        fun animateProgressTo(target: Float) {
+                            cancelProgressJob()
+                            if (sideProgress == target) return
+                            progressJob = scope.launch {
+                                animate(
+                                    initialValue = sideProgress,
+                                    targetValue = target,
+                                    animationSpec = tween(
+                                        PROGRESS_SETTLE_MS,
+                                        easing = FastOutSlowInEasing
+                                    )
+                                ) { value, _ -> sideProgress = value }
+                            }
+                        }
+
+                        // D4："点哪张图哪张全屏"。露边页要"先翻到它 + 同时放大回全屏"——
+                        // 两件事并行，只做其中一件都会先跳正再缩放，观感断裂
+                        fun expandPage(targetPage: Int) {
+                            val safe = targetPage.coerceIn(0, uiState.items.size - 1)
+                            if (safe == pagerState.currentPage) {
+                                animateProgressTo(0f)
+                                return
+                            }
+                            cancelProgressJob()
+                            progressJob = scope.launch {
+                                launch { pagerState.animateScrollToPage(safe) }
+                                animate(
+                                    initialValue = sideProgress,
+                                    targetValue = 0f,
+                                    animationSpec = tween(
+                                        PROGRESS_SETTLE_MS,
+                                        easing = FastOutSlowInEasing
+                                    )
+                                ) { value, _ -> sideProgress = value }
+                            }
+                        }
+
+                        // 供 ImageViewer 读取的"当前页占视口比例"：lambda 形式让捏合动画每帧只更新
+                        // graphicsLayer、不触发整页重组（三页同时 60fps 重组会掉帧）
+                        val sideScaleProvider: (() -> Float)? = if (threeLevelEnabled) {
+                            remember { { ViewerSideBySide.pageFraction(sideProgress) } }
+                        } else {
+                            null
+                        }
+
+                        // 捏合三段回调（与页无关，整段只建一次）
+                        val sideStartHandler: (() -> Unit)? = if (threeLevelEnabled) {
+                            {
+                                cancelProgressJob()
+                                gestureBaseProgress = sideProgress
+                            }
+                        } else {
+                            null
+                        }
+                        val sideHandler: ((Float) -> Unit)? = if (threeLevelEnabled) {
+                            { gestureScale ->
+                                cancelProgressJob()
+                                sideProgress = ViewerSideBySide.progressFromGesture(
+                                    gestureBaseProgress, gestureScale
+                                )
+                            }
+                        } else {
+                            null
+                        }
+                        val sideSettleHandler: ((Float) -> Unit)? = if (threeLevelEnabled) {
+                            {
+                                // 松手吸附：≥0.5 → 并排 1.0；<0.5 → 全屏 0。并排态继续合拢
+                                // （进度 1.0~1.5 的临时缩小档）同样吸附回 1.0 —— 绝不退出图库
+                                animateProgressTo(ViewerSideBySide.settleProgress(sideProgress))
+                            }
+                        } else {
+                            null
+                        }
+
+                        // 并排是图片专属体验：翻到视频页时把进度收回全屏。视频层没有档位缩放，
+                        // 停在并排会变成"全尺寸视频 + 露边"，且点击语义也会错乱
+                        LaunchedEffect(pagerState.currentPage, sideBySideActive) {
+                            if (sideBySideActive &&
+                                uiState.items.getOrNull(pagerState.currentPage)?.isVideo == true
+                            ) {
+                                animateProgressTo(0f)
+                            }
+                        }
+
                         HorizontalPager(
                             state = pagerState,
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .onSizeChanged { pagerSize = it },
+                            // 并排露边必须让 pager 提前组合相邻页（API 名 beyondViewportPageCount，
+                            // 即派工单里的 beyondBoundsPageCount），否则两侧露出来的是黑底
+                            beyondViewportPageCount = if (threeLevelEnabled) 1 else 0,
                             key = { index -> "${uiState.items[index].promptId}_${uiState.items[index].filename}" }
                         ) { page ->
                             val item = uiState.items[page]
@@ -270,12 +462,58 @@ fun MediaViewerScreen(
                                 null
                             }
 
-                            // Use clipToBounds to ensure content doesn't bleed during transitions
+                            // 并排几何（D2/D3）：页宽保持全屏（布局与命中区域都不变），只做
+                            // "整页按页距向内平移"这一步 —— 当前页 k=0 不动，左右邻页各向内收
+                            // (1 - 档位比例) × 屏宽，配合图片自身的档位缩放，最终呈现
+                            // "中间 70% + 两侧各露 15%"。全部在 graphicsLayer lambda 内读
+                            // sideProgress：捏合每帧只更新 layer 属性，不重组分页内容
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
+                                    .graphicsLayer {
+                                        if (threeLevelEnabled) {
+                                            val scale = ViewerSideBySide.pageFraction(sideProgress)
+                                            // k = 本页相对"滚动中的当前位置"的页距（-1 左邻 / 0 当前 / +1 右邻）
+                                            val pageDistance = (page - pagerState.currentPage) -
+                                                pagerState.currentPageOffsetFraction
+                                            translationX = pageDistance * size.width * (scale - 1f)
+                                        }
+                                    }
                                     .clipToBounds()
                             ) {
+                                // D4 并排态点击：点在居中页 → 放大回全屏；点在露边页 → 先翻到
+                                // 该页再同步放大。全屏态保持 null，单击继续走既有 onSingleTap
+                                // （保留双击缩放：并排回调非 null 时 ImageViewer 会跳过双击判定）
+                                val sideTap: ((Float, Float) -> Unit)? =
+                                    if (threeLevelEnabled && sideBySideActive) {
+                                        { imageLocalX, _ ->
+                                            // 物理落点可能是任意一页（露边的邻页与当前页的布局
+                                            // 区域互相重叠，右侧那页还画在上层）。ImageViewer 上报的
+                                            // 是"图片被档位缩放之后"的层内坐标，必须连同缩放与页位移
+                                            // 一起反算回视口坐标 —— 少算缩放这一步会让落点整体偏向中间，
+                                            // 表现就是"点露边页只放大不翻页"（纯函数里带单测钉住）
+                                            val fraction =
+                                                ViewerSideBySide.pageFraction(sideProgress)
+                                            val pageDistance = (page - pagerState.currentPage) -
+                                                pagerState.currentPageOffsetFraction
+                                            val screenX = ViewerSideBySide.viewportXFromImageLocal(
+                                                imageLocalX = imageLocalX,
+                                                viewportWidth = pagerSize.width.toFloat(),
+                                                fraction = fraction,
+                                                pageDistance = pageDistance
+                                            )
+                                            val zone = ViewerSideBySide.tapZone(
+                                                screenX,
+                                                pagerSize.width.toFloat(),
+                                                sideProgress
+                                            )
+                                            // zone：-1 = 左邻、0 = 居中（当前页）、+1 = 右邻
+                                            expandPage(pagerState.currentPage + zone)
+                                        }
+                                    } else {
+                                        null
+                                    }
+
                                 MediaContent(
                                     isVideo = item.isVideo,
                                     bitmap = displayBitmap,
@@ -286,7 +524,30 @@ fun MediaViewerScreen(
                                     failureCategory = failureCategory,
                                     onRetry = { viewModel.retryCurrentItem() },
                                     // 下滑脱离手势的关闭出口复用屏幕级 onClose（唯一关闭链路）
-                                    onViewerClose = onClose
+                                    onViewerClose = onClose,
+                                    // E1~E5 只挂在进入时的那一页图片上（revealActive 已含
+                                    // currentPage == initialPage；翻页动画中的邻页 page 不同）
+                                    flyBackCellRect = if (revealActive && page == initialPage) {
+                                        galleryCellRect
+                                    } else {
+                                        null
+                                    },
+                                    // E4：飞回已无缝落格，关闭时抑制 Activity 层缩小淡出
+                                    onFlyBackCompleted = if (revealActive && page == initialPage) {
+                                        { MediaViewerActivity.suppressNextExitTransition = true }
+                                    } else {
+                                        null
+                                    },
+                                    // 并排预览三级手势（仅 GALLERY 图片页接线；视频页不传，
+                                    // 由上面的 LaunchedEffect 把进度收回全屏）。
+                                    // 这里按 item.isVideo 再门控一次：视频页在播放地址还没拿到的
+                                    // 瞬间显示的是缩略图（走 ImageViewer 分支），若把并排回调传进去，
+                                    // 捏合会先撑开并排、紧接着被上面那个 effect 拽回全屏，两下打架
+                                    onSideBySideStart = if (item.isVideo) null else sideStartHandler,
+                                    onSideBySide = if (item.isVideo) null else sideHandler,
+                                    onSideBySideSettle = if (item.isVideo) null else sideSettleHandler,
+                                    onSideBySideTap = if (item.isVideo) null else sideTap,
+                                    sideBySideScale = if (item.isVideo) null else sideScaleProvider
                                 )
 
                                 // 原图超过下载上限时的说明 + 取原图的途径。
@@ -339,59 +600,6 @@ fun MediaViewerScreen(
                                         modifier = Modifier
                                             .align(Alignment.BottomCenter)
                                             .padding(16.dp)
-                                    )
-                                }
-                            }
-                        }
-
-                        // Navigation arrows need pagerState, so move them inside
-                        // Left navigation arrow
-                        if (uiState.totalCount > 1) {
-                            AnimatedVisibility(
-                                visible = uiState.isUiVisible && uiState.currentIndex > 0,
-                                enter = fadeIn(animationSpec = tween(250)),
-                                exit = fadeOut(animationSpec = tween(250)),
-                                modifier = Modifier
-                                    .align(Alignment.CenterStart)
-                                    .padding(start = 16.dp)
-                            ) {
-                                FilledTonalIconButton(
-                                    onClick = {
-                                        scope.launch {
-                                            pagerState.animateScrollToPage(pagerState.currentPage - 1)
-                                        }
-                                    },
-                                    modifier = Modifier.size(48.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                                        contentDescription = stringResource(R.string.media_viewer_previous),
-                                        modifier = Modifier.size(32.dp)
-                                    )
-                                }
-                            }
-
-                            // Right navigation arrow
-                            AnimatedVisibility(
-                                visible = uiState.isUiVisible && uiState.currentIndex < uiState.totalCount - 1,
-                                enter = fadeIn(animationSpec = tween(250)),
-                                exit = fadeOut(animationSpec = tween(250)),
-                                modifier = Modifier
-                                    .align(Alignment.CenterEnd)
-                                    .padding(end = 16.dp)
-                            ) {
-                                FilledTonalIconButton(
-                                    onClick = {
-                                        scope.launch {
-                                            pagerState.animateScrollToPage(pagerState.currentPage + 1)
-                                        }
-                                    },
-                                    modifier = Modifier.size(48.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                        contentDescription = stringResource(R.string.media_viewer_next),
-                                        modifier = Modifier.size(32.dp)
                                     )
                                 }
                             }
@@ -487,27 +695,10 @@ fun MediaViewerScreen(
             )
         }
 
-        // Back FAB
-        AnimatedVisibility(
-            visible = uiState.isUiVisible,
-            enter = fadeIn(animationSpec = tween(250)),
-            exit = fadeOut(animationSpec = tween(250)),
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .navigationBarsPadding()
-                .padding(end = 16.dp, bottom = fabBottomPadding)
-        ) {
-            FloatingActionButton(
-                onClick = onClose,
-                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
-            ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = stringResource(R.string.content_description_back)
-                )
-            }
-        }
+        // 返回按钮（F2，v4.16.2 已删除）：关闭查看器只剩三条入口 ——
+        // ① 下滑手势（MediaContent → ImageViewer/VideoPlayer 的 onViewerClose）
+        // ② 并排态张开手指回全屏、并排态下拉关闭
+        // ③ 系统返回键（本页顶部 BackHandler）
 
         // Metadata bottom sheet
         if (showMetadataSheet) {
@@ -612,12 +803,26 @@ private fun MediaContent(
     failureCategory: ViewerFailureCategory? = null,
     onRetry: (() -> Unit)? = null,
     // 下滑脱离关闭的回调；null = 组件不启用脱离手势（缩略图槽位等无关闭语义的场景）
-    onViewerClose: (() -> Unit)? = null
+    onViewerClose: (() -> Unit)? = null,
+    // B-23b 第三批（E1~E5）：本页的飞回目标格子矩形（window px）。非 null = 该页启用
+    // 下拉透出与飞回（分段遮罩在 ImageViewer 内）；null = 行为与旧版完全一致
+    flyBackCellRect: ViewerRect? = null,
+    // E4：飞回动画完成后的通知（先于 onViewerClose），上层据此抑制 Activity 层缩小淡出
+    onFlyBackCompleted: (() -> Unit)? = null,
+    // 并排预览三级手势（D1~D5，v4.16.2）：仅 GALLERY 模式的图片页由上层接线。
+    // 四个回调全 null 时 ImageViewer 的行为与改动前完全一致（不含任何并排分支）
+    onSideBySideStart: (() -> Unit)? = null,
+    onSideBySide: ((Float) -> Unit)? = null,
+    onSideBySideSettle: ((Float) -> Unit)? = null,
+    onSideBySideTap: ((Float, Float) -> Unit)? = null,
+    sideBySideScale: (() -> Float)? = null
 ) {
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black),
+        // 这里**不能**铺不透明背景：并排预览（D2/D3）下每一页都会被整体缩放并
+        // 向中间平移，页与页的布局区域互相重叠。若每页自带不透明黑底，当前页
+        // 的黑底会盖掉左邻露边、右邻的黑底又会盖掉中间图右侧（实测各吃 48px）。
+        // 屏幕根容器（MediaViewerScreen 的 Box）已经是纯黑，少这一层视觉零差别。
+        modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center
     ) {
         when {
@@ -640,27 +845,45 @@ private fun MediaContent(
                     bitmap = bitmap,
                     modifier = Modifier.fillMaxSize(),
                     onSingleTap = onSingleTap,
-                    onClose = onViewerClose
+                    onClose = onViewerClose,
+                    onFlyBackCompleted = onFlyBackCompleted,
+                    // E1~E5：格子矩形非 null 时本页启用下拉透出与飞回（分段遮罩、
+                    // 飞回落格都在 ImageViewer 内）；null = 与旧版完全一致
+                    flyBackCellRect = flyBackCellRect,
+                    onSideBySideStart = onSideBySideStart,
+                    onSideBySide = onSideBySide,
+                    onSideBySideSettle = onSideBySideSettle,
+                    onSideBySideTap = onSideBySideTap,
+                    sideBySideScale = sideBySideScale,
+                    // 查看器页不能自带不透明底：并排预览下页与页重叠，黑底会盖掉邻页露边
+                    // （屏幕根容器是纯黑，视觉零差别）
+                    pageBackground = false
                 )
             }
-            failureCategory != null -> {
-                // 加载失败（H1-a/H1-b）：图标 + 分档文案 + 重试。
-                // 修复前视频页到这里永远转圈、图片页静默黑屏，用户无从分辨"在加载"还是"坏了"
-                MediaLoadFailurePlaceholder(
-                    category = failureCategory,
-                    onRetry = onRetry,
-                    modifier = Modifier.fillMaxSize()
-                )
+            else -> {
+                // E1：透出页的加载/失败态先盖一层纯黑——背景截图不能从 spinner 与
+                // 失败占位后面漏出来（图片分支的黑幕在 ImageViewer 内分段驱动）
+                if (flyBackCellRect != null) {
+                    Box(modifier = Modifier.fillMaxSize().background(Color.Black))
+                }
+                if (failureCategory != null) {
+                    // 加载失败（H1-a/H1-b）：图标 + 分档文案 + 重试。
+                    // 修复前视频页到这里永远转圈、图片页静默黑屏，用户无从分辨"在加载"还是"坏了"
+                    MediaLoadFailurePlaceholder(
+                        category = failureCategory,
+                        onRetry = onRetry,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else if (isVideo || isLoading) {
+                    // Video pages without content always show spinner (never black)
+                    // This handles the case where thumbnail is not yet in cache
+                    // （视频页失败态已被上面的 failureCategory 分支拦下，走到这里的只剩
+                    //   非当前页视频与真正的加载中 —— 保持"never black"的原语义）
+                    CircularProgressIndicator(color = Color.White)
+                }
+                // Fallback: only images without bitmap and not loading show black
+                // （非当前页图片加载失败保持黑屏：它们是候补页，不该替用户下"失败"的结论）
             }
-            isVideo || isLoading -> {
-                // Video pages without content always show spinner (never black)
-                // This handles the case where thumbnail is not yet in cache
-                // （视频页失败态已被上面的 failureCategory 分支拦下，走到这里的只剩
-                //   非当前页视频与真正的加载中 —— 保持"never black"的原语义）
-                CircularProgressIndicator(color = Color.White)
-            }
-            // Fallback: only images without bitmap and not loading show black
-            // （非当前页图片加载失败保持黑屏：它们是候补页，不该替用户下"失败"的结论）
         }
     }
 }

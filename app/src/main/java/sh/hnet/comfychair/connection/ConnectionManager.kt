@@ -130,12 +130,20 @@ object ConnectionManager {
     private val _sessionExpired = MutableStateFlow(false)
     val sessionExpired: StateFlow<Boolean> = _sessionExpired.asStateFlow()
 
+    // 跨线程读写：尝试静默重连（[attemptSilentReconnect]）在无锁情况下直接读这两个字段，
+    // 写侧在连接/断开流程里。不加 @Volatile 可能读到旧引用（旧 client / 旧 clientId）导致重连失败。
+    @Volatile
     private var _client: ComfyUIClient? = null
+    @Volatile
     private var _clientId: String? = null
     private var _applicationContext: Context? = null
 
     // Shared node type registry (populated from /object_info)
     val nodeTypeRegistry = NodeTypeRegistry()
+
+    // Q3-1（v4.16.5）："parse + ready 信号 + extract"原子段的锁（见 [applyObjectInfo]）。
+    // 磁盘预填（IO 协程）与网络回调（OkHttp 线程）两条链路共用
+    private val registryApplyLock = Any()
 
     // Shared model cache (populated from /object_info)
     private val _modelCache = MutableStateFlow(ModelCache())
@@ -156,6 +164,15 @@ object ConnectionManager {
      * （顺带也就实现了"防连点"）。
      */
     private val introSyncInFlight = SingleFlight()
+
+    /**
+     * /object_info 拉取的跳过式闸门（Q3-2，v4.16.5）。
+     *
+     * 连接成功、onResume 补拉、设置页手点刷新三条链路都汇到 [fetchServerData]，
+     * 8MB 的请求同一时刻至多一个在飞。成功、失败、回调内异常都会释放（回调
+     * finally 里 exit），失败后重试不会被拦。
+     */
+    private val objectInfoFetchGate = SingleFlight()
 
     /**
      * 介绍数据热更新的执行编排（闸门 + 异常兜底 + 收尾都在里面）。
@@ -1074,12 +1091,45 @@ object ConnectionManager {
     // Model cache and node registry management
 
     /**
+     * 把一份 /object_info JSON **原子地**应用到节点注册表并装配模型列表（Q3-1，v4.16.5）。
+     *
+     * 磁盘预填（IO 协程）与网络回调（OkHttp 线程）两条链路都会走这里。解析、
+     * 就绪信号与列表提取在 [registryApplyLock] 内完成：两条链路先后进入时完全
+     * 串行，不会出现"A 线程 parse 完、B 线程又 parse 覆盖之后 A 才 extract"的
+     * 交错（那种交错会把 B 的数据装配进 A 的结果里，产生与自身代次不符的列表）。
+     * 注册表本身的并发安全由 NodeTypeRegistry 的局部 map + 原子替换保证（读方
+     * 拿到的永远是完整代次的快照）；这里再串行化两条调用链，保证"谁后完成谁生效"
+     * 且 parse 与 extract 严格同代。
+     *
+     * @return 装配好的模型列表（调用方自行写 StateFlow，保持 loading/loaded 语义）
+     */
+    private fun applyObjectInfo(objectInfo: JSONObject): ModelCache {
+        synchronized(registryApplyLock) {
+            nodeTypeRegistry.parseObjectInfo(objectInfo)
+            // 注册表就绪信号（动态参数类型推导的可用前提），订阅者据此重算。
+            // 放锁内：防止另一条链路 parse 后、本条信号尚未写出时被读回旧值
+            _nodeTypeRegistryReady.value = nodeTypeRegistry.isPopulated()
+            return extractModelLists()
+        }
+    }
+
+    /**
      * Fetch server data (node types and model lists) from /object_info.
      * Called automatically on connection and can be triggered manually via [refreshServerData].
+     *
+     * Q3-2（v4.16.5）：加 SingleFlight 跳过式守卫——连接成功、onResume 补拉、
+     * 设置页手点刷新三条链路可能在几毫秒内先后触发，8MB 的 /object_info 同一
+     * 时刻只允许一个在飞，后到的直接跳过（不排队）。失败时回调里 [SingleFlight.exit]
+     * 释放闸门，下一次补拉/手点可以立即重试，不会被永久拦住。
      */
     private fun fetchServerData() {
         val client = _client ?: run {
             DebugLogger.w(TAG, "fetchServerData: Client not available")
+            return
+        }
+        // 已有一个 /object_info 在飞：直接跳过（幂等请求，重复拉没有收益）
+        if (!objectInfoFetchGate.tryEnter()) {
+            DebugLogger.i(TAG, "fetchServerData: 已有请求在飞，跳过本次触发")
             return
         }
 
@@ -1090,50 +1140,54 @@ object ConnectionManager {
         primeModelCacheFromDisk()
 
         client.fetchFullObjectInfo { objectInfo ->
-            if (objectInfo != null) {
-                // Parse node definitions for workflow editor
-                nodeTypeRegistry.parseObjectInfo(objectInfo)
-                // 注册表就绪信号（动态参数类型推导的可用前提），订阅者据此重算
-                _nodeTypeRegistryReady.value = nodeTypeRegistry.isPopulated()
+            try {
+                if (objectInfo != null) {
+                    // Q3-1：解析 + 就绪信号 + 列表提取收成原子段（见 [applyObjectInfo]）
+                    val models = applyObjectInfo(objectInfo)
 
-                // 模型介绍表：与模型列表同批加载（刷新模型列表也就等于刷新介绍）。
-                // 表本身随 APK 内置、之后可被服务器上的版本覆盖，加载失败只是没有介绍，
-                // 不影响模型选择。
-                _applicationContext?.let { ModelIntroTable.ensureLoaded(it) }
+                    // 模型介绍表：与模型列表同批加载（刷新模型列表也就等于刷新介绍）。
+                    // 表本身随 APK 内置、之后可被服务器上的版本覆盖，加载失败只是没有介绍，
+                    // 不影响模型选择。
+                    _applicationContext?.let { ModelIntroTable.ensureLoaded(it) }
 
-                // 模型介绍**热更新**：把服务器上的介绍数据取回来（新下载的模型不必等发版）。
-                // 必须排在 ensureLoaded 之后 —— 同步要用刚装好的本地表做比对基准；
-                // 放在回调里而不是 fetchServerData 开头，是为了不跟 8MB 的 /object_info 抢带宽，
-                // 也避免列表拉取失败时白拉一次介绍。
-                syncModelIntros()
+                    // 模型介绍**热更新**：把服务器上的介绍数据取回来（新下载的模型不必等发版）。
+                    // 必须排在 ensureLoaded 之后 —— 同步要用刚装好的本地表做比对基准；
+                    // 放在回调里而不是 fetchServerData 开头，是为了不跟 8MB 的 /object_info 抢带宽，
+                    // 也避免列表拉取失败时白拉一次介绍。
+                    syncModelIntros()
 
-                // Cache object_info to disk for offline mode
-                val ctx = _applicationContext
-                val serverId = currentServerId
-                if (ctx != null && serverId != null) {
-                    ObjectInfoCache.saveObjectInfo(ctx, serverId, objectInfo)
+                    // Cache object_info to disk for offline mode
+                    val ctx = _applicationContext
+                    val serverId = currentServerId
+                    if (ctx != null && serverId != null) {
+                        ObjectInfoCache.saveObjectInfo(ctx, serverId, objectInfo)
+                    }
+
+                    _modelCache.value = models.copy(isLoaded = true, isLoading = false)
+                    DebugLogger.i(TAG, "Server data loaded: ${models.checkpoints.size} checkpoints, " +
+                            "${models.unets.size} unets, ${models.vaes.size} vaes, " +
+                            "${models.clips.size} clips, ${models.loras.size} loras")
+                    // 同时打到 logcat：DebugLogger 只存在内存里，现场排查「模型下拉为空」时
+                    // 需要能直接从 adb logcat 看到节点定义与各列表的规模
+                    android.util.Log.i(
+                        "ComfyChairModels",
+                        "节点定义已加载: nodes=${nodeTypeRegistry.getAllNodeTypes().size}, " +
+                                "ckpt=${models.checkpoints.size}, unet=${models.unets.size}, " +
+                                "vae=${models.vaes.size}, clip=${models.clips.size}, lora=${models.loras.size}"
+                    )
+                } else {
+                    DebugLogger.w(TAG, "Failed to fetch server data")
+                    // 失败不清已加载列表（可能还有磁盘预填的旧数据可显示），只置错误
+                    // 供 UI 区分「失败（可重试）」与「空（服务器真没模型）」（Q3-3）
+                    _modelCache.value = _modelCache.value.copy(
+                        isLoading = false,
+                        lastError = "Failed to fetch server data"
+                    )
                 }
-
-                // Extract model lists for generation screens (field-name-based discovery)
-                val models = extractModelLists()
-                _modelCache.value = models.copy(isLoaded = true, isLoading = false)
-                DebugLogger.i(TAG, "Server data loaded: ${models.checkpoints.size} checkpoints, " +
-                        "${models.unets.size} unets, ${models.vaes.size} vaes, " +
-                        "${models.clips.size} clips, ${models.loras.size} loras")
-                // 同时打到 logcat：DebugLogger 只存在内存里，现场排查「模型下拉为空」时
-                // 需要能直接从 adb logcat 看到节点定义与各列表的规模
-                android.util.Log.i(
-                    "ComfyChairModels",
-                    "节点定义已加载: nodes=${nodeTypeRegistry.getAllNodeTypes().size}, " +
-                            "ckpt=${models.checkpoints.size}, unet=${models.unets.size}, " +
-                            "vae=${models.vaes.size}, clip=${models.clips.size}, lora=${models.loras.size}"
-                )
-            } else {
-                DebugLogger.w(TAG, "Failed to fetch server data")
-                _modelCache.value = _modelCache.value.copy(
-                    isLoading = false,
-                    lastError = "Failed to fetch server data"
-                )
+            } finally {
+                // 成功、失败、回调内异常三条路径都必须释放闸门——忘记复位会让
+                // 之后所有补拉/手点被永久跳过（见 [SingleFlight] 类注释）
+                objectInfoFetchGate.exit()
             }
         }
     }
@@ -1194,10 +1248,10 @@ object ConnectionManager {
             // 读盘期间网络可能已经回来了 —— 别用旧缓存盖掉新数据
             if (_modelCache.value.isLoaded) return@launch
 
-            nodeTypeRegistry.parseObjectInfo(cached)
-            _nodeTypeRegistryReady.value = nodeTypeRegistry.isPopulated()
+            // Q3-1：parse + 就绪信号 + 提取走与网络回调同一把锁的原子段，
+            // 两条链路不再交错清空/覆盖同一份节点表
+            val models = applyObjectInfo(cached)
             ModelIntroTable.ensureLoaded(ctx)
-            val models = extractModelLists()
             _modelCache.value = models.copy(isLoaded = true, isLoading = true)
             android.util.Log.i(
                 "ComfyChairModels",

@@ -324,6 +324,115 @@ object AppSettings {
             .apply()
     }
 
+    // ============================================================
+    // 图库持久化缓存开关（v4.16.1 安全阀）
+    // ============================================================
+
+    private const val KEY_GALLERY_PERSISTENT_CACHE = "gallery_persistent_cache"
+
+    /**
+     * 图库持久化缓存（v4.16.1）是否启用，默认 **true**。
+     *
+     * 启用：图库列表缩略图走"统一档"链路 —— `preview=jpeg;75` 拉服务端压缩版，
+     * 客户端采样到长边 720、JPEG80 落盘到 `filesDir/gallery_store`（图片）与
+     * `filesDir/gallery_thumbs`（视频首帧）。filesDir 不受系统存储清理影响，
+     * 重开 App 直接命中磁盘缓存、立刻清晰；统一档不受「内存优先」开关控制，一律落盘。
+     *
+     * 置 false 时**完全回到旧行为**：`cacheDir` 两处目录 + 512 长边档 +
+     * 原图不落盘（cacheDir 在存储紧张时会被系统清空，即"重开就变模糊"的旧根因）。
+     * 新旧两条链路互不读写对方目录（详见 MediaCache.fetchThumbnail 的分流注释）。
+     */
+    fun isGalleryPersistentCacheEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_GALLERY_PERSISTENT_CACHE, true)  // Default: true（持久化）
+    }
+
+    fun setGalleryPersistentCacheEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_GALLERY_PERSISTENT_CACHE, enabled)
+            .apply()
+    }
+
+    // ============================================================
+    // 图库三级手势开关（v4.16.2 安全阀）
+    // ============================================================
+
+    private const val KEY_GALLERY_THREE_LEVEL = "gallery_three_level"
+    private const val KEY_GALLERY_PINCH_COLUMNS = "gallery_pinch_columns"
+
+    /**
+     * 单图查看器"并排预览"三级手势（v4.16.2，总体计划 D1~D5）是否启用，默认 **true**。
+     *
+     * 启用：图库模式查看器里，未放大态双指合拢 → 图片跟手缩小 → 松手吸附到"并排"
+     * （中间约 70%、两侧各露约 15%）；并排态继续合拢 → 临时再缩小一圈（约 55%）
+     * → 松手弹回并排；并排态张开手指 → 回全屏。并排态左右滑交给 pager 翻页。
+     *
+     * 置 false 时**完全回到旧行为**：未放大态双指合拢到阈值即"缩小淡出关闭查看器"
+     * （v4.15.x 的捏合退出链路原样保留，见 ImageViewer.playPinchCloseDismiss）。
+     */
+    fun isGalleryThreeLevelEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_GALLERY_THREE_LEVEL, true)  // Default: true（三级手势）
+    }
+
+    fun setGalleryThreeLevelEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_GALLERY_THREE_LEVEL, enabled)
+            .apply()
+    }
+
+    /**
+     * 图库网格"捏合改列数"（v4.16.2，总体计划 C1~C3）是否启用，默认 **true**。
+     *
+     * 启用：图库网格上双指捏合 → 格子跟手连续缩放 → 松手吸附到最近档位
+     * （2 / 3 / 4 列，含 scroll 锚定保住当前看的图）。
+     *
+     * 置 false 时**完全回到旧行为**：固定 2 列（[androidx.compose.foundation.lazy.grid.GridCells.Fixed]（2）），
+     * 不挂捏合手势，捏合无任何效果。
+     */
+    fun isGalleryPinchColumnsEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_GALLERY_PINCH_COLUMNS, true)  // Default: true（捏合改列数）
+    }
+
+    fun setGalleryPinchColumnsEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_GALLERY_PINCH_COLUMNS, enabled)
+            .apply()
+    }
+
+    // ============================================================
+    // 下拉透出图库 + 位置飞回开关（v4.16.3 安全阀，B-23b 第三批）
+    // ============================================================
+
+    private const val KEY_GALLERY_DISMISS_REVEAL = "gallery_dismiss_reveal"
+
+    /**
+     * 单图查看器"下拉透出图库 + 位置飞回"（v4.16.3，总体计划 E1~E5）是否启用，默认 **true**。
+     *
+     * 启用：图库模式查看器全屏态向下拖动，偏离原位约 10% 后黑底快速（约 120ms）淡到
+     * 0.2，进查看器那一刻截下的图库画面从背后透出（被点的那格已挖黑占位）；松手达到
+     * 关闭阈值时图片边缩小边飞回那格（落格尺寸 = 其他缩略图），未达阈值则弹回全屏、
+     * 背景恢复纯黑。
+     *
+     * 置 false 时**完全回到旧行为**：纯黑背景 + 现有下滑关闭（无截图透出、无飞回），
+     * 且打开查看器不再截屏（省一份位图内存）。
+     */
+    fun isGalleryDismissRevealEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_GALLERY_DISMISS_REVEAL, true)  // Default: true（下拉透出 + 飞回）
+    }
+
+    fun setGalleryDismissRevealEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_GALLERY_DISMISS_REVEAL, enabled)
+            .apply()
+    }
+
     private const val KEY_PROMPT_EXPAND = "prompt_expand"
 
     fun isPromptExpandEnabled(context: Context): Boolean {
@@ -335,6 +444,63 @@ object AppSettings {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_PROMPT_EXPAND, enabled)
+            .apply()
+    }
+
+    // ============================================================
+    // LoRA 档案并入目录树开关（v4.16.6 安全阀）
+    // ============================================================
+
+    private const val KEY_LORA_ARCHIVE_MERGED = "lora_archive_merged"
+
+    /**
+     * 「LoRA 效果档案并入目录树」（v4.16.6 Q4）是否启用，默认 **true**。
+     *
+     * 启用：模型介绍页重建为「类别 → 分组 → 条目」三层目录树；档案区不再单独列出
+     * 47 条——42 条已收录到介绍表的条目并入树中对应模型（效果在详情抽屉里看），
+     * 档案只保留 5 条介绍表没有的孤儿条目，作为一个普通一级文件夹节点挂在树顶。
+     * 合并只在内存展示层完成，数据文件（assets / filesDir）零修改。
+     *
+     * 置 false 时**完全回到旧行为**：顶部独立「LoRA 效果档案」分区（47 条全部列出）
+     * + 按存放路径展开的旧目录树（v4.16.5 形态）。
+     */
+    fun isLoraArchiveMerged(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_LORA_ARCHIVE_MERGED, true)  // Default: true（合并形态）
+    }
+
+    fun setLoraArchiveMerged(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_LORA_ARCHIVE_MERGED, enabled)
+            .apply()
+    }
+
+    // ============================================================
+    // 生成点击的键盘收起时机修复（v4.16.7 安全阀）
+    // ============================================================
+
+    private const val KEY_GENERATE_CLICK_IME_FIX = "generate_click_ime_fix"
+
+    /**
+     * 「点生成时先提交、收键盘延后一帧」（v4.16.7 S2 安全阀），默认 **true**。
+     *
+     * 背景：键盘收起会触发 imePadding 逐帧重排，按钮在窗口里位移 246px
+     * （R4 取证）。开启时 `onGenerate()` 先同步执行、`clearFocus()` 用
+     * `view.post` 推后一帧 —— 点击手势期间按钮布局保持稳定。
+     *
+     * 置 false 时**完全回到旧行为**：onClick 首行立即 clearFocus（v4.16.6 及之前
+     * 的顺序）。
+     */
+    fun isGenerateClickImeFixEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_GENERATE_CLICK_IME_FIX, true)  // Default: true（修复形态）
+    }
+
+    fun setGenerateClickImeFixEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_GENERATE_CLICK_IME_FIX, enabled)
             .apply()
     }
 

@@ -282,7 +282,6 @@
     <string name="label_sampler">Sampler</string>
     <string name="label_scheduler">Scheduler</string>
     <string name="label_seed">Seed</string>
-    <string name="label_random_seed">Seed aleatorio</string>
     <string name="label_randomize_seed">Aleatorizar</string>
     <string name="label_denoise">Reducción de ruido</string>
     <string name="label_batch_size">Tamaño del lote</string>
@@ -382,8 +381,6 @@
     <string name="media_viewer_delete">Eliminar</string>
     <string name="media_viewer_save">Guardar</string>
     <string name="media_viewer_share">Compartir</string>
-    <string name="media_viewer_previous">Anterior</string>
-    <string name="media_viewer_next">Siguiente</string>
 
     <!-- Workflow editor strings -->
     <string name="workflow_editor_zoom_in">Acercar</string>
@@ -656,7 +653,6 @@
     <string name="update_verifying">Verificando paquete...</string>
     <string name="update_ready_dialog_line">Descarga completa. Listo para instalar.</string>
     <string name="update_ready_title">Actualizacion lista</string>
-    <string name="update_ready_text">Version %1$s descargada. Toca para instalar.</string>
     <string name="update_failed_generic">Fallo la actualizacion.</string>
     <string name="update_action_now">Actualizar ahora</string>
     <string name="update_action_later">Mas tarde</string>
@@ -673,4 +669,7 @@
     <!-- v4.6.1 Modulo D: progreso de subida -->
     <string name="button_uploading_progress">Subiendo %1$d%%</string>
     <string name="button_uploading_progress_queue">Subiendo %1$d%% · %2$d en cola</string>
+    <!-- Q3-3 (v4.16.5): menú de modelos cuatro estados — fallido (reintentable) vs. realmente vacío -->
+    <string name="model_list_load_failed">No se pudo cargar la lista de modelos — toca para reintentar</string>
+    <string name="model_list_empty">No hay modelos disponibles en el servidor</string>
 </resources>

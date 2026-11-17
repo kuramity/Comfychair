@@ -32,37 +32,7 @@ import sh.hnet.comfychair.model.ModelIntro
 import sh.hnet.comfychair.model.splitIntroText
 
 /**
- * 模型下拉项：路径一行，下面再挂一行"底模 · 类型 · 作者"的小字。
- *
- * 副标题只在表里**确实收录**了这个模型时才出现——没有介绍就保持原样，
- * 不显示占位文字，免得把下拉列表撑得又长又空。
- */
-@Composable
-fun ModelOptionLabel(path: String, intro: ModelIntro?) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        // 路径允许折到第二行：模型名普遍偏长（LoRA 尤其，例如「触发词：（xxx）中文名」），
-        // 单行截断会让用户根本认不出是哪个模型
-        ModelPathText(path, maxLines = 2)
-        val subtitle = modelSubtitle(intro, stringResource(R.string.model_intro_missing_badge))
-        if (subtitle != null) {
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (intro?.missing == true) {
-                    MaterialTheme.colorScheme.error
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                },
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-    }
-}
-
-/**
- * 副标题内容：底模 · 类型 · 作者（只拼有值的部分）。目录树版下拉也用它。
+ * 副标题内容：底模 · 类型 · 作者（只拼有值的部分）。
  *
  * @param missingBadge 本地文件已移除时追加的标记文案（传空串表示不标）；
  *        标记走参数传而不是写死在这里，是因为本函数要保持纯函数、可被非 Composable 复用

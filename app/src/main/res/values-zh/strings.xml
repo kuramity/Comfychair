@@ -269,7 +269,7 @@
     <string name="button_select_all">全选</string>
     <string name="button_deselect_all">取消全选</string>
     <string name="dialog_delete_selected_title">删除所选项目？</string>
-    <string name="dialog_delete_selected_message">将从服务器删除 %d 项，删除后无法恢复。</string>
+    <string name="dialog_delete_selected_message">将从本机图库移除 %d 项，服务器上的文件不受影响；移除后无法恢复。</string>
     <string name="label_item_selected">已选择</string>
     <string name="label_3d_badge">3D 模型</string>
     <string name="msg_items_saved_to_gallery">项目已保存到相册</string>
@@ -305,7 +305,6 @@
     <string name="seed_mode_random">随机</string>
     <string name="seed_mode_increment">每次+1</string>
     <string name="seed_mode_decrement">每次−1</string>
-    <string name="label_random_seed">随机种子</string>
     <string name="label_randomize_seed">随机</string>
     <string name="label_denoise">降噪</string>
     <string name="label_batch_size">批量大小</string>
@@ -409,8 +408,6 @@
     <string name="media_viewer_delete">删除</string>
     <string name="media_viewer_save">保存</string>
     <string name="media_viewer_share">分享</string>
-    <string name="media_viewer_previous">上一个</string>
-    <string name="media_viewer_next">下一个</string>
 
     <!-- Workflow editor strings -->
     <string name="workflow_editor_zoom_in">放大</string>
@@ -791,7 +788,6 @@
     <string name="tag_copy_failed">写入剪贴板失败</string>
     <string name="tag_inserted">已插入（第 %1$d 位）</string>
     <!-- 模型介绍（数据由电脑端脚本预生成，App 只负责显示） -->
-    <string name="model_intro_view">查看模型介绍</string>
     <string name="model_intro_none">暂无介绍</string>
     <string name="model_intro_effect">实际效果</string>
     <string name="model_intro_params">推荐参数（你的工作流）</string>
@@ -808,10 +804,12 @@
     <string name="model_intro_effect_archive">LoRA 效果档案（%1$d 条）</string>
     <string name="model_intro_effect_archive_orphan_only">仅效果档案收录</string>
     <string name="model_list_loading">正在加载模型列表…</string>
+    <!-- Q3-3 (v4.16.5): 模型下拉四态 —— 失败（可重试）与"服务器真没模型"严格区分 -->
+    <string name="model_list_load_failed">模型列表加载失败，点此重试</string>
+    <string name="model_list_empty">服务器上没有可用模型</string>
     <string name="nav_model_intro">模型介绍</string>
     <string name="model_intro_screen_title">模型介绍</string>
     <string name="model_intro_screen_count">共 %1$d 个</string>
-    <string name="model_intro_root_folder">（根目录）</string>
     <string name="button_back">返回</string>
     <string name="model_intro_close">关闭</string>
     <string name="three_d_viewer_title">3D 模型</string>
@@ -824,7 +822,6 @@
     <string name="three_d_viewer_fullscreen">全屏查看</string>
     <string name="three_d_tab_model">3D 模型</string>
     <string name="three_d_tab_render">渲染图</string>
-    <string name="three_d_hint_drag">单指拖动旋转 · 双指捏合缩放 · 双击复位</string>
     <string name="three_d_no_result_hint">暂无 3D 模型，请先生成</string>
     <string name="update_channel_name">应用更新</string>
     <string name="update_channel_desc">更新下载进度与就绪通知</string>
@@ -837,7 +834,6 @@
     <string name="update_verifying">正在校验安装包…</string>
     <string name="update_ready_dialog_line">下载完成，可以安装。</string>
     <string name="update_ready_title">更新已就绪</string>
-    <string name="update_ready_text">版本 %1$s 已下载，点击安装。</string>
     <string name="update_failed_generic">更新失败。</string>
     <string name="update_action_now">立即更新</string>
     <string name="update_action_later">稍后</string>

@@ -196,6 +196,9 @@ class GenerationViewModel : ViewModel() {
      * 只要任务还在队列里这个计数就清零，所以排队/慢任务不会被误杀；
      * 真正会累计的只有「服务器已经不认这个 prompt」的情况（重启、队列被清）。
      */
+    // 跨线程读写：OkHttp 回调线程自增，viewModelScope 轮询协程清零，
+    // 不加 @Volatile 时另一线程可能长期读到旧值（漏失计数判断/误清零）
+    @Volatile
     private var pollMissCount = 0
 
     // Subscription jobs

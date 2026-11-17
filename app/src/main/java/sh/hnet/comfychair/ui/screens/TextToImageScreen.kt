@@ -1,6 +1,8 @@
 package sh.hnet.comfychair.ui.screens
 
 import android.app.Activity
+import android.os.SystemClock
+import android.util.Log
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExitTransition
@@ -57,12 +59,12 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.MediaViewerActivity
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.WorkflowEditorActivity
@@ -73,6 +75,7 @@ import sh.hnet.comfychair.model.ThreeDVisibility
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.GenerationTopBarActions
+import sh.hnet.comfychair.ui.components.GenerationTopBarTitle
 import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.previewSurfaceBackground
@@ -186,7 +189,17 @@ fun TextToImageScreen(
     )
     val imeHeight = WindowInsets.ime.getBottom(LocalDensity.current)
     var prevImeHeight by remember { mutableStateOf(imeHeight) }
-    SideEffect { prevImeHeight = imeHeight }
+    SideEffect {
+        // S2Probe（v4.16.7 取证）：键盘高度变化时间线（弹起/收起各一条，含前后值）。
+        // 与 focus / onClick 日志的时间戳对照，还原"收键盘 → 布局位移 → 点击"时序。
+        if (BuildConfig.DEBUG && imeHeight != prevImeHeight) {
+            Log.d(
+                "S2Probe",
+                "ime ${prevImeHeight}px->${imeHeight}px ts=${SystemClock.uptimeMillis()}"
+            )
+        }
+        prevImeHeight = imeHeight
+    }
     var promptFocused by remember { mutableStateOf(false) }
     val expandPrompt = promptExpandEnabled && promptFocused && imeHeight > 0 && imeHeight >= prevImeHeight
 
@@ -263,13 +276,10 @@ fun TextToImageScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         // Top App Bar with save/share actions (outside content Box)
         TopAppBar(
-            // 标题不换行：顶栏加了 3D 入口后窄屏会把标题挤成两行（与图生图页一致处理）
+            // v4.16.6（Q6）：四屏标题统一走 GenerationTopBarTitle —— 单行硬约束 +
+            // 窄屏自动降字号（顶栏加 3D 入口后窄屏会把标题挤成两行）
             title = {
-                Text(
-                    text = stringResource(R.string.nav_text_to_image),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                GenerationTopBarTitle(text = stringResource(R.string.nav_text_to_image))
             },
             windowInsets = WindowInsets(0, 0, 0, 0),
             actions = {
@@ -382,7 +392,17 @@ fun TextToImageScreen(
                 .fillMaxWidth()
                 .then(if (expandPrompt) Modifier.weight(1f) else Modifier)
                 .padding(horizontal = 16.dp, vertical = 8.dp)
-                .onFocusChanged { promptFocused = it.isFocused },
+                .onFocusChanged {
+                    // S2Probe（v4.16.7 取证）：输入框焦点变化（onClick 到达与否的旁证：
+                    // 无效击时焦点没被清除，说明 onClick 整个没执行）
+                    if (BuildConfig.DEBUG) {
+                        Log.d(
+                            "S2Probe",
+                            "focus=${it.isFocused} ts=${SystemClock.uptimeMillis()}"
+                        )
+                    }
+                    promptFocused = it.isFocused
+                },
             minLines = 2,
             maxLines = if (expandPrompt) Int.MAX_VALUE else 4,
             keyboardOptions = KeyboardOptions(autoCorrectEnabled = spellCheckEnabled),
@@ -455,8 +475,20 @@ fun TextToImageScreen(
                 isFetching = uiState.isFetching,
                 isConnecting = isConnecting,
                 onGenerate = {
+                    // S2Probe（v4.16.7 取证）：onGenerate 确实被调（区分"onClick 到达但
+                    // 校验失败"与"onClick 根本没到达"两条路径）
+                    if (BuildConfig.DEBUG) {
+                        Log.d("S2Probe", "onGenerate entered ts=${SystemClock.uptimeMillis()}")
+                    }
                     if (textToImageViewModel.hasValidConfiguration()) {
                         val workflowJson = textToImageViewModel.prepareWorkflowJson()
+                        if (BuildConfig.DEBUG) {
+                            Log.d(
+                                "S2Probe",
+                                "onGenerate valid=true workflowJson=${workflowJson != null} " +
+                                    "ts=${SystemClock.uptimeMillis()}"
+                            )
+                        }
                         if (workflowJson != null) {
                             generationViewModel.startGeneration(
                                 workflowJson,
@@ -476,6 +508,13 @@ fun TextToImageScreen(
                                 context.getString(R.string.error_failed_load_workflow),
                                 Toast.LENGTH_SHORT
                             ).show()
+                        }
+                    } else {
+                        if (BuildConfig.DEBUG) {
+                            Log.d(
+                                "S2Probe",
+                                "onGenerate valid=false ts=${SystemClock.uptimeMillis()}"
+                            )
                         }
                     }
                 },

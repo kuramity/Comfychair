@@ -29,9 +29,6 @@ object AppInstaller {
     /** 与 AndroidManifest 里 ${applicationId}.fileprovider 一致 */
     private const val AUTHORITIES_SUFFIX = ".fileprovider"
 
-    /** update.apk 在 FileProvider 里的共享路径名（对应 file_paths.xml 的 external-files-path） */
-    private const val PROVIDER_PATH = "update_files"
-
     /** 这个 APK 是否已就绪可安装（文件存在且非空） */
     fun isApkReady(context: Context): Boolean {
         val f = UpdateDownloadWorker.finalFile(context)
