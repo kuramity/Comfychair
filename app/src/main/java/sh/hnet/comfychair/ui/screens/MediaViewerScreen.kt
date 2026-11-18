@@ -1,6 +1,7 @@
 package sh.hnet.comfychair.ui.screens
 
 import android.graphics.Bitmap
+import android.util.Log
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -63,6 +64,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -79,6 +81,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.MediaViewerActivity
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.cache.MediaCache
@@ -177,6 +180,10 @@ fun MediaViewerScreen(
     // 纯黑背景 + 现有下滑关闭（无截图透出、无飞回）
     val dismissRevealEnabled = remember { AppSettings.isGalleryDismissRevealEnabled(context) }
 
+    // N2 挖空开关（v4.16.8）：开启 = 图库截图已在像素空间挖好空置格（默认）；
+    // 关闭 = 回退旧的覆盖层方案（在截图之上画黑矩形，即 E3 Canvas）
+    val revealHolePunchEnabled = remember { AppSettings.isGalleryRevealHolePunch(context) }
+
     // Metadata bottom sheet state
     var showMetadataSheet by remember { mutableStateOf(false) }
 
@@ -258,14 +265,17 @@ fun MediaViewerScreen(
                                 contentScale = ContentScale.FillBounds,
                                 modifier = Modifier.fillMaxSize()
                             )
-                            // E3：目标格子挖黑占位——画在截图之上，无论遮罩 alpha 是多少
-                            // 格子区域恒为纯黑，飞回的图落在它上面不会与截图里的缩略图重叠
-                            Canvas(Modifier.fillMaxSize()) {
-                                drawRect(
-                                    color = Color.Black,
-                                    topLeft = Offset(galleryCellRect.left, galleryCellRect.top),
-                                    size = Size(galleryCellRect.width, galleryCellRect.height)
-                                )
+                            // E3：目标格子挖黑占位——N2 挖空开关关闭时的旧覆盖层路径。
+                            // 挖空开启（默认）时截图里那格已经是"空置格子"，这里不再
+                            // 画黑矩形，避免"空置格 + 黑块"叠两层
+                            if (!revealHolePunchEnabled) {
+                                Canvas(Modifier.fillMaxSize()) {
+                                    drawRect(
+                                        color = Color.Black,
+                                        topLeft = Offset(galleryCellRect.left, galleryCellRect.top),
+                                        size = Size(galleryCellRect.width, galleryCellRect.height)
+                                    )
+                                }
                             }
                         }
 
@@ -359,6 +369,71 @@ fun MediaViewerScreen(
                             {
                                 cancelProgressJob()
                                 gestureBaseProgress = sideProgress
+                                // N5Probe（仅 debug 包输出）：手势起点快照
+                                if (BuildConfig.DEBUG) {
+                                    Log.d(
+                                        "N5Probe",
+                                        "sideStart base=$gestureBaseProgress " +
+                                            "offset=${pagerState.currentPageOffsetFraction} " +
+                                            "page=${pagerState.currentPage} " +
+                                            "scrolling=${pagerState.isScrollInProgress}"
+                                    )
+                                }
+                                // N5（v4.16.8，返工修订）：翻页拖动进行中落第二指时，双指
+                                // 事件被 ImageViewer consume，pager 的 drag 被打断，
+                                // currentPageOffsetFraction 可能冻结在中间值。N5Probe 实测
+                                // （22.5% 残留复合手势）：这里的 scrollToPage 会挂在 pager
+                                // 的 mutator 队列上不返回（post/later 日志 12s+ 未出现），
+                                // 归零实际由 pager 打断后的 settle 完成——时序不受我方
+                                // 控制。所以本调用只是尽力归零的兜底（无动画、不与
+                                // animateScrollToPage 竞争、只在确实有残留时执行），
+                                // 确定性保障放在页平移的 graphicsLayer 里：并排态直接把
+                                // offsetFraction 视为 0（见下方 N5 返工注释）。本回调每次
+                                // 手势只触发一次（ImageViewer 的
+                                // wasSideBySidePinch 门控），天然满足"首次判定"
+                                if (ViewerSideBySide.shouldNormalizePager(
+                                        pagerState.currentPageOffsetFraction
+                                    )
+                                ) {
+                                    // N5Probe（v4.16.8 取证，仅 debug 包输出）：scrollToPage
+                                    // 对"被手指拖动中/拖动被打断的 pager"是否真的生效——
+                                    // pre=调用瞬间值，post=suspend 返回后的值，later=让出
+                                    // 一帧后再读（检测 pager settle 是否又写回残留值）。
+                                    if (BuildConfig.DEBUG) {
+                                        Log.d(
+                                            "N5Probe",
+                                            "normalize before offset=" +
+                                                "${pagerState.currentPageOffsetFraction} " +
+                                                "page=${pagerState.currentPage} " +
+                                                "scrolling=${pagerState.isScrollInProgress}"
+                                        )
+                                    }
+                                    scope.launch {
+                                        if (BuildConfig.DEBUG) {
+                                            Log.d(
+                                                "N5Probe",
+                                                "normalize pre offset=" +
+                                                    "${pagerState.currentPageOffsetFraction}"
+                                            )
+                                        }
+                                        pagerState.scrollToPage(pagerState.currentPage)
+                                        if (BuildConfig.DEBUG) {
+                                            Log.d(
+                                                "N5Probe",
+                                                "normalize post offset=" +
+                                                    "${pagerState.currentPageOffsetFraction}"
+                                            )
+                                        }
+                                        withFrameNanos { }
+                                        if (BuildConfig.DEBUG) {
+                                            Log.d(
+                                                "N5Probe",
+                                                "normalize later offset=" +
+                                                    "${pagerState.currentPageOffsetFraction}"
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             null
@@ -369,6 +444,17 @@ fun MediaViewerScreen(
                                 sideProgress = ViewerSideBySide.progressFromGesture(
                                     gestureBaseProgress, gestureScale
                                 )
+                                // N5Probe（仅 debug 包输出）：并排进度轨迹，配合
+                                // start/settle 三点定位复合手势下进度链路的行为
+                                if (BuildConfig.DEBUG) {
+                                    Log.d(
+                                        "N5Probe",
+                                        "sideUpdate base=$gestureBaseProgress " +
+                                            "scale=$gestureScale " +
+                                            "progress=$sideProgress " +
+                                            "offset=${pagerState.currentPageOffsetFraction}"
+                                    )
+                                }
                             }
                         } else {
                             null
@@ -377,6 +463,15 @@ fun MediaViewerScreen(
                             {
                                 // 松手吸附：≥0.5 → 并排 1.0；<0.5 → 全屏 0。并排态继续合拢
                                 // （进度 1.0~1.5 的临时缩小档）同样吸附回 1.0 —— 绝不退出图库
+                                // N5Probe（仅 debug 包输出）：松手瞬间进度与吸附目标
+                                if (BuildConfig.DEBUG) {
+                                    Log.d(
+                                        "N5Probe",
+                                        "settle progress=$sideProgress " +
+                                            "target=${ViewerSideBySide.settleProgress(sideProgress)} " +
+                                            "offset=${pagerState.currentPageOffsetFraction}"
+                                    )
+                                }
                                 animateProgressTo(ViewerSideBySide.settleProgress(sideProgress))
                             }
                         } else {
@@ -474,8 +569,21 @@ fun MediaViewerScreen(
                                         if (threeLevelEnabled) {
                                             val scale = ViewerSideBySide.pageFraction(sideProgress)
                                             // k = 本页相对"滚动中的当前位置"的页距（-1 左邻 / 0 当前 / +1 右邻）
-                                            val pageDistance = (page - pagerState.currentPage) -
+                                            // N5（v4.16.8 返工）：并排态把 pager 的翻页残留视为 0。
+                                            // N5Probe 实测：复合手势落第二指后，scrollToPage 会挂在
+                                            // pager 的 mutator 队列上不返回（在途手势未释放，挂起
+                                            // 12s+ 仍无 post），残留归零实际依赖 pager 被打断后
+                                            // "自行 settle"这条不受我方控制的路径。渲染层直接忽略
+                                            // 残留值：只要进入并排（sideProgress > 0），页距一律按
+                                            // "pager 已归零"计算，冻结值永远污染不了页平移；
+                                            // sideProgress == 0（全屏态）保持原样，正常翻页不受影响
+                                            val offsetFraction = if (sideProgress > 0f) {
+                                                0f
+                                            } else {
                                                 pagerState.currentPageOffsetFraction
+                                            }
+                                            val pageDistance = (page - pagerState.currentPage) -
+                                                offsetFraction
                                             translationX = pageDistance * size.width * (scale - 1f)
                                         }
                                     }
@@ -537,6 +645,23 @@ fun MediaViewerScreen(
                                         { MediaViewerActivity.suppressNextExitTransition = true }
                                     } else {
                                         null
+                                    },
+                                    // N6（v4.16.9，方案 A2）：放大态贴边继续同向拖 → 主动翻页，
+                                    // direction 是 pager 页方向（+1 下一张 / -1 上一张）。
+                                    // coerceIn 兜住边界页（第 0 页上一张 / 末页下一张的
+                                    // animateScrollToPage 目标不变、等于空操作）；视频页不传
+                                    // （视频层无放大平移链路）。翻页后新页由新组合的
+                                    // ImageViewer 实例天然回到 scale=1、居中
+                                    onPanEdgeFling = if (item.isVideo) {
+                                        null
+                                    } else {
+                                        { direction ->
+                                            scope.launch {
+                                                val target = (pagerState.currentPage + direction)
+                                                    .coerceIn(0, uiState.items.size - 1)
+                                                pagerState.animateScrollToPage(target)
+                                            }
+                                        }
                                     },
                                     // 并排预览三级手势（仅 GALLERY 图片页接线；视频页不传，
                                     // 由上面的 LaunchedEffect 把进度收回全屏）。
@@ -809,6 +934,9 @@ private fun MediaContent(
     flyBackCellRect: ViewerRect? = null,
     // E4：飞回动画完成后的通知（先于 onViewerClose），上层据此抑制 Activity 层缩小淡出
     onFlyBackCompleted: (() -> Unit)? = null,
+    // N6（v4.16.9，方案 A2）：放大态贴边继续同向拖的翻页回调，+1 右翻 / -1 左翻。
+    // 上层用 pagerState.animateScrollToPage 主动翻页（A1 让位实测无效，见 ImageViewer）
+    onPanEdgeFling: ((direction: Int) -> Unit)? = null,
     // 并排预览三级手势（D1~D5，v4.16.2）：仅 GALLERY 模式的图片页由上层接线。
     // 四个回调全 null 时 ImageViewer 的行为与改动前完全一致（不含任何并排分支）
     onSideBySideStart: (() -> Unit)? = null,
@@ -850,14 +978,16 @@ private fun MediaContent(
                     // E1~E5：格子矩形非 null 时本页启用下拉透出与飞回（分段遮罩、
                     // 飞回落格都在 ImageViewer 内）；null = 与旧版完全一致
                     flyBackCellRect = flyBackCellRect,
+                    onPanEdgeFling = onPanEdgeFling,
                     onSideBySideStart = onSideBySideStart,
                     onSideBySide = onSideBySide,
                     onSideBySideSettle = onSideBySideSettle,
                     onSideBySideTap = onSideBySideTap,
-                    sideBySideScale = sideBySideScale,
-                    // 查看器页不能自带不透明底：并排预览下页与页重叠，黑底会盖掉邻页露边
-                    // （屏幕根容器是纯黑，视觉零差别）
-                    pageBackground = false
+                    sideBySideScale = sideBySideScale
+                    // v4.16.8 N3/N4：pageBackground 参数已随本版删除——背景分支收敛为
+                    // ImageViewer.drawBehind 三分支（判定见 resolveBackgroundBranch），
+                    // 全屏无格子态由"档位宽度黑"（sideScale=1 → 满宽满高）兜底，
+                    // 背景从此只有一处来源
                 )
             }
             else -> {

@@ -433,6 +433,35 @@ object AppSettings {
             .apply()
     }
 
+    // ============================================================
+    // 下拉透出"挖空截图"开关（v4.16.8 安全阀，N2）
+    // ============================================================
+
+    private const val KEY_GALLERY_REVEAL_HOLE_PUNCH = "gallery_reveal_hole_punch"
+
+    /**
+     * 下拉透出的"原位挖空"（v4.16.8，N2）是否启用，默认 **true**。
+     *
+     * 启用：截取图库画面时直接把被点格子的矩形区域在 Bitmap 像素空间里填成
+     * 图库背景色 —— 透出的画面上那格就是"空置格子"，与周围 gutter 视觉一致。
+     * 挖空发生在静态截图内，天然没有跨窗口坐标系对齐问题（旧覆盖层方案曾因
+     * 漏算网格 contentPadding 整体偏移 8dp，格子右缘/底缘各露出一条）。
+     *
+     * 置 false 时**回到旧覆盖层方案**：截图不挖空，由查看器在截图之上画黑矩形
+     * 占位（MediaViewerScreen 的 E3 Canvas）。
+     */
+    fun isGalleryRevealHolePunch(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_GALLERY_REVEAL_HOLE_PUNCH, true)  // Default: true（截图内挖空）
+    }
+
+    fun setGalleryRevealHolePunch(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_GALLERY_REVEAL_HOLE_PUNCH, enabled)
+            .apply()
+    }
+
     private const val KEY_PROMPT_EXPAND = "prompt_expand"
 
     fun isPromptExpandEnabled(context: Context): Boolean {

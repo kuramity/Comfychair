@@ -255,6 +255,12 @@ internal fun shouldDrawTouchGlow(showDots: Boolean, showTouchGlow: Boolean): Boo
  * @param enabled false 时皮肤**降级**而非整条关闭（v4.16.6 Q2）：渐变/辉光投影/点阵/
  *   按压回弹全部关闭，但保留一圈**降档白边**（约启用档一半 alpha）勾出禁用灰块的
  *   轮廓——深色底上半透明灰块没白边勾勒时边缘糊化，用户感知为"按钮形状变了"
+ * @param skinEnabled 皮肤总开关（v4.16.10 N1-2.2）：false 时**整条不挂**（无渐变/白边/
+ *   投影/辉光/点阵/按压缩放，回 v4.16.6 之前的 `return this` 零绘制行为）——与 [enabled]
+ *   拆成两个独立信号：[enabled] 表达"按钮可不可点"（false = 画禁用降档白边），
+ *   [skinEnabled] 表达"用户要不要皮肤"（false = 什么都不画）。原先两信号混用
+ *   （`enabled = xxxEnabled && dotFeedbackEnabled`），用户关掉波纹点阵后可用按钮会
+ *   误画禁用档白边（0.10 而非 0.22）。默认 true：不传的调用点（齿轮/顶栏图标）行为不变
  * @param gradientColors 双色渐变（null = 不画；disabled 态必须传 null）
  * @param glowColor 外辉光/投影颜色（accent，跟随调色盘）
  * @param rippleColor 触点辉光颜色（触点处一小团实心柔光，随寿命淡出）
@@ -279,6 +285,7 @@ fun Modifier.rippleFeedback(
     interactionSource: MutableInteractionSource? = null,
     shape: Shape = MaterialTheme.shapes.large,
     enabled: Boolean = true,
+    skinEnabled: Boolean = true,
     gradientColors: List<Color>? = null,
     glowColor: Color = MaterialTheme.colorScheme.primary,
     // 触点辉光颜色（v4.12.x 起唯一用途：触点处一小团实心柔光，随寿命淡出）
@@ -297,6 +304,10 @@ fun Modifier.rippleFeedback(
     haloDownward: Boolean = false,
     borderAlphaOverride: Float? = null,
 ): Modifier {
+    // v4.16.10（N1-2.2）：皮肤总开关关闭 → 整条不挂（零绘制），回 v4.16.6 之前的
+    // `return this` 行为。这是"用户关掉波纹点阵"的语义：连禁用降档白边也不画 ——
+    // 禁用降档（下一行注释）只服务"皮肤开着但按钮禁用"的组合。
+    if (!skinEnabled) return this
     // v4.16.6（Q2）：禁用不再整条 return —— 皮肤降级：白边保留但降档（禁用灰块轮廓可辨），
     // 渐变/辉光投影/点阵/按压回弹仍然关闭。禁用按钮收不到 PressInteraction（clickable
     // enabled=false），下面的 pressed 已按 enabled 门控 → scale 与白边增压恒为静置值，

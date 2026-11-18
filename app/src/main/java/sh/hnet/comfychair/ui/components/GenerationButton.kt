@@ -26,6 +26,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuDefaults
 import androidx.compose.material3.SplitButtonDefaults
+import androidx.compose.material3.SplitButtonShapes
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -77,6 +78,33 @@ internal const val TRAILING_GRADIENT_MIDPOINT_FRACTION = 0.5f
  */
 internal const val TRAILING_BORDER_OPEN_ALPHA = 0.32f
 
+/**
+ * 下拉白边 override 的解析（v4.16.10 N1-2.1，纯函数供单测钉规格）。
+ *
+ * 修复的缺陷：`!pressUnified -> 0.18f` 原先没有 enabled 门控 —— 断连禁用态的白边会跳过
+ * 禁用降档（深 0.10 / 浅 0.08）直接走启用档 0.18（亮约 80%），与
+ * [sh.hnet.comfychair.ui.components.ripple.RippleFeedbackModifier] 的注释承诺
+ *（"禁用还要 override 的调用点不存在"）矛盾。现在 [trailingEnabled] 为 false 时返回 null：
+ * override 层不干预，让皮肤层的禁用降档分支生效。
+ *
+ * @param pressUnified 模块 2 安全阀（false = 回退态：静置 18% 恒定、打开也不提亮）
+ * @param trailingEnabled 按钮是否可用（false = 离线禁用，返回 null 走禁用档白边）
+ * @param showMenu 队列菜单是否展开（true = 打开态提亮 32%，仅在模块 2 开关开启时生效）
+ * @return 白边 alpha 覆盖值；null = 不覆盖（皮肤层按主题/状态默认值取档）
+ */
+internal fun resolveTrailingBorderAlpha(
+    pressUnified: Boolean,
+    trailingEnabled: Boolean,
+    showMenu: Boolean,
+): Float? = when {
+    // 禁用一律 null：override 层不干预，皮肤层 `!enabled` 分支给禁用降档（深 0.10 / 浅 0.08）。
+    // showMenu 分支也要先过这关 —— 禁用态打不开菜单（保险丝），万一状态残留也不许拿启用档。
+    !trailingEnabled -> null
+    !pressUnified -> 0.18f
+    showMenu -> TRAILING_BORDER_OPEN_ALPHA
+    else -> null
+}
+
 /** 测试定位 tag（Compose 惯例：仅测试可见的 tag 允许留在生产代码）。 */
 private const val TRAILING_BUTTON_TAG = "trailing-button"
 private const val TRAILING_ARROW_TAG = "trailing-arrow"
@@ -89,6 +117,28 @@ private const val TRAILING_ARROW_TAG = "trailing-arrow"
  * 此处刻意不用 26dp —— 数值与改动前视觉一致，且保持与既有图标体系统一。
  */
 private val TRAILING_ICON_SIZE = 24.dp
+
+/**
+ * 生成主按钮的本体形状（v4.16.10 N1）：**四角全 28dp 胶囊**。
+ *
+ * 背景：M3 SplitButton 默认 leading 形状是"左全圆 + 右仅 4dp 小圆角"的**不对称半胶囊**，
+ * 而皮肤层（白边/渐变/点阵裁剪）一直按对称的 RoundedCornerShape(28.dp) 画 —— 启用态容器
+ * 透明时本体不可见、两条曲线各自安好；禁用后 M3 Surface 按不对称本体画出灰块，右端与
+ * 白边错开约 24.75dp（R7 取证）。现在把本体显式传成与皮肤同一条曲线：容器透明时零变化，
+ * 禁用灰块与白边逐角重合。本体与白边**共用同一个常量**（皮肤层 shape 参数不再写字面量），
+ * 两条曲线的同源关系由类型保证、由单测钉住（GenerationButtonShapeAlignmentTest）。
+ */
+internal val GENERATION_LEADING_BODY_SHAPE = RoundedCornerShape(28.dp)
+
+/**
+ * 下拉按钮的本体形状（v4.16.10 N1）：**四角全 18dp**（含按压态与 checked 展开态）。
+ *
+ * 背景：M3 默认 trailing 形状是"左 4dp + 右全圆"、checked 时整体 CircleShape，与皮肤层
+ * RoundedCornerShape(18.dp) 白边在禁用态左端错开 14.75dp、右端白边悬在灰块外 9.25dp
+ *（R7 取证）；展开态若落回 CircleShape 还会再错一次。统一传 18dp 后三条状态（静置/按压/
+ * 展开）与白边都是同一条曲线。与皮肤层 shape 参数共用本常量（同源由类型保证）。
+ */
+internal val GENERATION_TRAILING_BODY_SHAPE = RoundedCornerShape(18.dp)
 
 /**
  * 渐变辅色：强调色在 HSV 口径上色相 +35°。
@@ -248,6 +298,15 @@ fun GenerationButton(
                 }
             },
             enabled = leadingEnabled,
+            // v4.16.10（N1）：本体形状显式对齐皮肤层 —— M3 默认 leading 是"左全圆 + 右 4dp"
+            // 不对称半胶囊，禁用灰块会与 28dp 白边在右端错开约 24.75dp。三个状态（静置/按压）
+            // 全传 28dp（leading 无 checked 态，checkedShape 传 null 走 shape），四角与白边
+            // 逐角相等；同值形状下 M3 的圆角动画（rememberAnimatedShape）无跳变。
+            shapes = SplitButtonShapes(
+                shape = GENERATION_LEADING_BODY_SHAPE,
+                pressedShape = GENERATION_LEADING_BODY_SHAPE,
+                checkedShape = null,
+            ),
             // U3：M3 自带 elevation 阴影去掉 —— SplitButton 默认 LeadingButtonShape 是
             // "左圆右方"半胶囊，M3 阴影会在按钮尾部露出直角灰块（实测浅色主题可见），
             // 且与皮肤层可控投影叠加后发脏。主按钮投影统一由 rippleFeedback 的 2 层投影承担。
@@ -274,8 +333,15 @@ fun GenerationButton(
                     // CircleShape 是"四角百分比各取 50%"，在非正方形上会变成内切椭圆 ——
                     // 椭圆弧与真实按钮边缘最大偏离约 9dp，会让辉光看起来是条游离的弧线，
                     // 按钮两端的点阵/波纹也会被椭圆裁掉。48dp 方形图标按钮那种才适合 CircleShape。
-                    shape = RoundedCornerShape(28.dp),
-                    enabled = leadingEnabled && dotFeedbackEnabled,
+                    // v4.16.10（N1）：本体与皮肤共用 GENERATION_LEADING_BODY_SHAPE 常量，
+                    // 禁用灰块（本体）与白边（皮肤）是同一条曲线（同源由类型保证）。
+                    shape = GENERATION_LEADING_BODY_SHAPE,
+                    // v4.16.10（N1-2.2）：拆分"按钮禁用"与"皮肤开关"两个信号 —— enabled 只表达
+                    // 按钮本身可不可点（false = 画禁用降档白边），皮肤总开关移到 skinEnabled
+                    //（false = 完全不画，回 v4.16.6 之前的零绘制行为）。原先两个信号混用：
+                    // 用户关掉波纹点阵后，可用按钮会画出禁用档白边（0.10 而非 0.22）。
+                    enabled = leadingEnabled,
+                    skinEnabled = dotFeedbackEnabled,
                     // 渐变色不缓存（决策 7）：accent 变了重组时这里现取新值，绘制层下一帧跟随
                     gradientColors = if (leadingSkinActive) {
                         listOf(accent, accent.shiftAccentHue())
@@ -335,6 +401,16 @@ fun GenerationButton(
                 checked = showMenu,
                 onCheckedChange = { showMenu = it },
                 enabled = trailingEnabled,
+                // v4.16.10（N1）：本体形状显式对齐皮肤层 —— M3 默认 trailing 是"左 4dp + 右全圆"、
+                // checked 展开时整体 CircleShape，禁用灰块会与 18dp 白边左端错开 14.75dp、
+                // 右端白边悬在灰块外 9.25dp；展开态若落回圆形还会再错一次。静置/按压/展开
+                // 三个状态全传 18dp（首选方案：展开态保持圆角矩形，与白边同一条曲线），
+                // 四角与白边逐角相等；同值形状下 M3 的圆角动画无跳变。
+                shapes = SplitButtonShapes(
+                    shape = GENERATION_TRAILING_BODY_SHAPE,
+                    pressedShape = GENERATION_TRAILING_BODY_SHAPE,
+                    checkedShape = GENERATION_TRAILING_BODY_SHAPE,
+                ),
                 // U3：次级元素不带任何投影 —— M3 elevation 阴影会在半胶囊形状外露出
                 // 错形残边（同 leading），皮肤层白边 18% 已足够勾勒轮廓
                 elevation = null,
@@ -367,16 +443,22 @@ fun GenerationButton(
                     .rippleFeedback(
                         interactionSource = trailingInteraction,
                         // 决策 8：方形按钮圆角 18dp（对齐基准方形版），不再是胶囊的 28dp
-                        shape = RoundedCornerShape(18.dp),
-                        enabled = trailingEnabled && dotFeedbackEnabled,
+                        // v4.16.10（N1）：本体与皮肤共用 GENERATION_TRAILING_BODY_SHAPE 常量
+                        //（含 checked 展开态，见上方 shapes 注释），两条曲线同源。
+                        shape = GENERATION_TRAILING_BODY_SHAPE,
+                        // v4.16.10（N1-2.2）：拆分"按钮禁用"与"皮肤开关"（同 leading 注释）
+                        enabled = trailingEnabled,
+                        skinEnabled = dotFeedbackEnabled,
                         // C2（模块 2）：静置白边与主按钮同源（不传 override 走皮肤层默认
                         // 深色 22% / 浅色 12%）；S2：打开态提亮到 32%。开关关闭回 v2 旧规格
-                        // 18%（打开不提亮）；回退态（!skinV2）走皮肤层默认（深色 50%）
-                        borderAlphaOverride = when {
-                            !skinV2 -> null
-                            !pressUnified -> 0.18f
-                            showMenu -> TRAILING_BORDER_OPEN_ALPHA
-                            else -> null
+                        // 18%（打开不提亮）；回退态（!skinV2）走皮肤层默认（深色 50%）。
+                        // v4.16.10（N1-2.1）：override 解析抽成纯函数并补 enabled 门控 ——
+                        // 断连禁用态返回 null，让皮肤层禁用降档（0.10/0.08）生效，
+                        // 不再亮着启用档 0.18（修复前亮约 80%）。
+                        borderAlphaOverride = if (skinV2) {
+                            resolveTrailingBorderAlpha(pressUnified, trailingEnabled, showMenu)
+                        } else {
+                            null
                         },
                         // v2：无辉光无投影；回退态保留旧环形辉光
                         showHalo = !skinV2,

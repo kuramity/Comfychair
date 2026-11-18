@@ -11,6 +11,13 @@ import kotlin.math.abs
  */
 enum class ViewerPanDirection { UNDECIDED, HORIZONTAL, VERTICAL }
 
+/**
+ * N8（v4.16.9）：二维自由拖动松手后的归宿。
+ * - [FLY_BACK]：关闭查看器并飞回图库格子（原 playFlyBackDismiss 链路）；
+ * - [SPRING_BACK]：不关闭，位移双轴弹簧回 0（回全屏，原 settleDismissBack 链路）。
+ */
+enum class DismissOutcome { FLY_BACK, SPRING_BACK }
+
 /** 脱离拖动某个位移量对应的视觉状态（作用于图片层，graphicsLayer 消费） */
 data class DismissVisuals(val scale: Float, val alpha: Float)
 
@@ -156,6 +163,34 @@ object ViewerDismissGesture {
     }
 
     /**
+     * 查看器页背景分支选择（N3/N4，v4.16.8，纯函数 JVM 单测钉住）。
+     *
+     * ImageViewer.drawBehind 直接调用本函数、按返回的枚举绘制（代码级绑定，
+     * 不是"注释里声称的对应"）：判定表在这里改，drawBehind 的绘制跟着变；
+     * 判定表退化（如"非并排全屏不返回 SIDE_OR_FULL_BLACK"）会让
+     * ViewerBackgroundBranchTest 立刻变红。分支顺序不能换：
+     * ① 进入页全屏 → E1/E2 分段遮罩（透出逻辑完全不变）；
+     * ② 脱离拖动中 → 旧线性映射（无论是否并排态）；
+     * ③ 其余一律档位宽度黑——并排态宽度 = 页宽 × 档位比例；全屏态无飞回格子
+     *    （非进入页 / 已翻页）时档位比例 = 1，即满宽满高黑。
+     *    旧版在这类"整页透明"的输入下什么都不画（透出图库截图/网格，N3/N4），
+     *    反证：把"非进入页全屏"判成无背景，第 ③ 条断言必失败。
+     *
+     * @param hasFlyBackCellRect 本页是否带飞回格子矩形（进入页）
+     * @param inFullScreen 当前是否全屏态（并排进度 = 0）
+     * @param dismissY 脱离拖动的实时位移（px，> 0 才算拖动中）
+     */
+    fun resolveBackgroundBranch(
+        hasFlyBackCellRect: Boolean,
+        inFullScreen: Boolean,
+        dismissY: Float
+    ): ViewerBackgroundBranch = when {
+        hasFlyBackCellRect && inFullScreen -> ViewerBackgroundBranch.FLYBACK_MASK
+        dismissY > 0f -> ViewerBackgroundBranch.DISMISS_LINEAR
+        else -> ViewerBackgroundBranch.SIDE_OR_FULL_BLACK
+    }
+
+    /**
      * E4：飞回目标的 graphicsLayer 因子换算。
      *
      * 图片内容（Fit 矩形，居中于容器、未变换）最终要正好落在格子矩形上：
@@ -236,7 +271,144 @@ object ViewerDismissGesture {
         if (scaleAtGestureStart > PINCH_ZOOMED_THRESHOLD) return false
         return gestureScale <= PINCH_DISMISS_SCALE
     }
+
+    // ============================================================
+    // N6（v4.16.9）：放大态水平边界判定（平移到界后让位给翻页）
+    // ============================================================
+
+    /**
+     * 边界判定的浮点容差（px）：constrainOffset 的 coerceIn 会把 offset 精确钳在
+     * ±excessWidth，容差只为吸收累计浮点误差；1px 在任何密度下都低于可感知范围。
+     */
+    const val EDGE_TOLERANCE_PX = 1f
+
+    /**
+     * N6（A2）：放大态贴边继续同向拖的翻页触发阈值（占视口宽的比例）。
+     * 手指在边界外的过冲累计达到该比例即翻页。取 5% 的理由：贴边后 offset 已被
+     * constrainOffset 钳死，继续同向拖不存在任何别的效果，翻页是唯一合理反馈，
+     * 阈值只承担"滤掉抖动"的职责——5% 在 320px 视口是 16px（3~4 帧跟手拖动）、
+     * 在 1080px 视口是 54px，两种屏宽下都低于"误触感知线"且远小于死区感阈值。
+     * 初版 0.15 在设备实测中永远达不到：swipe 到边界后剩余过冲帧的 pan 累计
+     * 仅 ~27px（N6Probe 日志），阈值从未触发。
+     */
+    const val EDGE_FLING_OVERSCROLL_RATIO = 0.05f
+
+    /**
+     * N6：放大态水平平移是否已贴住左/右任一边界。
+     *
+     * excessWidth =（缩放后图宽 − 容器宽）的一半，与 constrainOffset 的钳制上界同源：
+     * |offsetX| 触及 excessWidth（容差内）即贴边。excessWidth ≤ 0（crop 放大或图宽
+     * 恰好铺满容器）时水平没有平移余地，任何位置都算贴边——左右拖动全都该让位给翻页，
+     * 与系统相册"放大到铺满宽度后横拖即翻页"的手感一致。异常输入（NaN）一律判未贴边：
+     * 让位是保守行为，不确定时宁可继续平移。
+     */
+    fun isAtHorizontalEdge(offsetX: Float, excessWidth: Float, tolerance: Float): Boolean {
+        if (!offsetX.isFinite() || !excessWidth.isFinite() || !tolerance.isFinite()) return false
+        if (excessWidth <= 0f) return true
+        return abs(offsetX) >= excessWidth - tolerance
+    }
+
+    /**
+     * N6：放大态平移的本次水平分量里，"指向已贴边边界之外"的过冲量（px，带方向）。
+     *
+     * 返回 0 = 正常平移（未贴边 / 拖动方向指回屏内），调用方照旧更新 offset 并 consume；
+     * 非 0 = 让位信号：正 = 向右界外推（右翻方向），负 = 向左界外推（左翻方向）。
+     * 方向必须一致才计过冲——贴右界时向左拖是"往回平移"，不是翻页意图，返回 0 让
+     * 调用方把累计清零（避免先右后左的抖动手势攒出假过冲）。
+     */
+    fun horizontalEdgeOverscrollPan(
+        offsetX: Float,
+        excessWidth: Float,
+        panX: Float,
+        tolerance: Float
+    ): Float {
+        if (!isAtHorizontalEdge(offsetX, excessWidth, tolerance)) return 0f
+        // 无水平余量：两侧都算贴边，任意方向的拖动都是过冲（方向语义由符号自带）
+        if (excessWidth <= 0f) return panX
+        return if (offsetX > 0f && panX > 0f) panX
+        else if (offsetX < 0f && panX < 0f) panX
+        else 0f
+    }
+
+    // ============================================================
+    // N8（v4.16.9）：二维自由拖动（下拉过阈值后放开横向跟手）
+    // ============================================================
+
+    /**
+     * N8：横向自由拖动的满格阈值（下拉深度占屏高的比例）。
+     * 用户规格"向下拖动约 20% 之后即可自由移动"；起步点取其一半（10%），恰好与
+     * REVEAL_PROGRESS_RATIO（透出图库的阈值）同步——图库开始透出时横向开始跟手，
+     * 两个反馈同时出现，不会有"图库已透出、横拖还没反应"的错位感。
+     */
+    const val FREE_DRAG_THRESHOLD_RATIO = 0.20f
+
+    /**
+     * N8：下拉深度 → 横向跟手权重（0..1）。
+     *
+     * 分段线性：进度 ≤ 起步点（thresholdRatio 的一半）→ 0（前段仍锁纵向）；
+     * 起步点 → thresholdRatio 之间线性爬升到 1；之后恒 1（完全放开）。
+     * 线性而不是阶跃：权重乘在累计 dx 上，权重渐变时 x 位移渐进跟手，
+     * 不会在过阈值的瞬间从 0 突跳到全量。
+     *
+     * thresholdRatio ≤ 0 视为"全程放开"（返回 1）——反证用例靠它变红：
+     * 阈值改 0 后 0.1×屏高的断言（期望 0）会得到 1。
+     * 屏高未测得 / NaN 一律返回 0：宁可不放开，也不把 NaN 带进位移。
+     */
+    fun resolveFreeDragFactor(dismissDy: Float, screenHeightPx: Float, thresholdRatio: Float): Float {
+        if (!dismissDy.isFinite() || !screenHeightPx.isFinite() || screenHeightPx <= 0f) return 0f
+        if (!thresholdRatio.isFinite() || thresholdRatio <= 0f) return 1f
+        val progress = abs(dismissDy) / screenHeightPx
+        val start = thresholdRatio * 0.5f
+        if (progress <= start) return 0f
+        return ((progress - start) / (thresholdRatio - start)).coerceIn(0f, 1f)
+    }
+
+    /**
+     * N8：二维拖动松手归宿判定（shouldDismiss 的 x 轴扩展版）。
+     *
+     * 判定顺序：
+     * ① 横向甩速超阈值（|vx| > 阈值）→ FLY_BACK：自由拖动后横向快速甩动是明确的
+     *    "甩掉查看器"意图，纵向上不再要求拖够 22%（原版只看 y，横向甩永远弹回）；
+     * ② 纵向达既有阈值（dy > 22% 屏高 或 下甩 vy > 阈值）→ FLY_BACK（原语义不变）；
+     * ③ 其余（含 |dy| < 3% 屏高且 |dx| < 3% 屏宽的"接近原位"）→ SPRING_BACK 回全屏。
+     *    归宿②的显式条件在判定上与③重合（dy 不达标本来就走 SPRING_BACK），这里
+     *    保留 dx/screenWidthPx 参数把规格写进签名：横向位移大而纵身未达标同样回全屏
+     *    （x 弹簧归零），绝不允许"横拖很远但 dy 没到 22% 就误关闭"。
+     */
+    fun resolveDismissOutcome(
+        dy: Float,
+        dx: Float,
+        velocityYDownPxPerSec: Float,
+        velocityXPxPerSec: Float,
+        screenHeightPx: Float,
+        screenWidthPx: Float,
+        velocityThresholdPxPerSec: Float
+    ): DismissOutcome {
+        if (abs(velocityXPxPerSec) > velocityThresholdPxPerSec) return DismissOutcome.FLY_BACK
+        val distanceExceeded = dy > screenHeightPx * DISMISS_DISTANCE_RATIO
+        val velocityExceeded = velocityYDownPxPerSec > velocityThresholdPxPerSec
+        return if (distanceExceeded || velocityExceeded) {
+            DismissOutcome.FLY_BACK
+        } else {
+            DismissOutcome.SPRING_BACK
+        }
+    }
 }
+
+/**
+ * 查看器页背景的绘制分支（N3/N4，v4.16.8）。
+ *
+ * ImageViewer 的 drawBehind 按优先级取**第一个**命中的分支：
+ * - [FLYBACK_MASK]：进入页全屏态——E1/E2 分段遮罩（拖动中淡到 0.2 透出图库）；
+ * - [DISMISS_LINEAR]：脱离拖动中——旧线性映射遮罩（D5，并排态下拉也走这条）；
+ * - [SIDE_OR_FULL_BLACK]：档位宽度黑（并排态宽度 = 页宽 × 档位比例，绝不盖露边
+ *   的邻图）；全屏态且无飞回格子矩形（非进入页 / 已翻页）时 sideScale = 1，
+ *   满宽满高黑——把原本整页透明的"相邻页 / 加载中页"全部压黑（N3/N4 修复）。
+ *
+ * 旧版还有第四分支 pageBackground（整页不透明黑）：分支三改造覆盖全屏态后它在
+ * 任何输入下都不可达，已随本版删除——背景从此只有这一处来源。
+ */
+enum class ViewerBackgroundBranch { FLYBACK_MASK, DISMISS_LINEAR, SIDE_OR_FULL_BLACK }
 
 /**
  * 并排预览三级手势（D1~D5，v4.16.2）的纯判定逻辑。
@@ -379,6 +551,22 @@ object ViewerSideBySide {
      * 并排态张开到手（进度掉过 0.5）→ 回全屏。
      */
     fun settleProgress(progress: Float): Float = if (progress >= SETTLE_THRESHOLD) 1f else 0f
+
+    /**
+     * 并排接管第一帧是否要归零 pager 的翻页残留（N5，v4.16.8，纯函数）。
+     *
+     * 翻页拖动进行中落第二指时，双指事件被 ImageViewer 全部 consume，pager 的
+     * drag 被取消且不触发 settle，currentPageOffsetFraction 冻结在中间值——页
+     * 平移公式一直含它，并排后整页带着偏移（"图片只占半边、另一侧黑区"）。
+     * 归零用 scrollToPage（瞬时），只在残留超过 1% 视口宽时执行，避免在
+     * fraction 本来就是 0（绝大多数情况）时发起无意义的 scroll 调用。
+     *
+     * NaN / 无穷按"需要归零"处理：scrollToPage 会把任何状态复位到当前页原点。
+     */
+    fun shouldNormalizePager(offsetFraction: Float): Boolean {
+        if (!offsetFraction.isFinite()) return true
+        return abs(offsetFraction) > 0.01f
+    }
 
     /**
      * 并排态点击命中分区（D4"点哪张图哪张全屏"）。

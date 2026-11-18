@@ -1,6 +1,8 @@
 package sh.hnet.comfychair.ui.components
 
 import android.graphics.Bitmap
+import android.util.Log
+import sh.hnet.comfychair.BuildConfig
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.VectorConverter
@@ -40,6 +42,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import kotlin.math.abs
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
@@ -88,18 +91,19 @@ fun ImageViewer(
     // 用 lambda 而不是 Float：它在 graphicsLayer lambda 内被读取，捏合动画每帧只更新 layer
     // 属性、不触发本组件重组。null = 全屏（因子 1，视觉零变化）
     sideBySideScale: (() -> Float)? = null,
-    // 是否为本组件铺一层不透明黑底。默认 true = 保持既有行为（ImageSlotViewer 这类
-    // 单图槽位依赖它：从 0 缩放进场时不能露出后面的内容）。
-    // 查看器（MediaViewerScreen 的分页）必须传 false —— 并排预览下每页会被缩放平移、
-    // 页与页区域重叠，页自带不透明黑底会把邻页露边整块盖掉（屏幕根容器本身是黑的）。
-    pageBackground: Boolean = true,
     // B-23b 第三批（E1~E5）：飞回目标格子矩形（window px，与页内坐标系一致——页
     // 从 window (0,0) 起铺满全屏）。非 null = 该页启用"下拉透出图库 + 位置飞回"：
     // 黑底遮罩改走分段映射（E2），松手达阈值播飞回（E4）；null = 行为与旧版完全一致
     flyBackCellRect: ViewerRect? = null,
     // 飞回动画完成后的通知（E4）：先于 onClose 调用，上层据此抑制 Activity 层的
     // 缩小淡出过渡（飞回已无缝落格，再淡出反而突兀）
-    onFlyBackCompleted: (() -> Unit)? = null
+    onFlyBackCompleted: (() -> Unit)? = null,
+    // N6（v4.16.9，方案 A2）：放大态平移贴边后继续同向拖动过冲达阈值时回调翻页。
+    // 参数是 pager 页方向：+1 = 下一张 / -1 = 上一张（手指向左拖 = 看右边 = 下一张）。
+    // 为什么主动回调而不是"让位"（A1，不再 consume 事件）：设备实测 A1 无效——
+    // Pager 的 scrollable 在手势早期的 touch slop 阶段就被本层 consume 打断，后续
+    // 放行它也不再接手（N6Probe 取证：overscroll 三帧放行、页码纹丝不动）。null = 不启用
+    onPanEdgeFling: ((direction: Int) -> Unit)? = null
 ) {
     // 手势事件在 pointerInput(Unit) 内消费闭包：回调参数要用 rememberUpdatedState
     // 转成稳定引用，重组更新后手势里读到的才是最新值（并排态激活/退出全靠它切换）
@@ -110,6 +114,7 @@ fun ImageViewer(
     val currentSideBySideScale by rememberUpdatedState(sideBySideScale)
     val currentFlyBackCellRect by rememberUpdatedState(flyBackCellRect)
     val currentOnFlyBackCompleted by rememberUpdatedState(onFlyBackCompleted)
+    val currentOnPanEdgeFling by rememberUpdatedState(onPanEdgeFling)
 
     // Animatable values for smooth zoom transitions
     val scaleAnimatable = remember { Animatable(1f) }
@@ -117,9 +122,13 @@ fun ImageViewer(
     val scope = rememberCoroutineScope()
 
     // 下滑脱离拖动：手势中的实时位移（px，向下为正）；回位时由 Animatable 接管写值，
-    // isDismissSettling 是两者的数据源开关——graphicsLayer/drawBehind 里按它取值
+    // isDismissSettling 是两者的数据源开关——graphicsLayer/drawBehind 里按它取值。
+    // N8（v4.16.9）：mirror 一条 x 轴——下拉过阈值后横向也跟手（二维自由拖动），
+    // y 轴口径不变（向下全量 / 向上 0.2 阻尼），透出程度依旧只看 y
     var dismissDragY by remember { mutableFloatStateOf(0f) }
+    var dismissDragX by remember { mutableFloatStateOf(0f) }
     val dismissDragAnimatable = remember { Animatable(0f) }
+    val dismissDragAnimatableX = remember { Animatable(0f) }
     var isDismissSettling by remember { mutableStateOf(false) }
     var settleJob by remember { mutableStateOf<Job?>(null) }
 
@@ -259,16 +268,27 @@ fun ImageViewer(
     }
 
     // 未达关闭阈值时的弹簧回位（位移/缩放/透明度都会随位移归零而复原）
+    // N8（v4.16.9）：x 轴与 y 轴同参数并行回位，两轴都落定才退出回位状态——
+    // 只等 y 的话 x 还在半途就被切回手势值，图片会带着横向残位移瞬跳
     fun settleDismissBack() {
         settleJob?.cancel()
         settleJob = scope.launch {
             // 先同步当前值再切数据源，避免切换瞬间渲染出一帧零位移
             dismissDragAnimatable.snapTo(dismissDragY)
+            dismissDragAnimatableX.snapTo(dismissDragX)
             isDismissSettling = true
             dismissDragY = 0f
+            dismissDragX = 0f
             // E5：回弹过程中遮罩恢复纯黑——由上方监听 isDismissSettling 的
             // snapshotFlow 按 Animatable 每帧值驱动 maskRevealed 翻转
-            dismissDragAnimatable.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 300f))
+            val settleY = launch {
+                dismissDragAnimatable.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 300f))
+            }
+            val settleX = launch {
+                dismissDragAnimatableX.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 300f))
+            }
+            settleY.join()
+            settleX.join()
             isDismissSettling = false
         }
     }
@@ -284,13 +304,15 @@ fun ImageViewer(
             onClose?.invoke()
             return
         }
-        // 起始快照：松手瞬间的脱离拖动视觉（graphicsLayer 因子口径，见下方 graphicsLayer）
+        // 起始快照：松手瞬间的脱离拖动视觉（graphicsLayer 因子口径，见下方 graphicsLayer）。
+        // N8（v4.16.9）：自由拖动后 x 也要进快照——否则图片先瞬跳回中轴再飞，观感断裂
         val startY = dismissDragY
+        val startX = dismissDragX
         val visuals = ViewerDismissGesture.dismissTransform(startY, containerSize.height.toFloat())
         flyBackStart = FlyBackStartFactors(
             scaleX = visuals.scale,
             scaleY = visuals.scale,
-            translationX = offset.x,
+            translationX = offset.x + startX,
             translationY = offset.y + startY,
             alpha = visuals.alpha
         )
@@ -332,51 +354,69 @@ fun ImageViewer(
     Box(
         modifier = modifier
             .fillMaxSize()
-            // 底色/拖动遮罩：
-            // - pageBackground=true（默认，单图槽位等场景）：整页铺不透明黑底，
-            //   保证从 0 缩放进场时不会露出后面的内容；
-            // - pageBackground=false（查看器分页）：**不能**铺不透明底 —— 并排预览下每页
-            //   会被缩放平移、页与页区域重叠，自带黑底会把邻页露边整块盖掉（实测左邻
-            //   全被盖、中间图右侧被压掉 44px）。屏幕根容器本身是黑的，不需要这层。
-            // - 无论如何，真正往下拖时都画那层随位移变淡的遮罩
+            // 底色/拖动遮罩（v4.16.8 N3/N4 收敛成三分支）：分支判定收敛到纯函数
+            // ViewerDismissGesture.resolveBackgroundBranch（判定表由 JVM 单测
+            // ViewerBackgroundBranchTest 钉住），这里只按返回的枚举绘制——
+            // 判定与绘制分离，改判定规则必挂测试，不存在"内联复制两处漂移"：
+            // ① 进入页全屏：E1/E2 分段遮罩（拖动中淡到 0.2 透出图库）；
+            // ② 脱离拖动中：旧线性映射遮罩；
+            // ③ 其余一律"档位宽度黑"：并排态宽度 = 页宽 × 档位比例（绝不盖露边的
+            //    邻图）；全屏态且无飞回格子矩形（非进入页 / 已翻页 / 加载中）时
+            //    sideScale = 1 → 满宽满高黑——旧版这类输入什么都不画、整页透明，
+            //    翻页两侧与相邻页直接透出图库（N3/N4 的 bug）。
+            // 旧版第四分支 pageBackground（整页不透明黑）在本版删除：分支③覆盖
+            // 全屏态后它在任何输入下都不可达——背景从此只有这一处来源。
+            // 单图槽位（ImageSlotViewer）不传 sideBySideScale / flyBackCellRect，
+            // 走分支③满宽满高黑，行为与旧 pageBackground=true 完全一致。
             .drawBehind {
                 val dismissY = if (isDismissSettling) dismissDragAnimatable.value else dismissDragY
                 // 并排态（页被缩放平移）时分段遮罩会跟着页面几何走、透出的截图对不上，
                 // 所以只有全屏态才走 E2 分段遮罩；并排态回退旧线性映射（D5"现有链路"）
                 val inFullScreen = (currentSideBySideScale?.invoke() ?: 1f) == 1f
-                if (flyBackCellRect != null && inFullScreen) {
-                    // E1/E2：透出模式——遮罩恒画（初始 1f 把背景截图盖成纯黑），
-                    // 拖动越过 10% 阈值后由 120ms tween 快速淡到 0.2（图库透出约 80%）
-                    drawRect(Color.Black.copy(alpha = maskAlphaAnimatable.value))
-                } else if (dismissY > 0f) {
-                    drawRect(
-                        Color.Black.copy(
-                            alpha = ViewerDismissGesture.dismissTransform(
-                                dismissY, containerSize.height.toFloat()
-                            ).alpha
+                when (
+                    ViewerDismissGesture.resolveBackgroundBranch(
+                        hasFlyBackCellRect = flyBackCellRect != null,
+                        inFullScreen = inFullScreen,
+                        dismissY = dismissY
+                    )
+                ) {
+                    ViewerBackgroundBranch.FLYBACK_MASK -> {
+                        // E1/E2：透出模式——遮罩恒画（初始 1f 把背景截图盖成纯黑），
+                        // 拖动越过 10% 阈值后由 120ms tween 快速淡到 0.2（图库透出约 80%）
+                        drawRect(Color.Black.copy(alpha = maskAlphaAnimatable.value))
+                    }
+                    ViewerBackgroundBranch.DISMISS_LINEAR -> {
+                        drawRect(
+                            Color.Black.copy(
+                                alpha = ViewerDismissGesture.dismissTransform(
+                                    dismissY, containerSize.height.toFloat()
+                                ).alpha
+                            )
                         )
-                    )
-                } else if (!inFullScreen) {
-                    // 并排态兜底黑（Q1-1，v4.16.5）：pageBackground=false 的页在并排态
-                    // 三个旧分支全不命中 → 整页透明 → 透出背后的图库截图（bug：并排贴
-                    // 在图库上）。这里补一块"档位宽度的黑"：宽度 = 页宽 × 当前档位比例
-                    // （全屏 1 / 并排 0.7 / 临时档 0.55），居中、满高。
-                    // 为什么不铺满页：并排下页与页布局区域重叠、右侧邻页画在上层，满页
-                    // 黑会重演"各吃 48px"互盖邻图的旧 bug。档位宽度与图片的档位缩放由
-                    // 同一个 sideScale 驱动，黑缘与露边邻图边缘几何上严格重合（黑缘 =
-                    // 页心 ± 页宽×档位/2 = 邻图缘），动画全程既盖住本页透出的截图、又
-                    // 绝不盖住两侧露出的邻页。松手弹回全屏时 sideScale → 1，黑宽同步
-                    // 回满页，过渡连续。并排下拉（dismissY > 0）走上一分支的旧线性映射，
-                    // 透出图库的 D5 行为保持不变
-                    val sideScale = currentSideBySideScale?.invoke() ?: 1f
-                    val blackWidth = size.width * sideScale
-                    drawRect(
-                        color = Color.Black,
-                        topLeft = Offset((size.width - blackWidth) * 0.5f, 0f),
-                        size = Size(blackWidth, size.height)
-                    )
-                } else if (pageBackground) {
-                    drawRect(Color.Black)
+                    }
+                    ViewerBackgroundBranch.SIDE_OR_FULL_BLACK -> {
+                        // 档位宽度黑（Q1-1，v4.16.5 引入；N3/N4，v4.16.8 放开到全屏无格子态）：
+                        // 宽度 = 页宽 × 当前档位比例（全屏 1 / 并排 0.7 / 临时档 0.55），居中、满高。
+                        // 为什么并排态不铺满页：并排下页与页布局区域重叠、右侧邻页画在上层，
+                        // 满页黑会重演"各吃 48px"互盖邻图的旧 bug。档位宽度与图片的档位缩放由
+                        // 同一个 sideScale 驱动，黑缘与露边邻图边缘几何上严格重合（黑缘 =
+                        // 页心 ± 页宽×档位/2 = 邻图缘），动画全程既盖住本页透出的截图、又
+                        // 绝不盖住两侧露出的邻页。松手弹回全屏时 sideScale → 1，黑宽同步
+                        // 回满页，过渡连续。
+                        // 全屏态且 flyBackCellRect == null（非进入页 / 已翻页 / 邻页加载中）
+                        // 时 sideScale = 1 → 满宽满高黑：翻页态下 pager 的两页并排排列、
+                        // 不重叠（页宽 = 视口宽，靠 pager 自身滚动物理平移，与并排态的
+                        // graphicsLayer 收拢不同），满宽黑只盖本页，不盖邻页。
+                        // 并排下拉（dismissY > 0）走上一分支的旧线性映射，透出图库的
+                        // D5 行为保持不变
+                        val sideScale = currentSideBySideScale?.invoke() ?: 1f
+                        val blackWidth = size.width * sideScale
+                        drawRect(
+                            color = Color.Black,
+                            topLeft = Offset((size.width - blackWidth) * 0.5f, 0f),
+                            size = Size(blackWidth, size.height)
+                        )
+                    }
                 }
             }
             .onSizeChanged { containerSize = it },
@@ -392,6 +432,8 @@ fun ImageViewer(
                 .graphicsLayer {
                     // lambda 形式：状态变化只更新 layer 属性不走重组，拖动才能每帧跟手
                     val dismissY = if (isDismissSettling) dismissDragAnimatable.value else dismissDragY
+                    // N8（v4.16.9）：横向自由拖动位移，数据源开关与 y 同口径
+                    val dismissX = if (isDismissSettling) dismissDragAnimatableX.value else dismissDragX
                     val visuals = ViewerDismissGesture.dismissTransform(
                         dismissY, containerSize.height.toFloat()
                     )
@@ -430,14 +472,15 @@ fun ImageViewer(
                             // 由 onClose 收尾，绝不把 NaN 渲染出来
                             scaleX = currentScale * visuals.scale
                             scaleY = currentScale * visuals.scale
-                            translationX = currentOffset.x
+                            translationX = currentOffset.x + dismissX
                             translationY = currentOffset.y + dismissY
                             alpha = visuals.alpha
                         }
                     } else {
                         scaleX = currentScale * visuals.scale * pinchScale * sideScale
                         scaleY = currentScale * visuals.scale * pinchScale * sideScale
-                        translationX = currentOffset.x
+                        // N8：横向自由拖动位移叠加在平移上（透出程度仍只看 dismissY）
+                        translationX = currentOffset.x + dismissX
                         translationY = currentOffset.y + dismissY
                         alpha = visuals.alpha * pinchAlpha
                     }
@@ -449,16 +492,21 @@ fun ImageViewer(
                         val firstDownPosition = firstDown.position
 
                         // 新手势按下：若上一手势的回位动画还在跑，停掉并从当前动画值
-                        // 无缝接管位移，避免图片先跳回原点再跟手
+                        // 无缝接管位移，避免图片先跳回原点再跟手（N8：x 轴同口径接管）
                         if (isDismissSettling) {
                             settleJob?.cancel()
                             isDismissSettling = false
                             dismissDragY = dismissDragAnimatable.value
+                            dismissDragX = dismissDragAnimatableX.value
                         }
 
                         var wasPanOrZoom = false
                         var pointerCount = 1
                         var totalMovement = 0f  // Track total finger movement
+
+                        if (BuildConfig.DEBUG) {
+                            Log.d("N6Probe", "down scale=$scale offset=$offset")
+                        }
 
                         // scale==1 时的方向锁定（见单指分支）：本手势内判定一次后不再翻转
                         var lockedDirection = ViewerPanDirection.UNDECIDED
@@ -472,6 +520,12 @@ fun ImageViewer(
                         // 每帧重新判定而非 once-true 锁死——捏过头又张开时意图自动取消
                         var pinchGestureScale = 1f
                         var pinchDismissIntent = false
+
+                        // N6（A2，v4.16.9）：放大态贴边过冲累计量与"本次手势已触发翻页"标志。
+                        // 累计在拖动方向反转时清零（先右后左的抖动不攒假过冲）；触发一次后
+                        // 本手势内不再触发——连翻靠抬手再滑，避免一次长拖连翻数页
+                        var edgeOverscrollAccum = 0f
+                        var edgeFlingConsumed = false
 
                         // 捏合退出的起点锁定（R-B23a2）：按下瞬间的缩放快照，整段手势不变。
                         // 旧实现逐帧喂 scaleBeforeZoom 有误判：双击放大到 2x 后一口气捏合，
@@ -501,9 +555,18 @@ fun ImageViewer(
                             onClose != null &&
                             ViewerSideBySide.canEngageFromStart(scale)
 
-                        // 向下全量跟手；向上按阻尼轻微跟手（明确区别于"上滑关闭"，松手弹回）
-                        fun updateDismissDrag(totalDy: Float) {
+                        // 向下全量跟手；向上按阻尼轻微跟手（明确区别于"上滑关闭"，松手弹回）。
+                        // N8（v4.16.9）：横向自由拖动——累计 dx 乘以"下拉深度权重"（resolveFreeDragFactor），
+                        // 前 10% 屏高锁纵向（权重 0），10%~20% 渐进放开，20% 后完全跟手。
+                        // x 的口径是"累计 dx × 权重"而不是增量累计：权重渐变时位移连续无跳变，
+                        // 手指往回拖时 x 自动反向，透出程度依旧只看 y（横向不影响遮罩）
+                        fun updateDismissDrag(totalDy: Float, totalDx: Float) {
                             dismissDragY = if (totalDy > 0f) totalDy else totalDy * 0.2f
+                            dismissDragX = totalDx * ViewerDismissGesture.resolveFreeDragFactor(
+                                dismissDragY,
+                                containerSize.height.toFloat(),
+                                ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
+                            )
                             // E2：拖动进度跨过 10% 时翻转遮罩目标（翻转由 LaunchedEffect
                             // 启动 120ms tween 过渡）；未启用透出时布尔恒 false 不产生过渡
                             if (currentFlyBackCellRect != null) {
@@ -593,6 +656,9 @@ fun ImageViewer(
 
                                     scale = newScale
                                     offset = constrainOffset(newOffset, newScale)
+                                    if (BuildConfig.DEBUG) {
+                                        Log.d("N6Probe", "zoom z=$zoom scale->$newScale intent=$pinchIntent")
+                                    }
 
                                     // 捏合退出意图（C1）：未放大态才累计缩小量；放大态交给既有
                                     // "缩回 1f"路径并重置累计——否则缩回 1f 的最后一帧会被误记
@@ -632,6 +698,52 @@ fun ImageViewer(
                                                 Offset(offset.x + pan.x * scale, offset.y + pan.y * scale),
                                                 scale
                                             )
+                                            // N6（v4.16.9，方案 A2）：贴边后继续同向拖的过冲累计。
+                                            // horizontalEdgeOverscrollPan 在"未贴边 / 方向指回屏内"
+                                            // 时返回 0——后者同时把累计清零，防抖动手势攒假过冲。
+                                            // 单位换算：pan 来自指针事件的本地坐标，graphicsLayer 的
+                                            // scale 变换使它 = 手指屏幕位移 / scale（设备实测 155px
+                                            // 手指在 5x 下只上报 ~31px 本地位移），累计前乘回 scale
+                                            // 归一到屏幕 px，与下方阈值（视口宽比例 = 屏幕 px）同单位。
+                                            // 过冲达到视口宽的 5% 即回调上层翻页（A1 让位实测无效，
+                                            // 见参数注释）；回调后本手势防重，事件仍照常 consume
+                                            //（翻页动画已由 pager 接管，后续拖动不再影响它）
+                                            val scaledWidth = displayedImageSize.width * scale
+                                            val excessWidth =
+                                                (scaledWidth - containerSize.width).coerceAtLeast(0f) / 2f
+                                            val overscrollPan = ViewerDismissGesture
+                                                .horizontalEdgeOverscrollPan(
+                                                    offset.x, excessWidth, pan.x,
+                                                    ViewerDismissGesture.EDGE_TOLERANCE_PX
+                                                )
+                                            val edgeFlingHandler = currentOnPanEdgeFling
+                                            if (overscrollPan != 0f && edgeFlingHandler != null && !edgeFlingConsumed) {
+                                                edgeOverscrollAccum += overscrollPan * scale
+                                                val flingThresholdPx =
+                                                    size.width * ViewerDismissGesture.EDGE_FLING_OVERSCROLL_RATIO
+                                                if (abs(edgeOverscrollAccum) >= flingThresholdPx) {
+                                                    edgeFlingConsumed = true
+                                                    // 方向换算：过冲带符号（正 = 手指向右推右界 = 看左边
+                                                    // = 上一张），翻页参数是 pager 方向，取相反数
+                                                    val pageDirection = if (edgeOverscrollAccum > 0f) -1 else 1
+                                                    edgeFlingHandler(pageDirection)
+                                                    if (BuildConfig.DEBUG) {
+                                                        Log.d(
+                                                            "N6Probe",
+                                                            "edgeFling dir=$pageDirection accum=$edgeOverscrollAccum"
+                                                        )
+                                                    }
+                                                }
+                                            } else if (overscrollPan == 0f) {
+                                                edgeOverscrollAccum = 0f
+                                            }
+                                            if (BuildConfig.DEBUG) {
+                                                Log.d(
+                                                    "N6Probe",
+                                                    "pan scale=$scale pan=$pan offset=$offset " +
+                                                        "excess=$excessWidth overscroll=$overscrollPan"
+                                                )
+                                            }
                                             change.consume()
                                         }
                                     } else if (onClose != null) {
@@ -648,6 +760,12 @@ fun ImageViewer(
                                             lockedDirection = ViewerDismissGesture.resolvePanDirection(
                                                 accumulatedDx, accumulatedDy, directionThresholdPx
                                             )
+                                            if (BuildConfig.DEBUG) {
+                                                Log.d(
+                                                    "N6Probe",
+                                                    "dir locked=$lockedDirection dx=$accumulatedDx dy=$accumulatedDy"
+                                                )
+                                            }
                                             if (lockedDirection == ViewerPanDirection.VERTICAL) {
                                                 // 锁定即脱离拖动：标记非 tap，位移由累计值驱动
                                                 wasPanOrZoom = true
@@ -655,8 +773,10 @@ fun ImageViewer(
                                         }
                                         if (lockedDirection == ViewerPanDirection.VERTICAL) {
                                             // accumulatedDy 自按下累计（锁定帧已含本帧增量），
-                                            // 直接以累计值驱动位移，跟手无跳变
-                                            updateDismissDrag(accumulatedDy)
+                                            // 直接以累计值驱动位移，跟手无跳变。
+                                            // N8（v4.16.9）：accumulatedDx 一起传入——是否生效由
+                                            // resolveFreeDragFactor 按下拉深度决定（前 10% 锁纵向）
+                                            updateDismissDrag(accumulatedDy, accumulatedDx)
                                             // 垂直手势归脱离拖动：consume 后 Pager 彻底收不到，
                                             // 不会出现垂直拖动带着翻页面走
                                             change.consume()
@@ -674,13 +794,18 @@ fun ImageViewer(
                         // 内部兜底）行为与旧版一致，直接 onClose
                         if (lockedDirection == ViewerPanDirection.VERTICAL && onClose != null && !isPinchClosing) {
                             val velocity = velocityTracker.calculateVelocity()
-                            val shouldClose = ViewerDismissGesture.shouldDismiss(
+                            // N8（v4.16.9）：归宿判定换成二维版——横向甩速超阈值同样判关闭，
+                            // 其余与原 shouldDismiss 同口径；未达关闭的一律双轴弹簧回全屏
+                            val outcome = ViewerDismissGesture.resolveDismissOutcome(
                                 dy = dismissDragY,
-                                screenHeightPx = size.height.toFloat(),
+                                dx = dismissDragX,
                                 velocityYDownPxPerSec = velocity.y,
+                                velocityXPxPerSec = velocity.x,
+                                screenHeightPx = size.height.toFloat(),
+                                screenWidthPx = size.width.toFloat(),
                                 velocityThresholdPxPerSec = velocityThresholdPx
                             )
-                            if (shouldClose) {
+                            if (outcome == DismissOutcome.FLY_BACK) {
                                 playFlyBackDismiss()
                             } else {
                                 settleDismissBack()

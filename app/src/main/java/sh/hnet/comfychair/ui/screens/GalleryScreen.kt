@@ -4,6 +4,8 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -84,6 +86,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -304,6 +307,10 @@ fun GalleryScreen(
     // 当前从图库打开的 3D 产物（非空时全屏显示 3D 查看器）
     var active3D by remember { mutableStateOf<ThreeDResultHolder.Result?>(null) }
 
+    // N2（v4.16.8）挖空的兜底色：正常路径从截图 gutter 采样（与周围像素一致），
+    // 采样失败时用主题背景兜底。主题支持用户自定义配色，所以不能写死色值
+    val galleryFallbackBackground = MaterialTheme.colorScheme.background.toArgb()
+
     // Function to launch media viewer
     fun launchMediaViewer(clickedIndex: Int) {
         // Set active view to MediaViewer
@@ -335,17 +342,49 @@ fun GalleryScreen(
             try {
                 revealSnapshot = (context as? Activity)?.window?.decorView?.drawToBitmap()
                 // 目标格子矩形（window 坐标）：visibleItemsInfo.offset 是相对 grid
-                // viewport 的，加上 grid 节点的 window 位置才与截图同基准。
+                // 内容区起点（contentPadding 之后）的偏移，加上 grid 节点的 window
+                // 位置**与 contentPadding** 才与截图同基准。
+                // v4.16.8 N2 修正：旧版漏加 contentPadding，矩形整体左上偏 8dp，
+                // 格子的右缘与底缘各露出一条 8dp（右下角交汇最明显）。
                 // 本函数在点击回调里执行，被点格子必然在可见区（不可见点不到）
                 val itemInfo = gridState.layoutInfo.visibleItemsInfo
                     .firstOrNull { it.index == clickedIndex }
                 if (itemInfo != null) {
-                    revealCellRect = ViewerRect(
-                        left = gridOriginInWindow.x + itemInfo.offset.x,
-                        top = gridOriginInWindow.y + itemInfo.offset.y,
-                        width = itemInfo.size.width.toFloat(),
-                        height = itemInfo.size.height.toFloat()
+                    val paddingPx = GALLERY_GRID_CONTENT_PADDING_DP *
+                        context.resources.displayMetrics.density
+                    revealCellRect = galleryRevealCellRect(
+                        gridOriginX = gridOriginInWindow.x,
+                        gridOriginY = gridOriginInWindow.y,
+                        contentPaddingPx = paddingPx,
+                        itemOffsetX = itemInfo.offset.x.toFloat(),
+                        itemOffsetY = itemInfo.offset.y.toFloat(),
+                        itemWidthPx = itemInfo.size.width.toFloat(),
+                        itemHeightPx = itemInfo.size.height.toFloat()
                     )
+                    // ============================================================
+                    // N2（v4.16.8）：截图内挖空——把目标格子区域在 Bitmap 像素空间里
+                    // 填成图库背景色。填色发生在静态截图内，不存在跨窗口坐标系对齐
+                    // 问题（旧覆盖层方案正是栽在这里）；透出的画面上那格就是"空置
+                    // 格子"。开关关闭时跳过，由查看器的黑矩形 Canvas 接管（旧方案）
+                    // ============================================================
+                    if (revealSnapshot != null &&
+                        AppSettings.isGalleryRevealHolePunch(context)
+                    ) {
+                        val punched = holePunchGallerySnapshot(
+                            snapshot = requireNotNull(revealSnapshot),
+                            cellRect = requireNotNull(revealCellRect),
+                            gutterHalfPx = paddingPx * 0.5f,
+                            fallbackColor = galleryFallbackBackground
+                        )
+                        if (punched == null) {
+                            // 挖空失败（copy OOM 等）：放弃整个截图回退纯黑——绝不让
+                            // 未挖空的截图透出原格子缩略图（N2 的 bug 就是"空置格透图"）
+                            revealSnapshot = null
+                            revealCellRect = null
+                        } else {
+                            revealSnapshot = punched
+                        }
+                    }
                 }
             } catch (_: Exception) {
                 // 截图失败（窗口未就绪等）：按"无截图"处理，查看器回退纯黑，不许崩
@@ -506,7 +545,8 @@ fun GalleryScreen(
                     // 列数由捏合手势决定（2/3/4，C1）；开关关闭时恒为 2
                     columns = GridCells.Fixed(columns),
                     state = gridState,
-                    contentPadding = PaddingValues(8.dp),
+                    // N2：内边距与挖空的格子矩形换算共用一个常量（一处来源）
+                    contentPadding = PaddingValues(GALLERY_GRID_CONTENT_PADDING_DP.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier
@@ -861,6 +901,107 @@ private fun GalleryItemCard(
                 }
             }
         }
+    }
+}
+
+// ============================================================
+// 下拉透出"截图挖空"（N2，v4.16.8）
+// ============================================================
+
+/** 图库网格四周内边距（dp）。格子矩形换算与 LazyVerticalGrid 的 contentPadding 必须同值——一处来源 */
+internal const val GALLERY_GRID_CONTENT_PADDING_DP = 8f
+
+/**
+ * 下拉透出的目标格子矩形（window px，v4.16.8 N2 修正版，纯函数便于单测）。
+ *
+ * 坐标换算：visibleItemsInfo.offset 是相对 grid **内容区起点**（contentPadding 之后）
+ * 的偏移，所以格子真实位置 = grid 节点在 window 中的位置 + contentPadding + offset。
+ * 旧版漏加 contentPadding，矩形整体左上偏 8dp（320x640@160dpi 实测：旧矩形
+ * [156,244] vs 真实格子 [164,252]），格子的右缘与底缘各露出一条 8dp。
+ */
+internal fun galleryRevealCellRect(
+    gridOriginX: Float,
+    gridOriginY: Float,
+    contentPaddingPx: Float,
+    itemOffsetX: Float,
+    itemOffsetY: Float,
+    itemWidthPx: Float,
+    itemHeightPx: Float
+): ViewerRect = ViewerRect(
+    left = gridOriginX + contentPaddingPx + itemOffsetX,
+    top = gridOriginY + contentPaddingPx + itemOffsetY,
+    width = itemWidthPx,
+    height = itemHeightPx
+)
+
+/**
+ * N2（v4.16.8）：从截图上目标格子外围的 gutter 取背景色。
+ *
+ * 为什么采样而不是直接用主题色：主题支持用户自定义配色，且 Compose 的
+ * colorScheme.background 与 XML theme 的 windowBackground 不保证同值——只有
+ * "采周围真实像素"能保证挖出来的空格与格子之间空隙视觉无缝。
+ * 采样点：上缘 → 左缘的 gutter 中点（格子矩形外 gutter 8dp 的正中）；
+ * 都越界时返回 null，调用方用主题背景兜底。
+ */
+private fun sampleSnapshotGutterColor(
+    snapshot: Bitmap,
+    cellRect: ViewerRect,
+    gutterHalfPx: Float
+): Int? {
+    val samplePoints = listOf(
+        cellRect.centerX to (cellRect.top - gutterHalfPx),
+        (cellRect.left - gutterHalfPx) to cellRect.centerY
+    )
+    for ((x, y) in samplePoints) {
+        val px = x.roundToInt()
+        val py = y.roundToInt()
+        if (px >= 0 && px < snapshot.width && py >= 0 && py < snapshot.height) {
+            return snapshot.getPixel(px, py)
+        }
+    }
+    return null
+}
+
+/**
+ * N2（v4.16.8）：在图库截图的像素空间内把目标格子区域挖成背景色。
+ *
+ * 填色发生在静态截图内 → 不存在跨窗口坐标系对齐问题（旧覆盖层方案正是栽在这里）。
+ * 挖空只改这张一次性截图，图库真实渲染不受影响：查看器关闭、截图释放后，
+ * 被点格子自动恢复显示原图。
+ *
+ * 失败（copy OOM / 绘制异常）返回 null，调用方必须放弃整张截图回退纯黑——
+ * 绝不能把未挖空的截图留在透出链路上（那等于 N2 的 bug 原样透出）。
+ */
+private fun holePunchGallerySnapshot(
+    snapshot: Bitmap,
+    cellRect: ViewerRect,
+    gutterHalfPx: Float,
+    fallbackColor: Int
+): Bitmap? {
+    return try {
+        // drawToBitmap 可能返回不可变位图：挖空要往里画，先拷一份可变的
+        //（整屏截图 10MB 级，只 copy 这一次）
+        val target = if (snapshot.isMutable) {
+            snapshot
+        } else {
+            snapshot.copy(Bitmap.Config.ARGB_8888, true)
+        }
+        val paint = Paint().apply {
+            color = sampleSnapshotGutterColor(target, cellRect, gutterHalfPx)
+                ?: fallbackColor
+            style = Paint.Style.FILL
+        }
+        // 外扩 1px：吃掉光栅化舍入可能留下的格子边缘残像（外扩区域本来就是
+        // 背景色 gutter，视觉零差别）
+        val canvas = Canvas(target)
+        val left = (cellRect.left - 1f).coerceAtLeast(0f)
+        val top = (cellRect.top - 1f).coerceAtLeast(0f)
+        val right = (cellRect.right + 1f).coerceAtMost(target.width.toFloat())
+        val bottom = (cellRect.bottom + 1f).coerceAtMost(target.height.toFloat())
+        canvas.drawRect(left, top, right, bottom, paint)
+        target
+    } catch (_: Exception) {
+        null
     }
 }
 

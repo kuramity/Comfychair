@@ -887,4 +887,321 @@ class ViewerDismissGestureLogicTest {
         assertEquals(target.scaleX, mid.scaleX, 0.0001f)
         assertEquals(target.translationY, mid.translationY, 0.0001f)
     }
+
+    // ---------- 8. 放大态水平边界判定（N6，v4.16.9） ----------
+
+    /** 便于换算：2x 放大后水平余量 excessWidth = 100px（左界 -100 / 右界 +100） */
+    private val excessWidth = 100f
+    private val edgeTolerance = 0.5f
+
+    @Test
+    fun `刚好到界判贴边`() {
+        // offsetX == excessWidth：constrainOffset 的 coerceIn 精确钳在此值，必须判贴边
+        assertTrue(
+            ViewerDismissGesture.isAtHorizontalEdge(excessWidth, excessWidth, edgeTolerance)
+        )
+        assertTrue(
+            ViewerDismissGesture.isAtHorizontalEdge(-excessWidth, excessWidth, edgeTolerance)
+        )
+    }
+
+    @Test
+    fun `差1px不算贴边`() {
+        // 容差 0.5px：差 1px 还有真实平移余地，判未贴边（继续正常平移）
+        assertFalse(
+            ViewerDismissGesture.isAtHorizontalEdge(excessWidth - 1f, excessWidth, edgeTolerance)
+        )
+        assertFalse(
+            ViewerDismissGesture.isAtHorizontalEdge(-(excessWidth - 1f), excessWidth, edgeTolerance)
+        )
+    }
+
+    @Test
+    fun `超出边界判贴边`() {
+        // 理论上 constrainOffset 不会输出超界值，判定对超界输入也要稳（true）
+        assertTrue(
+            ViewerDismissGesture.isAtHorizontalEdge(excessWidth + 1f, excessWidth, edgeTolerance)
+        )
+    }
+
+    @Test
+    fun `无水平余量时任何位置都算贴边`() {
+        // crop 放大铺满宽度（excessWidth = 0）：水平无平移余地，左右拖全该让位翻页
+        assertTrue(ViewerDismissGesture.isAtHorizontalEdge(0f, 0f, edgeTolerance))
+        assertTrue(ViewerDismissGesture.isAtHorizontalEdge(0f, -1f, edgeTolerance))
+    }
+
+    @Test
+    fun `异常输入判未贴边`() {
+        // NaN 不产生让位信号：不确定时宁可继续平移，不让位是保守行为
+        assertFalse(
+            ViewerDismissGesture.isAtHorizontalEdge(Float.NaN, excessWidth, edgeTolerance)
+        )
+        assertFalse(
+            ViewerDismissGesture.isAtHorizontalEdge(excessWidth, Float.NaN, edgeTolerance)
+        )
+    }
+
+    @Test
+    fun `贴右界向右拖产生正向过冲`() {
+        assertEquals(
+            30f,
+            ViewerDismissGesture.horizontalEdgeOverscrollPan(excessWidth, excessWidth, 30f, edgeTolerance),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `贴右界向左拖是往回平移不产生过冲`() {
+        // 方向不一致（拖回屏内）：返回 0，调用方把累计清零，防"先右后左"抖动攒假过冲
+        assertEquals(
+            0f,
+            ViewerDismissGesture.horizontalEdgeOverscrollPan(excessWidth, excessWidth, -30f, edgeTolerance),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `贴左界向左拖产生负向过冲`() {
+        assertEquals(
+            -30f,
+            ViewerDismissGesture.horizontalEdgeOverscrollPan(-excessWidth, excessWidth, -30f, edgeTolerance),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `未贴边不产生过冲`() {
+        assertEquals(
+            0f,
+            ViewerDismissGesture.horizontalEdgeOverscrollPan(excessWidth - 1f, excessWidth, 30f, edgeTolerance),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `无余量时任意方向都是过冲`() {
+        assertEquals(
+            30f,
+            ViewerDismissGesture.horizontalEdgeOverscrollPan(0f, 0f, 30f, edgeTolerance),
+            0.0001f
+        )
+        assertEquals(
+            -30f,
+            ViewerDismissGesture.horizontalEdgeOverscrollPan(0f, 0f, -30f, edgeTolerance),
+            0.0001f
+        )
+    }
+
+    // ---------- 9. 二维自由拖动阈值（N8，v4.16.9） ----------
+
+    @Test
+    fun `下拉到10个百分点屏高横向仍未放开`() {
+        // 前 10%（= 20% 阈值的一半起步点）锁纵向：权重 0
+        assertEquals(
+            0f,
+            ViewerDismissGesture.resolveFreeDragFactor(
+                screenHeight * 0.1f, screenHeight, ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `下拉到20个百分点屏高横向完全放开`() {
+        assertEquals(
+            1f,
+            ViewerDismissGesture.resolveFreeDragFactor(
+                screenHeight * 0.2f, screenHeight, ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `下拉超过20个百分点横向保持放开`() {
+        assertEquals(
+            1f,
+            ViewerDismissGesture.resolveFreeDragFactor(
+                screenHeight * 0.3f, screenHeight, ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `阈值之内横向权重线性爬升`() {
+        // 15% 屏高恰在起步点（10%）与满格点（20%）正中间 → 权重 0.5
+        assertEquals(
+            0.5f,
+            ViewerDismissGesture.resolveFreeDragFactor(
+                screenHeight * 0.15f, screenHeight, ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `向上拖（负值阻尼后）同样放开横向`() {
+        // |dismissDragY| 口径：向上拖 25% 屏高（阻尼后 -50）权重也是 1（回弹途中横移自由）
+        assertEquals(
+            1f,
+            ViewerDismissGesture.resolveFreeDragFactor(
+                -screenHeight * 0.25f, screenHeight, ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `阈值改成0后全程放开（反证内核）`() {
+        // 反证：thresholdRatio = 0 时 resolveFreeDragFactor 必须返回 1（全程放开）——
+        // 这正是"把阈值改成 0 后 0.1×屏高断言（期望 0）必失败"的机制来源：
+        // 正式用例`下拉到10个百分点屏高横向仍未放开`喂入 0 阈值时会得到 1 ≠ 0 而变红
+        assertEquals(
+            1f,
+            ViewerDismissGesture.resolveFreeDragFactor(screenHeight * 0.1f, screenHeight, 0f),
+            0.0001f
+        )
+        assertEquals(
+            1f,
+            ViewerDismissGesture.resolveFreeDragFactor(screenHeight * 0.1f, screenHeight, -0.2f),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun `屏高无效或NaN时横向权重为0`() {
+        // 宁可不放开，也不把 NaN 带进位移（graphicsLayer 防 NaN 同思路）
+        assertEquals(
+            0f,
+            ViewerDismissGesture.resolveFreeDragFactor(100f, 0f, ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO),
+            0.0001f
+        )
+        assertEquals(
+            0f,
+            ViewerDismissGesture.resolveFreeDragFactor(
+                Float.NaN, screenHeight, ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
+            ),
+            0.0001f
+        )
+    }
+
+    // ---------- 10. 二维拖动松手归宿（N8，v4.16.9） ----------
+
+    @Test
+    fun `纵向位移达标判关闭（原语义不变）`() {
+        assertEquals(
+            DismissOutcome.FLY_BACK,
+            ViewerDismissGesture.resolveDismissOutcome(
+                dy = screenHeight * ViewerDismissGesture.DISMISS_DISTANCE_RATIO + 1f,
+                dx = 0f,
+                velocityYDownPxPerSec = 0f,
+                velocityXPxPerSec = 0f,
+                screenHeightPx = screenHeight,
+                screenWidthPx = viewport,
+                velocityThresholdPxPerSec = velocityThreshold
+            )
+        )
+    }
+
+    @Test
+    fun `纵向甩速达标判关闭（原语义不变）`() {
+        assertEquals(
+            DismissOutcome.FLY_BACK,
+            ViewerDismissGesture.resolveDismissOutcome(
+                dy = 100f,
+                dx = 0f,
+                velocityYDownPxPerSec = velocityThreshold + 1f,
+                velocityXPxPerSec = 0f,
+                screenHeightPx = screenHeight,
+                screenWidthPx = viewport,
+                velocityThresholdPxPerSec = velocityThreshold
+            )
+        )
+    }
+
+    @Test
+    fun `横向甩速大即使纵向没拖够也判关闭`() {
+        // N8 新增：自由拖动后横向快速甩出是"甩掉查看器"意图，纵向上不再要求 22%
+        assertEquals(
+            DismissOutcome.FLY_BACK,
+            ViewerDismissGesture.resolveDismissOutcome(
+                dy = screenHeight * 0.05f,
+                dx = viewport * 0.3f,
+                velocityYDownPxPerSec = 0f,
+                velocityXPxPerSec = velocityThreshold + 1f,
+                screenHeightPx = screenHeight,
+                screenWidthPx = viewport,
+                velocityThresholdPxPerSec = velocityThreshold
+            )
+        )
+    }
+
+    @Test
+    fun `向左甩与向右甩同样判关闭`() {
+        // |vx| 口径：横向甩出不分左右
+        assertEquals(
+            DismissOutcome.FLY_BACK,
+            ViewerDismissGesture.resolveDismissOutcome(
+                dy = screenHeight * 0.05f,
+                dx = -viewport * 0.3f,
+                velocityYDownPxPerSec = 0f,
+                velocityXPxPerSec = -(velocityThreshold + 1f),
+                screenHeightPx = screenHeight,
+                screenWidthPx = viewport,
+                velocityThresholdPxPerSec = velocityThreshold
+            )
+        )
+    }
+
+    @Test
+    fun `两轴都未达标回全屏（接近原位归宿）`() {
+        assertEquals(
+            DismissOutcome.SPRING_BACK,
+            ViewerDismissGesture.resolveDismissOutcome(
+                dy = screenHeight * 0.02f,
+                dx = viewport * 0.02f,
+                velocityYDownPxPerSec = velocityThreshold * 0.5f,
+                velocityXPxPerSec = velocityThreshold * 0.5f,
+                screenHeightPx = screenHeight,
+                screenWidthPx = viewport,
+                velocityThresholdPxPerSec = velocityThreshold
+            )
+        )
+    }
+
+    @Test
+    fun `横向拖很远但纵向没达标仍回全屏不误关`() {
+        // 慢速横拖半屏松手：|dx| 很大但不甩——必须弹回全屏（x 弹簧归零），绝不许误关
+        assertEquals(
+            DismissOutcome.SPRING_BACK,
+            ViewerDismissGesture.resolveDismissOutcome(
+                dy = screenHeight * 0.05f,
+                dx = viewport * 0.5f,
+                velocityYDownPxPerSec = 0f,
+                velocityXPxPerSec = velocityThreshold * 0.5f,
+                screenHeightPx = screenHeight,
+                screenWidthPx = viewport,
+                velocityThresholdPxPerSec = velocityThreshold
+            )
+        )
+    }
+
+    @Test
+    fun `横向甩速恰好等于阈值不算甩出`() {
+        // 判定条件是"严格大于"：恰好贴线仍是回全屏
+        assertEquals(
+            DismissOutcome.SPRING_BACK,
+            ViewerDismissGesture.resolveDismissOutcome(
+                dy = screenHeight * 0.05f,
+                dx = 0f,
+                velocityYDownPxPerSec = 0f,
+                velocityXPxPerSec = velocityThreshold,
+                screenHeightPx = screenHeight,
+                screenWidthPx = viewport,
+                velocityThresholdPxPerSec = velocityThreshold
+            )
+        )
+    }
 }
