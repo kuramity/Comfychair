@@ -17,6 +17,7 @@ import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -46,12 +47,6 @@ import kotlin.math.abs
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
-/** 捏合关闭收尾（C2）：内容缩小到的目标缩放 */
-private const val PINCH_CLOSE_TARGET_SCALE = 0.86f
-
-/** 捏合关闭收尾时长（ms），与 Activity 过渡动画（viewer_fade_out_shrink）观感衔接 */
-private const val PINCH_CLOSE_DURATION_MS = 160
-
 /**
  * 下拉透出黑底遮罩的过渡时长（ms，B-23b 第三批 E2）：客户规格"约 120ms 快速淡到 0.2"。
  * 分段目标值由 ViewerDismissGesture.dismissMaskTargetAlpha 给出，这里只负责两态间的过渡
@@ -74,7 +69,15 @@ fun ImageViewer(
     modifier: Modifier = Modifier,
     onSingleTap: () -> Unit = {},
     // 下滑脱离关闭的回调；null = 不启用脱离手势（如缩略图槽位等无"关闭"语义的场景）
-    onClose: (() -> Unit)? = null,
+    //
+    // G6（任务书 12.2）：回调带**退出原因**。三条退出路径（下滑、双指收缩、系统返回）
+    // 在宿主页 MediaViewerScreen.exitViewer(reason) 收敛成同一个清理入口，本组件不再
+    // 各自决定"关哪几个标志位"——旧写法正是残影的来源（见 ViewerExitCleanup 的注释）。
+    onViewerClose: ((ViewerExitReason) -> Unit)? = null,
+    // G6：统一清理入口的注册表。本组件把"页内图层复位"注册进去，
+    // 系统返回这条路径（不经过本组件的手势代码）也能清到页内状态；
+    // 组件离开组合时注销，保证重复进出不累积注册
+    exitRegistry: ViewerExitRegistry? = null,
     // 并排预览三级手势（D1~D5，v4.16.2）：非 null 时未放大态的双指捏合交给并排进度，
     // 不再触发"缩小淡出关闭"。四个回调都由 MediaViewerScreen 在开关开启时传入；
     // ImageSlotViewer 等无关闭语义的调用方不传，行为与改动前完全一致
@@ -103,7 +106,36 @@ fun ImageViewer(
     // 为什么主动回调而不是"让位"（A1，不再 consume 事件）：设备实测 A1 无效——
     // Pager 的 scrollable 在手势早期的 touch slop 阶段就被本层 consume 打断，后续
     // 放行它也不再接手（N6Probe 取证：overscroll 三帧放行、页码纹丝不动）。null = 不启用
-    onPanEdgeFling: ((direction: Int) -> Unit)? = null
+    onPanEdgeFling: ((direction: Int) -> Unit)? = null,
+    // ============================================================
+    // G4（任务书 11.4）：队列模式竖滑快捷删除
+    // ============================================================
+    //
+    // 三个参数全 null 时本组件行为与改动前完全一致（全屏下滑关闭链路原样保留）。
+    //
+    // **判定按手势起点锁定**（与并排 D3、捏合 R-B23a2 同一原则）：方向锁定的那一帧
+    // 读一次 [swipeDeleteEnabled]，整段手势只服从一个语义——绝不允许"拖到一半
+    // 上层档位进度变了，纵移从删除切回关闭"这种中途换轨（G3 病根同款）。
+    //
+    // 语义分流：
+    // - 队列（并排）态纵向锁定 → 竖滑删除：跟手上行/下行对称，松手达阈值
+    //   [ViewerSwipeDelete.resolveOutcome] → 进站动画 → [onSwipeDeleteCommit]；
+    //   未达阈值 → 弹簧回位；
+    // - 全屏态纵向锁定 → 既有下滑关闭（dismissDragY > 0 单向 + 飞回/淡出），
+    //   删除链路完全不参与，G5/G6 已验收行为零变化。
+    //
+    // 轴间仲裁（实施要求 4）：删除手势激活期间 [onSwipeDeletePhaseChange] 上报 true，
+    // 宿主页冻结横向越界消费与吸附归零；本组件纵向锁定后事件全部 consume，
+    // pager 拿不到增量，横向吸附天然没有输入（与越界机制的 rawDrag 只在水平
+    // 手势里累计，两段手势不会同时持有两轴）。
+    //
+    // @return true = 本次纵向手势走删除语义；false = 走既有下滑关闭
+    swipeDeleteEnabled: (() -> Boolean)? = null,
+    // 进站动画播完（= 图片已"甩进回收站"）时回调一次。宿主在这里落回收站条目、
+    // 移除队列项；pager 因条目列表变化整段重建，本页手势状态随作用域销毁
+    onSwipeDeleteCommit: (() -> Unit)? = null,
+    // 删除手势相位上报（true = 激活 / false = 结束）：宿主页用它仲裁横向机制
+    onSwipeDeletePhaseChange: ((Boolean) -> Unit)? = null
 ) {
     // 手势事件在 pointerInput(Unit) 内消费闭包：回调参数要用 rememberUpdatedState
     // 转成稳定引用，重组更新后手势里读到的才是最新值（并排态激活/退出全靠它切换）
@@ -115,6 +147,15 @@ fun ImageViewer(
     val currentFlyBackCellRect by rememberUpdatedState(flyBackCellRect)
     val currentOnFlyBackCompleted by rememberUpdatedState(onFlyBackCompleted)
     val currentOnPanEdgeFling by rememberUpdatedState(onPanEdgeFling)
+    // G6（任务书 12.2）：退出回调也走 rememberUpdatedState。pointerInput(Unit) 的闭包
+    // 只在首次组合建一次，直接引用参数会把回调冻结在"第一次组合的那个 lambda"上——
+    // 而宿主页的统一清理入口（MediaViewerScreen.exitViewer）是每次组合重建的局部函数
+    val currentOnViewerClose by rememberUpdatedState(onViewerClose)
+    // G4（任务书 11.4）：竖滑删除的三个接线同样走 rememberUpdatedState（同上理由：
+    // 手势闭包只建一次，"当前是否队列态"这类每次组合都可能变的判定必须读最新值）
+    val currentSwipeDeleteEnabled by rememberUpdatedState(swipeDeleteEnabled)
+    val currentOnSwipeDeleteCommit by rememberUpdatedState(onSwipeDeleteCommit)
+    val currentOnSwipeDeletePhaseChange by rememberUpdatedState(onSwipeDeletePhaseChange)
 
     // Animatable values for smooth zoom transitions
     val scaleAnimatable = remember { Animatable(1f) }
@@ -164,53 +205,35 @@ fun ImageViewer(
     var isFlyBackAnimating by remember { mutableStateOf(false) }
     val flyBackAnimatable = remember { Animatable(0f) }
     var flyBackStart by remember { mutableStateOf(FlyBackStartFactors(1f, 1f, 0f, 0f, 1f)) }
+    // G6：飞回收尾协程句柄。统一清理要能取消它（任务书排查项 1 要求"退出路径的在途
+    // 动画必须回收"，旧实现只在 completion 里读结果、没有取消入口）
+    var flyBackJob by remember { mutableStateOf<Job?>(null) }
 
-    // 未达关闭阈值时的弹簧回位（位移/缩放/透明度都会随位移归零而复原）
-    // 与飞回收尾（playFlyBackDismiss）定义在 displayedImageSize 之后：两者都要读
-    // containerSize / displayedImageSize，Kotlin 局部函数不允许前向引用
+    // 双击缩放动画的在途协程句柄（G6：清理时取消，见 resetViewerLayers）。
+    // 注意只取消、不改 isAnimating / scale / offset —— 退出快照要冻结在当前帧，
+    // 把数据源开关翻回去会让图片在转场里突然跳回全屏尺寸（字段取舍见 ViewerExitCleanup.KEPT_FIELDS）
+    var zoomJob by remember { mutableStateOf<Job?>(null) }
 
-    // 捏合关闭收尾（C2）：内容缩小淡出后再真正关闭。isPinchClosing 是防重入标志——
-    // 动画播放期间第二次捏合或下滑不再触发关闭（否则会叠加两层退出）
-    val pinchCloseScaleAnimatable = remember { Animatable(1f) }
-    val pinchCloseAlphaAnimatable = remember { Animatable(1f) }
-    var isPinchClosing by remember { mutableStateOf(false) }
+    // ============================================================
+    // G4（任务书 11.4）：竖滑删除的页面状态
+    // ============================================================
+    // swipeDeleteActive：本次纵向手势**锁定为删除语义**（队列态下的纵向方向锁定帧
+    // 置位，回位弹簧播完 / 进站动画结束才复位）。graphicsLayer 与 drawBehind 都按它
+    // 分流视觉：true = ViewerSwipeDelete 双向映射 + 页内不画关闭遮罩；
+    // false = 既有下滑关闭链路原样。锁定只发生在手势第一帧（见手势循环里的
+    // gestureDeleteMode 局部量），中途上层档位变化不会翻转语义——与并排 D3
+    // "按手势起点锁定"同一原则，杜绝"拖一半从删除切成关闭"的 G3 式竞争。
+    var swipeDeleteActive by remember { mutableStateOf(false) }
+    // 进站动画在途：与 isFlyBackAnimating 同职责（期间输入消费丢弃、动画独占位移写值）
+    var isSwipeDeleteFlying by remember { mutableStateOf(false) }
+    var swipeDeleteFlyJob by remember { mutableStateOf<Job?>(null) }
+    // 进站动画的位移写值走 dismissDragAnimatable（isDismissSettling 当数据源开关，
+    // 与回位弹簧同一取值口径），动画值由这条协程持有。
+    // 甩速阈值 dp→px 的换算放在每次手势开始时（见 pointerInput 循环内），
+    // 与既有 dismiss 阈值同一口径，旋转/密度变化后不失效。
 
-    fun playPinchCloseDismiss() {
-        // isFlyBackAnimating 互斥（B-23b 第三批）：飞回与捏合收尾是两条退出链路，
-        // 任何一条在播时另一条都不得再启动——若两者都触发，以飞回为准
-        if (isPinchClosing || isFlyBackAnimating || onClose == null) return
-        isPinchClosing = true
-        scope.launch {
-            // 先同步基准值再启动，避免首帧跳变（与 settleDismissBack 同款处理）
-            pinchCloseScaleAnimatable.snapTo(1f)
-            pinchCloseAlphaAnimatable.snapTo(1f)
-            launch {
-                pinchCloseScaleAnimatable.animateTo(
-                    PINCH_CLOSE_TARGET_SCALE,
-                    tween(PINCH_CLOSE_DURATION_MS, easing = FastOutSlowInEasing)
-                )
-            }
-            launch {
-                pinchCloseAlphaAnimatable.animateTo(
-                    0f,
-                    tween(PINCH_CLOSE_DURATION_MS, easing = FastOutSlowInEasing)
-                )
-            }
-        }.invokeOnCompletion { cause ->
-            isPinchClosing = false
-            // cause 非空 = 协程被取消（如动画期间翻页导致本组件离开组合）：
-            // 只复位标志，不触发关闭——关闭必须由"动画正常播完"驱动
-            if (cause == null) {
-                onClose?.invoke()
-            }
-        }
-    }
-
-    // Current values (used during gestures for immediate feedback)
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
-    var isAnimating by remember { mutableStateOf(false) }
-
+    // 单击/双击判定所需的跨手势状态（G6：整组上移到清理函数之前声明，
+    // 因为 resetViewerLayers 要把 pendingSingleTap 取消掉 —— 局部函数不允许前向引用）
     // Track last tap for double-tap detection (must persist across gestures)
     var lastTapTime by remember { mutableStateOf(0L) }
     var lastTapPosition by remember { mutableStateOf(Offset.Zero) }
@@ -218,6 +241,83 @@ fun ImageViewer(
     // Pending single tap - we delay single tap action to check for double-tap
     var pendingSingleTap by remember { mutableStateOf(false) }
     var pendingSingleTapTime by remember { mutableStateOf(0L) }
+
+    // 未达关闭阈值时的弹簧回位（位移/缩放/透明度都会随位移归零而复原）
+    // 与飞回收尾（playFlyBackDismiss）定义在 displayedImageSize 之后：两者都要读
+    // containerSize / displayedImageSize，Kotlin 局部函数不允许前向引用
+
+    // G6（任务书 12.2）：双指收缩退出**不再自播内容层淡出动画**。
+    //
+    // 旧实现（C1/C2）在这里维护了第二条转场状态机：pinchCloseScale/AlphaAnimatable
+    // 把内容缩小淡出 160ms（参数与窗口动画 viewer_fade_out_shrink 一字不差），
+    // 播完才 onClose()；而收尾协程第一件事是 `isPinchClosing = false` —— 标志位一翻回，
+    // 图片立刻恢复成完全不透明，finish() 取的窗口快照于是把这层图片**再淡一次**到
+    // 宿主页上方：半透明的图片叠在提示词卡片与生成按钮上，就是报告里的残影（E4）。
+    //
+    // 现在三条退出路径（下滑、双指收缩、系统返回）共用同一段窗口转场，
+    // 本组件只管"退出时把机制状态归位"，不再负责动画 —— 见 ViewerExitCleanup。
+    var exitCommitted by remember { mutableStateOf(false) }
+
+    /**
+     * 页内图层的统一复位：字段集合就是 [ViewerExitCleanup.PAGE_FIELDS]，
+     * **与退出原因无关**（下滑 / 双指收缩 / 系统返回三条路径执行的是同一份清理）。
+     *
+     * 只做两件事：① 取消在途动画协程（含被中断、被取消的收尾，任务书实施指令 2/3）；
+     * ② 复位机制状态。刻意不改 scale / offset / dismissDrag / 档位进度 ——
+     * 退出转场的窗口快照要延续松手那一刻的画面，理由见 KEPT_FIELDS。
+     */
+    val resetViewerLayers: (ViewerExitReason) -> Unit = { reason ->
+        exitCommitted = true
+        isFlyBackAnimating = false
+        pendingSingleTap = false
+        // G4：删除手势状态一并复位（宿主退出时若有在途进站动画，取消它并上报
+        // 手势相位结束——宿主页的横向冻结标志不能带着 true 退出）
+        swipeDeleteFlyJob?.cancel()
+        swipeDeleteFlyJob = null
+        if (swipeDeleteActive) {
+            swipeDeleteActive = false
+            currentOnSwipeDeletePhaseChange?.invoke(false)
+        }
+        zoomJob?.cancel()
+        zoomJob = null
+        settleJob?.cancel()
+        settleJob = null
+        flyBackJob?.cancel()
+        flyBackJob = null
+        if (BuildConfig.DEBUG) {
+            Log.d("ViewerExit", "页内图层复位 reason=$reason")
+        }
+    }
+
+    // G6：把复位函数注册给宿主页的统一清理入口。
+    // 用 rememberUpdatedState 转发：注册的 lambda 实例保持稳定（注销/重复进出不会
+    // 累积注册），而它每次调用都拿到**最新一次组合**的复位函数
+    val latestResetViewerLayers by rememberUpdatedState(resetViewerLayers)
+    DisposableEffect(exitRegistry) {
+        val unregister = exitRegistry?.register { reason -> latestResetViewerLayers(reason) }
+        onDispose { unregister?.invoke() }
+    }
+
+    /**
+     * 页内向宿主页发起退出的唯一出口：本组件的两条收尾路径（下滑脱离 / 飞回落格、
+     * 双指收缩）都只调用它，退出原因由调用点给出。
+     *
+     * 本函数不自己清图层 —— 清图层是宿主页 [ViewerExitRegistry.fire] 的职责，
+     * 这样"系统返回"这条完全不经过本组件的路径执行的是同一份清理。
+     */
+    fun requestViewerExit(reason: ViewerExitReason) {
+        if (exitCommitted) return
+        exitCommitted = true
+        if (BuildConfig.DEBUG) {
+            Log.d("ViewerExit", "发起退出 reason=$reason flyBack=$isFlyBackAnimating")
+        }
+        currentOnViewerClose?.invoke(reason)
+    }
+
+    // Current values (used during gestures for immediate feedback)
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    var isAnimating by remember { mutableStateOf(false) }
 
     // Handle delayed single tap (wait to see if it becomes a double-tap)
     androidx.compose.runtime.LaunchedEffect(pendingSingleTap, pendingSingleTapTime) {
@@ -290,18 +390,61 @@ fun ImageViewer(
             settleY.join()
             settleX.join()
             isDismissSettling = false
+            // G4：删除手势的回位弹簧播完才算手势结束——此刻清激活标志并向宿主解除
+            // 横向冻结（提前解除会让残余弹簧帧又撞回越界机制）
+            if (swipeDeleteActive) {
+                swipeDeleteActive = false
+                currentOnSwipeDeletePhaseChange?.invoke(false)
+            }
+        }
+    }
+
+    /**
+     * G4：进站动画。竖滑达删除阈值松手后，图片沿拖拽方向继续外推到视口外
+     * （终点由 [ViewerSwipeDelete.flyTargetDy] 给出），缩放/透明/旋转沿用跟手同一
+     * 映射外推到饱和值 —— 跟手段与动画段共用一个函数，衔接处不可能跳变。
+     *
+     * 播完才回调 [onSwipeDeleteCommit]（宿主页此时落回收站条目、移除队列项，
+     * pager 因 itemsKey 变化整段重建，本页状态随组合销毁自然归位）。
+     * 动画被取消（组件离开组合 / 统一清理）= 协程带 cause 结束：**不补发 commit**，
+     * 与 playFlyBackDismiss 的取消语义一致（条目没进回收站就不该有后续撤销）。
+     */
+    fun playSwipeDeleteEnterBin() {
+        if (isSwipeDeleteFlying) return
+        val startDy = dismissDragY
+        isSwipeDeleteFlying = true
+        // 与 settleDismissBack 同一 scope（Main）：Animatable 依赖帧时钟，
+        // 换 Default 线程会直接 "No frame clock in the context" 崩
+        swipeDeleteFlyJob = scope.launch {
+            val target = ViewerSwipeDelete.flyTargetDy(startDy, containerSize.height.toFloat())
+            dismissDragAnimatable.snapTo(startDy)
+            isDismissSettling = true
+            dismissDragY = 0f
+            dismissDragAnimatable.animateTo(
+                target,
+                tween(ViewerSwipeDelete.FLY_TO_TRASH_DURATION_MS, easing = FastOutSlowInEasing)
+            )
+            isDismissSettling = false
+            isSwipeDeleteFlying = false
+            swipeDeleteFlyJob = null
+            // 手势相位于此刻解除：条目移除引发的 pager 重建紧随其后，
+            // 冻结标志活过动画段、死在动画段末尾，不留残值
+            swipeDeleteActive = false
+            currentOnSwipeDeletePhaseChange?.invoke(false)
+            currentOnSwipeDeleteCommit?.invoke()
         }
     }
 
     // E4：飞回收尾。松手达关闭阈值且本页启用透出时，不立即关闭——图片从松手瞬间
     // 的位置/尺寸（起始快照）边缩小边飞到目标格子矩形上，落格（尺寸 = 其他缩略图）
-    // 后才回调 onClose。前提被打破（放大态 / 并排态 / 格子缺失）一律退回旧链路
+    // 后才退出查看器。前提被打破（放大态 / 并排态 / 格子缺失）一律退回旧链路
     fun playFlyBackDismiss() {
-        if (isFlyBackAnimating || isPinchClosing) return
+        if (isFlyBackAnimating || exitCommitted || currentOnViewerClose == null) return
         val cellRect = currentFlyBackCellRect
         val sideScale = currentSideBySideScale?.invoke() ?: 1f
         if (cellRect == null || scale != 1f || sideScale != 1f || displayedImageSize == Size.Zero) {
-            onClose?.invoke()
+            // G6：退回旧链路时也必须走统一出口（原因：下滑脱离）
+            requestViewerExit(ViewerExitReason.DISMISS_DRAG)
             return
         }
         // 起始快照：松手瞬间的脱离拖动视觉（graphicsLayer 因子口径，见下方 graphicsLayer）。
@@ -317,19 +460,21 @@ fun ImageViewer(
             alpha = visuals.alpha
         )
         isFlyBackAnimating = true
-        scope.launch {
+        flyBackJob = scope.launch {
             flyBackAnimatable.snapTo(0f)
             flyBackAnimatable.animateTo(
                 1f,
                 tween(FLY_BACK_DURATION_MS, easing = FastOutSlowInEasing)
             )
-        }.invokeOnCompletion { cause ->
-            // cause 非空 = 协程被取消（动画期间组件离开组合，如翻页/删除重组）：
-            // 与捏合收尾同款处理，只复位标志、不触发关闭
-            if (cause == null) {
-                isFlyBackAnimating = false
-                currentOnFlyBackCompleted?.invoke()
-                onClose?.invoke()
+        }.also { job ->
+            job.invokeOnCompletion { cause ->
+                // cause 非空 = 协程被取消（动画期间组件离开组合 / 统一清理自己取消它）：
+                // 与捏合收尾同款处理，不重复发起退出（清理已经在做同一份复位）
+                if (cause == null) {
+                    isFlyBackAnimating = false
+                    currentOnFlyBackCompleted?.invoke()
+                    requestViewerExit(ViewerExitReason.DISMISS_DRAG)
+                }
             }
         }
     }
@@ -354,18 +499,17 @@ fun ImageViewer(
     Box(
         modifier = modifier
             .fillMaxSize()
-            // 底色/拖动遮罩（v4.16.8 N3/N4 收敛成三分支）：分支判定收敛到纯函数
-            // ViewerDismissGesture.resolveBackgroundBranch（判定表由 JVM 单测
+            // 底色/拖动遮罩（v4.16.8 N3/N4；G1 v4.16.11 收敛黑化责任）：分支判定收敛到
+            // 纯函数 ViewerDismissGesture.resolveBackgroundBranch（判定表由 JVM 单测
             // ViewerBackgroundBranchTest 钉住），这里只按返回的枚举绘制——
             // 判定与绘制分离，改判定规则必挂测试，不存在"内联复制两处漂移"：
             // ① 进入页全屏：E1/E2 分段遮罩（拖动中淡到 0.2 透出图库）；
             // ② 脱离拖动中：旧线性映射遮罩；
-            // ③ 其余一律"档位宽度黑"：并排态宽度 = 页宽 × 档位比例（绝不盖露边的
-            //    邻图）；全屏态且无飞回格子矩形（非进入页 / 已翻页 / 加载中）时
-            //    sideScale = 1 → 满宽满高黑——旧版这类输入什么都不画、整页透明，
-            //    翻页两侧与相邻页直接透出图库（N3/N4 的 bug）。
-            // 旧版第四分支 pageBackground（整页不透明黑）在本版删除：分支③覆盖
-            // 全屏态后它在任何输入下都不可达——背景从此只有这一处来源。
+            // ③ 全屏态其余情况：满宽满高黑——盖住透出链路背后的图库截图（N3/N4：
+            //    非进入页 / 已翻页 / 加载中页整页透明就透图库）；
+            // ④ 并排（队列）态：页内不画任何黑，背景黑化由容器（MediaViewerScreen
+            //    根 Box 的 background）统一负责——固定宽度黑补丁（页宽 × 档位比例）
+            //    已随 G1 拆除，露边区/无邻页端/越界新带都由容器那座纯黑承接。
             // 单图槽位（ImageSlotViewer）不传 sideBySideScale / flyBackCellRect，
             // 走分支③满宽满高黑，行为与旧 pageBackground=true 完全一致。
             .drawBehind {
@@ -377,7 +521,10 @@ fun ImageViewer(
                     ViewerDismissGesture.resolveBackgroundBranch(
                         hasFlyBackCellRect = flyBackCellRect != null,
                         inFullScreen = inFullScreen,
-                        dismissY = dismissY
+                        dismissY = dismissY,
+                        // G4：删除手势在途不画关闭遮罩（判定表见纯函数重载），
+                        // 否则并排态下滑删除时页内黑块会盖住两侧露边邻图
+                        inSwipeDelete = swipeDeleteActive
                     )
                 ) {
                     ViewerBackgroundBranch.FLYBACK_MASK -> {
@@ -394,28 +541,23 @@ fun ImageViewer(
                             )
                         )
                     }
-                    ViewerBackgroundBranch.SIDE_OR_FULL_BLACK -> {
-                        // 档位宽度黑（Q1-1，v4.16.5 引入；N3/N4，v4.16.8 放开到全屏无格子态）：
-                        // 宽度 = 页宽 × 当前档位比例（全屏 1 / 并排 0.7 / 临时档 0.55），居中、满高。
-                        // 为什么并排态不铺满页：并排下页与页布局区域重叠、右侧邻页画在上层，
-                        // 满页黑会重演"各吃 48px"互盖邻图的旧 bug。档位宽度与图片的档位缩放由
-                        // 同一个 sideScale 驱动，黑缘与露边邻图边缘几何上严格重合（黑缘 =
-                        // 页心 ± 页宽×档位/2 = 邻图缘），动画全程既盖住本页透出的截图、又
-                        // 绝不盖住两侧露出的邻页。松手弹回全屏时 sideScale → 1，黑宽同步
-                        // 回满页，过渡连续。
-                        // 全屏态且 flyBackCellRect == null（非进入页 / 已翻页 / 邻页加载中）
-                        // 时 sideScale = 1 → 满宽满高黑：翻页态下 pager 的两页并排排列、
-                        // 不重叠（页宽 = 视口宽，靠 pager 自身滚动物理平移，与并排态的
-                        // graphicsLayer 收拢不同），满宽黑只盖本页，不盖邻页。
-                        // 并排下拉（dismissY > 0）走上一分支的旧线性映射，透出图库的
-                        // D5 行为保持不变
-                        val sideScale = currentSideBySideScale?.invoke() ?: 1f
-                        val blackWidth = size.width * sideScale
-                        drawRect(
-                            color = Color.Black,
-                            topLeft = Offset((size.width - blackWidth) * 0.5f, 0f),
-                            size = Size(blackWidth, size.height)
-                        )
+                    ViewerBackgroundBranch.CONTAINER_BLACK -> {
+                        // 并排（队列）态：页内不画黑。两侧 15% 露边区、无邻页的一端、
+                        // 横向越界跟手露出的新带，都由容器背景（纯黑）承接——
+                        // G1 拆除的"档位宽度黑"不再参与任何遮挡。
+                        Unit
+                    }
+                    ViewerBackgroundBranch.FULL_PAGE_BLACK -> {
+                        // 全屏态满宽满高黑（N3/N4）：全屏没有邻页露边，满页黑不会盖住
+                        // 任何邻图；它的唯一职责是盖住透出链路背后的图库截图。
+                        // 并排态不铺满页：并排下页与页布局区域重叠（页盒只平移不缩放），
+                        // 满页黑会重演"各吃 48px"互盖邻图的旧 bug——那正是并排态走
+                        // 上一分支（容器负责）的原因。
+                        // 全屏且 flyBackCellRect == null（非进入页 / 已翻页 / 邻页加载中）
+                        // 与全屏进入页非拖动态都命中这里：翻页态下 pager 的两页并排排列、
+                        // 不重叠（页宽 = 视口宽，靠 pager 自身滚动物理平移），满宽黑只盖
+                        // 本页，不盖邻页。
+                        drawRect(color = Color.Black)
                     }
                 }
             }
@@ -437,13 +579,25 @@ fun ImageViewer(
                     val visuals = ViewerDismissGesture.dismissTransform(
                         dismissY, containerSize.height.toFloat()
                     )
+                    // G4：删除手势激活时改用双向对称的删除视觉（上滑/下滑镜像，
+                    // 缩放/透明/旋转共用 ViewerSwipeDelete.visuals 一个映射——
+                    // 跟手段与进站动画段同一函数，衔接零跳变）
+                    val deleteVisuals = if (swipeDeleteActive) {
+                        ViewerSwipeDelete.visuals(dismissY, containerSize.height.toFloat())
+                    } else {
+                        null
+                    }
                     val currentScale = if (isAnimating) scaleAnimatable.value else scale
                     val currentOffset = if (isAnimating) offsetAnimatable.value else offset
-                    // 捏合关闭收尾：整层缩小淡出（isPinchClosing 为 false 时因子恒 1，视觉零变化）
-                    val pinchScale = if (isPinchClosing) pinchCloseScaleAnimatable.value else 1f
-                    val pinchAlpha = if (isPinchClosing) pinchCloseAlphaAnimatable.value else 1f
+                    // G6（任务书 12.2）：这里**不再有**捏合关闭的内容层淡出因子。
+                    // 旧实现把双指收缩退出做成两段动画：内容层先缩小淡出 160ms
+                    // （pinchCloseScale/AlphaAnimatable），播完再把 isPinchClosing 翻回
+                    // false —— 翻回的那一帧图片恢复完全不透明，紧接着 finish() 的窗口
+                    // 转场把这层图片**再淡一次**到宿主页上方，就是报告里的半透明残影。
+                    // 现在退出转场只有窗口层那一段，三条路径共用同一时序（动画时序统一），
+                    // 内容层不再维护自己的退出状态机。
                     // 并排档位：上层给的"当前页占视口比例"（全屏 1f / 并排 0.7f / 临时档 0.55f）。
-                    // 与上面两个因子并列相乘 —— 三种视觉叠加时互不覆盖
+                    // 与缩放、脱离淡出因子并列相乘 —— 三种视觉叠加时互不覆盖
                     val sideScale = currentSideBySideScale?.invoke() ?: 1f
                     if (isFlyBackAnimating) {
                         // E4：飞回——因子由"松手快照 → 目标格子矩形"的插值完全接管
@@ -467,22 +621,30 @@ fun ImageViewer(
                             translationX = f.translationX
                             translationY = f.translationY
                             alpha = f.alpha
+                            rotationZ = 0f
                         } else {
                             // 动画中格子矩形丢失（不应发生）：按松手视觉定格，
-                            // 由 onClose 收尾，绝不把 NaN 渲染出来
+                            // 由统一退出出口 requestViewerExit 收尾，绝不把 NaN 渲染出来
                             scaleX = currentScale * visuals.scale
                             scaleY = currentScale * visuals.scale
                             translationX = currentOffset.x + dismissX
                             translationY = currentOffset.y + dismissY
                             alpha = visuals.alpha
+                            rotationZ = 0f
                         }
                     } else {
-                        scaleX = currentScale * visuals.scale * pinchScale * sideScale
-                        scaleY = currentScale * visuals.scale * pinchScale * sideScale
-                        // N8：横向自由拖动位移叠加在平移上（透出程度仍只看 dismissY）
+                        val effScaleFactor = deleteVisuals?.scale ?: visuals.scale
+                        scaleX = currentScale * effScaleFactor * sideScale
+                        scaleY = currentScale * effScaleFactor * sideScale
+                        // N8：横向自由拖动位移叠加在平移上（透出程度仍只看 dismissY）。
+                        // G4：删除模式下 dismissX 恒 0（updateDismissDrag 锁死横轴），
+                        // 这里不需要分支——位移源头就是轴间仲裁本身
                         translationX = currentOffset.x + dismissX
                         translationY = currentOffset.y + dismissY
-                        alpha = visuals.alpha * pinchAlpha
+                        alpha = deleteVisuals?.alpha ?: visuals.alpha
+                        // rotationZ 必须**每帧显式赋值**：graphicsLayer 的属性块跨帧复用，
+                        // 不写会残留上一次删除手势的倾角（删除结束、日常拖动带歪图）
+                        rotationZ = deleteVisuals?.rotationDeg ?: 0f
                     }
                 }
                 .pointerInput(Unit) {
@@ -510,11 +672,19 @@ fun ImageViewer(
 
                         // scale==1 时的方向锁定（见单指分支）：本手势内判定一次后不再翻转
                         var lockedDirection = ViewerPanDirection.UNDECIDED
+                        // G4：本手势纵向锁定时的语义（true = 队列竖滑删除 / false = 下滑关闭）。
+                        // **只在方向锁定的那一帧读一次 swipeDeleteEnabled 判定**，整段手势不翻转
+                        // （D3/R-B23a2 的"按手势起点锁定"原则：中途上层从队列切全屏、
+                        //  或并排进度被别的动画改动，都不允许换掉已经跟手运动的语义）。
+                        var gestureDeleteMode = false
                         var accumulatedDx = 0f
                         var accumulatedDy = 0f
                         val velocityTracker = VelocityTracker()
                         val directionThresholdPx = ViewerDismissGesture.DIRECTION_LOCK_THRESHOLD_DP.dp.toPx()
                         val velocityThresholdPx = ViewerDismissGesture.DISMISS_VELOCITY_DP_PER_SEC.dp.toPx()
+                        // G4：删除甩速阈值同样按手势起点换算（PointerInputScope 自带 Density）
+                        val swipeDeleteVelocityThresholdPx =
+                            ViewerSwipeDelete.DELETE_VELOCITY_DP_PER_SEC.dp.toPx()
 
                         // 捏合退出（C1）：本手势累计的双指缩小倍率（<1 为缩小）与退出意图。
                         // 每帧重新判定而非 once-true 锁死——捏过头又张开时意图自动取消
@@ -552,7 +722,7 @@ fun ImageViewer(
                         // 图片先缩回 Fit 又继续缩成 70% 并排，手感像是被"劫持"）。
                         // 规格要求已放大时整段手势只做 zoom，所以这里一次定死。
                         val sideBySideAllowed = currentOnSideBySide != null &&
-                            onClose != null &&
+                            currentOnViewerClose != null &&
                             ViewerSideBySide.canEngageFromStart(scale)
 
                         // 向下全量跟手；向上按阻尼轻微跟手（明确区别于"上滑关闭"，松手弹回）。
@@ -561,6 +731,15 @@ fun ImageViewer(
                         // x 的口径是"累计 dx × 权重"而不是增量累计：权重渐变时位移连续无跳变，
                         // 手指往回拖时 x 自动反向，透出程度依旧只看 y（横向不影响遮罩）
                         fun updateDismissDrag(totalDy: Float, totalDx: Float) {
+                            // G4：删除手势的纵移**双向对称跟手、横向锁死**——
+                            // 上滑与下滑等价（相册式甩删），横向不引入自由位移，
+                            // 这就是"竖向删除激活期间冻结横向机制"在本组件侧的一半；
+                            // 另一半（越界消费与吸附归零）由宿主页按相位标志冻结。
+                            if (swipeDeleteActive) {
+                                dismissDragY = totalDy
+                                dismissDragX = 0f
+                                return
+                            }
                             dismissDragY = if (totalDy > 0f) totalDy else totalDy * 0.2f
                             dismissDragX = totalDx * ViewerDismissGesture.resolveFreeDragFactor(
                                 dismissDragY,
@@ -586,6 +765,12 @@ fun ImageViewer(
                                 event.changes.forEach { it.consume() }
                                 continue
                             }
+                            // G4：进站动画在途同理——220ms 内图片已经在"甩进回收站"的路上，
+                            // 任何新输入都不能改变它的结局（松手、翻页、二次拖都不接）
+                            if (isSwipeDeleteFlying) {
+                                event.changes.forEach { it.consume() }
+                                continue
+                            }
 
                             // Track if we ever had multiple pointers
                             if (currentPointerCount > pointerCount) {
@@ -594,8 +779,14 @@ fun ImageViewer(
 
                             if (currentPointerCount >= 2) {
                                 // 捏合开始时脱离拖动还在进行：立即弹回，否则残留的
-                                // translationY 会叠在捏合的 offset 计算上产生跳变
-                                if (lockedDirection == ViewerPanDirection.VERTICAL && dismissDragY != 0f) {
+                                // translationY 会叠在捏合的 offset 计算上产生跳变。
+                                // G4 补充：删除手势在途（swipeDeleteActive）时**不弹回**——
+                                // 纵向锁定后本层已把单指事件全部 consume，正常到不了双指；
+                                // 第二指落下属于异常输入（多指抖动），维持删除手势、
+                                // 忽略本帧，绝不让半途的横向机制抢走纵向手势的位移状态
+                                if (lockedDirection == ViewerPanDirection.VERTICAL &&
+                                    dismissDragY != 0f && !swipeDeleteActive
+                                ) {
                                     settleDismissBack()
                                 }
                                 // Multi-touch: zoom and pan
@@ -662,10 +853,11 @@ fun ImageViewer(
 
                                     // 捏合退出意图（C1）：未放大态才累计缩小量；放大态交给既有
                                     // "缩回 1f"路径并重置累计——否则缩回 1f 的最后一帧会被误记
-                                    // 成退出意图（那一帧 zoom 可远小于阈值）。onClose == null 时
+                                    // 成退出意图（那一帧 zoom 可远小于阈值）。退出回调为 null 时
                                     // 不累计，行为与原来完全一致。判定源是手势起点快照而非
                                     // scaleBeforeZoom：起手已放大的手势永远不触发关闭（R-B23a2）
-                                    if (onClose != null && !isPinchClosing) {
+                                    // G6：已经发起退出（exitCommitted）时不再累计新意图
+                                    if (currentOnViewerClose != null && !exitCommitted) {
                                         if (scaleBeforeZoom > ViewerDismissGesture.PINCH_ZOOMED_THRESHOLD) {
                                             pinchGestureScale = 1f
                                         } else {
@@ -746,7 +938,7 @@ fun ImageViewer(
                                             }
                                             change.consume()
                                         }
-                                    } else if (onClose != null) {
+                                    } else if (currentOnViewerClose != null) {
                                         // scale==1 且查看器可关闭：方向锁定分流。
                                         // 水平必须留给 Pager 翻页（翻页唯一入口），只有明显
                                         // 垂直（|dy| > |dx|*1.2）的手势才归脱离拖动，斜向一律
@@ -769,6 +961,23 @@ fun ImageViewer(
                                             if (lockedDirection == ViewerPanDirection.VERTICAL) {
                                                 // 锁定即脱离拖动：标记非 tap，位移由累计值驱动
                                                 wasPanOrZoom = true
+                                                // G4：锁定帧一次性判定本手势语义。
+                                                // 删除链路只在**队列（并排）态**生效（宿主提供的
+                                                // enabled lambda 内含 sideBySide 判定），全屏态
+                                                // 返回 false → 走既有下滑关闭，G5/G6 行为零变化。
+                                                gestureDeleteMode =
+                                                    currentSwipeDeleteEnabled?.invoke() == true
+                                                if (gestureDeleteMode) {
+                                                    swipeDeleteActive = true
+                                                    currentOnSwipeDeletePhaseChange?.invoke(true)
+                                                }
+                                                if (BuildConfig.DEBUG) {
+                                                    Log.d(
+                                                        "SwipeDelete",
+                                                        "纵向锁定 删除模式=$gestureDeleteMode " +
+                                                            "dy=$accumulatedDy dx=$accumulatedDx"
+                                                    )
+                                                }
                                             }
                                         }
                                         if (lockedDirection == ViewerPanDirection.VERTICAL) {
@@ -787,37 +996,68 @@ fun ImageViewer(
                             }
                         } while (event.changes.any { it.pressed })
 
-                        // 脱离拖动松手：位移或向下甩速达标 → 关闭查看器（复用 onClose）；
-                        // 否则弹簧回位。isPinchClosing 期间不再触发（捏合收尾动画还在播）。
+                        // 脱离拖动松手：位移或向下甩速达标 → 退出查看器（走统一出口）；
+                        // 否则弹簧回位。已经发起退出（exitCommitted）时不再触发。
                         // B-23b 第三批（E4）：达标时先走飞回收尾——本页启用透出则图片
-                        // 边缩小边飞回格子、落格后才 onClose；未启用（playFlyBackDismiss
-                        // 内部兜底）行为与旧版一致，直接 onClose
-                        if (lockedDirection == ViewerPanDirection.VERTICAL && onClose != null && !isPinchClosing) {
+                        // 边缩小边飞回格子、落格后才退出；未启用（playFlyBackDismiss
+                        // 内部兜底）行为与旧版一致，直接走统一出口
+                        if (lockedDirection == ViewerPanDirection.VERTICAL &&
+                            currentOnViewerClose != null && !exitCommitted
+                        ) {
                             val velocity = velocityTracker.calculateVelocity()
-                            // N8（v4.16.9）：归宿判定换成二维版——横向甩速超阈值同样判关闭，
-                            // 其余与原 shouldDismiss 同口径；未达关闭的一律双轴弹簧回全屏
-                            val outcome = ViewerDismissGesture.resolveDismissOutcome(
-                                dy = dismissDragY,
-                                dx = dismissDragX,
-                                velocityYDownPxPerSec = velocity.y,
-                                velocityXPxPerSec = velocity.x,
-                                screenHeightPx = size.height.toFloat(),
-                                screenWidthPx = size.width.toFloat(),
-                                velocityThresholdPxPerSec = velocityThresholdPx
-                            )
-                            if (outcome == DismissOutcome.FLY_BACK) {
-                                playFlyBackDismiss()
+                            if (gestureDeleteMode) {
+                                // G4：队列态竖滑删除的松手归宿（上滑/下滑对称判定，
+                                // 阈值与几何见 ViewerSwipeDelete 纯函数；velocity.y 的
+                                // 符号约定不影响判定——取 |vy|）
+                                val outcome = ViewerSwipeDelete.resolveOutcome(
+                                    dyPx = dismissDragY,
+                                    screenHeightPx = size.height.toFloat(),
+                                    velocityYPxPerSec = velocity.y,
+                                    velocityThresholdPxPerSec = swipeDeleteVelocityThresholdPx
+                                )
+                                if (BuildConfig.DEBUG) {
+                                    Log.d(
+                                        "SwipeDelete",
+                                        "松手 dy=$dismissDragY vy=${velocity.y} -> $outcome"
+                                    )
+                                }
+                                when (outcome) {
+                                    SwipeDeleteOutcome.ENTER_TRASH -> playSwipeDeleteEnterBin()
+                                    SwipeDeleteOutcome.CANCEL -> settleDismissBack()
+                                }
                             } else {
-                                settleDismissBack()
+                                // N8（v4.16.9）：归宿判定换成二维版——横向甩速超阈值同样判关闭，
+                                // 其余与原 shouldDismiss 同口径；未达关闭的一律双轴弹簧回全屏
+                                val outcome = ViewerDismissGesture.resolveDismissOutcome(
+                                    dy = dismissDragY,
+                                    dx = dismissDragX,
+                                    velocityYDownPxPerSec = velocity.y,
+                                    velocityXPxPerSec = velocity.x,
+                                    screenHeightPx = size.height.toFloat(),
+                                    screenWidthPx = size.width.toFloat(),
+                                    velocityThresholdPxPerSec = velocityThresholdPx
+                                )
+                                if (outcome == DismissOutcome.FLY_BACK) {
+                                    playFlyBackDismiss()
+                                } else {
+                                    settleDismissBack()
+                                }
                             }
                         } else if (wasSideBySidePinch) {
                             // 并排捏合松手（D1~D5）：把累计倍率交回上层吸附（进度 ≥ 0.5 → 并排，
                             // 否则回全屏）。开关关闭时走不到这里（并排回调为 null，未进并排路径）
                             currentOnSideBySideSettle?.invoke(pinchGestureScale)
-                        } else if (pinchDismissIntent && onClose != null && !isPinchClosing) {
-                            // 捏合退出（C1）：走到这里必然是全部手指已抬起（do-while 退出条件），
-                            // 意图成立后先播收尾动画（C2），动画结束回调里才真正 onClose
-                            playPinchCloseDismiss()
+                        } else if (pinchDismissIntent && currentOnViewerClose != null) {
+                            // 捏合退出（C1，G6 改版）：走到这里必然是手势已结束——全部手指
+                            // 抬起，或事件流被中断/取消（do-while 的退出条件同样成立）。
+                            // 意图成立后**直接走统一出口**：不再在内容层自播一段淡出，
+                            // 退出转场由宿主页与窗口层承担一次、也只承担一次。
+                            // 旧写法（playPinchCloseDismiss）播完要把 isPinchClosing 翻回
+                            // false，图片在那一帧恢复不透明，随后 finish() 的窗口快照
+                            // 把这层图片再淡一次到宿主页上 = 报告里的半透明残影（E4）。
+                            // requestViewerExit 自带 exitCommitted 防重入，被中断/取消时
+                            // 也不会发起第二次退出（G6 实施指令 2）
+                            requestViewerExit(ViewerExitReason.PINCH_IN)
                         }
 
                         // Handle taps after gesture ends
@@ -858,17 +1098,24 @@ fun ImageViewer(
 
                                     if (currentScale > 1.05f) {
                                         // Animate zoom out to 1x (fit to screen)
-                                        scope.launch {
+                                        // G6：动画协程登记到 zoomJob，统一清理能取消它
+                                        //（只取消、不改 isAnimating / scale / offset，
+                                        //  退出快照因此冻结在当前帧，见 ViewerExitCleanup.KEPT_FIELDS）
+                                        zoomJob = scope.launch {
                                             isAnimating = true
                                             scaleAnimatable.snapTo(currentScale)
                                             offsetAnimatable.snapTo(currentOffset)
                                             // Run both animations in parallel
                                             launch { scaleAnimatable.animateTo(1f, tween(250)) }
                                             launch { offsetAnimatable.animateTo(Offset.Zero, tween(250)) }
-                                        }.invokeOnCompletion {
-                                            scale = 1f
-                                            offset = Offset.Zero
-                                            isAnimating = false
+                                        }.also { job ->
+                                            job.invokeOnCompletion {
+                                                if (it == null) {
+                                                    scale = 1f
+                                                    offset = Offset.Zero
+                                                    isAnimating = false
+                                                }
+                                            }
                                         }
                                     } else {
                                         // Animate zoom in to crop scale (fill screen)
@@ -879,17 +1126,21 @@ fun ImageViewer(
                                         )
                                         val constrainedOffset = constrainOffset(newOffset, targetScale)
 
-                                        scope.launch {
+                                        zoomJob = scope.launch {
                                             isAnimating = true
                                             scaleAnimatable.snapTo(currentScale)
                                             offsetAnimatable.snapTo(currentOffset)
                                             // Run both animations in parallel
                                             launch { scaleAnimatable.animateTo(targetScale, tween(250)) }
                                             launch { offsetAnimatable.animateTo(constrainedOffset, tween(250)) }
-                                        }.invokeOnCompletion {
-                                            scale = targetScale
-                                            offset = constrainedOffset
-                                            isAnimating = false
+                                        }.also { job ->
+                                            job.invokeOnCompletion {
+                                                if (it == null) {
+                                                    scale = targetScale
+                                                    offset = constrainedOffset
+                                                    isAnimating = false
+                                                }
+                                            }
                                         }
                                     }
                                     // Reset tap tracking after double-tap

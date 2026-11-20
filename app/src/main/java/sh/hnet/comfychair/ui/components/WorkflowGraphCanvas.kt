@@ -28,6 +28,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.RoundRect
@@ -94,6 +95,73 @@ private object NodeTextPaints {
     val editable = Paint()
     val valueText = Paint()
     val templateValue = Paint()
+}
+
+/**
+ * 节点/便签绘制期间复用的原生对象（Paint、Path）。
+ *
+ * 与 [NodeTextPaints] 的分工：那边是"属性固定、只改颜色"的常用画笔；这里收容原先在
+ * drawNode/drawNote 内部每帧、每节点、每输入 `new Paint()` 出来的对象。
+ * 这些对象只在 Compose 绘制线程访问，且每次使用前都会完整重设自己需要的全部属性
+ * （颜色、字号、字体、对齐、alpha），因此跨帧、跨节点复用不会串味。
+ *
+ * 用 `remember { GraphPaintCache() }` 持有 → 只在首次组合时分配，不随每帧重组重建。
+ */
+private class GraphPaintCache {
+    val valueBox = Paint()
+    val connectedInput = Paint()
+    val unconnectedInput = Paint()
+    val editedValue = Paint()
+    val toggleTrack = Paint()
+    val toggleThumb = Paint()
+    val outputLabel = Paint()
+    val noteTitle = Paint()
+    val noteContent = Paint()
+
+    /** 节点圆角裁剪路径：每个节点用 rewind 重写同一个 Path，避免每帧每节点分配原生 Path。 */
+    val nodeClipPath = Path()
+}
+
+/** 文本截断缓存的键：宽度与字号都用 Float，同一绘制路径算出的值稳定，可直接按值比较。 */
+private data class TextMeasureKey(
+    val text: String,
+    val maxWidth: Float,
+    val textSize: Float,
+    val bold: Boolean
+)
+
+/**
+ * 文本截断结果缓存（命中即跳过 measureText）。
+ *
+ * 热点背景：每个节点标题、每个输入值、便签的每行文字每帧都要走 [truncateTextUncached]；
+ * 文本超宽时它还要逐字符回退测量（O(n²) 次 native measureText）。
+ * 150-300 节点的工作流在平移/缩放时这部分会占掉大量主线程时间，而平移缩放期间
+ * 文本、可用宽度、字号、字体都不变，缓存命中率接近 100%。
+ *
+ * 键里必须带 bold 标志：同样的文本在粗体/常规下测量宽度不同，共用一个结果会截错。
+ * 颜色与 alpha 不影响测量宽度，故不进键（换主题不会算错，也不白白失效）。
+ *
+ * 只在 Compose 绘制线程（单线程）访问，无需同步；LRU 上限防止长时间浏览不同工作流时
+ * 无限增长（缓存值都是短字符串，单条成本极低）。
+ */
+private class TextMeasureCache(private val maxEntries: Int = 4096) {
+    private val cache = object : LinkedHashMap<TextMeasureKey, String>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<TextMeasureKey, String>): Boolean =
+            size > maxEntries
+    }
+
+    fun truncate(text: String, maxWidth: Float, paint: Paint): String {
+        val key = TextMeasureKey(
+            text = text,
+            maxWidth = maxWidth,
+            textSize = paint.textSize,
+            bold = paint.typeface === Typeface.DEFAULT_BOLD
+        )
+        cache[key]?.let { return it }
+        val result = truncateTextUncached(text, maxWidth, paint)
+        cache[key] = result
+        return result
+    }
 }
 
 /**
@@ -310,6 +378,11 @@ fun WorkflowGraphCanvas(
     // TextMeasurer for markdown rendering in notes
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
+
+    // 绘制缓存：用 remember 持有 —— 跨重组存活，Paint 与文本测量结果不会每帧重建。
+    // 这两者是 150-300 节点工作流平移/缩放时的主要热点（每个节点/输入每帧都要用）。
+    val graphPaintCache = remember { GraphPaintCache() }
+    val textMeasureCache = remember { TextMeasureCache() }
 
     // Track if note heights changed during drawing (triggers relayout)
     var noteHeightsChanged by remember { mutableStateOf(false) }
@@ -741,8 +814,9 @@ fun WorkflowGraphCanvas(
     val editIconSize = 32f
     val editIconPadding = 12f
 
-    Canvas(
-        modifier = modifier
+    // 画布的指针事件链（拖拽 / 缩放 / 连线手势）先存入变量，
+    // 让 Canvas 在"绘制内容"声明之后再组装 —— 绘制内容要放进 drawWithCache 的 onDrawBehind。
+    val canvasModifier = modifier
             // Node/Note drag gesture handler for manual placement (custom implementation that consumes events)
             .pointerInput(isEditMode, isManualPlacementEnabled) {
                 if (!isEditMode || !currentIsManualPlacementEnabled.value) {
@@ -1227,7 +1301,8 @@ fun WorkflowGraphCanvas(
                     }
                 }
             }
-    ) {
+    // 画布绘制内容。视口边界由 drawWithCache 的缓存块算好后作为参数传入（Canvas 组装在本函数末尾）。
+    val drawCanvasContent: DrawScope.(GraphViewport) -> Unit = { viewport ->
         // Compute node IDs that are valid connection targets in connection mode
         val connectionCandidateNodeIds = connectionModeState?.validTargetSlots?.map { it.nodeId }?.toSet() ?: emptySet()
 
@@ -1319,6 +1394,19 @@ fun WorkflowGraphCanvas(
             val sortedAnimatedNodes = animatedNodes.sortedBy { it.node.id }
             sortedAnimatedNodes.forEach { (node, alpha) ->
                 if (alpha > 0.01f) {
+                    // 视口剔除：只绘制与视口（外扩约 64 屏幕像素）相交的节点。
+                    // 屏幕外节点的背景、文字、slot 与文本测量全部跳过 —— 这是 150-300 节点
+                    // 工作流平移/缩放掉帧的主要来源。位置已含拖拽偏移，判断用的是本帧实际矩形。
+                    if (!isNodeVisible(
+                            nodeLeft = node.x,
+                            nodeTop = node.y,
+                            nodeRight = node.x + node.width,
+                            nodeBottom = node.y + node.height,
+                            viewport = viewport
+                        )
+                    ) {
+                        return@forEach
+                    }
                     val highlightState = when {
                         // Mapping mode selection
                         isFieldMappingMode && node.id in mappingSelectedNodeIds -> NodeHighlightState.SELECTED
@@ -1373,7 +1461,9 @@ fun WorkflowGraphCanvas(
                                 inputWireColors = nodeInputColors[node.id] ?: emptyMap(),
                                 showEditIcon = isEditMode,
                                 editIconDrawable = editIconDrawable,
-                                mappedFields = graph.mappedFields
+                                mappedFields = graph.mappedFields,
+                                paints = graphPaintCache,
+                                textCache = textMeasureCache
                             )
                         }
                     } else {
@@ -1391,7 +1481,9 @@ fun WorkflowGraphCanvas(
                             inputWireColors = nodeInputColors[node.id] ?: emptyMap(),
                             showEditIcon = isEditMode,
                             editIconDrawable = editIconDrawable,
-                            mappedFields = graph.mappedFields
+                            mappedFields = graph.mappedFields,
+                            paints = graphPaintCache,
+                            textCache = textMeasureCache
                         )
                     }
                 }
@@ -1426,7 +1518,9 @@ fun WorkflowGraphCanvas(
                                 showEditIcon = isEditMode,
                                 editIconDrawable = editIconDrawable,
                                 textMeasurer = textMeasurer,
-                                density = density
+                                density = density,
+                                paints = graphPaintCache,
+                                textCache = textMeasureCache
                             )
                         }
                     } else {
@@ -1438,7 +1532,9 @@ fun WorkflowGraphCanvas(
                             showEditIcon = isEditMode,
                             editIconDrawable = editIconDrawable,
                             textMeasurer = textMeasurer,
-                            density = density
+                            density = density,
+                            paints = graphPaintCache,
+                            textCache = textMeasureCache
                         )
                     }
 
@@ -1466,6 +1562,11 @@ fun WorkflowGraphCanvas(
 
                 // Draw output slots on all nodes (one per output) - use animatedNodes with alpha
                 animatedNodes.forEach { (node, nodeAlpha) ->
+                    // 视口剔除：屏幕外节点不画输出插槽。插槽绘制与命中测试无关，
+                    // 点按/长按仍由 pointerInput 里的几何判断处理，跳过绘制不影响交互。
+                    if (!isNodeVisible(node.x, node.y, node.x + node.width, node.y + node.height, viewport)) {
+                        return@forEach
+                    }
                     val outputX = node.x + node.width
 
                     node.outputs.forEachIndexed { outputIndex, output ->
@@ -1538,6 +1639,10 @@ fun WorkflowGraphCanvas(
 
                 // Draw input slots for connection-type inputs on all nodes - use animatedNodes with alpha
                 animatedNodes.forEach { (node, nodeAlpha) ->
+                    // 视口剔除：屏幕外节点不画输入插槽（理由同输出插槽：绘制与命中测试解耦）。
+                    if (!isNodeVisible(node.x, node.y, node.x + node.width, node.y + node.height, viewport)) {
+                        return@forEach
+                    }
                     var inputIndex = 0
                     node.inputs.forEach { (inputName, inputValue) ->
                         val isConnectionInput =
@@ -1701,6 +1806,27 @@ fun WorkflowGraphCanvas(
             }
         }
     }
+
+    // 画布组装：绘制内容放进 drawWithCache 的 onDrawBehind。
+    // 缓存块只算"本帧绘制上下文"——视口边界（GraphViewport），尺寸 / 偏移 / 缩放变化时重算；
+    // 这三个参数都由父组件状态驱动重组，缓存块与视口始终同步。
+    // Paint 与文本测量结果由 remember 的缓存对象持有，跨重组存活。
+    // Canvas 的 onDraw 保持为空：绘制已经在 drawWithCache 的 onDrawBehind 里完成，不能画两遍。
+    Canvas(
+        modifier = canvasModifier.drawWithCache {
+            val viewport = GraphViewport.of(
+                canvasWidth = size.width,
+                canvasHeight = size.height,
+                offsetX = offset.x,
+                offsetY = offset.y,
+                scale = scale
+            )
+            onDrawBehind {
+                // 显式传 receiver：绘制内容是 DrawScope 扩展函数类型的局部变量
+                drawCanvasContent.invoke(this, viewport)
+            }
+        }
+    ) { }
 }
 
 /**
@@ -1720,7 +1846,10 @@ private fun DrawScope.drawNode(
     inputWireColors: Map<String, Int> = emptyMap(),
     showEditIcon: Boolean = false,
     editIconDrawable: Drawable? = null,
-    mappedFields: Map<Pair<String, String>, String> = emptyMap()
+    mappedFields: Map<Pair<String, String>, String> = emptyMap(),
+    // 绘制缓存（Paint 复用 + 文本测量结果），由调用方 remember 持有
+    paints: GraphPaintCache,
+    textCache: TextMeasureCache
 ) {
     val headerHeight = WorkflowLayoutEngine.NODE_HEADER_HEIGHT
     val cornerRadius = 16f
@@ -1759,7 +1888,9 @@ private fun DrawScope.drawNode(
     }
 
     // Create clip path for the entire node shape
-    val nodeClipPath = Path().apply {
+    // 复用缓存里的同一个 Path：先 rewind 清空再写入本节点几何，避免每帧每节点分配原生 Path
+    val nodeClipPath = paints.nodeClipPath.apply {
+        rewind()
         addRoundRect(
             RoundRect(
                 left = node.x,
@@ -1835,7 +1966,7 @@ private fun DrawScope.drawNode(
             typeface = Typeface.DEFAULT_BOLD
             isAntiAlias = true
         }
-        val title = truncateText(node.title, titleMaxWidth, titlePaint)
+        val title = textCache.truncate(node.title, titleMaxWidth, titlePaint)
         drawText(title, node.x + 16f, node.y + 40f, titlePaint)
 
         // Draw icons in top-right corner of header when in edit mode
@@ -1890,7 +2021,7 @@ private fun DrawScope.drawNode(
         }
 
         // Paint for value box background (uses header color)
-        val valueBoxPaint = Paint().apply {
+        val valueBoxPaint = paints.valueBox.apply {
             color = headerColorArgb
             isAntiAlias = true
         }
@@ -1951,7 +2082,7 @@ private fun DrawScope.drawNode(
                 wireColor != null -> {
                     // Blend wire color with standard text color (50/50)
                     val blendedColor = blendColors(wireColor, textSecondaryArgb, 0.5f)
-                    Paint().apply {
+                    paints.connectedInput.apply {
                         color = blendedColor
                         textSize = 22f
                         typeface = Typeface.DEFAULT_BOLD
@@ -1961,7 +2092,7 @@ private fun DrawScope.drawNode(
                 // Unconnected slot: bold with slot type color
                 slotTypeColor != null -> {
                     val blendedColor = blendColors(slotTypeColor, textSecondaryArgb, 0.5f)
-                    Paint().apply {
+                    paints.unconnectedInput.apply {
                         color = blendedColor
                         textSize = 22f
                         typeface = Typeface.DEFAULT_BOLD
@@ -1987,7 +2118,7 @@ private fun DrawScope.drawNode(
                 val toggleRadius = toggleHeight / 2
 
                 // Draw track (edited: blended red, on: selectedBorder/primary, off: nodeBorder/outline)
-                val trackPaint = Paint().apply {
+                val trackPaint = paints.toggleTrack.apply {
                     color = when {
                         isEdited -> blendColors(textPrimaryArgb, editedColorArgb, 0.5f)
                         currentValue -> colors.selectedBorder.withAlpha().toArgb()
@@ -2014,7 +2145,7 @@ private fun DrawScope.drawNode(
                 } else {
                     android.graphics.Color.WHITE
                 }
-                val thumbPaint = Paint().apply {
+                val thumbPaint = paints.toggleThumb.apply {
                     color = thumbColor
                     isAntiAlias = true
                 }.also { it.alpha = drawableAlpha }
@@ -2032,7 +2163,7 @@ private fun DrawScope.drawNode(
                 // Choose paint based on whether this is a template or edited value
                 val valuePaint = when {
                     hasTemplatePattern -> templateValuePaint
-                    isEdited -> Paint().apply {
+                    isEdited -> paints.editedValue.apply {
                         color = blendColors(textPrimaryArgb, editedColorArgb, 0.5f)
                         textSize = 20f
                         typeface = Typeface.DEFAULT_BOLD
@@ -2043,7 +2174,7 @@ private fun DrawScope.drawNode(
                 }
 
                 // Truncate value to fit in available space
-                val truncatedValue = truncateText(valueStr, maxValueWidth, valuePaint)
+                val truncatedValue = textCache.truncate(valueStr, maxValueWidth, valuePaint)
 
                 // Center the box vertically on the text baseline
                 val boxTop = inputY - textHeight - boxPaddingV + 4f
@@ -2076,7 +2207,7 @@ private fun DrawScope.drawNode(
             // Create paint for output name (right-aligned, colored)
             val outputPaint = if (outputColorInt != null) {
                 val blendedColor = blendColors(outputColorInt, textSecondaryArgb, 0.5f)
-                Paint().apply {
+                paints.outputLabel.apply {
                     color = blendedColor
                     textSize = 22f
                     typeface = Typeface.DEFAULT_BOLD
@@ -2084,7 +2215,7 @@ private fun DrawScope.drawNode(
                     textAlign = Paint.Align.RIGHT
                 }
             } else {
-                Paint().apply {
+                paints.outputLabel.apply {
                     color = textSecondaryArgb
                     textSize = 22f
                     typeface = Typeface.DEFAULT_BOLD
@@ -2321,7 +2452,10 @@ private fun DrawScope.drawNote(
     showEditIcon: Boolean = false,
     editIconDrawable: Drawable? = null,
     textMeasurer: TextMeasurer? = null,
-    density: androidx.compose.ui.unit.Density? = null
+    density: androidx.compose.ui.unit.Density? = null,
+    // 绘制缓存（Paint 复用 + 文本测量结果），由调用方 remember 持有
+    paints: GraphPaintCache,
+    textCache: TextMeasureCache
 ) {
     // Helper to apply alpha to a color
     fun Color.withAlpha() = this.copy(alpha = this.alpha * alpha)
@@ -2399,13 +2533,13 @@ private fun DrawScope.drawNote(
     val textColorArgb = textColor.toArgb()
     drawContext.canvas.nativeCanvas.apply {
         val titleMaxWidth = if (showEditIcon) note.width - 104f else note.width - 32f
-        val titlePaint = android.graphics.Paint().apply {
+        val titlePaint = paints.noteTitle.apply {
             color = textColorArgb
             textSize = 24f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             isAntiAlias = true
         }
-        val title = truncateText(note.title, titleMaxWidth, titlePaint)
+        val title = textCache.truncate(note.title, titleMaxWidth, titlePaint)
         drawText(title, note.x + 16f, note.y + 40f, titlePaint)
 
         // Draw edit icon when in edit mode
@@ -2434,7 +2568,7 @@ private fun DrawScope.drawNote(
     } else {
         // Fallback: Draw content using native canvas (no markdown formatting)
         drawContext.canvas.nativeCanvas.apply {
-            val contentPaint = android.graphics.Paint().apply {
+            val contentPaint = paints.noteContent.apply {
                 color = textColorArgb
                 textSize = 20f
                 isAntiAlias = true
@@ -2445,7 +2579,7 @@ private fun DrawScope.drawNote(
 
             var contentY = note.y + headerHeight + 28f
             for (line in lines) {
-                val truncatedLine = truncateText(line, note.width - 32f, contentPaint)
+                val truncatedLine = textCache.truncate(line, note.width - 32f, contentPaint)
                 drawText(truncatedLine, note.x + 16f, contentY, contentPaint)
                 contentY += lineHeight
             }
@@ -2481,9 +2615,107 @@ private fun calculateOutputY(node: WorkflowNode, outputIndex: Int): Float {
 
 
 /**
- * Truncate text to fit within a given width
+ * 视口剔除的外扩距离（屏幕像素）。
+ *
+ * 必须覆盖一切画到节点矩形之外的装饰：高亮边框最粗 8f（描边居中，向外溢出 4f）、
+ * 连线插槽半径最大 16f、拖拽节点时约 1.2 倍的放大效果，以及抗锯齿边缘。
+ * 取 64px 足够宽裕，保证视口边缘的节点在平移/缩放时完整进出，不会半截闪现。
  */
-private fun truncateText(text: String, maxWidth: Float, paint: Paint): String {
+internal const val NODE_CULL_PADDING_PX = 64f
+
+/**
+ * 图坐标系下的视口矩形（[left]/[top]/[right]/[bottom] 不含外扩，外扩单独记在 [paddingPx]）。
+ *
+ * 画布变换是 `屏幕坐标 = offset + 图坐标 * scale`（见绘制主体的 withTransform），
+ * 所以图坐标视口为：left = -offsetX / scale，right = (canvasWidth - offsetX) / scale，上下同理。
+ *
+ * @param paddingPx 图坐标下的外扩距离（屏幕 64px ÷ scale），保证屏幕上的外扩量恒定。
+ */
+internal data class GraphViewport(
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+    val paddingPx: Float
+) {
+    companion object {
+        /** scale 下限保护：极端缩放或非法值下避免除零出 Infinity，使剔除判断整体失效。 */
+        private const val MIN_SCALE = 1e-4f
+
+        /** 由画布尺寸、平移与缩放算出图坐标视口。纯函数，便于 JVM 单测。 */
+        fun of(
+            canvasWidth: Float,
+            canvasHeight: Float,
+            offsetX: Float,
+            offsetY: Float,
+            scale: Float
+        ): GraphViewport {
+            val safeScale = if (scale > MIN_SCALE) scale else MIN_SCALE
+            return GraphViewport(
+                left = -offsetX / safeScale,
+                top = -offsetY / safeScale,
+                right = (canvasWidth - offsetX) / safeScale,
+                bottom = (canvasHeight - offsetY) / safeScale,
+                paddingPx = NODE_CULL_PADDING_PX / safeScale
+            )
+        }
+    }
+}
+
+/**
+ * 判断节点矩形是否与视口（按 [paddingPx] 向外扩后）相交。
+ *
+ * 纯函数，不依赖 Compose 运行时，JVM 单测直接钉死边界行为。
+ * 边界一律按"相交"处理（`>=` / `<=`）：节点恰好贴住视口边缘时仍然绘制，
+ * 否则平移一像素就会让贴边节点先消失再出现，视觉上就是闪烁。
+ */
+internal fun isNodeVisible(
+    nodeLeft: Float,
+    nodeTop: Float,
+    nodeRight: Float,
+    nodeBottom: Float,
+    viewportLeft: Float,
+    viewportTop: Float,
+    viewportRight: Float,
+    viewportBottom: Float,
+    paddingPx: Float
+): Boolean =
+    nodeRight >= viewportLeft - paddingPx &&
+        nodeLeft <= viewportRight + paddingPx &&
+        nodeBottom >= viewportTop - paddingPx &&
+        nodeTop <= viewportBottom + paddingPx
+
+/** [isNodeVisible] 的便捷重载：外扩距离取自视口自身的 [GraphViewport.paddingPx]。 */
+internal fun isNodeVisible(
+    nodeLeft: Float,
+    nodeTop: Float,
+    nodeRight: Float,
+    nodeBottom: Float,
+    viewport: GraphViewport
+): Boolean {
+    // 视口退化成 0 面积（画布尺寸仍为 0 / 尚未完成测量）时不做剔除：
+    // 此时任何几何判断都会把所有节点判成"在视口外"，画面会直接空白。
+    if (viewport.right <= viewport.left || viewport.bottom <= viewport.top) return true
+    return isNodeVisible(
+        nodeLeft = nodeLeft,
+        nodeTop = nodeTop,
+        nodeRight = nodeRight,
+        nodeBottom = nodeBottom,
+        viewportLeft = viewport.left,
+        viewportTop = viewport.top,
+        viewportRight = viewport.right,
+        viewportBottom = viewport.bottom,
+        paddingPx = viewport.paddingPx
+    )
+}
+
+/**
+ * Truncate text to fit within a given width.
+ *
+ * 这是无缓存实现：绘制路径一律通过 [TextMeasureCache.truncate] 调用它，
+ * 避免同一段文本每帧重复走 measureText（超宽时还是逐字符回退测量）。
+ */
+private fun truncateTextUncached(text: String, maxWidth: Float, paint: Paint): String {
     if (paint.measureText(text) <= maxWidth) return text
 
     var truncated = text

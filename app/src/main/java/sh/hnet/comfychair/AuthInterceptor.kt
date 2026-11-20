@@ -14,6 +14,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * outside the expected server host) and fires [onSessionExpired] at most once per session.
  * Call [resetSessionExpiredFlag] after re-authentication to re-arm detection.
  *
+ * Cookie 凭据不再手工写入 `Cookie` 请求头：用户粘贴的 Cookie 串由 [cookieJar] 逐条解析播种，
+ * 由 OkHttp 按主机作用域管理，跨主机重定向不会外发。
+ *
  * @param credentials Initial credentials to use
  * @param expectedHost Server hostname used to detect cross-domain SSO redirects;
  *                     null disables redirect-based expiry detection
@@ -22,6 +25,9 @@ class AuthInterceptor(
     credentials: AuthCredentials = AuthCredentials.None,
     private val expectedHost: String? = null
 ) : Interceptor {
+
+    /** Cookie 会话仓库；没有 expectedHost 时不启用（也就无法使用 Cookie 认证） */
+    internal val cookieJar: SessionCookieJar? = expectedHost?.let { SessionCookieJar(it) }
 
     @Volatile
     private var currentCredentials: AuthCredentials = credentials
@@ -36,6 +42,10 @@ class AuthInterceptor(
 
     fun setCredentials(newCredentials: AuthCredentials) {
         currentCredentials = newCredentials
+        // 离开 Cookie 认证时清空仓库，避免旧会话 Cookie 残留在后续请求上
+        if (newCredentials !is AuthCredentials.Cookie) {
+            cookieJar?.clear()
+        }
     }
 
     fun getCredentials(): AuthCredentials = currentCredentials
@@ -65,9 +75,11 @@ class AuthInterceptor(
             is AuthCredentials.Bearer -> originalRequest.newBuilder()
                 .header("Authorization", "Bearer ${creds.token}")
                 .build()
-            is AuthCredentials.Cookie -> originalRequest.newBuilder()
-                .header("Cookie", creds.cookies)
-                .build()
+            is AuthCredentials.Cookie -> {
+                // 交给 CookieJar 按作用域播种，请求头由 OkHttp 的 Cookie 桥接器按主机生成
+                cookieJar?.seed(creds.cookies, originalRequest.url.scheme)
+                originalRequest
+            }
         }
 
         val response = chain.proceed(request)

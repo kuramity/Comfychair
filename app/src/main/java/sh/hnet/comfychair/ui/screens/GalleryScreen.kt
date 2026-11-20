@@ -6,12 +6,15 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.os.Handler
+import android.os.Looper
+import android.view.PixelCopy
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
-import androidx.core.view.drawToBitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,6 +26,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -33,17 +37,22 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.ImageSearch
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material.icons.filled.SelectAll
@@ -55,6 +64,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -62,7 +72,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -72,6 +82,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.FilterQuality
@@ -87,19 +98,33 @@ import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.text.DateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 import sh.hnet.comfychair.BitmapCache
 import sh.hnet.comfychair.MediaViewerActivity
+import sh.hnet.comfychair.MediaViewerSession
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.storage.AppSettings
+import sh.hnet.comfychair.storage.GalleryTrashEntry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
 import sh.hnet.comfychair.cache.ActiveView
 import sh.hnet.comfychair.cache.MediaCache
+import sh.hnet.comfychair.cache.MediaCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.ui.components.shared.ThreeDViewerSheet
@@ -122,8 +147,8 @@ fun GalleryScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val uiState by galleryViewModel.uiState.collectAsState()
-    val connectionStatus by generationViewModel.connectionStatus.collectAsState()
+    val uiState by galleryViewModel.uiState.collectAsStateWithLifecycle()
+    val connectionStatus by generationViewModel.connectionStatus.collectAsStateWithLifecycle()
 
     // 离线态从连接状态派生：强制离线与自动离线都要显示"未缓存"占位图标，且要实时刷新
     val isOffline = rememberIsOffline()
@@ -228,17 +253,27 @@ fun GalleryScreen(
         }
     }
 
+    // 打开查看器的在途标记：截图改成异步（P1-28）后需要防止连点重复 launch。
+    // 声明必须在 mediaViewerLauncher 回调之前（回调里复位）
+    var isLaunchingViewer by remember { mutableStateOf(false) }
+
     // State and effects
     // Activity result launcher for MediaViewerActivity
     val mediaViewerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
+        // 查看器已返回：允许下一次点击再打开（P1-28 的防连点标记在这里复位）
+        isLaunchingViewer = false
+
         // Restore active view to Gallery
         MediaCache.setActiveView(ActiveView.GALLERY)
 
         // B-23b 第三批：查看器已关闭，释放透出用的图库截图（下次打开会被整体覆盖，
         // 这里主动清掉省一份位图内存）
         BitmapCache.clearGallerySnapshot()
+
+        // P1-29：查看器已关闭，释放进程内保存的条目列表
+        MediaViewerSession.clear()
 
         // Refresh gallery if item was deleted (silent refresh, no spinner)
         if (result.resultCode == Activity.RESULT_OK) {
@@ -286,6 +321,37 @@ fun GalleryScreen(
                 is GalleryEvent.ShowMedia -> {
                     // Handle media display
                 }
+                // G4：回收站"彻底删除"的分路由结果播报。四类各说各话 ——
+                // 服务器删了 / 只清了本机（服务器文件保留）/ 待重试 / 属于其它服务器。
+                // 谎报任何一种状态都是破坏性操作红线，所以哪怕只命中一类也如实说。
+                is GalleryEvent.TrashPurged -> {
+                    val s = event.summary
+                    val parts = buildList {
+                        if (s.removedWithServer > 0) {
+                            add(context.getString(R.string.msg_trash_purged_server, s.removedWithServer))
+                        }
+                        if (s.removedLocalOnly > 0) {
+                            add(
+                                context.getString(
+                            R.string.msg_trash_purged_local_only, s.removedLocalOnly
+                                )
+                            )
+                        }
+                        if (s.queuedForRetry > 0) {
+                            add(context.getString(R.string.msg_trash_purge_pending, s.queuedForRetry))
+                        }
+                        if (s.keptForOtherServer > 0) {
+                            add(
+                                context.getString(
+                                    R.string.msg_trash_kept_other_server, s.keptForOtherServer
+                                )
+                            )
+                        }
+                    }
+                    if (parts.isNotEmpty()) {
+                        Toast.makeText(context, parts.joinToString("；"), Toast.LENGTH_LONG).show()
+                    }
+                }
             }
         }
     }
@@ -313,6 +379,8 @@ fun GalleryScreen(
 
     // Function to launch media viewer
     fun launchMediaViewer(clickedIndex: Int) {
+        if (isLaunchingViewer) return
+
         // Set active view to MediaViewer
         MediaCache.setActiveView(ActiveView.MEDIA_VIEWER)
 
@@ -328,82 +396,125 @@ fun GalleryScreen(
             items = viewerItems,
             initialIndex = clickedIndex
         )
+        val activity = context as? Activity
+        isLaunchingViewer = true
+
+        fun startViewer() {
+            mediaViewerLauncher.launch(intent)
+            // 打开过渡（C2）：launch 内部同步发起 startActivityForResult，这里紧接着设置——
+            // 列表保持不动，查看器以缩小淡入进场（与关闭时的缩小淡出对称）
+            activity?.overridePendingTransition(
+                R.anim.viewer_fade_in_grow, R.anim.gallery_stay
+            )
+        }
 
         // ============================================================
-        // B-23b 第三批（E1~E2）：截图与格子矩形——必须在 launch 之前同步截取
+        // B-23b 第三批（E1~E2）+ P1-28：截图与格子矩形
         // ============================================================
-        // View.draw 是同步的：这一刻图库还在前台，截到的才是图库画面；
-        // launch 之后查看器窗口盖上来，再截就是查看器自己。
+        // 修复前在点击回调里同步 `decorView.drawToBitmap()`：整屏（含顶栏、全部可见格子）
+        // 的软件绘制压在主线程上，图库越满越久，点开查看器会先卡一下。
+        // 现在改走 PixelCopy：像素拷贝由 RenderThread 完成，回调回到主线程；
+        // 挖空（copy + 逐格填色）再挪到 Default 线程。
+        //
         // 捏合改列动画进行中（pinchScale != 1）时格子矩形是布局坐标、与视觉位置
         // 错位，按"无截图"处理回退纯黑，绝不透出错位的画面
-        var revealSnapshot: Bitmap? = null
-        var revealCellRect: ViewerRect? = null
-        if (AppSettings.isGalleryDismissRevealEnabled(context) && pinchScale == 1f) {
-            try {
-                revealSnapshot = (context as? Activity)?.window?.decorView?.drawToBitmap()
-                // 目标格子矩形（window 坐标）：visibleItemsInfo.offset 是相对 grid
-                // 内容区起点（contentPadding 之后）的偏移，加上 grid 节点的 window
-                // 位置**与 contentPadding** 才与截图同基准。
-                // v4.16.8 N2 修正：旧版漏加 contentPadding，矩形整体左上偏 8dp，
-                // 格子的右缘与底缘各露出一条 8dp（右下角交汇最明显）。
-                // 本函数在点击回调里执行，被点格子必然在可见区（不可见点不到）
-                val itemInfo = gridState.layoutInfo.visibleItemsInfo
-                    .firstOrNull { it.index == clickedIndex }
-                if (itemInfo != null) {
-                    val paddingPx = GALLERY_GRID_CONTENT_PADDING_DP *
-                        context.resources.displayMetrics.density
-                    revealCellRect = galleryRevealCellRect(
-                        gridOriginX = gridOriginInWindow.x,
-                        gridOriginY = gridOriginInWindow.y,
-                        contentPaddingPx = paddingPx,
-                        itemOffsetX = itemInfo.offset.x.toFloat(),
-                        itemOffsetY = itemInfo.offset.y.toFloat(),
-                        itemWidthPx = itemInfo.size.width.toFloat(),
-                        itemHeightPx = itemInfo.size.height.toFloat()
-                    )
-                    // ============================================================
-                    // N2（v4.16.8）：截图内挖空——把目标格子区域在 Bitmap 像素空间里
-                    // 填成图库背景色。填色发生在静态截图内，不存在跨窗口坐标系对齐
-                    // 问题（旧覆盖层方案正是栽在这里）；透出的画面上那格就是"空置
-                    // 格子"。开关关闭时跳过，由查看器的黑矩形 Canvas 接管（旧方案）
-                    // ============================================================
-                    if (revealSnapshot != null &&
-                        AppSettings.isGalleryRevealHolePunch(context)
-                    ) {
-                        val punched = holePunchGallerySnapshot(
-                            snapshot = requireNotNull(revealSnapshot),
-                            cellRect = requireNotNull(revealCellRect),
-                            gutterHalfPx = paddingPx * 0.5f,
-                            fallbackColor = galleryFallbackBackground
-                        )
-                        if (punched == null) {
-                            // 挖空失败（copy OOM 等）：放弃整个截图回退纯黑——绝不让
-                            // 未挖空的截图透出原格子缩略图（N2 的 bug 就是"空置格透图"）
-                            revealSnapshot = null
-                            revealCellRect = null
-                        } else {
-                            revealSnapshot = punched
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-                // 截图失败（窗口未就绪等）：按"无截图"处理，查看器回退纯黑，不许崩
-                revealSnapshot = null
-                revealCellRect = null
-            }
+        val revealEnabled = AppSettings.isGalleryDismissRevealEnabled(context) && pinchScale == 1f
+        if (!revealEnabled || activity == null) {
+            BitmapCache.putGallerySnapshot(null, null)
+            startViewer()
+            return
         }
-        BitmapCache.putGallerySnapshot(revealSnapshot, revealCellRect)
 
-        mediaViewerLauncher.launch(intent)
-        // 打开过渡（C2）：launch 内部同步发起 startActivityForResult，这里紧接着设置——
-        // 列表保持不动，查看器以缩小淡入进场（与关闭时的缩小淡出对称）
-        (context as? Activity)?.overridePendingTransition(
-            R.anim.viewer_fade_in_grow, R.anim.gallery_stay
-        )
+        // 目标格子矩形（window 坐标）必须在主线程、且在截图发起前读：
+        // visibleItemsInfo 只在组合线程有效，截图后布局可能已经变化
+        val paddingPx = GALLERY_GRID_CONTENT_PADDING_DP * context.resources.displayMetrics.density
+        val itemInfo = gridState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == clickedIndex }
+        val revealCellRect: ViewerRect? = itemInfo?.let {
+            galleryRevealCellRect(
+                gridOriginX = gridOriginInWindow.x,
+                gridOriginY = gridOriginInWindow.y,
+                contentPaddingPx = paddingPx,
+                itemOffsetX = it.offset.x.toFloat(),
+                itemOffsetY = it.offset.y.toFloat(),
+                itemWidthPx = it.size.width.toFloat(),
+                itemHeightPx = it.size.height.toFloat()
+            )
+        }
+        val holePunchEnabled = AppSettings.isGalleryRevealHolePunch(context)
+        val fallbackColor = galleryFallbackBackground
+
+        scope.launch {
+            // ① 截屏（PixelCopy，异步、不占主线程做整屏绘制）
+            val snapshot = captureWindowSnapshot(activity)
+            // ② 挖空（像素级操作，放 Default 线程）
+            val punched = if (snapshot != null && revealCellRect != null && holePunchEnabled) {
+                withContext(Dispatchers.Default) {
+                    holePunchGallerySnapshot(
+                        snapshot = snapshot,
+                        cellRect = revealCellRect,
+                        gutterHalfPx = paddingPx * 0.5f,
+                        fallbackColor = fallbackColor
+                    )
+                }
+            } else {
+                snapshot
+            }
+            // 挖空失败（copy OOM 等）：放弃整个截图回退纯黑——绝不让未挖空的截图
+            // 透出原格子缩略图（N2 的 bug 就是"空置格透图"）
+            val finalSnapshot = if (holePunchEnabled && revealCellRect != null && punched == null) {
+                null
+            } else {
+                punched
+            }
+            BitmapCache.putGallerySnapshot(
+                finalSnapshot,
+                if (finalSnapshot != null) revealCellRect else null
+            )
+            // ③ 启动查看器（回到主线程执行 startActivityForResult）
+            startViewer()
+        }
     }
 
-    // 批量删除前的确认（一次删掉几十张不可撤销，必须拦一道）
+    // 批量删除前的确认（一次移几十张进回收站也要拦一道，防手滑）
     var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    // ============================================================
+    // G4（任务书 11.4）：回收站（图库一级回收站 = 删除的落点与恢复入口）
+    // ============================================================
+    //
+    // 两阶段的 UI 对应：
+    // - 阶段一（这里及查看器的删除动作）：移入回收站。列表消失、本地缓存保留；
+    // - 阶段二（回收站面板里的"彻底删除 / 清空"）：服务器联动删除 + 本地残留清理。
+    //   **首次启用必须先过清单确认**（pendingPurgeDialog），确认状态按服务器持久化。
+    //
+    // 面板用全屏 Dialog：不动图库既有布局树（网格滚动位置、捏合状态在开合之间零损失），
+    // 系统返回键天然被 Dialog 接走（关面板而不是退出页面）。
+    val trashEntries by galleryViewModel.trashEntries.collectAsStateWithLifecycle()
+    var showTrashScreen by rememberSaveable { mutableStateOf(false) }
+    // 非空 = 首次启用的"将删除文件清单"确认框开着，值就是确认后要执行的 identities
+    var pendingPurgeIdentities by remember { mutableStateOf<List<String>?>(null) }
+    // 当前连接服务器 id：条目 serverId 与它比对，决定"能否联动删服务器"的文案与分组
+    val currentServerId = ConnectionManager.currentServerId.orEmpty()
+
+    /**
+     * 发起"彻底删除"（阶段二入口的统一闸口）。
+     *
+     * 破坏性硬约束 2 的落点：当前服务器**首次**走这条链路时，先展示将删除的
+     * 服务器文件清单并等确认；确认状态按 serverId 持久化（用户已答复的交互
+     * 决策：只问一次，之后同服务器不再问）。清单里没有当前服务器条目时
+     * （全是别家服务器的）没有服务器删除动作，不必拦。
+     */
+    fun requestPurgeTrash(identities: List<String>) {
+        if (identities.isEmpty()) return
+        val onCurrentServer = identities.count { id ->
+            trashEntries.any { it.identityKey == id && it.serverId == currentServerId }
+        }
+        if (onCurrentServer == 0 || AppSettings.isServerLinkedDeleteConfirmed(context, currentServerId)) {
+            galleryViewModel.purgeTrashEntries(identities)
+        } else {
+            pendingPurgeIdentities = identities
+        }
+    }
 
     // Create prefetch items list from gallery items
     val prefetchItems = remember(uiState.items) {
@@ -446,9 +557,13 @@ fun GalleryScreen(
     LaunchedEffect(itemsKey) {
         if (uiState.items.isNotEmpty()) {
             // Base prefetch on current scroll position instead of always starting from 0
-            val startIndex = gridState.firstVisibleItemIndex.coerceAtLeast(0)
-            val endIndex = (startIndex + 24).coerceAtMost(uiState.items.size)
-            val initialItems = uiState.items.subList(startIndex, endIndex).map { item ->
+            // P1-23：区间两端都要夹到 size 以内。删除条目 / 刷新后 firstVisibleItemIndex
+            // 可能仍停在旧的大值上，原先只夹尾部，subList(start > size) 会直接抛越界
+            val range = galleryPrefetchRange(
+                itemCount = uiState.items.size,
+                firstVisibleIndex = gridState.firstVisibleItemIndex
+            )
+            val initialItems = uiState.items.subList(range.first, range.last).map { item ->
                 MediaCache.PrefetchItem(
                     key = item.toCacheKey(),
                     isVideo = item.isVideo,
@@ -522,7 +637,36 @@ fun GalleryScreen(
                         Icon(Icons.Default.Share, contentDescription = stringResource(R.string.button_share))
                     }
                 } else {
-                    // Normal mode actions: Select and Menu
+                    // Normal mode actions: Trash (G4), Select and Menu
+                    IconButton(onClick = { showTrashScreen = true }) {
+                        Box {
+                            Icon(
+                                Icons.Default.DeleteSweep,
+                                contentDescription = stringResource(R.string.action_gallery_trash),
+                                tint = if (trashEntries.isNotEmpty()) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                            // 角标只报"有多少条待处理"，不做拦截性弹窗
+                            if (trashEntries.isNotEmpty()) {
+                                Text(
+                                    text = if (trashEntries.size > 99) "99+" else trashEntries.size.toString(),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onError,
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(top=(-4).dp, end=(-6).dp)
+                                        .background(
+                                            MaterialTheme.colorScheme.error,
+                                            CircleShape
+                                        )
+                                        .padding(horizontal = 4.dp)
+                                )
+                            }
+                        }
+                    }
                     IconButton(onClick = { galleryViewModel.enterSelectionMode() }) {
                         Icon(Icons.Default.Checklist, contentDescription = stringResource(R.string.button_gallery_select))
                     }
@@ -665,7 +809,7 @@ fun GalleryScreen(
         }
     }
 
-    // 批量删除确认：删除走 ComfyUI 历史接口，删掉即从服务器消失，不可撤销
+    // 批量删除确认（G4 后语义 = 移入回收站，可恢复；不再是"删掉即从服务器消失"）
     if (showDeleteConfirm) {
         AlertDialog(
             onDismissRequest = { showDeleteConfirm = false },
@@ -706,12 +850,302 @@ fun GalleryScreen(
         )
     }
 
+    // ============================================================
+    // G4：回收站面板（全屏 Dialog）
+    // ============================================================
+    if (showTrashScreen) {
+        Dialog(
+            onDismissRequest = { showTrashScreen = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Surface(color = MaterialTheme.colorScheme.background) {
+                GalleryTrashPanel(
+                    entries = trashEntries,
+                    currentServerId = currentServerId,
+                    onBack = { showTrashScreen = false },
+                    onRestore = { identity -> galleryViewModel.restoreTrashEntry(identity) },
+                    onPurgeOne = { identity -> requestPurgeTrash(listOf(identity)) },
+                    onClearAll = { requestPurgeTrash(trashEntries.map { it.identityKey }) }
+                )
+            }
+        }
+    }
+
+    // G4 硬约束 2：首次启用"联动删除服务器文件"前，展示**将删除的服务器文件清单**
+    // 并确认；确认状态按 serverId 持久化，之后同服务器不再问（用户已确认：只问一次）。
+    pendingPurgeIdentities?.let { identities ->
+        val manifest = trashEntries.filter { it.identityKey in identities.toSet() && it.serverId == currentServerId }
+        AlertDialog(
+            onDismissRequest = { pendingPurgeIdentities = null },
+            icon = {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = { Text(stringResource(R.string.dialog_trash_purge_title)) },
+            text = {
+                Column {
+                    Text(stringResource(R.string.dialog_trash_purge_message, manifest.size))
+                    LazyColumn(modifier = Modifier.padding(top = 8.dp)) {
+                        items(manifest, key = { it.identityKey }) { entry ->
+                            Text(
+                                text = entry.item.filename,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    Text(
+                        text = stringResource(R.string.dialog_trash_purge_note),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingPurgeIdentities = null
+                        AppSettings.setServerLinkedDeleteConfirmed(context, currentServerId)
+                        galleryViewModel.purgeTrashEntries(identities)
+                    }
+                ) {
+                    Text(
+                        text = stringResource(R.string.button_confirm_and_purge),
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingPurgeIdentities = null }) {
+                    Text(stringResource(R.string.button_cancel))
+                }
+            }
+        )
+    }
+
     // 图库 3D 查看器：与生成页同一个组件（下载 glb → SceneView 渲染 → 失败弹错误）
     if (active3D != null) {
         ThreeDViewerSheet(
             result = active3D!!,
             onDismiss = { active3D = null }
         )
+    }
+}
+
+// ============================================================
+// G4（任务书 11.4）：回收站面板
+// ============================================================
+
+/**
+ * 回收站全屏列表面板。
+ *
+ * 每行 = 一条回收站条目：缩略图（仅当前服务器条目，别家的缓存键对不上不白拉网络）、
+ * 文件名、删除时间与**两阶段状态**（待重试 / 属于其它服务器原样如实标注），
+ * 行尾两个动作：恢复（阶段一回退）、彻底删除（阶段二，走调用方的首次确认闸口）。
+ *
+ * **不做任何自动清理**（硬约束 4）：面板里没有"过期自动删"之类的策略入口，
+ * 条目只随用户逐条恢复 / 彻底删除 / 清空而消失。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GalleryTrashPanel(
+    entries: List<GalleryTrashEntry>,
+    currentServerId: String,
+    onBack: () -> Unit,
+    onRestore: (String) -> Unit,
+    onPurgeOne: (String) -> Unit,
+    onClearAll: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier.fillMaxSize()) {
+        TopAppBar(
+            title = {
+                Text(stringResource(R.string.gallery_trash_title, entries.size))
+            },
+            windowInsets = WindowInsets(0, 0, 0, 0),
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        Icons.Default.ArrowBack,
+                        contentDescription = stringResource(R.string.gallery_trash_back)
+                    )
+                }
+            },
+            actions = {
+                // 清空 = 对全部条目发起阶段二；别家服务器的条目会被如实报"保留"，
+                // 不会被冒充成"已清空"
+                TextButton(onClick = onClearAll, enabled = entries.isNotEmpty()) {
+                    Text(
+                        text = stringResource(R.string.gallery_trash_clear_all),
+                        color = if (entries.isNotEmpty()) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                        }
+                    )
+                }
+            }
+        )
+        if (entries.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        Icons.Default.DeleteSweep,
+                        contentDescription = null,
+                        modifier = Modifier.size(56.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    )
+                    Text(
+                        text = stringResource(R.string.gallery_trash_empty),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            val timeFormat = remember {
+                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.getDefault())
+            }
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(entries.sortedByDescending { it.deletedAt }, key = { it.identityKey }) { entry ->
+                    GalleryTrashEntryRow(
+                        entry = entry,
+                        onCurrentServer = entry.serverId == currentServerId,
+                        timeText = timeFormat.format(Date(entry.deletedAt)),
+                        onRestore = { onRestore(entry.identityKey) },
+                        onPurge = { onPurgeOne(entry.identityKey) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 回收站单行。两阶段状态在这一处可观测：待重试（红字 + lastError）/ 在站（灰字）。 */
+@Composable
+private fun GalleryTrashEntryRow(
+    entry: GalleryTrashEntry,
+    onCurrentServer: Boolean,
+    timeText: String,
+    onRestore: () -> Unit,
+    onPurge: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // 缩略图：只有当前服务器的条目值得拉缓存（key 里 serverId 不同台对不上，
+        // 别家条目走网络请求要么失败要么拿错文件 —— 直接图标兜底）
+        if (onCurrentServer) {
+            val cacheKey = MediaCacheKey.of(
+                entry.item.promptId, entry.item.filename, entry.item.type, entry.serverId
+            )
+            val (bitmap, _) = rememberLazyBitmap(
+                cacheKey = cacheKey,
+                isVideo = entry.item.isVideo,
+                subfolder = entry.item.subfolder,
+                type = entry.item.type,
+                thumbnail = true
+            )
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center
+            ) {
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                } else {
+                    Icon(
+                        imageVector = if (entry.item.isVideo) Icons.Default.PlayArrow else Icons.Default.Image,
+                        contentDescription = null,
+                        modifier = Modifier.size(24.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    )
+                }
+            }
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.CloudOff,
+                    contentDescription = null,
+                    modifier = Modifier.size(24.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                )
+            }
+        }
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 12.dp)
+        ) {
+            Text(
+                text = entry.item.filename,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            // 状态行按优先级：待重试 > 非当前服务器 > 普通在站
+            when {
+                entry.pendingRetry -> Text(
+                    text = buildString {
+                        append(stringResource(R.string.gallery_trash_pending_retry))
+                        entry.lastError?.let { append("（").append(it).append("）") }
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                !onCurrentServer -> Text(
+                    text = stringResource(R.string.gallery_trash_other_server),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                else -> Text(
+                    text = stringResource(R.string.gallery_trash_in_trash_since, timeText),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        IconButton(onClick = onRestore) {
+            Icon(
+                Icons.Default.Restore,
+                contentDescription = stringResource(R.string.gallery_trash_restore),
+                tint = MaterialTheme.colorScheme.primary
+            )
+        }
+        IconButton(onClick = onPurge) {
+            Icon(
+                Icons.Default.Delete,
+                contentDescription = stringResource(R.string.gallery_trash_delete_forever),
+                tint = MaterialTheme.colorScheme.error
+            )
+        }
     }
 }
 
@@ -910,6 +1344,94 @@ private fun GalleryItemCard(
 
 /** 图库网格四周内边距（dp）。格子矩形换算与 LazyVerticalGrid 的 contentPadding 必须同值——一处来源 */
 internal const val GALLERY_GRID_CONTENT_PADDING_DP = 8f
+
+/**
+ * 首屏预取的窗口大小（从首个可见项往后取这么多项）。
+ *
+ * 抽成常量是为了让 [galleryPrefetchRange] 的边界行为可以在单测里精确覆盖。
+ */
+internal const val GALLERY_PREFETCH_WINDOW = 24
+
+/**
+ * 首屏预取的索引区间（P1-23，纯函数便于单测）。
+ *
+ * 修复前是 `items.subList(firstVisibleItemIndex, (firstVisible + 24).coerceAtMost(size))`：
+ * 只把**尾部**夹到 size，起点没夹。删除条目 / 刷新后列表变短时，
+ * `firstVisibleItemIndex` 可能还停在旧的大值上（> size），`subList` 直接抛
+ * `IndexOutOfBoundsException` —— 表现为删完图回到图库就崩。
+ *
+ * 这里把两端都夹进 `[0, size]`，并保证 `start <= end`（空列表返回 0..0，subList 合法）。
+ */
+internal fun galleryPrefetchRange(
+    itemCount: Int,
+    firstVisibleIndex: Int,
+    windowSize: Int = GALLERY_PREFETCH_WINDOW
+): IntRange {
+    if (itemCount <= 0) return 0..0
+    val start = firstVisibleIndex.coerceIn(0, itemCount)
+    val end = (start + windowSize.coerceAtLeast(0)).coerceAtMost(itemCount)
+    return start..end
+}
+
+/**
+ * 用 PixelCopy 异步抓取当前窗口画面（P1-28）。
+ *
+ * 为什么不用 `decorView.drawToBitmap()`：那是**软件绘制**，整屏（顶栏 + 所有可见格子）
+ * 在调用线程上逐层 draw 一遍。它在点击回调里同步执行 = 主线程卡顿，
+ * 图库越满越明显。
+ *
+ * PixelCopy 由系统在 RenderThread 侧把窗口表面拷进 Bitmap，拷贝完成后再回调主线程，
+ * 主线程只做"发起"和"收结果"。
+ *
+ * @return 成功返回窗口尺寸的位图；窗口未就绪 / 拷贝失败返回 null（调用方回退纯黑）
+ */
+internal suspend fun captureWindowSnapshot(activity: Activity): Bitmap? =
+    withContext(Dispatchers.Main.immediate) {
+        val window = activity.window
+        val decorView = window.decorView
+        val width = decorView.width
+        val height = decorView.height
+        if (width <= 0 || height <= 0) return@withContext null
+
+        val bitmap = try {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        } catch (_: OutOfMemoryError) {
+            return@withContext null
+        }
+
+try {
+            // 超时兜底：窗口正在销毁/不可见时 PixelCopy 的回调可能永远不来，
+            // 没有超时的话协程会一直挂着 —— 表现为"点了图没反应"
+            withTimeoutOrNull(WINDOW_SNAPSHOT_TIMEOUT_MS) {
+                suspendCancellableCoroutine { continuation ->
+                    PixelCopy.request(
+                        window,
+                        bitmap,
+                        { result ->
+                            if (!continuation.isActive) return@request
+                            if (result == PixelCopy.SUCCESS) {
+                                continuation.resume(bitmap)
+                            } else {
+                                bitmap.recycle()
+                                continuation.resume(null)
+                            }
+                        },
+                        Handler(Looper.getMainLooper())
+                    )
+                }
+            } ?: run {
+                bitmap.recycle()
+                null
+            }
+        } catch (e: Exception) {
+            // 窗口还没挂上 Surface（极早期的点击）等情况：按"无截图"处理
+            bitmap.recycle()
+            null
+        }
+    }
+
+/** 窗口截图（PixelCopy）的超时上限（ms）：超时按"无截图"回退，绝不让打开查看器挂住 */
+private const val WINDOW_SNAPSHOT_TIMEOUT_MS = 800L
 
 /**
  * 下拉透出的目标格子矩形（window px，v4.16.8 N2 修正版，纯函数便于单测）。

@@ -1,13 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Backup rules for Android Auto Backup (API 23-30)
-    See: https://developer.android.com/guide/topics/data/autobackup
-    Note: This file is ignored for devices running API 31+; use data_extraction_rules.xml instead.
--->
-<full-backup-content>
-    <!-- Include all shared preferences -->
-    <include domain="sharedpref" path="." />
+    Android Auto Backup 规则（API 23-30）
+    参考：https://developer.android.com/guide/topics/data/autobackup
+    注意：API 31+ 不读取本文件，走 data_extraction_rules.xml。
 
-    <!-- Exclude connection settings (hostname/port) for security -->
-    <exclude domain="sharedpref" path="ComfyChairPrefs.xml" />
+    这里改为白名单：只备份用户自建数据；凭据、服务器配置、任务队列一律不离开设备。
+-->
+<full-backup-content xmlns:tools="http://schemas.android.com/tools">
+    <!-- 用户设置与生成参数（可备份） -->
+    <include domain="sharedpref" path="AppSettings.xml" />
+    <include domain="sharedpref" path="PromptPresetPrefs.xml" />
+    <include domain="sharedpref" path="WorkflowValuesPrefs.xml" />
+    <include domain="sharedpref" path="TextToImageFragmentPrefs.xml" />
+    <include domain="sharedpref" path="ImageToImageFragmentPrefs.xml" />
+    <include domain="sharedpref" path="TextToVideoFragmentPrefs.xml" />
+    <include domain="sharedpref" path="ImageToVideoFragmentPrefs.xml" />
+    <include domain="sharedpref" path="GenerationViewModelPrefs.xml" />
+    <include domain="sharedpref" path="tag_library_state.xml" />
+    <include domain="sharedpref" path="tag_library_prefs.xml" />
+    <include domain="sharedpref" path="UserWorkflowsPrefs.xml" />
+    <include domain="sharedpref" path="SkillPromptPrefs.xml" />
+
+    <!--
+        敏感数据显式排除：即使将来误加全量 include，也不得把它们带走。
+        lint 的 FullBackupContent 规则会把这些 exclude 判成"不在任何 include 路径内"，
+        但白名单模式下它们本来就不会被备份，这里保留纯属**兜底文档**，因此抑制该告警。
+    -->
+    <exclude domain="sharedpref" path="CredentialPrefs.xml" tools:ignore="FullBackupContent" />
+    <exclude domain="sharedpref" path="ServerPrefs.xml" tools:ignore="FullBackupContent" />
+    <exclude domain="sharedpref" path="JobRegistryPrefs.xml" tools:ignore="FullBackupContent" />
 </full-backup-content>

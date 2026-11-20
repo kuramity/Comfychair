@@ -1,6 +1,7 @@
 package sh.hnet.comfychair.storage
 
 import android.content.Context
+import android.content.SharedPreferences
 
 /**
  * Global app settings singleton.
@@ -21,21 +22,39 @@ object AppSettings {
     private const val KEY_PARTICLE_OVERLAY_ENABLED = "particle_overlay_enabled"
     private const val KEY_RIPPLE_DOT_FEEDBACK_ENABLED = "ripple_dot_feedback_enabled"
 
+    /** 首次调用 [prefsOf] 时记下的 application context（不持有 Activity，避免泄漏）。 */
+    @Volatile
+    private var appContext: Context? = null
+
+    /**
+     * 进程级 SharedPreferences 句柄：系统本来就按 (文件名, 模式) 缓存同一实例，
+     * 这里把原先 48 处 `context.getSharedPreferences(...)` 样板收成一处。
+     */
+    private val prefs: SharedPreferences by lazy {
+        requireNotNull(appContext) { "AppSettings 首次读取前必须先经过 prefsOf(context)" }
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    /** 取 SharedPreferences 的唯一入口：首次调用记下 applicationContext，之后共用 [prefs]。 */
+    private fun prefsOf(context: Context): SharedPreferences {
+        if (appContext == null) appContext = context.applicationContext ?: context
+        return prefs
+    }
+
     /**
      * Check if live preview is enabled.
      * When enabled (default), intermediate preview images are shown during generation.
      * When disabled, only the final result is displayed.
      */
     fun isLivePreviewEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_LIVE_PREVIEW_ENABLED, true)  // Default: true (show live previews)
+        return prefsOf(context).getBoolean(KEY_LIVE_PREVIEW_ENABLED, true)  // Default: true (show live previews)
     }
 
     /**
      * Set whether live preview should be enabled.
      */
     fun setLivePreviewEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_LIVE_PREVIEW_ENABLED, enabled)
             .apply()
@@ -47,15 +66,14 @@ object AppSettings {
      * When disabled, media is written directly to disk (disk-first mode for low-end devices).
      */
     fun isMemoryFirstCache(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_MEMORY_FIRST_CACHE, true)  // Default: true (memory-first)
+        return prefsOf(context).getBoolean(KEY_MEMORY_FIRST_CACHE, true)  // Default: true (memory-first)
     }
 
     /**
      * Set whether memory-first caching should be enabled.
      */
     fun setMemoryFirstCache(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_MEMORY_FIRST_CACHE, enabled)
             .apply()
@@ -67,15 +85,14 @@ object AppSettings {
      * Only applicable in memory-first mode.
      */
     fun isMediaCacheDisabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_MEDIA_CACHE_DISABLED, false)
+        return prefsOf(context).getBoolean(KEY_MEDIA_CACHE_DISABLED, false)
     }
 
     /**
      * Set whether media cache should be disabled.
      */
     fun setMediaCacheDisabled(context: Context, disabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_MEDIA_CACHE_DISABLED, disabled)
             .apply()
@@ -87,15 +104,14 @@ object AppSettings {
      * Default is false (off).
      */
     fun isDebugLoggingEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_DEBUG_LOGGING_ENABLED, false)
+        return prefsOf(context).getBoolean(KEY_DEBUG_LOGGING_ENABLED, false)
     }
 
     /**
      * Set whether debug logging should be enabled.
      */
     fun setDebugLoggingEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_DEBUG_LOGGING_ENABLED, enabled)
             .apply()
@@ -106,15 +122,14 @@ object AppSettings {
      * When enabled (default), the app auto-connects to the last selected server on startup.
      */
     fun isAutoConnectEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_AUTO_CONNECT, true)  // Default: true (auto-connect)
+        return prefsOf(context).getBoolean(KEY_AUTO_CONNECT, true)  // Default: true (auto-connect)
     }
 
     /**
      * Set whether auto-connect should be enabled.
      */
     fun setAutoConnectEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_AUTO_CONNECT, enabled)
             .apply()
@@ -126,15 +141,14 @@ object AppSettings {
      * When disabled, only user-created workflows are shown.
      */
     fun isShowBuiltInWorkflows(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_SHOW_BUILT_IN_WORKFLOWS, true)  // Default: true (show built-in)
+        return prefsOf(context).getBoolean(KEY_SHOW_BUILT_IN_WORKFLOWS, true)  // Default: true (show built-in)
     }
 
     /**
      * Set whether built-in workflows should be shown.
      */
     fun setShowBuiltInWorkflows(context: Context, show: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_SHOW_BUILT_IN_WORKFLOWS, show)
             .apply()
@@ -153,8 +167,7 @@ object AppSettings {
      * 默认 false（不强制离线）。
      */
     fun isOfflineMode(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_OFFLINE_MODE, false)
+        return prefsOf(context).getBoolean(KEY_OFFLINE_MODE, false)
     }
 
     /**
@@ -165,7 +178,7 @@ object AppSettings {
      * 离线缓存与后台连接一起跟着变。
      */
     fun setOfflineMode(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_OFFLINE_MODE, enabled)
             .apply()
@@ -176,15 +189,14 @@ object AppSettings {
      * Default is "hermite" (Hermite spline).
      */
     fun getEdgeRouterId(context: Context): String {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(KEY_EDGE_ROUTER, DEFAULT_EDGE_ROUTER) ?: DEFAULT_EDGE_ROUTER
+        return prefsOf(context).getString(KEY_EDGE_ROUTER, DEFAULT_EDGE_ROUTER) ?: DEFAULT_EDGE_ROUTER
     }
 
     /**
      * Set the edge router ID for the workflow editor.
      */
     fun setEdgeRouterId(context: Context, routerId: String) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putString(KEY_EDGE_ROUTER, routerId)
             .apply()
@@ -196,12 +208,11 @@ object AppSettings {
      * flagged as errors, so the feature is opt-in.
      */
     fun isPromptSpellCheckEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_PROMPT_SPELL_CHECK, false)
+        return prefsOf(context).getBoolean(KEY_PROMPT_SPELL_CHECK, false)
     }
 
     fun setPromptSpellCheckEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_PROMPT_SPELL_CHECK, enabled)
             .apply()
@@ -213,12 +224,11 @@ object AppSettings {
      * 实心粒子"，默认不组合、不转发触点；打开开关可一键回退旧特效。
      */
     fun isParticleOverlayEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_PARTICLE_OVERLAY_ENABLED, false)  // Default: false（按钮内 ripple 皮肤替代）
+        return prefsOf(context).getBoolean(KEY_PARTICLE_OVERLAY_ENABLED, false)  // Default: false（按钮内 ripple 皮肤替代）
     }
 
     fun setParticleOverlayEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_PARTICLE_OVERLAY_ENABLED, enabled)
             .apply()
@@ -230,12 +240,11 @@ object AppSettings {
      * 原样返回，按钮恢复无特效的原始形态。
      */
     fun isRippleDotFeedbackEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_RIPPLE_DOT_FEEDBACK_ENABLED, true)  // Default: true
+        return prefsOf(context).getBoolean(KEY_RIPPLE_DOT_FEEDBACK_ENABLED, true)  // Default: true
     }
 
     fun setRippleDotFeedbackEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_RIPPLE_DOT_FEEDBACK_ENABLED, enabled)
             .apply()
@@ -255,12 +264,11 @@ object AppSettings {
      * 齿轮回 `OutlinedIconButton`；间距回原值。波纹点阵不受本开关影响（另有总开关）。
      */
     fun isUiSkinV2Enabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_UI_SKIN_V2_ENABLED, true)  // Default: true
+        return prefsOf(context).getBoolean(KEY_UI_SKIN_V2_ENABLED, true)  // Default: true
     }
 
     fun setUiSkinV2Enabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_UI_SKIN_V2_ENABLED, enabled)
             .apply()
@@ -284,12 +292,11 @@ object AppSettings {
      * `Modifier.rotate` 上 —— 与旧版逐像素一致。
      */
     fun isTrailingIconCentered(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_TRAILING_ICON_CENTERED, true)  // Default: true
+        return prefsOf(context).getBoolean(KEY_TRAILING_ICON_CENTERED, true)  // Default: true
     }
 
     fun setTrailingIconCentered(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_TRAILING_ICON_CENTERED, enabled)
             .apply()
@@ -313,12 +320,11 @@ object AppSettings {
      * 齿轮打开只旋转无底色、下拉 0.30 混合渐变 + 0.18 白边（静置/打开同值）。
      */
     fun isPressFeedbackUnified(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_PRESS_FEEDBACK_UNIFIED, true)  // Default: true
+        return prefsOf(context).getBoolean(KEY_PRESS_FEEDBACK_UNIFIED, true)  // Default: true
     }
 
     fun setPressFeedbackUnified(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_PRESS_FEEDBACK_UNIFIED, enabled)
             .apply()
@@ -343,12 +349,11 @@ object AppSettings {
      * 新旧两条链路互不读写对方目录（详见 MediaCache.fetchThumbnail 的分流注释）。
      */
     fun isGalleryPersistentCacheEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GALLERY_PERSISTENT_CACHE, true)  // Default: true（持久化）
+        return prefsOf(context).getBoolean(KEY_GALLERY_PERSISTENT_CACHE, true)  // Default: true（持久化）
     }
 
     fun setGalleryPersistentCacheEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_GALLERY_PERSISTENT_CACHE, enabled)
             .apply()
@@ -372,12 +377,11 @@ object AppSettings {
      * （v4.15.x 的捏合退出链路原样保留，见 ImageViewer.playPinchCloseDismiss）。
      */
     fun isGalleryThreeLevelEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GALLERY_THREE_LEVEL, true)  // Default: true（三级手势）
+        return prefsOf(context).getBoolean(KEY_GALLERY_THREE_LEVEL, true)  // Default: true（三级手势）
     }
 
     fun setGalleryThreeLevelEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_GALLERY_THREE_LEVEL, enabled)
             .apply()
@@ -393,12 +397,11 @@ object AppSettings {
      * 不挂捏合手势，捏合无任何效果。
      */
     fun isGalleryPinchColumnsEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GALLERY_PINCH_COLUMNS, true)  // Default: true（捏合改列数）
+        return prefsOf(context).getBoolean(KEY_GALLERY_PINCH_COLUMNS, true)  // Default: true（捏合改列数）
     }
 
     fun setGalleryPinchColumnsEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_GALLERY_PINCH_COLUMNS, enabled)
             .apply()
@@ -422,12 +425,11 @@ object AppSettings {
      * 且打开查看器不再截屏（省一份位图内存）。
      */
     fun isGalleryDismissRevealEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GALLERY_DISMISS_REVEAL, true)  // Default: true（下拉透出 + 飞回）
+        return prefsOf(context).getBoolean(KEY_GALLERY_DISMISS_REVEAL, true)  // Default: true（下拉透出 + 飞回）
     }
 
     fun setGalleryDismissRevealEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_GALLERY_DISMISS_REVEAL, enabled)
             .apply()
@@ -451,12 +453,11 @@ object AppSettings {
      * 占位（MediaViewerScreen 的 E3 Canvas）。
      */
     fun isGalleryRevealHolePunch(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GALLERY_REVEAL_HOLE_PUNCH, true)  // Default: true（截图内挖空）
+        return prefsOf(context).getBoolean(KEY_GALLERY_REVEAL_HOLE_PUNCH, true)  // Default: true（截图内挖空）
     }
 
     fun setGalleryRevealHolePunch(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_GALLERY_REVEAL_HOLE_PUNCH, enabled)
             .apply()
@@ -465,12 +466,11 @@ object AppSettings {
     private const val KEY_PROMPT_EXPAND = "prompt_expand"
 
     fun isPromptExpandEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_PROMPT_EXPAND, false)
+        return prefsOf(context).getBoolean(KEY_PROMPT_EXPAND, false)
     }
 
     fun setPromptExpandEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_PROMPT_EXPAND, enabled)
             .apply()
@@ -494,12 +494,11 @@ object AppSettings {
      * + 按存放路径展开的旧目录树（v4.16.5 形态）。
      */
     fun isLoraArchiveMerged(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_LORA_ARCHIVE_MERGED, true)  // Default: true（合并形态）
+        return prefsOf(context).getBoolean(KEY_LORA_ARCHIVE_MERGED, true)  // Default: true（合并形态）
     }
 
     fun setLoraArchiveMerged(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_LORA_ARCHIVE_MERGED, enabled)
             .apply()
@@ -522,12 +521,11 @@ object AppSettings {
      * 的顺序）。
      */
     fun isGenerateClickImeFixEnabled(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GENERATE_CLICK_IME_FIX, true)  // Default: true（修复形态）
+        return prefsOf(context).getBoolean(KEY_GENERATE_CLICK_IME_FIX, true)  // Default: true（修复形态）
     }
 
     fun setGenerateClickImeFixEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_GENERATE_CLICK_IME_FIX, enabled)
             .apply()
@@ -549,12 +547,11 @@ object AppSettings {
      * 只影响 Worker 的下载策略，不影响通知与 UI 展示。
      */
     fun isUpdateDownloadLegacyMode(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_UPDATE_DOWNLOAD_LEGACY_MODE, false)  // Default: false (新逻辑)
+        return prefsOf(context).getBoolean(KEY_UPDATE_DOWNLOAD_LEGACY_MODE, false)  // Default: false (新逻辑)
     }
 
     fun setUpdateDownloadLegacyMode(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsOf(context)
             .edit()
             .putBoolean(KEY_UPDATE_DOWNLOAD_LEGACY_MODE, enabled)
             .apply()
@@ -587,18 +584,18 @@ object AppSettings {
      * 存一套就够，也杜绝了「两套参数改到互相打架」。
      */
     fun getThemeCustomColors(context: Context): IntArray? {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        if (!prefs.contains(KEY_THEME_CUSTOM_ACCENT)) return null
+        val sp = prefsOf(context)
+        if (!sp.contains(KEY_THEME_CUSTOM_ACCENT)) return null
         return intArrayOf(
-            prefs.getInt(KEY_THEME_CUSTOM_ACCENT, UNSET_COLOR),
-            prefs.getInt(KEY_THEME_CUSTOM_BASE, UNSET_COLOR),
-            prefs.getInt(KEY_THEME_CUSTOM_TEXT, UNSET_COLOR)
+            sp.getInt(KEY_THEME_CUSTOM_ACCENT, UNSET_COLOR),
+            sp.getInt(KEY_THEME_CUSTOM_BASE, UNSET_COLOR),
+            sp.getInt(KEY_THEME_CUSTOM_TEXT, UNSET_COLOR)
         )
     }
 
     /** 写入自定义配色；三项全空（或传 null）表示回到原厂色板，键一并抹掉。 */
     fun setThemeCustomColors(context: Context, colors: IntArray?) {
-        val editor = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+        val editor = prefsOf(context).edit()
         val allUnset = colors == null || colors.all { it == UNSET_COLOR }
         if (allUnset) {
             editor.remove(KEY_THEME_CUSTOM_ACCENT)
@@ -612,6 +609,30 @@ object AppSettings {
                 .putInt(KEY_THEME_CUSTOM_TEXT, colors.getOrElse(2) { UNSET_COLOR })
         }
         editor.apply()
+    }
+
+    // ============================================================
+    // G4（任务书 11.4）：回收站"联动删除服务器文件"首次确认
+    // ============================================================
+
+    private const val KEY_SERVER_LINKED_DELETE_CONFIRMED_PREFIX = "server_linked_delete_confirmed_"
+
+    /**
+     * 该服务器是否已经确认过"回收站二次删除会联动删除服务器文件"。
+     *
+     * 硬约束 2：首次启用前必须展示将删除的文件清单并获得确认；确认状态**持久化**，
+     * 之后同一服务器不再重复询问（用户已确认的交互决策：只问一次）。
+     * 按 serverId 分键：换服务器 = 换一批要删的文件，确认不能跨服务器复用。
+     */
+    fun isServerLinkedDeleteConfirmed(context: Context, serverId: String): Boolean =
+        prefsOf(context).getBoolean(KEY_SERVER_LINKED_DELETE_CONFIRMED_PREFIX + serverId, false)
+
+    /** 记录"用户看过清单并确认启用"。仅在确认对话框点「确认启用并删除」时调用。 */
+    fun setServerLinkedDeleteConfirmed(context: Context, serverId: String) {
+        prefsOf(context)
+            .edit()
+            .putBoolean(KEY_SERVER_LINKED_DELETE_CONFIRMED_PREFIX + serverId, true)
+            .apply()
     }
 
 }

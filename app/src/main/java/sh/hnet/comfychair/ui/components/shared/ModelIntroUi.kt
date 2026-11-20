@@ -30,6 +30,7 @@ import sh.hnet.comfychair.R
 import sh.hnet.comfychair.model.LoraEffectTable
 import sh.hnet.comfychair.model.ModelIntro
 import sh.hnet.comfychair.model.splitIntroText
+import sh.hnet.comfychair.ui.util.withStableKeys
 
 /**
  * 副标题内容：底模 · 类型 · 作者（只拼有值的部分）。
@@ -180,6 +181,9 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
                 // 整段塞给一个 Text 时最长 5 万多字符单次排版慢到肉眼可见，所以切成
                 // 小片段逐段排版（splitIntroText，拼接恒等于原文），首屏只排可见的那几段。
                 val chunks = remember(original) { splitIntroText(original) }
+                // 以片段原文本身当业务标识（相同段落重复出现时按出现顺序消歧）；
+                // 不用下标：原文重抓后长度变化会让下标指向另一段，行状态（选区、滚动锚点）会错位。
+                val keyedChunks = remember(chunks) { chunks.withStableKeys { it } }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -195,9 +199,9 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
                             .fillMaxWidth()
                             .padding(12.dp)
                     ) {
-                        items(chunks) { chunk ->
+                        items(keyedChunks, key = { it.key }) { item ->
                             Text(
-                                text = chunk,
+                                text = item.value,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )

@@ -7,19 +7,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 查看器页背景分支选择（N3/N4，v4.16.8）与并排接管归零判定（N5，v4.16.8）的纯逻辑测试。
+ * 查看器页背景分支选择（N3/N4，v4.16.8；G1，v4.16.11 黑化责任收敛）与并排接管归零判定
+ * （N5，v4.16.8）的纯逻辑测试。
  *
  * 钉住四件事：
  * 1. 进入页全屏 → E1/E2 分段遮罩（透出逻辑不变）；
  * 2. 脱离拖动中 → 旧线性映射（并排态下拉同样走这条）；
- * 3. **其余一律有黑**——非进入页全屏、并排态、加载中邻页都必须命中档位/满宽黑，
+ * 3. 全屏态**其余一律有黑**——非进入页全屏、加载中邻页都必须命中页内满页黑，
  *    绝不允许出现"无背景"分支（N3/N4 的透图库 bug）；
- * 4. N5：pager 翻页残留只有超过 1% 视口宽才发起归零，0 与微小抖动不打扰 pager。
+ * 4. 并排（队列）态页内**不画黑**（CONTAINER_BLACK）——G1 拆掉了"档位宽度黑"
+ *    固定宽度补丁，背景黑化改由容器背景（MediaViewerScreen 根 Box 的纯黑）统一
+ *    负责。并排态页内再画黑就等于把补丁加回来：补丁宽度（页宽 × 档位比例）与
+ *    露边区/越界新带无关，只会重演"补丁宽度即漏洞宽度"；
+ * 5. N5：pager 翻页残留只有超过 1% 视口宽才发起归零，0 与微小抖动不打扰 pager。
  *
- * 实现级绑定（v4.16.8 返工）：生产绘制点 ImageViewer.drawBehind 直接调用
- * resolveBackgroundBranch、按返回枚举绘制（ImageViewer.kt drawBehind 内的
- * when 分支），不再内联复制判定。因此本文件的判定表断言就是绘制行为的
- * 断言：判定表退化 → 本组测试必红 → 绘制不可能悄悄回退。
+ * 实现级绑定（v4.16.8 返工，v4.16.11 沿用）：生产绘制点 ImageViewer.drawBehind
+ * 直接调用 resolveBackgroundBranch、按返回枚举绘制（ImageViewer.kt drawBehind 内的
+ * when 分支），不再内联复制判定。因此本文件的判定表断言就是绘制行为的断言。
  */
 class ViewerBackgroundBranchTest {
 
@@ -59,66 +63,123 @@ class ViewerBackgroundBranchTest {
         )
     }
 
-    // ---------- 3. 其余一律档位/满宽黑 ----------
+    // ---------- 3. 全屏态其余情况一律满页黑 ----------
 
     @Test
-    fun `非进入页全屏必须画满宽黑`() {
+    fun `非进入页全屏必须画满页黑`() {
         // N4 核心：非进入页（邻页/已翻页）全屏静止时，旧版什么都不画 → 整页透明
-        // 透出图库；新版必须命中档位黑（sideScale=1 → 满宽满高）
+        // 透出图库；新版必须命中页内满页黑
         assertEquals(
-            ViewerBackgroundBranch.SIDE_OR_FULL_BLACK,
+            ViewerBackgroundBranch.FULL_PAGE_BLACK,
             ViewerDismissGesture.resolveBackgroundBranch(false, true, 0f)
-        )
-    }
-
-    @Test
-    fun `并排态走档位黑`() {
-        // 并排态（不论有无格子矩形——并排时格子矩形页走分支一的条件不满足）
-        assertEquals(
-            ViewerBackgroundBranch.SIDE_OR_FULL_BLACK,
-            ViewerDismissGesture.resolveBackgroundBranch(false, false, 0f)
-        )
-        assertEquals(
-            ViewerBackgroundBranch.SIDE_OR_FULL_BLACK,
-            ViewerDismissGesture.resolveBackgroundBranch(true, false, 0f)
         )
     }
 
     @Test
     fun `加载中邻页无格子矩形也必须有黑`() {
         // 加载中/失败的邻页：内容为空且无格子矩形，全屏态。旧版整页透明（注释写着
-        // "show black"实际什么都不画）；新版满宽满高黑
+        // "show black"实际什么都不画）；新版满页黑
         assertEquals(
-            ViewerBackgroundBranch.SIDE_OR_FULL_BLACK,
+            ViewerBackgroundBranch.FULL_PAGE_BLACK,
             ViewerDismissGesture.resolveBackgroundBranch(false, true, 0f)
         )
     }
 
-    /**
-     * 反证：假如把"非进入页全屏"判成"无背景"（旧版行为），第 3 组断言必失败。
-     *
-     * 本测试在测试内放一个旧实现（v4.16.7 的分支三条件 `!inFullScreen`）的镜像，
-     * 用同一输入对比：非进入页 + 全屏时旧镜像不画黑（无背景），正实现命中
-     * SIDE_OR_FULL_BLACK——两者结论相反。若实现退化回旧条件，上面的
-     * assertEquals(SIDE_OR_FULL_BLACK) 必失败（测试不是恒真的）。
-     * 实现级反证已实测（v4.16.8 返工）：drawBehind 现在直接调用本函数，把
-     * else 分支临时改成返回 DISMISS_LINEAR 后本组 4 条断言当场失败
-     * （9 tests, 4 failed），改回后全绿——判定表被本组测试真实锁住。
-     */
+    // ---------- 4. 并排（队列）态：页内不画，由容器背景负责 ----------
+
     @Test
-    fun `反证_旧分支条件会把非进入页全屏判成无背景`() {
-        val hasFlyBackCellRect = false
-        val inFullScreen = true
-        // 旧镜像：v4.16.7 的分支三条件 !inFullScreen——全屏态不命中 → 无背景
-        val legacyWouldDrawBlack = !inFullScreen
-        assertFalse(legacyWouldDrawBlack)
-        // 正实现同一输入必须有黑：
-        val resolved = ViewerDismissGesture.resolveBackgroundBranch(
-            hasFlyBackCellRect, inFullScreen, 0f
+    fun `并排态交给容器背景`() {
+        // G1：并排态页内不再画"档位宽度黑"补丁，背景由容器（根 Box 纯黑）承接。
+        // 无论本页有没有飞回格子矩形，并排态都走 CONTAINER_BLACK
+        assertEquals(
+            ViewerBackgroundBranch.CONTAINER_BLACK,
+            ViewerDismissGesture.resolveBackgroundBranch(false, false, 0f)
         )
-        assertEquals(ViewerBackgroundBranch.SIDE_OR_FULL_BLACK, resolved)
-        // 新旧结论相反 → 正实现的断言真实钉住了这次修复
-        assertNotEquals(legacyWouldDrawBlack, resolved == ViewerBackgroundBranch.SIDE_OR_FULL_BLACK)
+        assertEquals(
+            ViewerBackgroundBranch.CONTAINER_BLACK,
+            ViewerDismissGesture.resolveBackgroundBranch(true, false, 0f)
+        )
+    }
+
+    /**
+     * 反证：把 v4.16.7 的真实绘制判定链做成镜像，与当前实现逐格对比。
+     *
+     * 上一版这里是 `val legacyWouldDrawPageBlack = !inFullScreen` —— 一个只对单个
+     * 硬编码向量成立的布尔常量，既没有真的建模旧代码，`assertFalse` 也只是断言了
+     * 自己刚写下的字面量（恒真）。这里改成**完整镜像**被替换掉的 drawBehind
+     * 分支链（197549a ImageViewer.kt:344-380），并按输入全矩阵对比。
+     *
+     * 旧链（查看器分页 pageBackground=false，197549a MediaViewerScreen.kt:860）：
+     * ① flyBackCellRect != null && inFullScreen → E1/E2 分段遮罩；
+     * ② dismissY > 0f → 线性遮罩；
+     * ③ !inFullScreen → 档位宽度黑（blackWidth = size.width * sideScale）；
+     * ④ 其余（全屏、非进入页、未拖动）→ 落到 pageBackground，而分页传 false → 不画。
+     *
+     * 关于③的常见误读：blackWidth 那段**只在非全屏时执行**（with-else 链上游已判空），
+     * 全屏态 sideScale 虽为 1，代码根本走不到那里，所以"满屏 = 满宽满高黑"不成立，
+     * 全屏非进入页在旧版是真的一整页透明（N4 的透图库 bug）。
+     */
+    private fun legacyV4167DrawsPageBlack(
+        hasFlyBackCellRect: Boolean,
+        inFullScreen: Boolean,
+        dismissY: Float,
+        pageBackground: Boolean = false
+    ): Boolean = when {
+        hasFlyBackCellRect && inFullScreen -> true
+        dismissY > 0f -> true
+        !inFullScreen -> true
+        pageBackground -> true
+        else -> false
+    }
+
+    /** 现实现的分支 → 页内是否画了黑（CONTAINER_BLACK 交给容器，页内不画） */
+    private fun drawsPageBlack(branch: ViewerBackgroundBranch): Boolean = when (branch) {
+        ViewerBackgroundBranch.FLYBACK_MASK,
+        ViewerBackgroundBranch.DISMISS_LINEAR,
+        ViewerBackgroundBranch.FULL_PAGE_BLACK -> true
+        ViewerBackgroundBranch.CONTAINER_BLACK -> false
+    }
+
+    @Test
+    fun `反证_旧绘制链只在全屏非进入页与现实现相反`() {
+        // 全矩阵：进入页 / 非进入页 × 全屏 / 并排 × 静止 / 拖动，共 8 格。
+        // 每格写成 输入 → (旧镜像是否画黑, 现实现是否画黑)
+        val vectors = listOf(
+            Triple(true, true, 0f) to (true to true),      // 进入页全屏静止：两边都画
+            Triple(true, true, 120f) to (true to true),    // 进入页全屏拖动：分段遮罩
+            Triple(false, true, 0f) to (false to true),    // ★ N4：旧版不画 / 新版满页黑
+            Triple(false, true, 120f) to (true to true),   // 非进入页全屏拖动：线性遮罩
+            Triple(true, false, 0f) to (true to false),    // 并排+进入页：旧档位宽黑 / 新交容器
+            Triple(true, false, 120f) to (true to true),   // 并排拖动：两边线性遮罩
+            Triple(false, false, 0f) to (true to false),   // 并排普通页：旧档位宽黑 / 新交容器
+            Triple(false, false, 120f) to (true to true)   // 并排拖动：两边线性遮罩
+        )
+        for ((input, expected) in vectors) {
+            val (hasFlyBackCellRect, inFullScreen, dismissY) = input
+            val (legacyBlack, currentBlack) = expected
+            val cell = "hasFlyBackCellRect=$hasFlyBackCellRect, " +
+                "inFullScreen=$inFullScreen, dismissY=$dismissY"
+            assertEquals(
+                "$cell 旧镜像与 v4.16.7 判定链不符",
+                legacyBlack,
+                legacyV4167DrawsPageBlack(hasFlyBackCellRect, inFullScreen, dismissY)
+            )
+            assertEquals(
+                "$cell 现实现判定与 N3/N4/G1 判定表不符",
+                currentBlack,
+                drawsPageBlack(
+                    ViewerDismissGesture.resolveBackgroundBranch(
+                        hasFlyBackCellRect, inFullScreen, dismissY
+                    )
+                )
+            )
+        }
+        // ★ 被修复的那一格必须新旧相反：实现退回到"全屏非进入页不画"时，
+        // 上面矩阵的 currentBlack 断言会先红；这条再把差异本身钉住
+        assertNotEquals(
+            legacyV4167DrawsPageBlack(false, true, 0f),
+            drawsPageBlack(ViewerDismissGesture.resolveBackgroundBranch(false, true, 0f))
+        )
     }
 
     // ---------- 4. N5：pager 残留归零判定 ----------

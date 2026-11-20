@@ -1,13 +1,9 @@
 package sh.hnet.comfychair.viewmodel
 
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
-import android.os.Environment
-import android.provider.MediaStore
-import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -31,7 +27,9 @@ import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.util.GenerationMetadata
 import sh.hnet.comfychair.util.MetadataParser
 import sh.hnet.comfychair.util.Mp4MetadataExtractor
+import sh.hnet.comfychair.util.PhotoManager
 import sh.hnet.comfychair.util.PngMetadataExtractor
+import sh.hnet.comfychair.util.ShareFileStore
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 import java.io.File
@@ -221,6 +219,24 @@ sealed class MediaViewerEvent {
 }
 
 /**
+ * G4（任务书 11.4）：查看器内"移入回收站"的一次性撤销槽位。
+ *
+ * 竖滑删除（和工具栏删除键，同一链路）落回收站后给出**限时撤销**入口
+ * （用户已确认的交互决策：2 秒）。槽位是单发的：新的删除会顶掉旧槽位
+ * （旧条目此时只能在回收站界面里恢复，不再给就地撤销 —— "一次性撤销入口"的语义）。
+ *
+ * @param trashIdentity 回收站条目身份键（阶段一撤销 = 按它恢复）
+ * @param item 被移走的队列项（撤销时原样插回）
+ * @param viewerIndex 移走时在**查看器列表**里的下标（撤销回原位置；
+ *                    图库列表侧的原位置由 Repository 按条目保存的 index 找回）
+ */
+data class ViewerTrashUndoState(
+    val trashIdentity: String,
+    val item: MediaViewerItem,
+    val viewerIndex: Int
+)
+
+/**
  * ViewModel for the MediaViewer screen
  */
 class MediaViewerViewModel : ViewModel() {
@@ -397,8 +413,8 @@ class MediaViewerViewModel : ViewModel() {
         MediaCache.prefetchAround(index, prefetchItems)
     }
 
-    /** Convert MediaViewerItem to MediaCacheKey */
-    private fun MediaViewerItem.toCacheKey() = MediaCacheKey(promptId, filename)
+    /** Convert MediaViewerItem to MediaCacheKey（type + 当前服务器进键，见 P2-2） */
+    private fun MediaViewerItem.toCacheKey() = MediaCacheKey.of(promptId, filename, type)
 
     fun navigateNext() {
         val state = _uiState.value
@@ -575,7 +591,8 @@ class MediaViewerViewModel : ViewModel() {
                 // For SINGLE mode videos, try to read from local file first
                 state.mode == ViewerMode.SINGLE && item.isVideo && state.currentVideoUri != null -> {
                     try {
-                        context.contentResolver.openInputStream(state.currentVideoUri)?.use {
+                        // P2-12：播放 URI 是 file://，contentResolver 读不了，统一走 ShareFileStore
+                        ShareFileStore.openMediaInput(context, state.currentVideoUri)?.use {
                             it.readBytes()
                         }
                     } catch (e: Exception) {
@@ -592,7 +609,7 @@ class MediaViewerViewModel : ViewModel() {
                         // 先复用内存缓存里的那一份：图库预取/缩略图提取通常已经取过同一段视频，
                         // 不查缓存就会同一条目下两份（几十 MB）。缓存没命中才真去下载。
                         val cached = MediaCache.getCachedVideoBytes(
-                            MediaCacheKey(item.promptId, item.filename)
+                            MediaCacheKey.of(item.promptId, item.filename, item.type)
                         )
                         if (cached != null) {
                             android.util.Log.i(
@@ -698,62 +715,147 @@ class MediaViewerViewModel : ViewModel() {
         val item = state.currentItem ?: return
 
         viewModelScope.launch {
-            // 只从手机端移除：服务器的历史记录与 output 目录里的文件都不动（与图库页同一语义）。
-            // 走 Repository 的本地移除入口而不是自己发请求，是因为删除墓碑要跟着落盘 ——
-            // 否则下次刷新服务器历史时，这条记录会原样复活。
+            // G4 阶段一：删除 = **移入回收站**（可恢复）。
+            // 走 Repository 的回收站入口，一次完成：回收站落盘（完整定位 + 时间戳 +
+            // serverId）、列表过滤、持久墓碑 + 会话墓碑。
+            // 与旧"直接删除"的关键差别：**不再 MediaCache.evict** —— 阶段一本地资源
+            // 必须保留（撤销与回收站缩略图都要用）；本地残留的清理由阶段二
+            // （回收站彻底删除 → Repository.finishLocalCleanup）负责。
             //
-            // 这里刻意不再要求"先连上服务器"：删除是纯本地操作，离线时也应当能删。
-            GalleryRepository.getInstance().removeItemLocally(item.promptId)
-            val success = true
-
-            if (success) {
-                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_history_item_deleted_success))
-
-                // Mark that items were deleted (for result reporting)
-                _hasDeletedItems.value = true
-
-                // Evict from MediaCache (uses stable key, not index)
-                MediaCache.evict(item.toCacheKey())
-
-                // Get fresh state after async operation
-                val currentState = _uiState.value
-                val currentItems = currentState.items.toMutableList()
-
-                // Make sure we're removing the correct item
-                val actualIndexToRemove = currentItems.indexOfFirst {
-                    it.promptId == item.promptId && it.filename == item.filename
-                }
-
-                if (actualIndexToRemove >= 0) {
-                    currentItems.removeAt(actualIndexToRemove)
-                }
-
-                if (currentItems.isEmpty()) {
-                    // No more items, close viewer
-                    _events.emit(MediaViewerEvent.ItemDeleted)
-                    _events.emit(MediaViewerEvent.Close)
-                } else {
-                    // Adjust index and show next/previous item
-                    val newIndex = actualIndexToRemove.coerceIn(0, currentItems.size - 1)
-
-                    // Clear metadata cache (still uses indices)
-                    cachedMetadata.clear()
-                    _currentMetadata.value = null
-
-                    _uiState.value = currentState.copy(
-                        items = currentItems,
-                        currentIndex = newIndex,
-                        currentBitmap = null,
-                        currentVideoUri = null,
-                        isLoading = true
+            // 这里刻意不要求"先连上服务器"：移入回收站是纯本地操作，离线时也应当能做；
+            // 服务器文件的联动删除只发生在阶段二，且只认服务器响应。
+            // P1-19 粒度约束原样保留：条目身份 = (promptId, filename)。
+            val identities = GalleryRepository.getInstance().moveToTrash(
+                listOf(
+                    GalleryItem(
+                        promptId = item.promptId,
+                        filename = item.filename,
+                        subfolder = item.subfolder,
+                        type = item.type,
+                        isVideo = item.isVideo,
+                        index = item.index
                     )
-                    _events.emit(MediaViewerEvent.ItemDeleted)
-                    loadCurrentItem()
-                }
+                )
+            )
+
+            // Mark that items were removed from the list (for result reporting)
+            _hasDeletedItems.value = true
+
+            // Get fresh state after async operation
+            val currentState = _uiState.value
+            val currentItems = currentState.items.toMutableList()
+
+            // Make sure we're removing the correct item
+            val actualIndexToRemove = currentItems.indexOfFirst {
+                it.promptId == item.promptId && it.filename == item.filename
+            }
+
+            if (actualIndexToRemove >= 0) {
+                currentItems.removeAt(actualIndexToRemove)
+            }
+
+            // 一次性撤销槽位（竖滑删除与工具栏删除共用）：新删除顶掉旧槽位
+            identities.firstOrNull()?.let { identity ->
+                _trashUndo.value = ViewerTrashUndoState(
+                    trashIdentity = identity,
+                    item = item,
+                    viewerIndex = actualIndexToRemove.coerceAtLeast(0)
+                )
+                scheduleUndoExpiry(identity)
+            }
+
+            if (currentItems.isEmpty()) {
+                // No more items, close viewer（队列都删空了就没有"就地撤销"的位置，
+                // 条目仍在回收站里，可去图库回收站界面恢复）
+                _trashUndo.value = null
+                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_trash_moved))
+                _events.emit(MediaViewerEvent.ItemDeleted)
+                _events.emit(MediaViewerEvent.Close)
             } else {
-                _events.emit(MediaViewerEvent.ShowToast(R.string.error_history_item_delete))
+                // Adjust index and show next/previous item —— 进站后队列补位：
+                // 移除下标即新位置（末位被删则自动退一位），下一张顶上
+                val newIndex = actualIndexToRemove.coerceIn(0, currentItems.size - 1)
+
+                // Clear metadata cache (still uses indices)
+                cachedMetadata.clear()
+                _currentMetadata.value = null
+
+                _uiState.value = currentState.copy(
+                    items = currentItems,
+                    currentIndex = newIndex,
+                    currentBitmap = null,
+                    currentVideoUri = null,
+                    isLoading = true
+                )
+                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_trash_moved))
+                _events.emit(MediaViewerEvent.ItemDeleted)
+                loadCurrentItem()
             }
         }
+    }
+
+    // ============================================================
+    // G4：竖滑删除的一次性撤销（限时 2 秒，用户已确认的交互决策）
+    // ============================================================
+
+    private val _trashUndo = MutableStateFlow<ViewerTrashUndoState?>(null)
+
+    /** 撤销槽位（非 null = 限时撤销窗口开着）。 */
+    val trashUndo: StateFlow<ViewerTrashUndoState?> = _trashUndo.asStateFlow()
+
+    /** 2 秒后关窗：只关**当时还开着的那条**的窗（新删除已顶掉旧槽位时不误关新窗）。 */
+    private fun scheduleUndoExpiry(identity: String) {
+        viewModelScope.launch {
+            // 时长单一来源：手势侧的 ViewerSwipeDelete.UNDO_WINDOW_MS（2 秒，用户确认值）
+            kotlinx.coroutines.delay(sh.hnet.comfychair.ui.components.ViewerSwipeDelete.UNDO_WINDOW_MS)
+            if (_trashUndo.value?.trashIdentity == identity) {
+                _trashUndo.value = null
+            }
+        }
+    }
+
+    /**
+     * 撤销刚才的"移入回收站"（阶段一回退）。
+     *
+     * 两侧同时恢复：图库列表侧走 Repository.restoreFromTrash（删墓碑 + 按保存的
+     * index 找回原位置）；查看器队列侧把条目插回删除前的下标（"恢复原队列位置"）。
+     * 槽位已被超时关闭 / 被新删除顶掉 → 静默返回 false（回收站界面仍可恢复，
+     * 这里不弹"撤销失败"吓人——用户点到的多半是刚过期的条）。
+     */
+    fun undoTrashMove(): Boolean {
+        val undo = _trashUndo.value ?: return false
+        _trashUndo.value = null
+        val restored = GalleryRepository.getInstance().restoreFromTrash(undo.trashIdentity)
+        if (!restored) {
+            viewModelScope.launch {
+                _events.emit(MediaViewerEvent.ShowToast(R.string.error_history_item_delete))
+            }
+            return false
+        }
+        val current = _uiState.value
+        if (current.items.none {
+                it.promptId == undo.item.promptId && it.filename == undo.item.filename
+            }
+        ) {
+            val items = current.items.toMutableList()
+            val at = undo.viewerIndex.coerceIn(0, items.size)
+            items.add(at, undo.item)
+            val safeIndex = at.coerceIn(0, items.size - 1)
+            cachedMetadata.clear()
+            _currentMetadata.value = null
+            _uiState.value = current.copy(
+                items = items,
+                currentIndex = safeIndex,
+                currentBitmap = null,
+                currentVideoUri = null,
+                isLoading = true
+            )
+            loadCurrentItem()
+        }
+        viewModelScope.launch {
+            _events.emit(MediaViewerEvent.ShowToast(R.string.msg_trash_restored))
+        }
+        return true
     }
 
     fun saveCurrentItem() {
@@ -787,26 +889,13 @@ class MediaViewerViewModel : ViewModel() {
         }
 
         withContext(Dispatchers.IO) {
-            try {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.png")
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ComfyChair")
-                }
-
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                uri?.let { outputUri ->
-                    resolver.openOutputStream(outputUri)?.use { outputStream ->
-                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-                    }
-                }
-
-                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_image_saved_to_gallery))
-            } catch (e: Exception) {
-                _events.emit(MediaViewerEvent.ShowToast(R.string.error_save_image))
-            }
+            // P1-22：成功/失败以真实写入结果为准（IS_PENDING 流程）
+            val saved = PhotoManager.saveBitmap(context, bitmap)
+            _events.emit(
+                MediaViewerEvent.ShowToast(
+                    if (saved) R.string.msg_image_saved_to_gallery else R.string.error_save_image
+                )
+            )
         }
     }
 
@@ -817,33 +906,22 @@ class MediaViewerViewModel : ViewModel() {
         }
 
         withContext(Dispatchers.IO) {
-            try {
-                val videoBytes = context.contentResolver.openInputStream(videoUri)?.use {
-                    it.readBytes()
-                } ?: run {
-                    _events.emit(MediaViewerEvent.ShowToast(R.string.error_save_video))
-                    return@withContext
-                }
-
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.mp4")
-                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ComfyChair")
-                }
-
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                uri?.let { outputUri ->
-                    resolver.openOutputStream(outputUri)?.use { outputStream ->
-                        outputStream.write(videoBytes)
-                    }
-                }
-
-                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_video_saved_to_gallery))
-            } catch (e: Exception) {
+            // P2-12：播放 URI 已改为 file://（进程内播放，不经 FileProvider），
+            // contentResolver.openInputStream 读不了 file://，统一走 ShareFileStore
+            val videoBytes = runCatching {
+                ShareFileStore.openMediaInput(context, videoUri)?.use { it.readBytes() }
+            }.getOrNull()
+            if (videoBytes == null) {
                 _events.emit(MediaViewerEvent.ShowToast(R.string.error_save_video))
+                return@withContext
             }
+
+            val saved = PhotoManager.saveVideoBytes(context, videoBytes)
+            _events.emit(
+                MediaViewerEvent.ShowToast(
+                    if (saved) R.string.msg_video_saved_to_gallery else R.string.error_save_video
+                )
+            )
         }
     }
 
@@ -860,26 +938,12 @@ class MediaViewerViewModel : ViewModel() {
                 return@withContext
             }
 
-            try {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.png")
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ComfyChair")
-                }
-
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                uri?.let { outputUri ->
-                    resolver.openOutputStream(outputUri)?.use { outputStream ->
-                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-                    }
-                }
-
-                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_image_saved_to_gallery))
-            } catch (e: Exception) {
-                _events.emit(MediaViewerEvent.ShowToast(R.string.error_save_image))
-            }
+            val saved = PhotoManager.saveBitmap(context, bitmap)
+            _events.emit(
+                MediaViewerEvent.ShowToast(
+                    if (saved) R.string.msg_image_saved_to_gallery else R.string.error_save_image
+                )
+            )
         }
     }
 
@@ -896,26 +960,12 @@ class MediaViewerViewModel : ViewModel() {
                 return@withContext
             }
 
-            try {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.mp4")
-                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ComfyChair")
-                }
-
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                uri?.let { outputUri ->
-                    resolver.openOutputStream(outputUri)?.use { outputStream ->
-                        outputStream.write(videoBytes)
-                    }
-                }
-
-                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_video_saved_to_gallery))
-            } catch (e: Exception) {
-                _events.emit(MediaViewerEvent.ShowToast(R.string.error_save_video))
-            }
+            val saved = PhotoManager.saveVideoBytes(context, videoBytes)
+            _events.emit(
+                MediaViewerEvent.ShowToast(
+                    if (saved) R.string.msg_video_saved_to_gallery else R.string.error_save_video
+                )
+            )
         }
     }
 
@@ -949,16 +999,13 @@ class MediaViewerViewModel : ViewModel() {
 
         withContext(Dispatchers.IO) {
             try {
-                val shareFile = File(context.cacheDir, "share_image.png")
+                // P2-12：分享载荷写进 cacheDir/share/
+                val shareFile = ShareFileStore.file(context, "share_image.png")
                 shareFile.outputStream().use { outputStream ->
                     bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
                 }
 
-                val uri = FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    shareFile
-                )
+                val uri = ShareFileStore.uriFor(context, shareFile)
 
                 withContext(Dispatchers.Main) {
                     val shareIntent = Intent().apply {
@@ -985,11 +1032,21 @@ class MediaViewerViewModel : ViewModel() {
             return
         }
 
+        // P2-12：播放 URI 现在是 file://，不能直接塞进 ACTION_SEND（会抛 FileUriExposedException），
+        // 先复制一份到 cacheDir/share/ 再分享它的 content URI。
+        val shareUri = withContext(Dispatchers.IO) {
+            ShareFileStore.exportVideoForShare(context, videoUri)
+        }
+        if (shareUri == null) {
+            _events.emit(MediaViewerEvent.ShowToast(R.string.error_share_video))
+            return
+        }
+
         withContext(Dispatchers.Main) {
             try {
                 val shareIntent = Intent().apply {
                     action = Intent.ACTION_SEND
-                    putExtra(Intent.EXTRA_STREAM, videoUri)
+                    putExtra(Intent.EXTRA_STREAM, shareUri)
                     type = "video/mp4"
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
@@ -1033,14 +1090,11 @@ class MediaViewerViewModel : ViewModel() {
 
         withContext(Dispatchers.IO) {
             try {
-                val shareFile = File(context.cacheDir, "share_video.mp4")
+                // P2-12：分享载荷写进 cacheDir/share/
+                val shareFile = ShareFileStore.file(context, "share_video.mp4")
                 shareFile.writeBytes(videoBytes)
 
-                val uri = FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    shareFile
-                )
+                val uri = ShareFileStore.uriFor(context, shareFile)
 
                 withContext(Dispatchers.Main) {
                     val shareIntent = Intent().apply {

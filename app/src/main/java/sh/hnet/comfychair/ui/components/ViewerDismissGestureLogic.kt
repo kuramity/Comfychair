@@ -163,31 +163,51 @@ object ViewerDismissGesture {
     }
 
     /**
-     * 查看器页背景分支选择（N3/N4，v4.16.8，纯函数 JVM 单测钉住）。
+     * 查看器页背景分支选择（N3/N4，v4.16.8；G1，v4.16.11 收敛黑化责任，纯函数 JVM 单测钉住）。
      *
      * ImageViewer.drawBehind 直接调用本函数、按返回的枚举绘制（代码级绑定，
      * 不是"注释里声称的对应"）：判定表在这里改，drawBehind 的绘制跟着变；
-     * 判定表退化（如"非并排全屏不返回 SIDE_OR_FULL_BLACK"）会让
-     * ViewerBackgroundBranchTest 立刻变红。分支顺序不能换：
+     * 判定表退化会让 ViewerBackgroundBranchTest 立刻变红。分支顺序不能换：
      * ① 进入页全屏 → E1/E2 分段遮罩（透出逻辑完全不变）；
      * ② 脱离拖动中 → 旧线性映射（无论是否并排态）；
-     * ③ 其余一律档位宽度黑——并排态宽度 = 页宽 × 档位比例；全屏态无飞回格子
-     *    （非进入页 / 已翻页）时档位比例 = 1，即满宽满高黑。
-     *    旧版在这类"整页透明"的输入下什么都不画（透出图库截图/网格，N3/N4），
-     *    反证：把"非进入页全屏"判成无背景，第 ③ 条断言必失败。
+     * ③ 其余全屏态 → 页内满宽满高黑：盖住背后的图库截图（N3/N4：非进入页 /
+     *    已翻页 / 邻页加载中都可能整页透明，不画就透出图库）；
+     * ④ 其余并排态 → 页内**不画**，由容器背景（MediaViewerScreen 根 Box 的
+     *    background(Color.Black)，见 G1）承接。
+     *
+     * 为什么并排态不再画"档位宽度黑"（G1 拆除的固定宽度补丁）：那是一块宽度 =
+     * 页宽 × 档位比例的手工黑矩形，补丁宽度即漏洞宽度——并排态页盒只平移不缩放
+     * （缩放发生在 ImageViewer 内部），补丁只能靠手算宽度贴住图片边缘；一旦页面
+     * 被整体平移（越界跟手 / 平台 overscroll），补丁跟着走、它没覆盖到的两侧
+     * 15% 露边区就露出背后的图库截图。黑化改由容器统一负责后，页内任何间隙
+     * （越界露出的新带、无邻页的一端、加载中的邻页）都是容器纯黑，与补丁宽度无关。
+     *
+     * G4（v4.16.14）新增参数 [inSwipeDelete]：队列模式的**竖滑删除手势**与下滑关闭
+     * 共用同一个纵向位移状态（dismissDragY），但它不是"关闭"——不该触发 ②的
+     * DISMISS_LINEAR 页内黑遮罩（那块遮罩在并排态会盖住两侧露边邻图，重现
+     * "各吃 48px"的旧 bug）。删除手势激活期间直接按 ③/④ 的状态归属走，
+     * 与 dismissY 数值无关。默认 false：原三参调用点与既有单测行为不变。
      *
      * @param hasFlyBackCellRect 本页是否带飞回格子矩形（进入页）
      * @param inFullScreen 当前是否全屏态（并排进度 = 0）
      * @param dismissY 脱离拖动的实时位移（px，> 0 才算拖动中）
+     * @param inSwipeDelete 本页面内竖滑删除手势是否在途（跟手 / 进站动画 / 回位弹簧）
      */
     fun resolveBackgroundBranch(
         hasFlyBackCellRect: Boolean,
         inFullScreen: Boolean,
-        dismissY: Float
+        dismissY: Float,
+        inSwipeDelete: Boolean = false
     ): ViewerBackgroundBranch = when {
         hasFlyBackCellRect && inFullScreen -> ViewerBackgroundBranch.FLYBACK_MASK
+        inSwipeDelete ->
+            // 删除手势在途：页内不画关闭遮罩。全屏态兜底满页黑（盖截图），
+            // 并排态交给容器纯黑（露边区必须透出邻图）
+            if (inFullScreen) ViewerBackgroundBranch.FULL_PAGE_BLACK
+            else ViewerBackgroundBranch.CONTAINER_BLACK
         dismissY > 0f -> ViewerBackgroundBranch.DISMISS_LINEAR
-        else -> ViewerBackgroundBranch.SIDE_OR_FULL_BLACK
+        inFullScreen -> ViewerBackgroundBranch.FULL_PAGE_BLACK
+        else -> ViewerBackgroundBranch.CONTAINER_BLACK
     }
 
     /**
@@ -396,19 +416,24 @@ object ViewerDismissGesture {
 }
 
 /**
- * 查看器页背景的绘制分支（N3/N4，v4.16.8）。
+ * 查看器页背景的绘制分支（N3/N4，v4.16.8；G1，v4.16.11 拆掉并排固定宽度补丁）。
  *
  * ImageViewer 的 drawBehind 按优先级取**第一个**命中的分支：
  * - [FLYBACK_MASK]：进入页全屏态——E1/E2 分段遮罩（拖动中淡到 0.2 透出图库）；
  * - [DISMISS_LINEAR]：脱离拖动中——旧线性映射遮罩（D5，并排态下拉也走这条）；
- * - [SIDE_OR_FULL_BLACK]：档位宽度黑（并排态宽度 = 页宽 × 档位比例，绝不盖露边
- *   的邻图）；全屏态且无飞回格子矩形（非进入页 / 已翻页）时 sideScale = 1，
- *   满宽满高黑——把原本整页透明的"相邻页 / 加载中页"全部压黑（N3/N4 修复）。
- *
- * 旧版还有第四分支 pageBackground（整页不透明黑）：分支三改造覆盖全屏态后它在
- * 任何输入下都不可达，已随本版删除——背景从此只有这一处来源。
+ * - [FULL_PAGE_BLACK]：全屏态其余情况——页内满宽满高黑。全屏态没有"邻页露边"，
+ *   满页黑不会盖住任何邻图；它的职责只有一个：盖住透出链路背后的图库截图
+ *   （非进入页 / 已翻页 / 加载中页）；
+ * - [CONTAINER_BLACK]：并排（队列）态——页内**不画任何黑**。两侧 15% 露边区、
+ *   无邻页的一端、越界跟手露出的新带，全部由容器背景（纯黑）承接，与页内
+ *   几何无关（G1：固定宽度黑补丁拆除后，背景黑化不再依赖任何遮挡层）。
  */
-enum class ViewerBackgroundBranch { FLYBACK_MASK, DISMISS_LINEAR, SIDE_OR_FULL_BLACK }
+enum class ViewerBackgroundBranch {
+    FLYBACK_MASK,
+    DISMISS_LINEAR,
+    FULL_PAGE_BLACK,
+    CONTAINER_BLACK
+}
 
 /**
  * 并排预览三级手势（D1~D5，v4.16.2）的纯判定逻辑。
@@ -632,5 +657,535 @@ object ViewerSideBySide {
         val d = if (pageDistance.isFinite()) pageDistance else 0f
         val inPage = (imageLocalX - half) * s + half
         return inPage + d * viewportWidth * s
+    }
+}
+
+/**
+ * 查看器横向越界（rubber-band）的纯判定与位移映射（G1，v4.16.11）。
+ *
+ * 全屏单图与队列（并排）模式共用这一套规则：边界处允许有限越界位移，
+ * 位移随手指位移**非线性衰减**（拉得越远越拉不动），松手回弹到吸附位；
+ * 露出的区域由容器背景（纯黑）承接——见 MediaViewerScreen 根 Box 的
+ * background(Color.Black) 与 ImageViewer 的 CONTAINER_BLACK 分支。
+ *
+ * 为什么抽成纯函数：手势链路（嵌套滚动增量、回弹动画）在 JVM 单测里跑不起来，
+ * 但「这个方向算不算越界」「原始拖拽映射成多少位移」两段算术可以精确覆盖边界，
+ * UI 层只负责喂增量、写平移。
+ */
+object ViewerOverscroll {
+
+    /**
+     * 越界位移上限（占视口宽的比例）。
+     *
+     * 0.18 的取值口径：并排态两端各露 15% 视口，越界上限比它略宽一点，
+     * 拖到顶时"黑色延长带（15% 露边 + 18% 越界）"左右对称、不喧宾夺主；
+     * 同时保证越界带不会把整幅图推出屏幕（中间页始终还占 70% 的一部分）。
+     */
+    const val MAX_DISPLACEMENT_RATIO = 0.18f
+
+    /**
+     * 阻尼系数：位移公式里乘在原始拖拽距离上的系数（1f = 起步 1:1 跟手）。
+     * 下调会整体变"硬"（同样手指位移只跟一部分），上调会变"软"；
+     * 1f 是手感基准（起步跟手、越拉越沉），与全屏/并排两态共用同一个值。
+     */
+    const val DAMPING = 1f
+
+    /**
+     * 松手回弹时长（ms）。
+     *
+     * 用具名时长 + tween（FastOutSlowIn）而不是弹簧：弹簧在欠阻尼下会过冲，
+     * 表现为"回弹到位后又弹一下"（验收明确不允许二次回跳）；260ms 与并排
+     * 档位吸附（PROGRESS_SETTLE_MS = 280ms）同一节奏，两套动画同时出现时不打架。
+     */
+    const val SETTLE_DURATION_MS = 260
+
+    /**
+     * 这个方向在当前页是否越界（两端对称）。
+     *
+     * 方向口径与 pager 的滚动增量一致：deltaX > 0 = 内容右移 = 看上一张；
+     * deltaX < 0 = 内容左移 = 看下一张。只有"首张继续往右拉 / 末张继续往左拉"
+     * 才是越界——其余位置 pager 自己能把增量吃进翻页，不该产生越界位移。
+     *
+     * 单页（pageCount = 1）两端都是边界，两个方向都算越界；空列表 / 非有限增量
+     * / 零增量一律不算（宁可不动，也不把 NaN 带进位移）。
+     */
+    fun isOutOfBoundsDirection(currentPage: Int, pageCount: Int, deltaX: Float): Boolean {
+        if (pageCount <= 0) return false
+        if (!deltaX.isFinite() || deltaX == 0f) return false
+        // 页码越界（删除条目瞬间的旧值）一律按端点处理，避免越界判定抖动
+        val page = currentPage.coerceIn(0, pageCount - 1)
+        return if (deltaX > 0f) page == 0 else page == pageCount - 1
+    }
+
+    /**
+     * 原始拖拽距离 → 实际越界位移（带符号，非线性衰减 + 上限夹取）。
+     *
+     * 公式 d = M·u/(u+M)（u = |raw| × damping，M = maxDistance）：
+     * - 起步导数 = damping（1f 时手指位移与实际位移 1:1，跟手不滞后）；
+     * - 处处单调递增但严格小于 M（越拉越沉，永远拉不到上限之上）；
+     * - u 远小于 M 时 d ≈ u（小幅拖拽也有等量可见位移），u 远大于 M 时 d → M。
+     * 这就是"位移随拖拽距离非线性衰减 + 越界位移上限"的完整实现；末尾的
+     * coerceIn 只是浮点兜底（数学上 d 恒 < M）。
+     *
+     * maxDistance ≤ 0（视口尺寸未测得）/ 任一参数非有限 → 0：宁可不跟手，
+     * 也不把 NaN 写进 graphicsLayer 平移（NaN 会让整层消失）。
+     */
+    fun rubberBandDisplacement(rawDistance: Float, maxDistance: Float, damping: Float): Float {
+        if (!rawDistance.isFinite() || !maxDistance.isFinite() || !damping.isFinite()) return 0f
+        if (maxDistance <= 0f || rawDistance == 0f) return 0f
+        val amount = abs(rawDistance) * damping.coerceAtLeast(0f)
+        if (!amount.isFinite() || amount <= 0f) return 0f
+        val displacement = maxDistance * amount / (amount + maxDistance)
+        if (!displacement.isFinite()) return 0f
+        val clamped = displacement.coerceIn(0f, maxDistance)
+        return if (rawDistance > 0f) clamped else -clamped
+    }
+
+    /**
+     * [rubberBandDisplacement] 的反解：已知当前越界位移，求等效的原始拖拽距离。
+     *
+     * 用途：回弹动画播放中用户再次按下，位移必须从当前值无缝接续（先反解出 raw
+     * 作为新手势的起点）。若直接按 0 起算，位移会先跳回 0 再跟手（可见跳变）。
+     * 反解公式 u = M·d/(M−d)，raw = u/damping；d 已贴上限时按 0.999M 兜底，
+     * 保证结果有限（不会因为除零炸出 Infinity）。
+     */
+    fun rawDistanceForDisplacement(displacement: Float, maxDistance: Float, damping: Float): Float {
+        if (!displacement.isFinite() || !maxDistance.isFinite() || !damping.isFinite()) return 0f
+        if (maxDistance <= 0f || damping <= 0f || displacement == 0f) return 0f
+        val magnitude = abs(displacement).coerceAtMost(maxDistance * 0.999f)
+        val amount = maxDistance * magnitude / (maxDistance - magnitude)
+        if (!amount.isFinite()) return 0f
+        val raw = amount / damping
+        if (!raw.isFinite()) return 0f
+        return if (displacement > 0f) raw else -raw
+    }
+
+    /**
+     * 视口宽度 → 越界位移上限（px）。宽度未测得 / 非有限 → 0（本次不产生位移）。
+     */
+    fun maxDisplacementPx(viewportWidth: Float): Float {
+        if (!viewportWidth.isFinite() || viewportWidth <= 0f) return 0f
+        return viewportWidth * MAX_DISPLACEMENT_RATIO
+    }
+
+    /**
+     * 一次水平增量喂进越界机制后的结果（纯数据）。
+     *
+     * @param rawDrag 更新后的原始累计（px，带符号；0 = 已回到吸附位）
+     * @param displacement 更新后的可见位移（px，带符号）
+     * @param consumed 本次被越界机制消费掉的增量（px，带符号）。pager 只能拿到
+     *                 `delta - consumed`，越界与翻页的先后顺序全靠这个数区分
+     */
+    data class DragStep(val rawDrag: Float, val displacement: Float, val consumed: Float)
+
+    /**
+     * 越界外推：pager 在端点已经吃不下、且增量指向界外。
+     *
+     * 全额消费（`consumed = delta`）：平台 overscroll 效果已关闭，这里不消费的话
+     * 同一段手指位移会被父级再算一次。原始累计直接相加，位移按 [rubberBandDisplacement]
+     * 非线性衰减——拖得越远，同样增量换到的位移越少。
+     *
+     * 异常输入（非有限增量 / 上限为 0）不消费、不产生位移，只把累计原样带回：
+     * 宁可不跟手，也不把 NaN 写进平移。
+     */
+    fun accumulateOutward(
+        rawDrag: Float,
+        delta: Float,
+        maxDistance: Float,
+        damping: Float
+    ): DragStep {
+        val base = if (rawDrag.isFinite()) rawDrag else 0f
+        if (!delta.isFinite() || delta == 0f) {
+            return DragStep(base, rubberBandDisplacement(base, maxDistance, damping), 0f)
+        }
+        val next = base + delta
+        if (!next.isFinite()) {
+            return DragStep(base, rubberBandDisplacement(base, maxDistance, damping), 0f)
+        }
+        return DragStep(next, rubberBandDisplacement(next, maxDistance, damping), delta)
+    }
+
+    /**
+     * 回拖：增量指回屏内（与已产生的越界位移反向）。
+     *
+     * 顺序规则——**先把越界位移吃回来，再谈翻页**：
+     * - 没吃回零点：整段增量都用于回弹（`consumed = delta`），pager 拿不到东西翻页；
+     * - 越过零点：只消费到零点的那一段（rawDrag / displacement 归 0），
+     *   剩余增量（delta − consumed）留给 pager 正常翻页。
+     *
+     * 没有累计 / 同向增量 / 异常输入一律 `consumed = 0`：调用方应原样把增量交给
+     * pager（同向增量属于 [accumulateOutward] 的职责，这里不重复实现）。
+     */
+    fun reverseStep(
+        rawDrag: Float,
+        delta: Float,
+        maxDistance: Float,
+        damping: Float
+    ): DragStep {
+        if (!rawDrag.isFinite() || rawDrag == 0f) return DragStep(0f, 0f, 0f)
+        if (!delta.isFinite() || delta == 0f) {
+            return DragStep(rawDrag, rubberBandDisplacement(rawDrag, maxDistance, damping), 0f)
+        }
+        // 同向（继续往外拉）：不由本函数处理，不消费
+        if ((rawDrag > 0f) == (delta > 0f)) {
+            return DragStep(rawDrag, rubberBandDisplacement(rawDrag, maxDistance, damping), 0f)
+        }
+        val next = rawDrag + delta
+        val crossedZero = next == 0f || (next > 0f) != (rawDrag > 0f)
+        if (crossedZero) {
+            // 只吃回零点：剩余量（若无）交给 pager
+            return DragStep(0f, 0f, -rawDrag)
+        }
+        return DragStep(next, rubberBandDisplacement(next, maxDistance, damping), delta)
+    }
+
+    /**
+     * 越界状态下松手甩速该不该被吞掉（G2 补漏，v4.16.13）。
+     *
+     * 规则与 [reverseStep] 的拖拽口径**逐字对齐**（那边是增量、这边是速度）：
+     * - 甩速方向与越界方向**相同**（继续往外甩）→ true：两端没有可翻的页，
+     *   速度必须吞掉，否则 pager 会带着越界位移往外 fling；
+     * - 甩速方向**指向页内**（越过零点的回甩）→ false：把速度整份交给 pager，
+     *   pager 能做正常的惯性跨页。修复前 onPreFling 不看方向、无条件
+     *   `return available`，于是"越界后快速回甩"也被吞干净，只能靠拖动过半吸附
+     *   —— 与拖拽路径（回拖越过零点后余量交 pager）自相矛盾。
+     *
+     * 方向取哪个状态：正常手势中 rawDrag 与 displacement 同号且都非零；
+     * rawDrag 已归零（回弹动画在途、抬手与 fling 同帧时会出现）就用 displacement
+     * 的符号补位。两者都是 0 表示当前没有越界状态，一律返回 false（不吞）。
+     *
+     * 零速 / 非有限速度返回 false：此时"吞不吞"对 pager 没有区别（0 速度翻不了页），
+     * 保守取不吞，避免把 NaN 语义写进分支。
+     */
+    fun shouldSwallowFlingVelocity(rawDrag: Float, displacement: Float, velocityX: Float): Boolean {
+        if (!velocityX.isFinite() || velocityX == 0f) return false
+        val direction = when {
+            rawDrag.isFinite() && rawDrag != 0f -> rawDrag
+            displacement.isFinite() && displacement != 0f -> displacement
+            else -> return false
+        }
+        return (direction > 0f) == (velocityX > 0f)
+    }
+}
+
+// ============================================================
+// G6（任务书 12.2）：查看器退出的统一清理计划
+// ============================================================
+
+/**
+ * 查看器退出原因。
+ *
+ * **只进日志**：既不参与"清哪些字段"的决策（见 [ViewerExitCleanup.plan]，
+ * 对任何原因返回同一份清单），也不参与"这条路径自己播一段退出动画"的决策
+ * （见 [ViewerExitCleanup.playsContentSideTransition]，恒为 false）。
+ * 这是 G6 的结构性要求：三条退出路径不得各留一份清理、也不得各维护一份动画时序。
+ */
+enum class ViewerExitReason {
+    /** 下滑 / 二维自由拖动松手达阈值 */
+    DISMISS_DRAG,
+
+    /** 未放大态双指收缩到 0.92 以下 */
+    PINCH_IN,
+
+    /** 系统返回键（MediaViewerScreen 的 BackHandler） */
+    SYSTEM_BACK,
+
+    /** 条目被删空等 ViewModel 主动要求关闭 */
+    AUTO_CLOSE
+}
+
+/**
+ * 退出清理计划（纯函数，JVM 单测钉住；实现见 ImageViewer.resetViewerLayers 与
+ * MediaViewerScreen.exitViewer）。
+ *
+ * **为什么必须有这份清单**（G6 残影的根因，按代码逐段核对后的结论）：
+ * 1. 三条退出路径原先各清各的 —— 下滑走 playFlyBackDismiss、双指收缩走
+ *    playPinchCloseDismiss、系统返回只调 onClose()：页内的缩放/收尾状态只有
+ *    前两条会碰，而且碰的方式是"翻可见标志位"；
+ * 2. 双指收缩还额外维护了**第二条转场状态机**：内容层先自己缩小淡出
+ *    （PINCH_CLOSE_TARGET_SCALE 0.86 / 160ms，与窗口动画 viewer_fade_out_shrink
+ *    参数一字不差），播完才 finish()；而收尾协程第一件事就是
+ *    `isPinchClosing = false` —— 标志位一翻回 false，graphicsLayer 的淡出因子
+ *    就从动画终值（alpha 0f）回到 1f，图片重新变成完全不透明；
+ *    紧接着 finish() 的 overridePendingTransition 把"此刻的窗口画面"再淡出
+ *    160ms，宿主页已经在下面画好了，于是那一层不透明图片就被淡成半透明
+ *    叠在提示词卡片与生成按钮上 —— 这正是任务书 E4 描述的残影
+ *    （两段淡出 + 标志位翻回，缺一个都不会出现）。
+ *
+ * 修法因此是两条，缺一不可：
+ * - **动画时序统一**：双指收缩不再自播内容层淡出，三条路径共用同一段窗口转场
+ *   （[playsContentSideTransition] 恒 false，把这条规则做成可测的纯函数）；
+ * - **清理收敛**：三条路径只调 MediaViewerScreen.exitViewer(reason)，
+ *   取消在途动画协程 + 把机制状态归位 + 复位 pager 平移量
+ *   （字段清单就是下面的 PLAN，与 reason 无关）。
+ *
+ * 清单分两段（字段归属的组件不同，但**同一个入口按同一顺序**执行）：
+ * - [PAGE_FIELDS]：页内（ImageViewer）的收尾动画与机制标志位；
+ * - [SCREEN_FIELDS]：屏幕级（MediaViewerScreen）的越界位移与在途动画。
+ *
+ * [KEPT_FIELDS] 是**刻意不复位**的字段与理由：退出转场的窗口快照要延续用户
+ * 松手那一刻的画面，复位它们会造成可见跳变（把"残影"换成"抽帧"不算修好）。
+ */
+object ViewerExitCleanup {
+
+    /**
+     * 页内必须复位的字段（ImageViewer）。
+     *
+     * 每一项都是"机制状态"（标志位 / 在途协程），复位它们不会改变当前帧画面：
+     * - exitCommitted：本页已发起退出的标志位。置位后不得再启动任何收尾动画、
+     *   不得再累计新的退出意图（防"两次淡出"与重复 finish）；
+     * - isFlyBackAnimating：飞回收尾的在途标志位（下滑路径专用）；
+     * - pendingSingleTap：退出后不该再补发一次"单击切换 UI"；
+     * - zoomJob / settleJob / flyBackJob：在途动画协程。转场被中断或取消也必须
+     *   回收，不允许留着一个还在往已销毁的图层里写值（任务书实施指令 2/3）。
+     */
+    val PAGE_FIELDS: List<String> = listOf(
+        "exitCommitted",
+        "isFlyBackAnimating",
+        "pendingSingleTap",
+        "zoomJob",
+        "settleJob",
+        "flyBackJob"
+    )
+
+    /**
+     * 屏幕级必须复位的字段（MediaViewerScreen）。
+     *
+     * - overscrollPx / overscrollRawDrag：pager 的 graphicsLayer 平移量。
+     *   留着不清，退出快照就是一幅"整体偏移 0~18% 视口宽"的图，淡出时像
+     *   一层贴歪了的残影；
+     * - overscrollSettleJob / progressJob：回弹与档位吸附动画；
+     * - pagerGestureActive：手势相位。退出后不可能再有手指，留着 true
+     *   会让"静止残留归零"那条 effect 永久放弃归零。
+     */
+    val SCREEN_FIELDS: List<String> = listOf(
+        "overscrollPx",
+        "overscrollRawDrag",
+        "overscrollSettleJob",
+        "progressJob",
+        "pagerGestureActive"
+    )
+
+    /**
+     * 刻意**不复位**的字段（连同理由钉在这里，防止以后有人"顺手清干净"）：
+     * - scale / offset / isAnimating：双击缩放或平移动画进行中退出，冻结在
+     *   当前帧（取消动画协程但不改数据源开关）才连续；把它们改成 1f/Zero
+     *   会在退出快照里出现一次"突然回全屏"；
+     * - dismissDragY / dismissDragX：下滑退出松手时图片就停在该位置，
+     *   窗口淡出延续这个位置才是"跟着手关掉"的观感；
+     * - sideProgress / gestureBaseProgress：并排（队列）态下拉关闭是已验收
+     *   行为，档位布局要带到转场结束；
+     * - maskRevealed：透出遮罩的目标值。置回 false 会让黑幕淡回纯黑，
+     *   把已经透出来的图库又盖掉一帧；
+     * - isDismissSettling：弹簧回位的数据源开关。清理只取消回位协程、**不翻这个开关**，
+     *   图层因此冻结在回位的当前帧 —— 翻回 false 会让图片从半途"瞬跳"回手势位移值。
+     */
+    val KEPT_FIELDS: List<String> = listOf(
+        "scale",
+        "offset",
+        "isAnimating",
+        "dismissDragY",
+        "dismissDragX",
+        "isDismissSettling",
+        "sideProgress",
+        "gestureBaseProgress",
+        "maskRevealed"
+    )
+
+    /** 唯一清单实例：三个 reason 拿到的是同一个对象（单测断言引用相等） */
+    private val PLAN: List<String> = PAGE_FIELDS + SCREEN_FIELDS
+
+    /**
+     * 退出必须复位的字段清单。
+     *
+     * 签名带 reason 是为了让调用点写清楚"因哪条路径退出"，但**返回值与 reason
+     * 无关** —— 任何按 reason 分支"少清几项"的改动都会让 ViewerExitCleanupTest 变红。
+     */
+    fun plan(reason: ViewerExitReason): List<String> = PLAN
+
+    /**
+     * 该退出原因是否需要**内容层自己再播一段退出动画**。
+     *
+     * G6 的答案是**一律 false**：三条退出路径共用同一段窗口转场
+     * （res/anim/viewer_fade_out_shrink：alpha 1→0 + scale 1→0.86 + 160ms），
+     * 内容层不再维护第二条转场状态机。
+     *
+     * 修复前双指收缩在内容层先淡出 160ms，播完把 isPinchClosing 翻回 false
+     * （图片恢复不透明），随后 finish() 取的窗口快照把这层图片**再淡一次**到
+     * 宿主页上方 —— 那半透明的一层就是报告里的残影。任务书 12.1 实施指令 3
+     * "三条退出路径统一到同一转场实现，禁止各自维护一份动画时序"在退出侧的
+     * 落点就是这里。
+     *
+     * 这个函数保留（恒返回 false）而不是删掉：任何"给某条路径单独加一段动画"
+     * 的改动都会让 ViewerExitCleanupTest 变红。
+     */
+    fun playsContentSideTransition(reason: ViewerExitReason): Boolean = false
+}
+
+/**
+ * 页内组件向统一退出入口注册"图层复位"的小注册表（G6）。
+ *
+ * 为什么需要它：缩放 / 脱离位移 / 收尾动画这些状态属于分页组件 ImageViewer 的组合域，
+ * 屏幕级入口够不到；而系统返回这条路径根本不经过 ImageViewer 的手势代码。
+ * 没有注册表就得在 BackHandler 里"再写一份清理"，正是任务书禁止的"各留一份"。
+ *
+ * ImageViewer 在 DisposableEffect 里注册、离开组合时注销，因此
+ * ① 三条退出路径都只调 [ViewerExitRegistry.fire]（同一份清理），
+ * ② 重复进出不会累积注册（注销保证）。
+ *
+ * 本类只持有回调，不引 compose 类型，保持纯函数模块可在 JVM 单测里直接实例化。
+ */
+class ViewerExitRegistry {
+
+    private val cleanups = mutableListOf<(ViewerExitReason) -> Unit>()
+
+    /** 当前注册的复位回调数量（单测用它证明"重复进出不累积"） */
+    val registered: Int get() = cleanups.size
+
+    /**
+     * 注册一个复位回调，返回注销函数。
+     *
+     * 同一个回调重复注册会被忽略（防重组时忘记注销导致累积）。
+     */
+    fun register(cleanup: (ViewerExitReason) -> Unit): () -> Unit {
+        if (cleanups.none { it === cleanup }) cleanups += cleanup
+        // 用下标删除而不是 removeIf：removeIf 是 JDK/Android API 24+ 的默认方法，
+        // 低版本设备上会 NoSuchMethodError；这里只有一处注销路径，下标删除更直白
+        return {
+            val index = cleanups.indexOfFirst { it === cleanup }
+            if (index >= 0) cleanups.removeAt(index)
+        }
+    }
+
+    /**
+     * 按注册顺序执行全部复位回调。
+     *
+     * 遍历前先拷贝：回调自身可能注销（组件正离开组合），直接遍历原列表会
+     * ConcurrentModificationException —— 那等于退出时崩溃。
+     */
+    fun fire(reason: ViewerExitReason) {
+        cleanups.toList().forEach { it(reason) }
+    }
+}
+
+// ============================================================
+// G4（任务书 11.4）：队列模式竖滑快捷删除 —— 纯判定逻辑
+// ============================================================
+
+/** 竖滑删除松手的归宿。 */
+enum class SwipeDeleteOutcome {
+    /** 位移或甩速达标：播放进站动画并移入回收站（阶段一，可恢复） */
+    ENTER_TRASH,
+
+    /** 未达标：弹簧回位，什么都不删 */
+    CANCEL
+}
+
+/** 竖滑跟手期间的图片视觉（与 [DismissVisuals] 同思路：判定与绘制分离）。 */
+data class SwipeDeleteVisuals(
+    val scale: Float,
+    val alpha: Float,
+    val rotationDeg: Float
+)
+
+/**
+ * 队列模式"上滑/下滑 → 拖入一级回收站"（手机相册式快捷删除）的判定与位移映射。
+ *
+ * 与下滑关闭（[ViewerDismissGesture]）的关系：共用同一手势入口与同一个纵向位移
+ * 状态（ImageViewer 的 dismissDragY），**语义按模式分流** ——
+ * 全屏态下拉 = 关闭查看器（G5/G6 已验收行为，原样保留）；
+ * 队列（并排）态竖滑 = 删除当前图（本对象）。
+ *
+ * 双向对称：上滑与下滑等价（派工单原文"上滑或下滑"），判定用 |dy| / |vy|；
+ * 方向偏差沿用 ViewerDismissGesture.resolvePanDirection 的 1.2 倍纵向偏置锁——
+ * 斜向手势一律让给横向翻页，这条是 30 次斜滑误触率验收的第一道闸。
+ */
+object ViewerSwipeDelete {
+
+    /**
+     * 松手删除阈值：|dy| 超过屏高的 25%。
+     *
+     * 比下滑关闭的 22% 略高一档：删除是破坏性操作（虽然可撤销、进回收站），
+     * 手感应"明显比关闭更坚决"，压低斜滑/过滑误触率。
+     */
+    const val DELETE_DISTANCE_RATIO = 0.25f
+
+    /** 松手删除的甩速阈值（dp/s）：比关闭的 900 高，快速擦过不算删除意图 */
+    const val DELETE_VELOCITY_DP_PER_SEC = 1100f
+
+    /** 视觉饱和深度：|dy| 达到屏高 60% 时跟手视觉到极值（缩放 0.35 / 全透明前段） */
+    const val VISUAL_SATURATION_RATIO = 0.6f
+
+    /** 进站动画时长（ms）：与档位吸附（280）/ 越界回弹（260）同一节奏带 */
+    const val FLY_TO_TRASH_DURATION_MS = 220
+
+    /** 撤销提示保留时长（ms）——用户已确认的交互决策：2 秒 */
+    const val UNDO_WINDOW_MS = 2000L
+
+    /** 跟手期间的最大缩小（下限 0.35）与最大旋转（±10°，相册式"甩进垃圾桶"的倾向感） */
+    private const val MIN_SCALE = 0.35f
+    private const val MAX_ROTATION_DEG = 10f
+
+    /**
+     * 松手归宿：|dy| ≥ 屏高×25% 或 |vy| ≥ 阈值 → 进站。
+     *
+     * 两个阈值任一达标即可（与下滑关闭同构）；NaN / 屏高未测得一律 CANCEL——
+     * 不确定时宁可什么都不删（破坏性操作的保守方向）。
+     * velocityThresholdPxPerSec 由调用方按密度换算喂入（纯函数不做 Density 运算）。
+     */
+    fun resolveOutcome(
+        dyPx: Float,
+        screenHeightPx: Float,
+        velocityYPxPerSec: Float,
+        velocityThresholdPxPerSec: Float
+    ): SwipeDeleteOutcome {
+        if (!dyPx.isFinite() || !screenHeightPx.isFinite() || screenHeightPx <= 0f) {
+            return SwipeDeleteOutcome.CANCEL
+        }
+        val distanceExceeded = abs(dyPx) >= screenHeightPx * DELETE_DISTANCE_RATIO
+        val velocityExceeded = velocityYPxPerSec.isFinite() &&
+            abs(velocityYPxPerSec) >= velocityThresholdPxPerSec
+        return if (distanceExceeded || velocityExceeded) {
+            SwipeDeleteOutcome.ENTER_TRASH
+        } else {
+            SwipeDeleteOutcome.CANCEL
+        }
+    }
+
+    /**
+     * 纵向位移 → 跟手视觉。双向对称（上滑下滑镜像），进度 = |dy| / (屏高×60%) 钳 [0,1]。
+     *
+     * 缩放 1→0.35、透明度 1→0、旋转随拖拽方向偏转（上滑向上翻、下滑向下翻）。
+     * 进站动画不另设公式：把位移继续外推到 [flyTargetDy] 代入本函数即可，
+     * 跟手段与动画段共用一个映射，衔接处不可能跳变。
+     */
+    fun visuals(dyPx: Float, screenHeightPx: Float): SwipeDeleteVisuals {
+        if (!dyPx.isFinite() || !screenHeightPx.isFinite() || screenHeightPx <= 0f) {
+            return SwipeDeleteVisuals(1f, 1f, 0f)
+        }
+        val saturation = (screenHeightPx * VISUAL_SATURATION_RATIO).coerceAtLeast(1f)
+        val progress = (abs(dyPx) / saturation).coerceIn(0f, 1f)
+        val direction = if (dyPx >= 0f) 1f else -1f
+        return SwipeDeleteVisuals(
+            scale = (1f - 0.65f * progress).coerceAtLeast(MIN_SCALE),
+            // 透明度到 0.02（而非 0）：进站动画末帧仍有一粒可感的"消失点"，
+            // 纯 0 会让图片在落定前一帧凭空跳没
+            alpha = (1f - progress).coerceAtLeast(0.02f),
+            rotationDeg = direction * MAX_ROTATION_DEG * progress
+        )
+    }
+
+    /**
+     * 进站动画的终点位移（px，带符号）：沿拖拽方向飞出 1.3 屏高。
+     *
+     * 终点代入 [visuals] 正好落在饱和极值（progress=1：scale 0.35 / alpha 0.02 /
+     * rotation ±10°），动画结束时图片已飞出视口、近全透明 —— 视觉上就是
+     * "被甩进屏幕外下方的回收站"。dyPx 为 0（异常调用）返回 0，动画退化为原地淡出。
+     */
+    fun flyTargetDy(dyPx: Float, screenHeightPx: Float): Float {
+        if (!dyPx.isFinite() || !screenHeightPx.isFinite() || screenHeightPx <= 0f) return 0f
+        if (dyPx == 0f) return 0f
+        val direction = if (dyPx > 0f) 1f else -1f
+        return direction * screenHeightPx * 1.3f
     }
 }

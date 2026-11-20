@@ -53,15 +53,15 @@ import sh.hnet.comfychair.model.withClipUpdated
 import sh.hnet.comfychair.model.withSlotAdded
 import sh.hnet.comfychair.workflow.TimelineSlotDetector
 import sh.hnet.comfychair.workflow.WorkflowConstraintsProvider
-import sh.hnet.comfychair.ui.components.config.CommonGenerationState
+import sh.hnet.comfychair.model.contract.CommonGenerationState
 import sh.hnet.comfychair.model.WorkflowValues
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.taglibrary.state.PromptBridge
 import sh.hnet.comfychair.taglibrary.state.PromptTargetFactory
-import sh.hnet.comfychair.ui.components.shared.WorkflowItemBase
+import sh.hnet.comfychair.model.contract.WorkflowItemBase
 import sh.hnet.comfychair.util.BitmapDecodeUtils
 import sh.hnet.comfychair.util.DebugLogger
-import sh.hnet.comfychair.util.LoraChainManager
+import sh.hnet.comfychair.lora.LoraChainManager
 import sh.hnet.comfychair.util.Obfuscator
 import sh.hnet.comfychair.util.SeasonalPrompts
 import sh.hnet.comfychair.util.UploadImageEncoder
@@ -444,6 +444,36 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
     override val initialState = ImageToVideoUiState()
 
     /**
+     * 当前正在播放的视频键（5.2）：拿到 URI 时登记、切走 / 清空时注销。
+     *
+     * 磁盘优先模式下 [MediaStateHolder.getVideoUri] 返回的就是 filesDir 里那个文件，
+     * 只靠「每类最近一次 prompt」保护不住它 —— 用户再生成一个视频，旧 promptId 立刻被顶掉，
+     * 正在播放的文件就可能被磁盘裁剪删掉。登记后裁剪会整组跳过（见 trimVideoFiles）。
+     */
+    private var playingVideoKey: MediaStateHolder.MediaKey? = null
+
+    /** 登记「这个视频正在播放」；同一键重复调用不会重复登记。 */
+    private fun markPlayingVideo(key: MediaStateHolder.MediaKey) {
+        if (playingVideoKey == key) return
+        playingVideoKey?.let { MediaStateHolder.unregisterPlayingVideo(it) }
+        playingVideoKey = key
+        MediaStateHolder.registerPlayingVideo(key)
+    }
+
+    /** 注销当前播放登记（播放已切走 / 清空）。 */
+    private fun clearPlayingVideo() {
+        playingVideoKey?.let { MediaStateHolder.unregisterPlayingVideo(it) }
+        playingVideoKey = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        clearPlayingVideo()
+        // P2-20：注销标签库桥接，静态 map 不再钉住已销毁的 ViewModel
+        PromptBridge.unregister(OWNER_ID)
+    }
+
+    /**
      * 注册到标签库桥接：使标签库页面可以读写本页的正/负向提示词（需求 5.2）。
      */
     init {
@@ -496,6 +526,21 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         viewModelScope.launch {
             ConnectionManager.modelCache.collect { cache ->
                 _uiState.update { state ->
+                    // P1-7（R2-M1）：断线/重连的 invalidateAll() 会把 ModelCache 整体置空
+                    //（isLoaded=false、所有列表为空）。那份快照不是"服务器上没有模型"的证据：
+                    // 照常走下面的校验会把已选模型清空、deferred 恢复值一并抹掉，
+                    // `LoraChainManager.filterUnavailable(chain, emptyList)` 更会把整条
+                    // high/low-noise LoRA 链清空，随后 saveWorkflowValues 以
+                    // takeIf { isNotEmpty() } 把它写成 null 落盘 —— 视频双模型流的 LoRA 就永久丢了。
+                    // 直接跳过本次更新，等真实列表回来再校验。
+                    if (!ValidationUtils.isUsableModelCache(cache)) {
+                        DebugLogger.d(
+                            TAG,
+                            "跳过空模型缓存快照（isLoaded=${cache.isLoaded}），保留已选模型、LoRA 链与 deferred 值"
+                        )
+                        // 原样返回当前状态（不写状态 = 不触发重组、不落盘空选择）
+                        return@update state
+                    }
                     // Apply deferred selections first, then validate or fall back to first available
                     // Single-model patterns
                     val checkpoint = state.deferredCheckpoint?.takeIf { it in cache.checkpoints }
@@ -626,6 +671,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
             }
             if (uri != null) {
                 _uiState.value = _uiState.value.copy(currentVideoUri = uri)
+                // 播放方登记（5.2）：裁剪不要删掉这个文件（磁盘优先模式下 URI 就指向它）
+                markPlayingVideo(key)
             }
         }
     }
@@ -2158,6 +2205,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         // when navigating back to this screen during generation
         MediaStateHolder.evict(MediaStateHolder.MediaKey.ItvPreview)
         _uiState.value = _uiState.value.copy(previewBitmap = null, currentVideoUri = null)
+        // 播放已清空：注销裁剪保护（5.2）
+        clearPlayingVideo()
         // Clear prompt ID tracking to prevent restoration on subsequent screen navigations
         MediaStateHolder.clearCurrentItvPromptId()
     }
@@ -2165,6 +2214,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
     fun clearPreview() {
         lastClearedForPromptId = null // Reset tracking when manually clearing
         _uiState.value = _uiState.value.copy(previewBitmap = null, currentVideoUri = null)
+        // 播放已清空：注销裁剪保护（5.2）
+        clearPlayingVideo()
         // Clear prompt ID tracking to prevent restoration on subsequent screen navigations
         MediaStateHolder.clearCurrentItvPromptId()
     }
@@ -2279,6 +2330,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
             if (uri != null) {
                 // Clear preview bitmap so video player takes display precedence
                 _uiState.value = _uiState.value.copy(currentVideoUri = uri, previewBitmap = null)
+                // 播放方登记（5.2）：新视频开始播放，旧的那份同时注销
+                markPlayingVideo(MediaStateHolder.MediaKey.ItvVideo(promptId))
                 deleteLastPreviewImage()
                 generationViewModelRef?.completeGeneration(promptId)
             }

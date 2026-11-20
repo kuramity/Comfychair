@@ -1,13 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    FileProvider paths configuration
-    Defines which directories can be shared via FileProvider
+    FileProvider 可共享路径（P2-12：不再把整个 cacheDir / filesDir 声明成可共享根）
+
+    历史：原配置用 cache-path / files-path 的 path="." 把两个应用私有目录整体
+    暴露给 FileProvider —— 分享一份图片，挂出去的是「整个缓存目录 / 整个文件目录」
+    的可寻址范围（工作流、图库索引、播放临时文件都在里面）。
+
+    现在的约定：
+    - 分享载荷（图片/视频副本）只写 cacheDir/share/，也只有这里会生成 content URI
+      （见 util/ShareFileStore.kt）；
+    - 播放链路在应用进程内，使用 file://，不经过 FileProvider，因此不需要声明
+      任何缓存/文件根；
+    - 内置更新模块的 APK（含 sha256 旁车）继续走 external-files-path 的 update/ 子目录。
+
+    ⚠️ 新增任何 FileProvider 分享路径时，先把文件写进专用子目录，再在这里补一条
+    对应子目录的声明；禁止再出现 path="."。
 -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Cache directory for temporary share files -->
-    <cache-path name="shared_images" path="." />
-    <!-- Files directory for saved videos and images -->
-    <files-path name="internal_files" path="." />
-    <!-- 内置更新模块（v4.6.0）：getExternalFilesDir/update/ 下的 update.apk 安装包 -->
+    <!-- 对外分享的载荷目录（cacheDir/share/） -->
+    <cache-path name="share" path="share/" />
+    <!-- 内置更新模块（v4.6.0）：getExternalFilesDir/update/ 下的 update.apk -->
     <external-files-path name="update_files" path="update/" />
 </paths>

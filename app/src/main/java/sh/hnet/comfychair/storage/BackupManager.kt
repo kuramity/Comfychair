@@ -22,7 +22,9 @@ import java.util.TimeZone
 sealed class RestoreResult {
     data class Success(
         val serversChanged: Boolean,
-        val skippedWorkflows: Int = 0
+        val skippedWorkflows: Int = 0,
+        /** P2-24：地址/端口不合法而被整条跳过的服务器个数 */
+        val skippedServers: Int = 0
     ) : RestoreResult()
 
     data class Failure(val errorMessageResId: Int) : RestoreResult()
@@ -152,10 +154,30 @@ class BackupManager(private val context: Context) {
         val existingServers = serverStorage.getServers()
         val serverIdMapping = mutableMapOf<String, String>() // backupId -> actualId
         var serversChanged = false
+        // P2-24：不合法条目整条跳过并计数（hostname 格式 / 端口越界），恢复完提示用户
+        var skippedServers = 0
 
         for (i in 0 until serversArray.length()) {
-            val serverJson = serversArray.optJSONObject(i) ?: continue
-            val backupServer = Server.fromJson(serverJson) ?: continue
+            val serverJson = serversArray.optJSONObject(i) ?: run {
+                skippedServers++
+                continue
+            }
+            val backupServer = Server.fromJson(serverJson) ?: run {
+                skippedServers++
+                DebugLogger.w(TAG, "跳过服务器条目 #$i：缺少 id/name/hostname/port")
+                continue
+            }
+
+            // P2-24：逐台校验地址与端口 —— BackupValidator 的 validateHostname/validatePort
+            // 此前是死代码，畸形地址（含空格、带路径、端口 70000）会被原样恢复。
+            if (!validator.validateServer(backupServer.hostname, backupServer.port)) {
+                skippedServers++
+                DebugLogger.w(
+                    TAG,
+                    "跳过服务器条目 #$i：地址或端口不合法（hostname=${Obfuscator.hostname(backupServer.hostname)}, port=${backupServer.port}）"
+                )
+                continue
+            }
 
             // Check if server with same name exists
             val existingServer = existingServers.find { it.name == backupServer.name }
@@ -164,10 +186,18 @@ class BackupManager(private val context: Context) {
                 serverIdMapping[backupServer.id] = existingServer.id
             } else {
                 // Add new server with its original ID
-                serverStorage.addServer(backupServer)
+                if (!serverStorage.addServer(backupServer)) {
+                    // 服务器列表已损坏：恢复写入被拒绝，交给界面提示
+                    DebugLogger.e(TAG, "服务器列表已损坏，恢复服务器配置被拒绝")
+                    return RestoreResult.Failure(R.string.error_server_list_corrupted)
+                }
                 serverIdMapping[backupServer.id] = backupServer.id
                 serversChanged = true
             }
+        }
+
+        if (skippedServers > 0) {
+            DebugLogger.w(TAG, "恢复时跳过 $skippedServers 个不合法的服务器条目")
         }
 
         // Set selected server
@@ -201,10 +231,11 @@ class BackupManager(private val context: Context) {
             restorePromptPresets(presets)
         }
 
-        DebugLogger.i(TAG, "Backup restore completed. Servers changed: $serversChanged, skipped workflows: $skippedWorkflows")
+        DebugLogger.i(TAG, "Backup restore completed. Servers changed: $serversChanged, skipped workflows: $skippedWorkflows, skipped servers: $skippedServers")
         return RestoreResult.Success(
             serversChanged = serversChanged,
-            skippedWorkflows = skippedWorkflows
+            skippedWorkflows = skippedWorkflows,
+            skippedServers = skippedServers
         )
     }
 
@@ -315,8 +346,14 @@ class BackupManager(private val context: Context) {
 
             for (i in 0 until metadataArray.length()) {
                 val metadata = metadataArray.getJSONObject(i)
-                val filename = metadata.getString("filename")
-                val file = File(dir, filename)
+                val filename = metadata.optString("filename")
+                // P1-18：filename 是外部输入（可能是更早一次导入写进来的），
+                // 读之前同样要过白名单 + 目录内校验，拒绝 ../../ 之类的穿越
+                val file = WorkflowFilePolicy.resolveInDir(dir, filename)
+                if (file == null) {
+                    DebugLogger.w(TAG, "导出时跳过非法工作流文件名：'$filename'")
+                    continue
+                }
 
                 if (file.exists()) {
                     val workflowEntry = JSONObject().apply {
@@ -642,6 +679,16 @@ class BackupManager(private val context: Context) {
                     continue
                 }
 
+                // P1-18：filename 来自备份文件（外部输入），必须过白名单 + canonicalPath
+                // 校验：拒绝 `../../evil.json`、绝对路径、控制字符，以及规范化后跑到
+                // user_workflows 目录之外的落点。不允许的条目直接跳过并计入 skipped。
+                val file = WorkflowFilePolicy.resolveInDir(dir, filename)
+                if (file == null) {
+                    DebugLogger.w(TAG, "恢复工作流被拒绝：非法文件名 '$filename'")
+                    skipped++
+                    continue
+                }
+
                 // Validate file content is valid JSON
                 try {
                     JSONObject(fileContent)
@@ -657,7 +704,6 @@ class BackupManager(private val context: Context) {
                 }
 
                 // Save workflow file
-                val file = File(dir, filename)
                 file.writeText(fileContent)
 
                 // Add to metadata

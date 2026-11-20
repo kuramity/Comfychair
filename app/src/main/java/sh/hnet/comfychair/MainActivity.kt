@@ -29,8 +29,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         // Run preferences maintenance in background to clean up stale entries
+        // 启动时拿不到「用户显式删除服务器」的证据，按非显式处理（fail-closed）
         lifecycleScope.launch(Dispatchers.IO) {
-            PreferencesMaintenance.performMaintenance(applicationContext)
+            PreferencesMaintenance.performMaintenance(applicationContext, explicitDeletion = false)
         }
 
         setContent {

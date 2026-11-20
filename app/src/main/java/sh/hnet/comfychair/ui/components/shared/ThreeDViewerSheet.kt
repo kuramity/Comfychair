@@ -61,6 +61,9 @@ import sh.hnet.comfychair.model.ThreeDFraming
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.model.ThreeDVisibility
 import sh.hnet.comfychair.ui.components.ripple.RippleIconButton
+import sh.hnet.comfychair.util.DebugLogger
+import sh.hnet.comfychair.util.Obfuscator
+import sh.hnet.comfychair.util.SafeFileName
 import java.io.File
 import kotlin.math.sqrt
 import kotlin.math.tan
@@ -198,9 +201,31 @@ private fun rememberLocalModel3D(result: ThreeDResultHolder.Result): LocalModel3
     var file by remember { mutableStateOf<File?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var downloading by remember { mutableStateOf(false) }
+    // 请求代次：result 变化后，上一轮下载的回调不得再改状态/覆盖新文件（P2-4 的"旧回调覆盖新文件"）
+    var requestToken by remember { mutableStateOf<Any?>(null) }
 
-    LaunchedEffect(result.filename, result.subfolder) {
-        val dest = File(File(context.filesDir, MODEL3D_DIR), result.filename)
+    LaunchedEffect(result.filename, result.subfolder, result.type) {
+        // F3：代次必须在**所有提前返回之前**更新。修复前只在真正发起下载时赋值，
+        // 若新结果命中本地缓存直接 return，token 仍是上一轮的 → 上一轮在飞的下载回调
+        // 校验会通过并覆盖新结果（快速切换时显示与标题不符的模型）。
+        val token = Any()
+        requestToken = token
+
+        // 新一轮请求开始：先清掉上一轮的展示状态
+        file = null
+        error = null
+        downloading = false
+
+        val modelDir = File(context.filesDir, MODEL3D_DIR)
+        // P2-4：filename 来自 /history，属于外部输入。落盘前净化：
+        // 去掉目录段（/ 与 \）、白名单过滤、拒绝 . / .. / 隐藏名，并校验规范路径仍在 modelDir 内。
+        val safeName = SafeFileName.sanitize(result.filename, modelDir)
+        if (safeName == null) {
+            DebugLogger.w(TAG_3D, "3D 文件名不合法，拒绝落盘: ${Obfuscator.filename(result.filename)}")
+            error = context.getString(R.string.three_d_download_failed)
+            return@LaunchedEffect
+        }
+        val dest = File(modelDir, safeName)
         if (dest.exists() && dest.length() > 0) {
             file = dest
             return@LaunchedEffect
@@ -212,6 +237,8 @@ private fun rememberLocalModel3D(result: ThreeDResultHolder.Result): LocalModel3
         }
         downloading = true
         client.fetchRawFile(result.filename, result.subfolder, result.type, dest) { ok, _ ->
+            // 旧回调（result 已经换掉）：既不写状态也不动文件展示
+            if (requestToken !== token) return@fetchRawFile
             downloading = false
             if (ok) {
                 file = dest

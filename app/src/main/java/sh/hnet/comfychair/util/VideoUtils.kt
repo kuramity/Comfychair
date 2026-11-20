@@ -1,13 +1,10 @@
 package sh.hnet.comfychair.util
 
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
 import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -57,65 +54,50 @@ object VideoUtils {
                 return@fetchHistory
             }
 
-            // Find video in outputs
-            // Note: ComfyUI may return videos in "videos", "gifs", or even "images" arrays
-            // We check file extension to identify video files
-            val outputKeys = outputs.keys()
-            while (outputKeys.hasNext()) {
-                val nodeId = outputKeys.next()
-                val nodeOutput = outputs.optJSONObject(nodeId)
-
-                // Check videos, gifs, and images arrays for video files
-                val videos = nodeOutput?.optJSONArray("videos")
-                    ?: nodeOutput?.optJSONArray("gifs")
-                    ?: nodeOutput?.optJSONArray("images")
-
-                if (videos != null && videos.length() > 0) {
-                    val videoInfo = videos.optJSONObject(0)
-                    val filename = videoInfo?.optString("filename") ?: continue
-                    val subfolder = videoInfo.optString("subfolder", "")
-                    val type = videoInfo.optString("type", "output")
-
-                    // Fetch video bytes
-                    client.fetchVideo(filename, subfolder, type) { videoBytes, failureType ->
-                        if (videoBytes == null) {
-                            if (failureType == ConnectionFailure.STALLED) {
-                                mainHandler.post {
-                                    ConnectionManager.showConnectionAlert(context, failureType)
-                                    onComplete(null)
-                                }
-                            } else {
-                                mainHandler.post { onComplete(null) }
-                            }
-                            return@fetchVideo
-                        }
-
-                        // Store in memory/disk based on caching mode
-                        val mediaKey = when (filePrefix) {
-                            FilePrefix.TEXT_TO_VIDEO -> MediaStateHolder.MediaKey.TtvVideo(promptId)
-                            FilePrefix.IMAGE_TO_VIDEO -> MediaStateHolder.MediaKey.ItvVideo(promptId)
-                            else -> null
-                        }
-
-                        if (mediaKey == null) {
-                            mainHandler.post { onComplete(null) }
-                            return@fetchVideo
-                        }
-
-                        // Pass context for disk-first mode support
-                        MediaStateHolder.putVideoBytes(mediaKey, videoBytes, context)
-
-                        // Get URI for playback (creates temp file in cacheDir)
-                        CoroutineScope(Dispatchers.Main).launch {
-                            val uri = MediaStateHolder.getVideoUri(context, mediaKey)
-                            onComplete(uri)
-                        }
-                    }
-                    return@fetchHistory
-                }
+            // 统一挑选视频（P2-6）：遍历所有节点、检查 videos/gifs/images 三个数组、
+            // 按扩展名过滤。旧实现 `videos ?: gifs ?: images` 后取 [0] 会在遇到空数组时
+            // 提前结束，还会把 images 里的 png 当视频下载。
+            val video = VideoOutputSelector.first(outputs)
+            if (video == null) {
+                mainHandler.post { onComplete(null) }
+                return@fetchHistory
             }
 
-            mainHandler.post { onComplete(null) }
+            // Fetch video bytes
+            client.fetchVideo(video.filename, video.subfolder, video.type) { videoBytes, failureType ->
+                if (videoBytes == null) {
+                    if (failureType == ConnectionFailure.STALLED) {
+                        mainHandler.post {
+                            ConnectionManager.showConnectionAlert(context, failureType)
+                            onComplete(null)
+                        }
+                    } else {
+                        mainHandler.post { onComplete(null) }
+                    }
+                    return@fetchVideo
+                }
+
+                // Store in memory/disk based on caching mode
+                val mediaKey = when (filePrefix) {
+                    FilePrefix.TEXT_TO_VIDEO -> MediaStateHolder.MediaKey.TtvVideo(promptId)
+                    FilePrefix.IMAGE_TO_VIDEO -> MediaStateHolder.MediaKey.ItvVideo(promptId)
+                    else -> null
+                }
+
+                if (mediaKey == null) {
+                    mainHandler.post { onComplete(null) }
+                    return@fetchVideo
+                }
+
+                // Pass context for disk-first mode support
+                MediaStateHolder.putVideoBytes(mediaKey, videoBytes, context)
+
+                // Get URI for playback (creates temp file in cacheDir)
+                CoroutineScope(Dispatchers.Main).launch {
+                    val uri = MediaStateHolder.getVideoUri(context, mediaKey)
+                    onComplete(uri)
+                }
+            }
         }
     }
 
@@ -134,39 +116,27 @@ object VideoUtils {
         if (videoUri == null) return
 
         withContext(Dispatchers.IO) {
-            try {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, "${filenamePrefix}_${System.currentTimeMillis()}.mp4")
-                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ComfyChair")
-                }
+            // P1-22：走统一的相册写入（IS_PENDING → 发布），失败时必须回滚并报失败。
+            // 修复前 insert 失败静默无提示、openOutputStream 返回 null 时仍弹"已保存"。
+            val saved = PhotoManager.saveVideo(
+                context = context,
+                displayName = "${filenamePrefix}_${System.currentTimeMillis()}.mp4"
+            ) { outputStream ->
+                // P2-12：播放 URI 已改为 file://（进程内播放，不经 FileProvider），
+                // contentResolver.openInputStream 读不了 file://，统一走 ShareFileStore
+                ShareFileStore.openMediaInput(context, videoUri)?.use { inputStream ->
+                    inputStream.copyTo(outputStream)
+                } ?: throw java.io.IOException("无法读取视频源：$videoUri")
+            }
 
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                uri?.let { outputUri ->
-                    resolver.openOutputStream(outputUri)?.use { outputStream ->
-                        resolver.openInputStream(videoUri)?.use { inputStream ->
-                            inputStream.copyTo(outputStream)
-                        }
-                    }
-
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(
-                            context,
-                            context.getString(R.string.msg_video_saved_to_gallery),
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(
-                        context,
-                        context.getString(R.string.error_save_video),
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    context,
+                    context.getString(
+                        if (saved) R.string.msg_video_saved_to_gallery else R.string.error_save_video
+                    ),
+                    Toast.LENGTH_SHORT
+                ).show()
             }
         }
     }
@@ -180,10 +150,32 @@ object VideoUtils {
     fun shareVideo(context: Context, videoUri: Uri?) {
         if (videoUri == null) return
 
+        // P2-12：播放 URI 现在是 file://，不能直接放进 ACTION_SEND
+        //（Intent 离开进程时 file:// 会抛 FileUriExposedException）。
+        // 先按需复制一份到 cacheDir/share/，分享它的 content URI。
+        // 复制可能涉及几十 MB，放 IO 线程，避免点分享时卡住 UI。
+        CoroutineScope(Dispatchers.Main).launch {
+            val shareUri = withContext(Dispatchers.IO) {
+                runCatching { ShareFileStore.exportVideoForShare(context, videoUri) }.getOrNull()
+            }
+            if (shareUri == null) {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.error_share_video),
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@launch
+            }
+            launchShareChooser(context, shareUri)
+        }
+    }
+
+    /** 拉起系统分享选择器（已在主线程） */
+    private fun launchShareChooser(context: Context, shareUri: Uri) {
         try {
             val shareIntent = Intent().apply {
                 action = Intent.ACTION_SEND
-                putExtra(Intent.EXTRA_STREAM, videoUri)
+                putExtra(Intent.EXTRA_STREAM, shareUri)
                 type = "video/mp4"
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }

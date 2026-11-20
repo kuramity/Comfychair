@@ -9,9 +9,12 @@ import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.rememberSplineBasedDecay
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -28,6 +31,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerDefaults
+import androidx.compose.foundation.pager.PagerSnapDistance
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -54,7 +59,7 @@ import androidx.compose.material3.VerticalDivider
 import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -62,9 +67,9 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -73,11 +78,16 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -91,6 +101,11 @@ import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.ui.components.ImageViewer
 import sh.hnet.comfychair.ui.components.MetadataBottomSheet
 import sh.hnet.comfychair.ui.components.VideoPlayer
+import sh.hnet.comfychair.ui.components.ViewerExitCleanup
+import sh.hnet.comfychair.ui.components.ViewerExitReason
+import sh.hnet.comfychair.ui.components.ViewerExitRegistry
+import sh.hnet.comfychair.ui.components.ViewerOverscroll
+import sh.hnet.comfychair.ui.components.ViewerPageMotion
 import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.components.ViewerSideBySide
 import sh.hnet.comfychair.ui.components.rememberLazyBitmap
@@ -163,10 +178,10 @@ fun MediaViewerScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val uiState by viewModel.uiState.collectAsState()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
-    val currentMetadata by viewModel.currentMetadata.collectAsState()
-    val isLoadingMetadata by viewModel.isLoadingMetadata.collectAsState()
+    val currentMetadata by viewModel.currentMetadata.collectAsStateWithLifecycle()
+    val isLoadingMetadata by viewModel.isLoadingMetadata.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
 
     // Layout constants - 8dp because navigationBarsPadding() adds ~24dp, totaling ~32dp like Workflow Editor
@@ -184,6 +199,108 @@ fun MediaViewerScreen(
     // 关闭 = 回退旧的覆盖层方案（在截图之上画黑矩形，即 E3 Canvas）
     val revealHolePunchEnabled = remember { AppSettings.isGalleryRevealHolePunch(context) }
 
+    // ============================================================
+    // G6（任务书 12.2）：退出相关状态与**唯一清理入口**
+    // ============================================================
+    // 为什么这些状态要从 pager 代码块里提到组合最外层：
+    // 它们原先只在 pager 作用域可见，于是"退出清理"只能各写一份 —— 下滑与双指收缩
+    // 在 ImageViewer 里各清各的，系统返回（BackHandler）则**完全够不到**档位进度与
+    // 越界位移，退出时 pager 的 graphicsLayer 还带着那 0~18% 视口宽的平移量。
+    // finish() 取的窗口转场快照因此是一幅"画歪了的图"，淡出时就像一层贴歪的残影。
+    // 提到最外层后，三条路径统一调 exitViewer(reason)（任务书实施指令 1）。
+    //
+    // remember 仍以条目列表指纹为 key：删图会让 pager 整段重建，档位与越界状态
+    // 照旧回到中性值（与提升前的行为一致）。
+    val itemsKey = uiState.items.map { "${it.promptId}_${it.filename}" }.joinToString(",")
+
+    // 并排预览三级手势的进度状态（语义见 ViewerSideBySide：0 = 全屏；1 = 并排；1.5 = 临时缩小档）
+    var sideProgress by remember(itemsKey) { mutableFloatStateOf(0f) }
+    // 本次捏合的起始进度：ImageViewer 只上报"自手势起点累计的缩放倍率"，
+    // 换算成绝对进度必须知道起点（全屏 0 / 并排 1 / 吸附动画被打断的中间值）
+    var gestureBaseProgress by remember(itemsKey) { mutableFloatStateOf(0f) }
+    var progressJob by remember(itemsKey) { mutableStateOf<Job?>(null) }
+    var pagerSize by remember(itemsKey) { mutableStateOf(IntSize.Zero) }
+
+    // G1（v4.16.11）：横向越界（rubber-band）位移，px、带符号。
+    // 全屏与并排（队列）两态共用同一套状态与同一段回弹动画——
+    // 手感一致由"同一实现"保证，而不是两套参数各调一遍。
+    // 判定与位移映射是纯函数（ViewerOverscroll，JVM 单测钉住）。
+    var overscrollPx by remember(itemsKey) { mutableFloatStateOf(0f) }       // 当前显示的越界位移
+    var overscrollRawDrag by remember(itemsKey) { mutableFloatStateOf(0f) }  // 原始手指累计（未衰减）
+    var overscrollSettleJob by remember(itemsKey) { mutableStateOf<Job?>(null) }
+
+    // G2/G3（v4.16.12）：手指是否按在 pager 上（第一根按下 → 全部抬起）。
+    // 翻页位移状态机里唯一的"手势相位"信号：手势进行中禁止任何程序化
+    // 滚动/归零写回翻页位移（G3 规则 1/2），手势结束后才允许吸附。
+    // 由 pager 那一层被动观察指针得到（不消费任何事件）。
+    var pagerGestureActive by remember(itemsKey) { mutableStateOf(false) }
+
+    // G4（任务书 11.4）：竖滑删除手势相位（页内 ImageViewer 上报）。
+    // **轴间仲裁的屏幕侧一半**：删除手势激活期间冻结横向越界的增量消费与
+    // fling 速度接管，也冻结"静止残留归零"的吸附前置归零 —— 组件侧另一半是
+    // ImageViewer 纵向锁定后的事件全量 consume（pager 拿不到增量，吸附没有输入）。
+    // 用 State 而不是普通 Boolean：越界 NestedScrollConnection 是 remember(pagerState)
+    // 缓存的连接对象，闭包只能持有状态引用读最新值（每次组合重建的局部变量会被冻结）。
+    val swipeDeleteActiveState = remember(itemsKey) { mutableStateOf(false) }
+
+    // G6：页内组件（ImageViewer）把"图层复位"注册到这里，统一入口按同一顺序调用。
+    // 系统返回这条路径不经过 ImageViewer 的手势代码，没有注册表就只能在 BackHandler
+    // 里再抄一份清理 —— 正是任务书禁止的"各留一份"。
+    val exitRegistry = remember { ViewerExitRegistry() }
+    // 防重入：转场中的动画完成回调、pager 重建都可能再次请求退出。
+    // 重复退出不得累积动画、不得重复 finish（G6 验收项"重复进出不得累积"）
+    val exitStarted = remember { mutableStateOf(false) }
+
+    /**
+     * 查看器退出的唯一清理入口（G6，任务书 12.2 实施指令 1）。
+     *
+     * 三条退出路径 —— 下滑脱离（DISMISS_DRAG）、双指收缩（PINCH_IN）、
+     * 系统返回（SYSTEM_BACK）—— 全部只调用本函数；reason **只进日志**：
+     * 清理范围与 reason 无关（字段清单见 [ViewerExitCleanup.plan]，单测钉住同一性），
+     * 退出转场也与 reason 无关（[ViewerExitCleanup.playsContentSideTransition] 恒 false，
+     * 三条路径共用同一段窗口淡出，不允许谁再自播一段）。
+     */
+    fun exitViewer(reason: ViewerExitReason) {
+        if (exitStarted.value) {
+            if (BuildConfig.DEBUG) {
+                Log.d("ViewerExit", "忽略重复退出请求 reason=$reason")
+            }
+            return
+        }
+        exitStarted.value = true
+        if (BuildConfig.DEBUG) {
+            Log.d(
+                "ViewerExit",
+                "退出清理 reason=$reason 字段=${ViewerExitCleanup.plan(reason).size} 项"
+            )
+        }
+        // ① 取消屏幕级在途动画：档位吸附、越界回弹
+        progressJob?.cancel()
+        progressJob = null
+        overscrollSettleJob?.cancel()
+        overscrollSettleJob = null
+        // ② 复位屏幕级位移与手势相位（ViewerExitCleanup.SCREEN_FIELDS）
+        overscrollPx = 0f
+        overscrollRawDrag = 0f
+        pagerGestureActive = false
+        // ③ 页内图层复位（ViewerExitCleanup.PAGE_FIELDS）：取消缩放/回位/收尾动画、
+        //    置位退出防重入标志。三条路径共用这一份实现（ImageViewer 注册进来的同一个回调）
+        exitRegistry.fire(reason)
+        // ④ 退出转场**只有窗口层那一段**（res/anim/viewer_fade_out_shrink），三条路径共用。
+        //    这里不再按 reason 决定"要不要再多播一段"：G6 的残影正是双指收缩自播了一段
+        //    内容层淡出、播完又把标志位翻回不透明、随后窗口快照把这层图片淡到宿主页上。
+        //    飞回落格那条（E4）仍由 ImageViewer 的 onFlyBackCompleted 抑制窗口转场，
+        //    因为它的画面已经无缝落到格子上，与"淡出"无关。
+        // ⑤ 关闭查看器。宿主页的交互与焦点由 Activity 栈恢复（finish 后宿主页重新获得
+        //    窗口焦点与输入），不再额外做"恢复可点击"的补丁
+        onClose()
+    }
+
+    // 手势/事件回调里要用最新一次的 exitViewer（局部函数每次组合重建）
+    val currentExitViewer by rememberUpdatedState<(ViewerExitReason) -> Unit> { reason ->
+        exitViewer(reason)
+    }
+
     // Metadata bottom sheet state
     var showMetadataSheet by remember { mutableStateOf(false) }
 
@@ -195,8 +312,10 @@ fun MediaViewerScreen(
     }
 
     // Handle system back button - ensures onClose() is called with proper result
+    // G6：系统返回走与手势完全相同的清理入口（旧实现直接 onClose()，
+    // 页内缩放/收尾状态与 pager 平移量都没人复位）
     BackHandler {
-        onClose()
+        currentExitViewer(ViewerExitReason.SYSTEM_BACK)
     }
 
     // Handle events
@@ -210,12 +329,19 @@ fun MediaViewerScreen(
                     // Items list changed, pager will recompose with new key
                 }
                 is MediaViewerEvent.Close -> {
-                    onClose()
+                    // G6：删空等自动关闭同样只走统一入口
+                    currentExitViewer(ViewerExitReason.AUTO_CLOSE)
                 }
             }
         }
     }
 
+    // 容器背景 = 查看器唯一的黑化来源（G1，v4.16.11）。
+    // 并排（队列）态页内不再画"档位宽度黑"补丁：两侧 15% 露边区、无邻页的一端、
+    // 横向越界跟手露出的新带，全部靠这一层纯黑承接。任何"页内黑色遮挡层"都不再
+    // 承担背景职责——只保留透出遮罩（下拉时按 alpha 淡出）与全屏态的满页黑
+    // （盖住背后的图库截图）。根 Box 必须先于所有内容绘制，pager 平移之后
+    // 露出的边带才看到的是黑。
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -226,16 +352,28 @@ fun MediaViewerScreen(
             ViewerMode.GALLERY -> {
                 if (uiState.items.isNotEmpty()) {
                     // Key the pager by items list identity to force recreation on deletion
-                    val itemsKey = uiState.items.map { "${it.promptId}_${it.filename}" }.joinToString(",")
+                    // （G6：itemsKey 的计算提到组合最外层 —— 退出清理要以同一个 key
+                    //  复位档位/越界状态，不能让它们留在只有手势够得到的作用域里）
 
-                    // B-23b 第三批：进入时的初始页。刻意放在 key(itemsKey) 之外——删除
-                    // 条目会改变 itemsKey 并销毁内部作用域，initialPage 若放在里面会被
-                    // 重置成删除后的 currentIndex，"进入那一刻的页"语义就丢了
-                    val initialPage = remember {
-                        uiState.currentIndex.coerceIn(0, uiState.items.size - 1)
+                    // B-23b 第三批：下拉透出/飞回只对"进入查看器时的那一张"启用。
+                    // 这里按**稳定键**记（不是索引）：删除条目后索引会移位，用索引判等会
+                    // 把旧的透出截图挂到另一张图上。
+                    val entryItemKey = remember {
+                        uiState.items.getOrNull(uiState.currentIndex)?.let {
+                            "${it.promptId}_${it.filename}"
+                        }
                     }
 
                     key(itemsKey) {
+                        // P1-24：initialPage 每次重建都重新读 ViewModel 的 currentIndex。
+                        // 修复前它被 remember 在 key() **之外**——删除条目会让 itemsKey 变化、
+                        // 整段 pager 重建，而 initialPage 仍是"进入那一刻的页"，
+                        // 于是删完一张就跳回进入页，而不是停在删除位置旁边。
+                        // 现在 currentIndex 由 ViewModel 在删除时已调整到合理位置，
+                        // 重建后直接用它；普通翻页不改变 itemsKey，pager 不会被重建。
+                        val initialPage = uiState.currentIndex.coerceIn(
+                            0, (uiState.items.size - 1).coerceAtLeast(0)
+                        )
                         val pagerState = rememberPagerState(
                             initialPage = initialPage,
                             pageCount = { uiState.items.size }
@@ -249,32 +387,110 @@ fun MediaViewerScreen(
                         // 脱节，回退纯黑 + 现有下滑关闭。视频页同样不启用（VideoPlayer
                         // 无分段遮罩链路，且初始页若是视频，透出会从播放器背后漏截图）
                         val revealItem = uiState.items.getOrNull(pagerState.currentPage)
+                        // 用稳定键判断"是否还是进入时那一张"（P1-24：索引会因删除移位）
+                        val revealItemKey = revealItem?.let { "${it.promptId}_${it.filename}" }
                         val revealActive = dismissRevealEnabled &&
                             gallerySnapshot != null && galleryCellRect != null &&
-                            pagerState.currentPage == initialPage &&
-                            revealItem?.isVideo == false
+                            revealItemKey != null && revealItemKey == entryItemKey &&
+                            revealItem.isVideo == false
+
+                        // ============================================================
+                        // 并排进度 + 横向越界位移
+                        // ============================================================
+                        // 这六个状态（sideProgress / gestureBaseProgress / progressJob /
+                        // pagerSize / overscrollPx / overscrollRawDrag / overscrollSettleJob /
+                        // pagerGestureActive）已提到组合最外层，见本文件顶部
+                        // "G6：退出相关状态与唯一清理入口"一节 —— 退出清理必须能在
+                        // BackHandler（系统返回）这条路径里够到它们，不能留在本作用域里。
+                        // 进度语义见 ViewerSideBySide：0 = 全屏；1 = 并排（当前页占视口 70%、
+                        // 两侧各露 15%）；1.5 = 临时缩小档（55%）。捏合期间直接写值跟手，
+                        // 松手由 animateProgressTo 做档位吸附。
+
+                        // 新手指落下时接管正在回弹的位移：由当前位移反解 raw 作为起点，
+                        // 否则位移会先跳回 0 再跟手（可见跳变）
+                        fun takeOverOverscrollSettle() {
+                            val job = overscrollSettleJob ?: return
+                            if (!job.isActive) {
+                                overscrollSettleJob = null
+                                return
+                            }
+                            job.cancel()
+                            overscrollSettleJob = null
+                            overscrollRawDrag = ViewerOverscroll.rawDistanceForDisplacement(
+                                displacement = overscrollPx,
+                                maxDistance = ViewerOverscroll.maxDisplacementPx(
+                                    pagerSize.width.toFloat()
+                                ),
+                                damping = ViewerOverscroll.DAMPING
+                            )
+                        }
+
+                        // 松手回弹：位移回到 0，原始累计同步清零。tween（非弹簧）——
+                        // 弹簧过冲就是验收里"二次回跳"的那种毛病。
+                        // 已在回弹中直接返回：抬手事件与 fling 分发在同一帧里各调一次，
+                        // 重启动画会让回弹从半途重新计时（看起来像卡了一下）
+                        fun settleOverscroll() {
+                            if (overscrollSettleJob?.isActive == true) return
+                            overscrollSettleJob?.cancel()
+                            val start = overscrollPx
+                            overscrollRawDrag = 0f
+                            if (start == 0f) {
+                                overscrollPx = 0f
+                                overscrollSettleJob = null
+                                return
+                            }
+                            overscrollSettleJob = scope.launch {
+                                animate(
+                                    initialValue = start,
+                                    targetValue = 0f,
+                                    animationSpec = tween(
+                                        ViewerOverscroll.SETTLE_DURATION_MS,
+                                        easing = FastOutSlowInEasing
+                                    )
+                                ) { value, _ -> overscrollPx = value }
+                                overscrollPx = 0f
+                            }
+                        }
 
                         // E1/E2 背景截图层：铺满屏幕、1:1 对齐进查看器那一刻的屏幕像素
                         //（截图本身就是全屏，不缩放不裁剪）。初始态页内黑底遮罩
                         //（ImageViewer drawBehind）alpha=1 把它盖成纯黑（E1）；
-                        // 下拉偏离原位约 10% 后遮罩快速淡到 0.2，图库从背后透出（E2）
+                        // 下拉偏离原位约 10% 后遮罩快速淡到 0.2，图库从背后透出（E2）。
+                        //
+                        // G1：截图只在**全屏态**参与画面。并排（队列）态一旦露边，
+                        // 截图就会从没有邻页的那一端 / 越界新带里漏出真实图库网格
+                        // （E1/E2 的穿帮）。所以并排进度一离开 0，截图整层透明——
+                        // 露出区域交给屏幕根容器的纯黑背景，与页内补丁宽度彻底无关。
+                        // 同时截图跟随越界位移一起平移：越界露出的新带必须是容器黑，
+                        // 不能是"截图被推走后仍留在原地"的图库画面。
                         if (revealActive && gallerySnapshot != null && galleryCellRect != null) {
-                            Image(
-                                bitmap = gallerySnapshot.asImageBitmap(),
-                                contentDescription = null,
-                                contentScale = ContentScale.FillBounds,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                            // E3：目标格子挖黑占位——N2 挖空开关关闭时的旧覆盖层路径。
-                            // 挖空开启（默认）时截图里那格已经是"空置格子"，这里不再
-                            // 画黑矩形，避免"空置格 + 黑块"叠两层
-                            if (!revealHolePunchEnabled) {
-                                Canvas(Modifier.fillMaxSize()) {
-                                    drawRect(
-                                        color = Color.Black,
-                                        topLeft = Offset(galleryCellRect.left, galleryCellRect.top),
-                                        size = Size(galleryCellRect.width, galleryCellRect.height)
-                                    )
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer {
+                                        // sideProgress 读在 layer lambda 内：捏合每帧只更新
+                                        // 图层属性，不触发整页重组
+                                        alpha = if (sideProgress == 0f) 1f else 0f
+                                        translationX = overscrollPx
+                                    }
+                            ) {
+                                Image(
+                                    bitmap = gallerySnapshot.asImageBitmap(),
+                                    contentDescription = null,
+                                    contentScale = ContentScale.FillBounds,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                                // E3：目标格子挖黑占位——N2 挖空开关关闭时的旧覆盖层路径。
+                                // 挖空开启（默认）时截图里那格已经是"空置格子"，这里不再
+                                // 画黑矩形，避免"空置格 + 黑块"叠两层
+                                if (!revealHolePunchEnabled) {
+                                    Canvas(Modifier.fillMaxSize()) {
+                                        drawRect(
+                                            color = Color.Black,
+                                            topLeft = Offset(galleryCellRect.left, galleryCellRect.top),
+                                            size = Size(galleryCellRect.width, galleryCellRect.height)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -288,7 +504,7 @@ fun MediaViewerScreen(
 
                                         // Update cache priorities based on new position
                                         val allKeys = uiState.items.map {
-                                            MediaCacheKey(it.promptId, it.filename)
+                                            MediaCacheKey.of(it.promptId, it.filename, it.type)
                                         }
                                         MediaCache.updateNavigationPriorities(page, allKeys)
                                     }
@@ -296,17 +512,42 @@ fun MediaViewerScreen(
                         }
 
                         // ============================================================
+                        // 翻页位移状态机 · 静止残留归零（N5 治本；G3 规则 2 的唯一例外）
+                        // ============================================================
+                        // pager 静止却带着非零翻页进度 = 双指接管取消了拖动、又没有 settle
+                        // （N5Probe 实测：残留值会一直留在那里）。归零只在**完全静止**时执行：
+                        // 手势按着、或拖动/惯性/程序化滚动在途，一律不碰 —— 那才是"手势中途
+                        // 重置翻页位移"，正是 G3 要根治的事（旧实现在捏合起点就调 scrollToPage，
+                        // 拖动未释放时它会挂在 pager 的 mutator 队列上，恢复时就是一次位移跳变）。
+                        // 渲染侧不依赖这次归零（displayPageFraction 在静止时直接按 0 显示），
+                        // 它是治本兜底：把状态修好，下一次拖动才始终从整页起步。
+                        LaunchedEffect(pagerState) {
+                            snapshotFlow {
+                                Triple(
+                                    pagerState.isScrollInProgress,
+                                    // G4：竖滑删除激活同样算"手势占用"——静止归零这条
+                                    // 吸附前置动作在删除手势期间必须放弃（轴间仲裁）
+                                    pagerGestureActive || swipeDeleteActiveState.value,
+                                    pagerState.currentPageOffsetFraction
+                                )
+                            }.collect { (scrolling, gestureActive, fraction) ->
+                                if (ViewerPageMotion.mayNormalizeStalePager(
+                                        gestureActive = gestureActive,
+                                        scrollInProgress = scrolling,
+                                        pagerFraction = fraction
+                                    )
+                                ) {
+                                    pagerState.scrollToPage(pagerState.currentPage)
+                                }
+                            }
+                        }
+
+                        // ============================================================
                         // 并排预览三级手势（D1~D5，v4.16.2）
                         // ============================================================
-                        // 进度语义见 ViewerSideBySide：0 = 全屏；1 = 并排（当前页占视口 70%、
-                        // 两侧各露 15%）；1.5 = 临时缩小档（55%）。捏合期间直接写值跟手，
-                        // 松手由 animateProgressTo 做档位吸附。
-                        var sideProgress by remember { mutableFloatStateOf(0f) }
-                        // 本次捏合的起始进度：ImageViewer 只上报"自手势起点累计的缩放倍率"，
-                        // 换算成绝对进度必须知道起点（全屏 0 / 并排 1 / 吸附动画被打断的中间值）
-                        var gestureBaseProgress by remember { mutableFloatStateOf(0f) }
-                        var progressJob by remember { mutableStateOf<Job?>(null) }
-                        var pagerSize by remember { mutableStateOf(IntSize.Zero) }
+                        // 进度状态（sideProgress / gestureBaseProgress / progressJob /
+                        // pagerSize）与越界位移状态已在背景截图之前声明——截图层的
+                        // 可见性与平移由它们驱动，不能前向引用。
 
                         // 布尔派生：只有"越过 0.5"时才让分页内容重组，捏合中的每帧 Float 变化不穿透
                         val sideBySideActive by remember {
@@ -369,6 +610,10 @@ fun MediaViewerScreen(
                             {
                                 cancelProgressJob()
                                 gestureBaseProgress = sideProgress
+                                // G1：越界位移还挂着时落第二指捏合——先把 pager 平移
+                                // 回吸附位（260ms 回弹），否则整段捏合期间页面都带着
+                                // 那笔横向偏移，并排几何会算错位置
+                                settleOverscroll()
                                 // N5Probe（仅 debug 包输出）：手势起点快照
                                 if (BuildConfig.DEBUG) {
                                     Log.d(
@@ -379,61 +624,17 @@ fun MediaViewerScreen(
                                             "scrolling=${pagerState.isScrollInProgress}"
                                     )
                                 }
-                                // N5（v4.16.8，返工修订）：翻页拖动进行中落第二指时，双指
-                                // 事件被 ImageViewer consume，pager 的 drag 被打断，
-                                // currentPageOffsetFraction 可能冻结在中间值。N5Probe 实测
-                                // （22.5% 残留复合手势）：这里的 scrollToPage 会挂在 pager
-                                // 的 mutator 队列上不返回（post/later 日志 12s+ 未出现），
-                                // 归零实际由 pager 打断后的 settle 完成——时序不受我方
-                                // 控制。所以本调用只是尽力归零的兜底（无动画、不与
-                                // animateScrollToPage 竞争、只在确实有残留时执行），
-                                // 确定性保障放在页平移的 graphicsLayer 里：并排态直接把
-                                // offsetFraction 视为 0（见下方 N5 返工注释）。本回调每次
-                                // 手势只触发一次（ImageViewer 的
-                                // wasSideBySidePinch 门控），天然满足"首次判定"
-                                if (ViewerSideBySide.shouldNormalizePager(
-                                        pagerState.currentPageOffsetFraction
-                                    )
-                                ) {
-                                    // N5Probe（v4.16.8 取证，仅 debug 包输出）：scrollToPage
-                                    // 对"被手指拖动中/拖动被打断的 pager"是否真的生效——
-                                    // pre=调用瞬间值，post=suspend 返回后的值，later=让出
-                                    // 一帧后再读（检测 pager settle 是否又写回残留值）。
-                                    if (BuildConfig.DEBUG) {
-                                        Log.d(
-                                            "N5Probe",
-                                            "normalize before offset=" +
-                                                "${pagerState.currentPageOffsetFraction} " +
-                                                "page=${pagerState.currentPage} " +
-                                                "scrolling=${pagerState.isScrollInProgress}"
-                                        )
-                                    }
-                                    scope.launch {
-                                        if (BuildConfig.DEBUG) {
-                                            Log.d(
-                                                "N5Probe",
-                                                "normalize pre offset=" +
-                                                    "${pagerState.currentPageOffsetFraction}"
-                                            )
-                                        }
-                                        pagerState.scrollToPage(pagerState.currentPage)
-                                        if (BuildConfig.DEBUG) {
-                                            Log.d(
-                                                "N5Probe",
-                                                "normalize post offset=" +
-                                                    "${pagerState.currentPageOffsetFraction}"
-                                            )
-                                        }
-                                        withFrameNanos { }
-                                        if (BuildConfig.DEBUG) {
-                                            Log.d(
-                                                "N5Probe",
-                                                "normalize later offset=" +
-                                                    "${pagerState.currentPageOffsetFraction}"
-                                            )
-                                        }
-                                    }
-                                }
+                                // G2/G3（v4.16.12）：这里**不再**在手势中途归零翻页位移。
+                                // 历史实现（v4.16.8 N5 返工）在捏合起点调 scrollToPage：
+                                // 拖动未释放时该调用会挂在 pager 的 mutator 队列上十几秒
+                                // （N5Probe 实测），一旦恢复执行就是一次"手势中途的位移
+                                // 重置"——正是 G3 禁止的第二种回抖来源。现在：
+                                // ① 手势期间的位移口径由 ViewerPageMotion.displayPageFraction
+                                //    统一处理（pager 静止时残留值不参与显示，不会把整页推出中心）；
+                                // ② 真正的归零放到「手指抬起且完全静止之后」的
+                                //    LaunchedEffect（见上方"静止残留归零"），只执行一次。
+                                // 本回调每次手势只触发一次（ImageViewer 的
+                                // wasSideBySidePinch 门控）。
                             }
                         } else {
                             null
@@ -488,11 +689,175 @@ fun MediaViewerScreen(
                             }
                         }
 
+                        // ============================================================
+                        // 横向越界（rubber-band）机制（G1，v4.16.11）
+                        // ============================================================
+                        // 全屏与并排（队列）两态共用这一套：pager 在两端继续外拉时，
+                        // 增量进 overscrollRawDrag，经纯函数非线性衰减成位移
+                        // overscrollPx，写在 pager 的 graphicsLayer 平移上；露出区域
+                        // 由屏幕根容器的纯黑背景承接（见本文件根 Box 的 background）。
+                        // 松手回弹到吸附位（位移回 0），不交给弹簧（避免二次回跳）。
+                        //
+                        // 页数取最新值：连接对象按 remember(pagerState) 缓存，直接读
+                        // uiState.items.size 会冻结在首次组合时的页数（删除条目后会错判边界）
+                        val currentPageCount by rememberUpdatedState(uiState.items.size)
+
+                        // 只吃手指拖动（UserInput）：pager 自身吸附/fling 产生的增量走
+                        // SideEffect，不能被当成越界（否则翻页途中会出现假位移）
+                        val overscrollConnection = remember(pagerState) {
+                            object : NestedScrollConnection {
+                                override fun onPreScroll(
+                                    available: Offset,
+                                    source: NestedScrollSource
+                                ): Offset {
+                                    if (source != NestedScrollSource.UserInput) return Offset.Zero
+                                    if (!available.x.isFinite() || available.x == 0f) return Offset.Zero
+                                    // G4 轴间仲裁：竖滑删除手势在途 → 越界机制完全让位
+                                    // （回弹接管、增量消费、fling 吞速一概不参与）。
+                                    // 正常情况下页内 consume 已让 pager 收不到增量，
+                                    // 这里是显式第二道闸：多指抖动等异常输入不得让两轴同动
+                                    if (swipeDeleteActiveState.value) return Offset.Zero
+                                    takeOverOverscrollSettle()
+                                    if (overscrollRawDrag == 0f) return Offset.Zero
+                                    // 回拖：先把已产生的越界位移吃回来，吃到零点后
+                                    // 剩余量由 reverseStep 的 consumed 留给 pager 翻页
+                                    val step = ViewerOverscroll.reverseStep(
+                                        rawDrag = overscrollRawDrag,
+                                        delta = available.x,
+                                        maxDistance = ViewerOverscroll.maxDisplacementPx(
+                                            pagerSize.width.toFloat()
+                                        ),
+                                        damping = ViewerOverscroll.DAMPING
+                                    )
+                                    overscrollRawDrag = step.rawDrag
+                                    overscrollPx = step.displacement
+                                    return Offset(step.consumed, 0f)
+                                }
+
+                                override fun onPostScroll(
+                                    consumed: Offset,
+                                    available: Offset,
+                                    source: NestedScrollSource
+                                ): Offset {
+                                    if (source != NestedScrollSource.UserInput) return Offset.Zero
+                                    if (!available.x.isFinite() || available.x == 0f) return Offset.Zero
+                                    // G4 轴间仲裁：同 onPreScroll（第二道闸）
+                                    if (swipeDeleteActiveState.value) return Offset.Zero
+                                    // 只有"已在两端仍未消费掉"的增量才算越界：页间正常翻页的
+                                    // 增量 pager 自己吃掉了，available 为 0，走不到这里
+                                    if (!ViewerOverscroll.isOutOfBoundsDirection(
+                                            pagerState.currentPage,
+                                            currentPageCount,
+                                            available.x
+                                        )
+                                    ) {
+                                        return Offset.Zero
+                                    }
+                                    takeOverOverscrollSettle()
+                                    val step = ViewerOverscroll.accumulateOutward(
+                                        rawDrag = overscrollRawDrag,
+                                        delta = available.x,
+                                        maxDistance = ViewerOverscroll.maxDisplacementPx(
+                                            pagerSize.width.toFloat()
+                                        ),
+                                        damping = ViewerOverscroll.DAMPING
+                                    )
+                                    overscrollRawDrag = step.rawDrag
+                                    overscrollPx = step.displacement
+                                    // 全部消费：平台 overscroll effect 已关闭
+                                    //（overscrollEffect = null），这里消费是为了让回拖时
+                                    // 增量不再被重复计入 pager
+                                    return Offset(step.consumed, 0f)
+                                }
+
+                                override suspend fun onPreFling(available: Velocity): Velocity {
+                                    // G4 轴间仲裁：删除手势在途不接管 fling（详见 onPreScroll 注释）
+                                    if (swipeDeleteActiveState.value) return Velocity.Zero
+                                    if (overscrollRawDrag == 0f && overscrollPx == 0f) {
+                                        return Velocity.Zero
+                                    }
+                                    // G2 补漏（v4.16.13）：吞不吞甩速要看**方向**，不能一刀切。
+                                    // 旧实现只要处在越界状态就 return available，把速度全吞了，
+                                    // 于是"越界后快速回甩"（甩向页内、pager 本来能翻页）也没有
+                                    // 惯性，只能靠拖动过半吸附 —— 与拖拽路径 reverseStep 的口径
+                                    // （同向不消费、越过零点把余量交 pager）自相矛盾。
+                                    // 纯函数判定见 ViewerOverscroll.shouldSwallowFlingVelocity。
+                                    // 位移回弹与方向无关：两种情况都要 settle 回吸附位。
+                                    val swallow = ViewerOverscroll.shouldSwallowFlingVelocity(
+                                        rawDrag = overscrollRawDrag,
+                                        displacement = overscrollPx,
+                                        velocityX = available.x
+                                    )
+                                    settleOverscroll()
+                                    return if (swallow) {
+                                        // 继续往外甩：两端没有可翻的页，速度不能交给 pager
+                                        available
+                                    } else {
+                                        // 甩向页内：速度整份交回 pager，走正常惯性跨页
+                                        Velocity.Zero
+                                    }
+                                }
+                            }
+                        }
+
+                        // ============================================================
+                        // 翻页位移状态机 · 松手后的惯性滑行（G2，v4.16.12）
+                        // ============================================================
+                        // 现状根因（框架字节码取证，Compose Foundation 1.10）：
+                        // PagerDefaults.flingBehavior 的默认参数是
+                        // `PagerSnapDistance.atMost(1)` —— 松手后滑行最多只吸附相邻一张，
+                        // 所以"快速甩动不产生跨页滑行"。速度本身没被丢弃（框架的
+                        // spline 摩擦衰减一直在算），被丢弃的是**跨页数**。
+                        //
+                        // 改法：保留框架的摩擦衰减轨迹（rememberSplineBasedDecay，与系统
+                        // 控件同一套物理），只把"跨页上限 + 吸附目标"换成纯函数：
+                        //   · 跨页上限 = ViewerPageMotion.flingPageCount(松手速度, 页距)
+                        //   · 吸附目标 = ViewerPageMotion.snapTargetPage(衰减终点, ...)
+                        // 慢速时跨页上限仍是 1 → 逐张手感与改动前完全一致。
+                        val pagerSnapDistance = remember(pagerState) {
+                            ViewerPagerSnapDistance { pagerState.pageCount }
+                        }
+                        val pagerFlingBehavior = PagerDefaults.flingBehavior(
+                            state = pagerState,
+                            pagerSnapDistance = pagerSnapDistance,
+                            decayAnimationSpec = rememberSplineBasedDecay()
+                        )
+
                         HorizontalPager(
                             state = pagerState,
+                            flingBehavior = pagerFlingBehavior,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .onSizeChanged { pagerSize = it },
+                                .onSizeChanged { pagerSize = it }
+                                // 越界位移：读在 layer lambda 内，拖动每帧只更新图层属性。
+                                // 放在最外层，让绘制与命中检测（嵌套滚动、抬手检测）一起平移
+                                .graphicsLayer { translationX = overscrollPx }
+                                .nestedScroll(overscrollConnection)
+                                // 抬手即回弹（被动观察，不消费任何事件）：越界回弹不能只
+                                // 依赖 fling 分发——零速抬手时 fling 是否下发由框架内部
+                                // 决定，位移会冻在半路。这一层只盯"最后一根手指抬起"，
+                                // 与 onPreFling（消费甩速、避免两端还带着速度翻页）互补。
+                                // G2/G3（v4.16.12）：同一观察点顺带维护手势相位——按下即
+                                // 关闭所有程序化写回翻页位移的入口，全部抬起才允许吸附/归零
+                                .pointerInput(Unit) {
+                                    awaitEachGesture {
+                                        awaitFirstDown(requireUnconsumed = false)
+                                        pagerGestureActive = true
+                                        try {
+                                            do {
+                                                val event = awaitPointerEvent()
+                                            } while (event.changes.any { it.pressed })
+                                        } finally {
+                                            // 松手与手势取消（被双指接管）都走这里：
+                                            // 之后才允许吸附（G3 规则 1）
+                                            pagerGestureActive = false
+                                        }
+                                        settleOverscroll()
+                                    }
+                                },
+                            // 平台 overscroll（Android 12+ 拉伸）关闭：越界跟手完全由上面
+                            // 的 rubber-band 接管，两端手感与全屏/并排两态严格一致
+                            overscrollEffect = null,
                             // 并排露边必须让 pager 提前组合相邻页（API 名 beyondViewportPageCount，
                             // 即派工单里的 beyondBoundsPageCount），否则两侧露出来的是黑底
                             beyondViewportPageCount = if (threeLevelEnabled) 1 else 0,
@@ -500,7 +865,11 @@ fun MediaViewerScreen(
                         ) { page ->
                             val item = uiState.items[page]
                             val isCurrentPage = page == pagerState.currentPage
-                            val cacheKey = MediaCacheKey(item.promptId, item.filename)
+                            val cacheKey = MediaCacheKey.of(item.promptId, item.filename, item.type)
+                            // 本页的稳定键：与 entryItemKey 比对，判断"是不是进入时那一张"
+                            //（P1-24：不能再用页索引，删除会让索引移位）
+                            val pageItemKey = "${item.promptId}_${item.filename}"
+                            val isEntryPage = pageItemKey == entryItemKey
 
                             // Lazy load bitmap from cache
                             val (bitmap, isBitmapLoading) = rememberLazyBitmap(
@@ -569,19 +938,21 @@ fun MediaViewerScreen(
                                         if (threeLevelEnabled) {
                                             val scale = ViewerSideBySide.pageFraction(sideProgress)
                                             // k = 本页相对"滚动中的当前位置"的页距（-1 左邻 / 0 当前 / +1 右邻）
-                                            // N5（v4.16.8 返工）：并排态把 pager 的翻页残留视为 0。
-                                            // N5Probe 实测：复合手势落第二指后，scrollToPage 会挂在
-                                            // pager 的 mutator 队列上不返回（在途手势未释放，挂起
-                                            // 12s+ 仍无 post），残留归零实际依赖 pager 被打断后
-                                            // "自行 settle"这条不受我方控制的路径。渲染层直接忽略
-                                            // 残留值：只要进入并排（sideProgress > 0），页距一律按
-                                            // "pager 已归零"计算，冻结值永远污染不了页平移；
-                                            // sideProgress == 0（全屏态）保持原样，正常翻页不受影响
-                                            val offsetFraction = if (sideProgress > 0f) {
-                                                0f
-                                            } else {
-                                                pagerState.currentPageOffsetFraction
-                                            }
+                                            // G3（v4.16.12）根因与修法：
+                                            // 旧实现只要处于并排态就无条件把翻页进度按 0 计算
+                                            // （`if (sideProgress > 0f) 0f`）。但 pager 自己仍在按
+                                            // 实时进度布局：currentPage 在进度 50% 处翻转的那一帧，
+                                            // 整数页距跳 1、实时进度补 -1，两者本该抵消；被强制成
+                                            // 0 之后只剩整数页距那一跳，整段页平移瞬移 0.3 个视口宽
+                                            // （档位系数 0.7）——这就是"自第 i 张往第 i+1 张拖、
+                                            // 越过约一半时前一图突然弹回并占据大半视口、把后图挤回"。
+                                            // 现在一律用实时进度（手势进度与显示单调一致）；
+                                            // 唯一返回 0 的情况是 pager **静止**却带着非零进度
+                                            // （N5 的取消残留），那时残留值本来就不该参与显示。
+                                            val offsetFraction = ViewerPageMotion.displayPageFraction(
+                                                pagerFraction = pagerState.currentPageOffsetFraction,
+                                                scrollInProgress = pagerState.isScrollInProgress
+                                            )
                                             val pageDistance = (page - pagerState.currentPage) -
                                                 offsetFraction
                                             translationX = pageDistance * size.width * (scale - 1f)
@@ -602,8 +973,13 @@ fun MediaViewerScreen(
                                             // 表现就是"点露边页只放大不翻页"（纯函数里带单测钉住）
                                             val fraction =
                                                 ViewerSideBySide.pageFraction(sideProgress)
+                                            // 与页平移用同一个进度口径（displayPageFraction），
+                                            // 否则残留值会让命中分区与实际画面对不上
                                             val pageDistance = (page - pagerState.currentPage) -
-                                                pagerState.currentPageOffsetFraction
+                                                ViewerPageMotion.displayPageFraction(
+                                                    pagerFraction = pagerState.currentPageOffsetFraction,
+                                                    scrollInProgress = pagerState.isScrollInProgress
+                                                )
                                             val screenX = ViewerSideBySide.viewportXFromImageLocal(
                                                 imageLocalX = imageLocalX,
                                                 viewportWidth = pagerSize.width.toFloat(),
@@ -631,17 +1007,20 @@ fun MediaViewerScreen(
                                     cacheKey = cacheKey,
                                     failureCategory = failureCategory,
                                     onRetry = { viewModel.retryCurrentItem() },
-                                    // 下滑脱离手势的关闭出口复用屏幕级 onClose（唯一关闭链路）
-                                    onViewerClose = onClose,
-                                    // E1~E5 只挂在进入时的那一页图片上（revealActive 已含
-                                    // currentPage == initialPage；翻页动画中的邻页 page 不同）
-                                    flyBackCellRect = if (revealActive && page == initialPage) {
+                                    // G6：下滑/双指收缩的退出都交给屏幕级唯一清理入口
+                                    onViewerClose = currentExitViewer,
+                                    exitRegistry = exitRegistry,
+                                    // E1~E5 只挂在进入时的那一页图片上（revealActive 已含 currentPage == entryPage；
+                                    // 翻页动画中的邻页 page 不同）
+                                    flyBackCellRect = if (revealActive && isEntryPage) {
                                         galleryCellRect
                                     } else {
                                         null
                                     },
+                                    // G1：并排（队列）态页内不画整页黑（背景由容器负责）
+                                    sideBySideActive = sideBySideActive,
                                     // E4：飞回已无缝落格，关闭时抑制 Activity 层缩小淡出
-                                    onFlyBackCompleted = if (revealActive && page == initialPage) {
+                                    onFlyBackCompleted = if (revealActive && isEntryPage) {
                                         { MediaViewerActivity.suppressNextExitTransition = true }
                                     } else {
                                         null
@@ -672,7 +1051,35 @@ fun MediaViewerScreen(
                                     onSideBySide = if (item.isVideo) null else sideHandler,
                                     onSideBySideSettle = if (item.isVideo) null else sideSettleHandler,
                                     onSideBySideTap = if (item.isVideo) null else sideTap,
-                                    sideBySideScale = if (item.isVideo) null else sideScaleProvider
+                                    sideBySideScale = if (item.isVideo) null else sideScaleProvider,
+                                    // ============================================================
+                                    // G4（任务书 11.4）：队列模式竖滑快捷删除接线
+                                    // ============================================================
+                                    // 只挂给「当前在架的图片页」：
+                                    // - 邻页不挂 —— 露边上的纵滑删除目标说不清（误删邻居），
+                                    //   维持既有语义（邻页纵向手势不消费、翻页优先）；
+                                    // - 视频页不挂 —— 并排本来就是图片专属体验（进度会被
+                                    //   强制收回全屏），竖滑走播放器既有链路；
+                                    // - threeLevelEnabled=false（三级手势安全阀关闭）时
+                                    //   enabled 恒 false —— 队列态不存在，删除手势整体停用，
+                                    //   下滑关闭行为与 v4.16.13 完全一致。
+                                    // 语义判定按手势起点锁定在 ImageViewer 内做
+                                    // （enabled 只在纵向锁定那一帧读一次）。
+                                    swipeDeleteEnabled = if (isCurrentPage && !item.isVideo) {
+                                        { threeLevelEnabled && sideBySideActive }
+                                    } else {
+                                        null
+                                    },
+                                    onSwipeDeleteCommit = if (isCurrentPage && !item.isVideo) {
+                                        { viewModel.deleteCurrentItem() }
+                                    } else {
+                                        null
+                                    },
+                                    onSwipeDeletePhaseChange = if (isCurrentPage && !item.isVideo) {
+                                        { active -> swipeDeleteActiveState.value = active }
+                                    } else {
+                                        null
+                                    }
                                 )
 
                                 // 原图超过下载上限时的说明 + 取原图的途径。
@@ -746,7 +1153,7 @@ fun MediaViewerScreen(
                 )
                 val singleFailure = if (showState == ViewerShowState.FAILED && item != null) {
                     inferFailureCategory(
-                        MediaCacheKey(item.promptId, item.filename),
+                        MediaCacheKey.of(item.promptId, item.filename, item.type),
                         uiState.loadFailure
                     )
                 } else {
@@ -760,8 +1167,9 @@ fun MediaViewerScreen(
                     onSingleTap = { viewModel.toggleUiVisibility() },
                     failureCategory = singleFailure,
                     onRetry = { viewModel.retryCurrentItem() },
-                    // 下滑脱离手势的关闭出口复用屏幕级 onClose（唯一关闭链路）
-                    onViewerClose = onClose
+                    // G6：单图模式同样只走屏幕级唯一清理入口
+                    onViewerClose = currentExitViewer,
+                    exitRegistry = exitRegistry,
                 )
             }
         }
@@ -824,6 +1232,39 @@ fun MediaViewerScreen(
         // ① 下滑手势（MediaContent → ImageViewer/VideoPlayer 的 onViewerClose）
         // ② 并排态张开手指回全屏、并排态下拉关闭
         // ③ 系统返回键（本页顶部 BackHandler）
+        // G6（任务书 12.2）：三条入口全部只调用本文件顶部的 exitViewer(reason)，
+        // 取消在途动画 + 复位越界位移 + 经注册表复位页内图层，然后才 onClose()。
+        // 历史上这里是"三份清理"（收缩路径还自播一段内容层淡出），残影就出在那。
+
+        // G4（任务书 11.4）：竖滑删除后的**一次性撤销条**（限时 2 秒，用户已确认的
+        // 交互决策）。挂在工具栏同侧、浮于其上：删除落点就在拇指够得到的下半屏，
+        // 撤销按钮必须出现在图片消失的地方附近。超时 / 再次删除 / 队列删空都会让它消失
+        // （槽位逻辑在 MediaViewerViewModel.trashUndo，条目本体始终在回收站界面可恢复）。
+        val trashUndo by viewModel.trashUndo.collectAsStateWithLifecycle()
+        if (uiState.mode == ViewerMode.GALLERY && trashUndo != null) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 76.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.inverseSurface,
+                contentColor = MaterialTheme.colorScheme.inverseOnSurface
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                ) {
+                    Text(
+                        text = stringResource(R.string.msg_trash_moved),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    TextButton(onClick = { viewModel.undoTrashMove() }) {
+                        Text(stringResource(R.string.button_undo))
+                    }
+                }
+            }
+        }
 
         // Metadata bottom sheet
         if (showMetadataSheet) {
@@ -927,11 +1368,20 @@ private fun MediaContent(
     // 失败占位（H1-a/H1-b）：调用方判定"内容缺失且不在加载"后传入；null = 不显示失败态
     failureCategory: ViewerFailureCategory? = null,
     onRetry: (() -> Unit)? = null,
-    // 下滑脱离关闭的回调；null = 组件不启用脱离手势（缩略图槽位等无关闭语义的场景）
-    onViewerClose: (() -> Unit)? = null,
+    // 关闭查看器的回调；null = 组件不启用关闭语义（缩略图槽位等场景）
+    //
+    // G6（任务书 12.2）：签名带**退出原因**。图片页的下滑脱离与双指收缩都经
+    // MediaViewerScreen.exitViewer(reason) 这**一个**清理入口；视频页播放器只有
+    // "关闭"一种语义，由下面包成 DISMISS_DRAG 后转调。
+    onViewerClose: ((ViewerExitReason) -> Unit)? = null,
+    // G6：ImageViewer 注册"页内图层复位"用的注册表（同一实例由屏幕级入口统一触发）
+    exitRegistry: ViewerExitRegistry? = null,
     // B-23b 第三批（E1~E5）：本页的飞回目标格子矩形（window px）。非 null = 该页启用
     // 下拉透出与飞回（分段遮罩在 ImageViewer 内）；null = 行为与旧版完全一致
     flyBackCellRect: ViewerRect? = null,
+    // G1（v4.16.11）：本页当前是否处于并排（队列）态。并排态下页内不再画任何整页黑
+    // （背景由容器负责）；加载中/失败态的"盖截图黑"只在全屏态需要
+    sideBySideActive: Boolean = false,
     // E4：飞回动画完成后的通知（先于 onViewerClose），上层据此抑制 Activity 层缩小淡出
     onFlyBackCompleted: (() -> Unit)? = null,
     // N6（v4.16.9，方案 A2）：放大态贴边继续同向拖的翻页回调，+1 右翻 / -1 左翻。
@@ -943,7 +1393,12 @@ private fun MediaContent(
     onSideBySide: ((Float) -> Unit)? = null,
     onSideBySideSettle: ((Float) -> Unit)? = null,
     onSideBySideTap: ((Float, Float) -> Unit)? = null,
-    sideBySideScale: (() -> Float)? = null
+    sideBySideScale: (() -> Float)? = null,
+    // G4（任务书 11.4）：队列竖滑快捷删除三件套（语义与接线约束见调用点注释）。
+    // 全 null = ImageViewer 行为与改动前一致
+    swipeDeleteEnabled: (() -> Boolean)? = null,
+    onSwipeDeleteCommit: (() -> Unit)? = null,
+    onSwipeDeletePhaseChange: ((Boolean) -> Unit)? = null
 ) {
     Box(
         // 这里**不能**铺不透明背景：并排预览（D2/D3）下每一页都会被整体缩放并
@@ -964,7 +1419,11 @@ private fun MediaContent(
                     enableZoom = true,
                     onSingleTap = onSingleTap,
                     cacheKey = cacheKey,
-                    onClose = onViewerClose
+                    // G6：视频播放器只有"关闭"一种语义，包成 DISMISS_DRAG 转调同一个
+                    // 屏幕级清理入口 —— 不允许出现"视频退出另一套清理"的第二份实现
+                    onClose = remember(onViewerClose) {
+                        onViewerClose?.let { close -> { close(ViewerExitReason.DISMISS_DRAG) } }
+                    }
                 )
             }
             bitmap != null -> {
@@ -973,7 +1432,9 @@ private fun MediaContent(
                     bitmap = bitmap,
                     modifier = Modifier.fillMaxSize(),
                     onSingleTap = onSingleTap,
-                    onClose = onViewerClose,
+                    onViewerClose = onViewerClose,
+                    // G6：页内复位注册给屏幕级统一清理入口（三条退出路径共用同一份清理）
+                    exitRegistry = exitRegistry,
                     onFlyBackCompleted = onFlyBackCompleted,
                     // E1~E5：格子矩形非 null 时本页启用下拉透出与飞回（分段遮罩、
                     // 飞回落格都在 ImageViewer 内）；null = 与旧版完全一致
@@ -983,7 +1444,10 @@ private fun MediaContent(
                     onSideBySide = onSideBySide,
                     onSideBySideSettle = onSideBySideSettle,
                     onSideBySideTap = onSideBySideTap,
-                    sideBySideScale = sideBySideScale
+                    sideBySideScale = sideBySideScale,
+                    onSwipeDeleteCommit = onSwipeDeleteCommit,
+                    swipeDeleteEnabled = swipeDeleteEnabled,
+                    onSwipeDeletePhaseChange = onSwipeDeletePhaseChange
                     // v4.16.8 N3/N4：pageBackground 参数已随本版删除——背景分支收敛为
                     // ImageViewer.drawBehind 三分支（判定见 resolveBackgroundBranch），
                     // 全屏无格子态由"档位宽度黑"（sideScale=1 → 满宽满高）兜底，
@@ -992,8 +1456,10 @@ private fun MediaContent(
             }
             else -> {
                 // E1：透出页的加载/失败态先盖一层纯黑——背景截图不能从 spinner 与
-                // 失败占位后面漏出来（图片分支的黑幕在 ImageViewer 内分段驱动）
-                if (flyBackCellRect != null) {
+                // 失败占位后面漏出来（图片分支的黑幕在 ImageViewer 内分段驱动）。
+                // G1：只在全屏态需要——并排（队列）态的截图层已整层透明，背景由
+                // 容器纯黑负责，页内再铺满页黑只会盖住两侧露出的邻图（"各吃 48px"）
+                if (flyBackCellRect != null && !sideBySideActive) {
                     Box(modifier = Modifier.fillMaxSize().background(Color.Black))
                 }
                 if (failureCategory != null) {
@@ -1091,4 +1557,42 @@ private fun MediaLoadFailureBar(
             }
         }
     }
+}
+
+/**
+ * G2（v4.16.12）：把纯函数 [ViewerPageMotion.snapTargetPage] 接进 Compose Pager
+ * 的吸附决策。
+ *
+ * 框架调用链（Compose Foundation 1.10 字节码取证）：`PagerDefaults.flingBehavior`
+ * 构造的 SnapFlingBehavior 先用 spline 摩擦衰减算出"滑行终点"，再把终点换算成
+ * `currentPage + round(滑行距离 / 页距)`（= 终点附近可见面积最大的那一页），
+ * 最后经本接口收窄成最终目标页。默认实现 `PagerSnapDistance.atMost(1)` 把跨页数
+ * 死钉在 1 —— 任务书里"快速甩动不产生跨页滑行"就是它。
+ *
+ * 这里只改一件事：跨页上限改由松手速度算（[ViewerPageMotion.flingPageCount]），
+ * 吸附目标仍取框架给的衰减终点（它已经按"round 到最近整页"算过），
+ * 方向也沿用框架给出的终点——不依赖 velocity 的符号约定（不同版本可能相反）。
+ *
+ * 页数用 `() -> Int` 而不是直接持有 PagerState：这条接线本身要能在 JVM 单测里
+ * 覆盖（ViewerPagerSnapDistanceTest），不把 Compose 状态机拖进测试。
+ */
+internal class ViewerPagerSnapDistance(
+    private val pageCountProvider: () -> Int
+) : PagerSnapDistance {
+
+    override fun calculateTargetPage(
+        startPage: Int,
+        suggestedTargetPage: Int,
+        velocity: Float,
+        pageSize: Int,
+        pageSpacing: Int
+    ): Int = ViewerPageMotion.snapTargetPage(
+        // 起点一律用框架传进来的 startPage：衰减终点是相对它算的，
+        // 换成 currentPage 会在"速度方向令 firstVisiblePage 偏移"时错一页
+        startPage = startPage,
+        decayEndPage = suggestedTargetPage.toFloat(),
+        velocityPxPerSec = velocity,
+        pagePitchPx = (pageSize + pageSpacing).toFloat(),
+        pageCount = pageCountProvider()
+    )
 }

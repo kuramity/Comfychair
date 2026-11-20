@@ -50,11 +50,45 @@ data class AppliedTag(
 
         /** 权重是否等于 1.0（等于时不加括号）。 */
         fun isNeutral(weight: Float): Boolean = kotlin.math.abs(weight - DEFAULT_WEIGHT) < EPS
+
+        /**
+         * 对标签名做提示词语法转义。
+         *
+         * **只转义圆括号**：ComfyUI 的提示词解析（`comfy/sd1_clip.py` 的
+         * `escape_important` / `unescape_important`）只把 `\(` `\)` 还原成字面括号，
+         * 冒号、方括号、反斜杠都不做还原。若给 `:` `[` `]` `\` 也加反斜杠，这些反斜杠
+         * 会原样进入 CLIP tokenizer，反而让提示词文本与标签名不一致
+         * （内置库里含冒号的标签有 1.3 万余个，如 `honkai:_star_rail`）。
+         *
+         * 括号本身必须转义：不转义时 `papyrus_(salon_pixiv)` 会被
+         * `parse_parentheses` 当成权重分组拆开，标签直接变形。
+         *
+         * 权重括号与权重冒号由 [toPromptToken] 在转义后拼接，不会被误伤。
+         */
+        fun escapeForPrompt(raw: String): String {
+            if (raw.isEmpty()) return raw
+            val sb = StringBuilder(raw.length + 4)
+            for (ch in raw) {
+                when (ch) {
+                    '(', ')' -> sb.append('\\').append(ch)
+                    else -> sb.append(ch)
+                }
+            }
+            return sb.toString()
+        }
     }
 
-    /** 提示词中的写法：1.0 → `tag`；其他 → `(tag:1.2)`。 */
-    fun toPromptToken(): String =
-        if (isNeutral(weight)) name else "($name:${formatWeight(weight)})"
+    /**
+     * 提示词中的写法：1.0 → `tag`；其他 → `(tag:1.2)`。
+     *
+     * 标签名先做圆括号转义：Danbooru 的标签名本身可能含圆括号
+     * （如 `papyrus_(salon_pixiv)`），不转义会被 ComfyUI 的提示词解析当成权重分组拆开。
+     * 所有插入路径（追加、指定位置插入、改权重）都经过本方法，因此转义只在这里做一次。
+     */
+    fun toPromptToken(): String {
+        val escapedName = escapeForPrompt(name)
+        return if (isNeutral(weight)) escapedName else "($escapedName:${formatWeight(weight)})"
+    }
 
     private fun formatWeight(w: Float): String {
         // 去掉多余的 0：1.20 → 1.2，1.00 → 1

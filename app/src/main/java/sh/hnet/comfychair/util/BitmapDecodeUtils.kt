@@ -40,7 +40,9 @@ object BitmapDecodeUtils {
         maxDimension: Int = MAX_USER_IMAGE_DIMENSION
     ): Bitmap? = withContext(Dispatchers.IO) {
         try {
-            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+            // 先解码，再按 EXIF 方向摆正（P1-26）：手机相册里的照片几乎都是
+            // "像素躺着 + EXIF 记 90°"，不读 EXIF 会把源图转错。
+            val decoded = context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeFileDescriptor(pfd.fileDescriptor, null, bounds)
                 if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
@@ -52,6 +54,17 @@ object BitmapDecodeUtils {
                     inSampleSize = sampleSizeFor(maxOf(bounds.outWidth, bounds.outHeight), maxDimension)
                 }
                 BitmapFactory.decodeFileDescriptor(pfd.fileDescriptor, null, options)
+            }
+
+            if (decoded == null) {
+                null
+            } else {
+                val orientation = runCatching {
+                    context.contentResolver.openInputStream(uri)?.use {
+                        ExifOrientation.readOrientation(it)
+                    } ?: android.media.ExifInterface.ORIENTATION_NORMAL
+                }.getOrDefault(android.media.ExifInterface.ORIENTATION_NORMAL)
+                ExifOrientation.applyToBitmap(decoded, orientation)
             }
         } catch (e: Exception) {
             Log.w(TAG, "解码用户选图失败", e)

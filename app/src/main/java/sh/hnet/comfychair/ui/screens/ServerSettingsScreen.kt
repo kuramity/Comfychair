@@ -20,7 +20,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
@@ -42,7 +45,7 @@ fun ServerSettingsScreen(
     onLogout: () -> Unit
 ) {
     val context = LocalContext.current
-    val uiState by viewModel.serverSettingsState.collectAsState()
+    val uiState by viewModel.serverSettingsState.collectAsStateWithLifecycle()
 
     // State and effects
     // Load system stats on first composition and start auto-refresh
@@ -51,9 +54,27 @@ fun ServerSettingsScreen(
     }
 
     // Start/stop auto-refresh when screen is shown/hidden
-    DisposableEffect(Unit) {
-        viewModel.startResourceAutoRefresh()
+    // P2-9：统计轮询跟**宿主的 STARTED 生命周期**走，而不是"是否在组合里"。
+    // 修复前只有 DisposableEffect 的 onDispose 会停 —— Activity 退到后台时组合仍在，
+    // 于是每 2 秒一次的 /system_stats 会一直打到用户回到前台为止（耗流量、占服务器）。
+    // 这里用 LifecycleEventObserver 实现「ON_START 起 / ON_STOP 停」，
+    // stop/start 在 ViewModel 内是幂等的，重复触发无害。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.startResourceAutoRefresh()
+                Lifecycle.Event.ON_STOP -> viewModel.stopResourceAutoRefresh()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        // 组合建立时可能已经是 STARTED（从后台切回后重建等），按当前状态补一次启动
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            viewModel.startResourceAutoRefresh()
+        }
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             viewModel.stopResourceAutoRefresh()
         }
     }
@@ -64,6 +85,13 @@ fun ServerSettingsScreen(
             when (event) {
                 is SettingsEvent.ShowToast -> {
                     Toast.makeText(context, event.messageResId, Toast.LENGTH_SHORT).show()
+                }
+                is SettingsEvent.ShowToastWithCount -> {
+                    Toast.makeText(
+                        context,
+                        context.getString(event.messageResId, event.count),
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
                 is SettingsEvent.RefreshNeeded -> {
                     // Handled by SettingsContainerActivity

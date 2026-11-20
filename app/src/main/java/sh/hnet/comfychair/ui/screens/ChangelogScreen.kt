@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -40,6 +41,7 @@ import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.update.ChangelogEntry
 import sh.hnet.comfychair.update.ChangelogParser
+import sh.hnet.comfychair.ui.util.withStableKeys
 
 /**
  * 更新日志页（设置页入口，离线只读）。
@@ -66,6 +68,10 @@ fun ChangelogScreen(onBack: () -> Unit) {
     val entries = remember(markdown) {
         markdown?.let { ChangelogParser.parse(it) } ?: emptyList()
     }
+    // 每张卡片以版本号为业务标识（版本号天然唯一，重复版本按出现顺序消歧）；
+    // 不用下标当 key：更新日志是倒序追加的，新增版本会让所有下标整体下移，
+    // 行状态会从一个版本串到另一个版本上。
+    val keyedEntries = remember(entries) { entries.withStableKeys { it.version } }
 
     Scaffold(
         topBar = {
@@ -104,10 +110,10 @@ fun ChangelogScreen(onBack: () -> Unit) {
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            items(entries.size) { index ->
+            items(keyedEntries, key = { it.key }) { item ->
                 ChangelogCard(
-                    entry = entries[index],
-                    isCurrent = entries[index].version == BuildConfig.VERSION_NAME
+                    entry = item.value,
+                    isCurrent = item.value.version == BuildConfig.VERSION_NAME
                 )
             }
         }

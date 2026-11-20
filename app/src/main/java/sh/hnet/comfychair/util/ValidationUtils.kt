@@ -2,6 +2,7 @@ package sh.hnet.comfychair.util
 
 import android.content.Context
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.connection.ModelCache
 
 /**
  * Centralized validation utilities for generation parameters.
@@ -138,12 +139,51 @@ object ValidationUtils {
     /**
      * Validate model selection against available models.
      * Returns current if valid and exists in available list, otherwise empty.
+     *
+     * P1-7：**候选列表为空时保留原值**。
+     *
+     * 空列表与"这个值不存在于列表里"不是一回事：
+     * - 列表为空只说明这一类候选当前不可用 —— 缓存未加载、断线重连把缓存清空、
+     *   或该工作流根本不用这一类模型；
+     * - 把它当成"选择无效"清空，会让用户在断线一次之后丢失已保存的模型/LoRA 选择，
+     *   而且下一次保存会把空串写回磁盘，重启也找不回来。
+     * 所以空列表一律原样返回，等服务端给出真实候选再校验。
+     *
      * @param current The currently selected model
      * @param available List of available models
      * @return Valid model selection or empty string
      */
     fun validateModelSelection(current: String, available: List<String>): String {
-        return if (current.isNotEmpty() && available.contains(current)) current else ""
+        if (current.isEmpty()) return ""
+        // 空候选 ≠ 无效选择：保留原值（理由见上）
+        if (available.isEmpty()) return current
+        return if (available.contains(current)) current else ""
+    }
+
+    /**
+     * P1-7 守卫：模型缓存快照是否足以用于"重新校验已选模型"。
+     *
+     * `ConnectionManager.invalidateAll()`（断线 / 重连 / 退出登录）会把 `ModelCache`
+     * 整体替换成空对象（isLoaded=false、所有列表为空）。此时如果照常跑各 ViewModel
+     * 的 `modelCache.collect`，会把所有已选模型清空、把 deferred 恢复值一并抹掉，
+     * 随后落盘 —— 用户的模型选择就这么没了。
+     *
+     * 判定沿用 `MainContainerActivity.onResume` 里"要不要补拉 /object_info"的口径
+     * （未加载完、或核心模型列表全空 → 视为不可用），并把判定范围放宽到全部模型列表：
+     * 只要服务器真的给出了任何一类候选，就让校验照常进行。
+     *
+     * @return true = 可以据此刷新已选模型；false = 跳过本次更新，保留现有选择与 deferred 值
+     */
+    fun isUsableModelCache(cache: ModelCache): Boolean {
+        if (!cache.isLoaded) return false
+        return cache.checkpoints.isNotEmpty() ||
+            cache.unets.isNotEmpty() ||
+            cache.vaes.isNotEmpty() ||
+            cache.clips.isNotEmpty() ||
+            cache.loras.isNotEmpty() ||
+            cache.textEncoders.isNotEmpty() ||
+            cache.latentUpscaleModels.isNotEmpty() ||
+            cache.upscaleModels.isNotEmpty()
     }
 
     /**
@@ -165,9 +205,14 @@ object ValidationUtils {
     /**
      * 门控切换后为新列表挑一个合法选中值：原值还在就保留，否则落到第一项（避免空框）。
      * 列表为空时返回空串。
+     *
+     * 注意这里**不能**直接用 [validateModelSelection] 的空列表语义（P1-7 让它"保留原值"）：
+     * 那是为了断线清空缓存时保住用户选择；而门控切换给出空列表 = 当前开关下确实没有候选，
+     * 此时保留一个不在候选里的值会让下拉框显示一个选不中的幽灵项。所以空列表仍返回空串。
      */
     fun pickClipsAfterGate(current: String, clips: List<String>): String {
-        return validateModelSelection(current, clips).ifEmpty { clips.firstOrNull() ?: "" }
+        if (clips.isEmpty()) return ""
+        return validateModelSelection(current, clips).ifEmpty { clips.first() }
     }
 
     /**
@@ -321,6 +366,14 @@ object ValidationUtils {
         if (value.isEmpty()) return null
         val floatValue = value.toFloatOrNull()
             ?: return context?.getString(R.string.error_invalid_number) ?: "Must be a number"
+
+        // NaN / ±Infinity 会被 Kotlin 的 toFloatOrNull 正常解析（"NaN"、"Infinity"、"-Infinity"），
+        // 而它们与 min/max 的比较**永远为 false**，于是 min/max 两处范围检查全部形同虚设。
+        // 这类值一旦写进工作流 JSON，org.json 会抛 "Forbidden numeric value: NaN"，
+        // 或者在服务端被当成合法数字提交；必须在输入校验这一层就拒掉。
+        if (!floatValue.isFinite()) {
+            return context?.getString(R.string.error_invalid_number) ?: "Must be a number"
+        }
 
         if (min != null && floatValue < min) {
             return context?.getString(R.string.error_value_min_float, min) ?: "Minimum: $min"

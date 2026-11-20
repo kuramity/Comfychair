@@ -51,7 +51,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -94,6 +94,7 @@ import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.model.ThreeDVisibility
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultDialog
 import sh.hnet.comfychair.ui.components.shared.FreeMemoryButton
+import sh.hnet.comfychair.ui.components.shared.bottomSheetSafeDrawingInsets
 import sh.hnet.comfychair.ui.components.shared.SettingsGearButton
 import sh.hnet.comfychair.ui.components.shared.rememberSpellCheckVisualTransformation
 import sh.hnet.comfychair.ui.theme.Dimensions
@@ -161,12 +162,15 @@ fun ImageToImageScreen(
 
     // State and effects
     // Collect state
-    val generationState by generationViewModel.generationState.collectAsState()
-    val connectionStatus by generationViewModel.connectionStatus.collectAsState()
-    val uiState by imageToImageViewModel.uiState.collectAsState()
-    val queueState by JobRegistry.queueState.collectAsState()
-    val isConnecting by ConnectionManager.isConnecting.collectAsState()
-    val presetUiState by presetViewModel.uiState.collectAsState()
+    val generationState by generationViewModel.generationState.collectAsStateWithLifecycle()
+    val connectionStatus by generationViewModel.connectionStatus.collectAsStateWithLifecycle()
+    val uiState by imageToImageViewModel.uiState.collectAsStateWithLifecycle()
+    val queueState by JobRegistry.queueState.collectAsStateWithLifecycle()
+    val isConnecting by ConnectionManager.isConnecting.collectAsStateWithLifecycle()
+    // P1-4：提交在途（闸门持有中）。并入按钮 enabled 条件，连点时按钮本身即禁用，
+    // 不再依赖 ViewModel 层静默丢弃来兜底。
+    val isSubmitting by generationViewModel.isSubmitting.collectAsStateWithLifecycle()
+    val presetUiState by presetViewModel.uiState.collectAsStateWithLifecycle()
 
     // ── 3D 产物状态（v4.4.0 提到页面顶层：顶部入口与结果区都要用）──
     //
@@ -178,7 +182,7 @@ fun ImageToImageScreen(
     // 当前工作流 id **必须按模式取**（v4.4.1 修的真机 bug）：
     // 图生图页有两个独立的选择器，3D 流都挂在编辑模式下，取错就是空串 →
     // ThreeDVisibility 判为"不属于当前流"，生成完的 3D 结果被丢掉。
-    val threeDResult by ThreeDResultHolder.result.collectAsState()
+    val threeDResult by ThreeDResultHolder.result.collectAsStateWithLifecycle()
     val currentWorkflowId = ThreeDVisibility.activeWorkflowId(
         isEditingMode = uiState.mode == ImageToImageMode.EDITING,
         plainId = uiState.selectedWorkflowId,
@@ -777,7 +781,9 @@ fun ImageToImageScreen(
                 isEnabled = imageToImageViewModel.hasValidConfiguration() &&
                     // 内嵌提示词的工作流（四视图、4x 放大等）不要求填写
                     (!uiState.capabilities.hasPositivePrompt || uiState.positivePrompt.isNotBlank()) &&
-                    uiState.sourceImage != null,
+                    uiState.sourceImage != null &&
+                    // P1-4：上一次提交还没回来时禁用，避免连点重复提交
+                    !isSubmitting,
                 isUploading = uiState.isUploading,
                 // v4.6.1 模块 D：上传进度（-1 = 无上传）
                 uploadProgress = uiState.uploadProgress,
@@ -885,7 +891,8 @@ fun ImageToImageScreen(
         ModalBottomSheet(
             onDismissRequest = { showOptionsSheet = false },
             sheetState = optionsSheetState,
-            contentWindowInsets = { WindowInsets(0, 0, 0, 0) }
+            // 统一安全区：底部让开手势条 / 三键导航栏与输入法，左右让开横屏刘海
+            contentWindowInsets = { bottomSheetSafeDrawingInsets() }
         ) {
             val callbacks = remember(imageToImageViewModel) {
                 UnifiedCallbacks(

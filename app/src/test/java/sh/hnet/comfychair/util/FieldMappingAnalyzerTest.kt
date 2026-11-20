@@ -3,6 +3,7 @@ package sh.hnet.comfychair.util
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import sh.hnet.comfychair.workflow.FieldCandidate
+import sh.hnet.comfychair.workflow.mapping.FieldMappingAnalyzer
 
 /**
  * 钉住字段映射的自动选中规则（Task 9 验收 8(b) 的回归点：`FieldMappingAnalyzer.autoSelectIndices`）。

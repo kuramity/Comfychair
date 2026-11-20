@@ -1,6 +1,7 @@
 package sh.hnet.comfychair.ui.screens
 
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.VectorConverter
@@ -87,7 +88,7 @@ import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -131,9 +132,27 @@ fun WorkflowEditorScreen(
     viewModel: WorkflowEditorViewModel,
     onClose: () -> Unit
 ) {
-    val uiState by viewModel.uiState.collectAsState()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val density = LocalDensity.current
     val context = LocalContext.current
+
+    // 系统返回键（手势/按键）必须与页面上的返回按钮走同一套流程。
+    // 以前这里没有 BackHandler：改了一半的图按一下返回就被 Activity 直接 finish，
+    // 「放弃修改」确认形同虚设，未保存的编辑全部丢失。
+    BackHandler {
+        when {
+            // 确认框开着时，返回键先收起确认框（不要穿透到下一层）
+            uiState.showDiscardConfirmation -> viewModel.dismissDiscardConfirmation()
+            // 节点属性侧栏开着时，返回键先关侧栏（与 FAB 的行为一致）
+            uiState.isEditingNode -> viewModel.dismissNodeEditor()
+            uiState.isFieldMappingMode -> viewModel.cancelMapping()
+            uiState.isCreateMode -> viewModel.handleCreateModeClose()
+            uiState.isEditExistingMode -> viewModel.handleEditExistingModeClose()
+            // 普通查看模式但处于画布编辑态：同样先走「放弃修改」确认，别把编辑直接丢掉
+            uiState.isEditMode -> viewModel.handleEditExistingModeClose()
+            else -> onClose()
+        }
+    }
 
     // Show hint Toast when entering edit mode
     val wasEditMode = remember { mutableStateOf(false) }
@@ -1376,7 +1395,10 @@ private fun FieldMappingPanel(
                         }
                         items(
                             items = requiredFields,
-                            key = { "req_${it.field.fieldKey}_${it.selectedCandidateIndex}" }
+                            // key 只取字段名：fieldKey 在同一次映射里唯一，是字段的业务标识。
+                            // 原先还拼了 selectedCandidateIndex，用户换个候选节点 key 就变，
+                            // 行被当成"新行"重建（展开态/动画复位）——那属于数据状态，不是行身份。
+                            key = { "req_${it.field.fieldKey}" }
                         ) { fieldMapping ->
                             FieldMappingRow(
                                 fieldMapping = fieldMapping,
@@ -1402,7 +1424,8 @@ private fun FieldMappingPanel(
                         }
                         items(
                             items = optionalFields,
-                            key = { "opt_${it.field.fieldKey}_${it.selectedCandidateIndex}" }
+                            // 同上：只取字段名，换候选节点不改变行身份
+                            key = { "opt_${it.field.fieldKey}" }
                         ) { fieldMapping ->
                             FieldMappingRow(
                                 fieldMapping = fieldMapping,

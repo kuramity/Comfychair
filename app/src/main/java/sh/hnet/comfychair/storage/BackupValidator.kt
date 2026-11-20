@@ -4,6 +4,7 @@ import org.json.JSONObject
 import sh.hnet.comfychair.WorkflowType
 import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.ScreenType
+import sh.hnet.comfychair.util.ServerUrlUtils
 import sh.hnet.comfychair.util.ValidationUtils
 
 /**
@@ -92,10 +93,18 @@ class BackupValidator {
 
     /**
      * Validate hostname format (IP address or hostname).
+     *
+     * P2-24：备份里的地址可能带着用户粘贴时残留的 `http://` / `https://` 前缀，
+     * 先按 [ServerUrlUtils.splitProtocol] 剥掉再校验，否则合法条目会被误判成非法。
      */
     fun validateHostname(hostname: String): Boolean {
-        if (hostname.isBlank()) return false
-        return IP_ADDRESS_PATTERN.matches(hostname) || HOSTNAME_PATTERN.matches(hostname)
+        val bare = ServerUrlUtils.splitProtocol(hostname).second
+        if (bare.isBlank()) return false
+        // 形如 IPv4（全是数字和点，且含点）却不是一个合法 IPv4：192.168.1 / 999.1.1.1
+        // 这类「缺段/越界」的地址不能靠主机名正则蒙混过关（P2-24）
+        val looksLikeIpv4 = bare.contains('.') && bare.all { it.isDigit() || it == '.' }
+        if (looksLikeIpv4) return IP_ADDRESS_PATTERN.matches(bare)
+        return HOSTNAME_PATTERN.matches(bare)
     }
 
     /**
@@ -104,6 +113,16 @@ class BackupValidator {
     fun validatePort(port: Int): Boolean {
         return port in MIN_PORT..MAX_PORT
     }
+
+    /**
+     * 备份里的服务器条目是否可用（P2-24）。
+     *
+     * 恢复时逐台调用：hostname 格式不合法或端口越界即整条跳过，不写进服务器列表 ——
+     * 修复前 `Server.fromJson` 只保证「非空、端口 > 0」，畸形地址（含空格、带路径、
+     * 端口 70000）会被原样恢复，后续连接/展示都会出问题。这两个校验函数原先是死代码。
+     */
+    fun validateServer(hostname: String, port: Int): Boolean =
+        validateHostname(hostname) && validatePort(port)
 
     /**
      * Validate workflow type against WorkflowType enum values.

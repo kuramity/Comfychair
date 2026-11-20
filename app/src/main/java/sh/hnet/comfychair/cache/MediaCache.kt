@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
-import androidx.core.content.FileProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -21,22 +20,123 @@ import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
+import sh.hnet.comfychair.util.ExifOrientation
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 /**
  * Stable cache key for media items.
- * Uses promptId + filename to survive index changes during deletions.
+ *
+ * 键由 **serverId + type + promptId + filename** 四段构成（P2-2）：
+ * - [serverId]：MediaCache 是进程级单例，所有服务器共用同一份内存/磁盘缓存。
+ *   不带服务器身份时，A 服务器与 B 服务器同名的产物会互相命中——典型的"换服务器后
+ *   看到的还是上一台的图"。
+ * - [type]：ComfyUI 的 `output` 与 `temp` 是两个独立目录，同名文件完全可能同时存在
+ *   （例如 `ComfyUI_00001_.png`），只按 (promptId, filename) 会互撞。
+ * - [promptId] + [filename]：在一次生成里区分具体产物（批量出图共用 promptId）。
+ *
+ * subfolder 没有进键：它参与 /view 的 URL 参数，但不参与产物身份；同一个
+ * (serverId, type, promptId, filename) 在不同 subfolder 下重复出现不是 ComfyUI 的正常
+ * 输出形态，为了不让键长度和磁盘文件名膨胀，这里只加 type + serverId。
+ *
+ * [keyString] 直接用作内存缓存键与磁盘文件名，编码规则见 [encodeKeyString] /
+ * [parseKeyString]：新格式带 `v2_` 前缀、前三段转义 `_` 与 `%`，filename 原样放在最后，
+ * 因此能被 [listCachedKeys] 无损反解回 key。旧版本写下的 `{promptId}_{filename}`
+ * 仍按旧规则解析（serverId 为空、type 按 output），保证历史磁盘文件的恢复逻辑不中断。
  */
 data class MediaCacheKey(
     val promptId: String,
-    val filename: String
+    val filename: String,
+    val type: String,
+    val serverId: String
 ) {
-    val keyString: String get() = "${promptId}_$filename"
+    val keyString: String get() = encodeKeyString(this)
+
     override fun toString(): String = keyString
+
+    companion object {
+        /** 新键格式前缀：promptId 是 UUID，不会以 `v2_` 开头，与旧格式天然区分。 */
+        private const val NEW_KEY_PREFIX = "v2_"
+
+        /** serverId 缺失（旧格式文件 / 未连接）时的占位符；不能用空串——编码后会出现连续下划线。 */
+        private const val NO_SERVER = "-"
+
+        /** 旧格式 `{promptId}_{filename}` 的默认产物类型。 */
+        const val DEFAULT_TYPE = "output"
+
+        /**
+         * 生产路径统一入口：serverId 取**当前连接服务器**。
+         *
+         * 离线态下 `currentServerId` 仍是上次连上的那台（见 ConnectionManager 的
+         * OfflineConnected），所以离线读缓存时键仍能对上。
+         */
+        fun of(
+            promptId: String,
+            filename: String,
+            type: String,
+            serverId: String? = ConnectionManager.currentServerId
+        ): MediaCacheKey = MediaCacheKey(
+            promptId = promptId,
+            filename = filename,
+            type = normalizeType(type),
+            serverId = serverId.orEmpty()
+        )
+
+        /** type 为空时按 ComfyUI 默认的 output 处理（/history 里个别节点的 type 字段缺失）。 */
+        internal fun normalizeType(type: String): String =
+            type.trim().ifBlank { DEFAULT_TYPE }
+
+        /** 前三段里可能出现的 `_` / `%` 转义，保证 `split('_', limit = 4)` 可以无损反解。 */
+        private fun escapePart(value: String): String =
+            value.replace("%", "%25").replace("_", "%5F")
+
+        private fun unescapePart(value: String): String =
+            value.replace("%5F", "_").replace("%25", "%")
+
+        internal fun encodeKeyString(key: MediaCacheKey): String {
+            val server = key.serverId.ifEmpty { NO_SERVER }
+            return NEW_KEY_PREFIX +
+                escapePart(server) + "_" +
+                escapePart(normalizeType(key.type)) + "_" +
+                escapePart(key.promptId) + "_" +
+                key.filename
+        }
+
+        /**
+         * 从磁盘文件名（已去掉扩展名）反解缓存键。
+         *
+         * 新格式：`v2_{serverId}_{type}_{promptId}_{filename}`（filename 允许含下划线）。
+         * 旧格式：`{promptId}_{filename}`（promptId 是无下划线的 UUID，按第一个下划线切）。
+         *
+         * 解析失败返回 null，由调用方跳过该文件。
+         */
+        internal fun parseKeyString(fileNameStem: String): MediaCacheKey? {
+            if (fileNameStem.startsWith(NEW_KEY_PREFIX)) {
+                val rest = fileNameStem.substring(NEW_KEY_PREFIX.length)
+                val parts = rest.split('_', limit = 4)
+                if (parts.size < 4) return null
+                val serverId = unescapePart(parts[0]).let { if (it == NO_SERVER) "" else it }
+                val type = normalizeType(unescapePart(parts[1]))
+                val promptId = unescapePart(parts[2])
+                val filename = parts[3]
+                if (promptId.isEmpty() || filename.isEmpty()) return null
+                return MediaCacheKey(promptId, filename, type, serverId)
+            }
+
+            val separator = fileNameStem.indexOf('_')
+            if (separator <= 0 || separator == fileNameStem.length - 1) return null
+            return MediaCacheKey(
+                promptId = fileNameStem.substring(0, separator),
+                filename = fileNameStem.substring(separator + 1),
+                type = DEFAULT_TYPE,
+                serverId = ""
+            )
+        }
+    }
 }
 
 /**
@@ -107,10 +207,28 @@ object MediaCache {
         get() = ConnectionManager.clientOrNull
 
     // Context for temp file operations (set once when first needed)
+    // 多个入口（两个 Activity 的 onCreate 与 ConnectionManager 两处）会在主线程/协程线程
+    // 首次调用 ensureInitialized：读侧必须 volatile，否则可能长时间读到 null 而跳过缓存读写
+    @Volatile
     private var applicationContext: Context? = null
-    private var isPrefetchWorkersStarted = false
+
+    /**
+     * 预取 worker 组是否已启动。
+     *
+     * 必须用 CAS 而不是 `if (!flag) { start(); flag = true }`：ensureInitialized 的调用点
+     * 分散在主线程（Activity.onCreate）与协程线程（ConnectionManager），check-then-act 会让
+     * 两个线程同时走进 startPrefetchWorkers，起两组 worker 抢同一个 [prefetchQueue]
+     * ——重复下载、[inProgressKeys] 互相打架。
+     * 进程内一次性：[reset] 刻意不复位（见那里的注释），否则每次断线重连都多一组 worker。
+     */
+    private val isPrefetchWorkersStarted = AtomicBoolean(false)
 
     // Caching mode - true for memory-first (default), false for disk-first
+    // 主线程写（MainContainerActivity.onCreate / ConnectionManager），
+    // 读取发生在 Dispatchers.Default 的预取 worker 与各 suspend 入口（见 fetchBitmap /
+    // getVideoUri 等处的 if (isMemoryFirstMode)）：必须 volatile，否则 worker 可能长时间
+    // 按旧模式分流（用户已切磁盘优先，预取仍走内存/临时文件路径）
+    @Volatile
     private var isMemoryFirstMode = true
 
     // Memory budget: 1/3 of max heap for bitmaps (full-res images), 1/8 for video bytes
@@ -270,6 +388,8 @@ object MediaCache {
             prefetchQueue.clear()
             inProgressKeys.clear()
             completionCallbacks.clear()
+            // P2-3：切到磁盘优先后不再使用播放临时文件，已写下的那批一并清掉
+            applicationContext?.let { context -> clearPlaybackTempFiles(context) }
         }
 
         if (layers.disk) {
@@ -305,45 +425,115 @@ object MediaCache {
         return File(getDiskCacheDir(context), "${key.keyString}.$ext")
     }
 
+    /** 旧版本的缓存文件名：`{promptId}_{filename}.{ext}`（那时键还没有 type/serverId）。 */
+    private fun legacyCacheFileName(key: MediaCacheKey, ext: String): String =
+        MediaCacheFileNames.legacyName(key.promptId, key.filename, ext)
+
     /**
-     * 扫一遍磁盘缓存目录，从文件名反推回缓存键。
+     * 读取磁盘缓存时的文件名解析（F1：升级兼容，规则见 [MediaCacheFileNames]）。
      *
-     * 命名规则是 `{promptId}_{filename}.{ext}`，而 promptId 是无下划线的 UUID，
-     * 所以按**第一个下划线**切分即可还原（filename 自身可能含下划线，不能用最后一个）。
+     * 新键格式带 `v2_{serverId}_{type}_` 前缀，目录名却没变；如果只按新名字找，
+     * 升级后既有的全部磁盘缓存都会读不到。因此：新名字命中直接用；否则回退旧名字，
+     * 旧文件命中后尽力改名成新名字（懒迁移），失败就继续用旧路径读。
      *
-     * 用途：图库索引曾经被"服务器历史为空"的那次刷新覆盖成空，而这些缓存文件都还在
-     * 磁盘上 —— 靠它们能把已经丢掉的那部分图库补回来，条目重新下载原图也走得通。
+     * 只用于**读**路径；写入一律用 [getDiskCacheFile] 的新名字。
      */
-    fun listCachedKeys(context: Context): List<MediaCacheKey> {
-        val files = getDiskCacheDir(context).listFiles() ?: return emptyList()
-        return files.mapNotNull { file ->
-            if (!file.isFile) return@mapNotNull null
-            val name = file.name.removeSuffix(".png").removeSuffix(".mp4")
-            val separator = name.indexOf('_')
-            if (separator <= 0 || separator == name.length - 1) return@mapNotNull null
-            MediaCacheKey(
-                promptId = name.substring(0, separator),
-                filename = name.substring(separator + 1)
-            )
+    private fun readableCacheFile(target: File, legacyName: String): File? =
+        MediaCacheFileNames.resolveReadable(target, legacyName)
+
+    /** 旧 cacheDir/gallery_cache 的读取解析（图片 png / 视频 mp4） */
+    private fun resolveDiskCacheFile(context: Context, key: MediaCacheKey, isVideo: Boolean): File? {
+        val ext = if (isVideo) "mp4" else "png"
+        return readableCacheFile(
+            target = getDiskCacheFile(context, key, isVideo),
+            legacyName = legacyCacheFileName(key, ext)
+        )
+    }
+
+    /** 旧 cacheDir/gallery_thumb 的读取解析（缩略图 jpg） */
+    private fun resolveThumbFile(context: Context, key: MediaCacheKey): File? =
+        readableCacheFile(
+            target = thumbFile(context, key),
+            legacyName = legacyCacheFileName(key, "jpg")
+        )
+
+    /** filesDir/gallery_store（图片）与 gallery_thumbs（视频首帧）的读取解析 */
+    private fun resolvePersistFile(context: Context, key: MediaCacheKey, isVideo: Boolean): File? {
+        val target = if (isVideo) persistThumbFile(context, key) else persistStoreFile(context, key)
+        return readableCacheFile(target = target, legacyName = legacyCacheFileName(key, "jpg"))
+    }
+
+    /**
+     * 扫一遍全部磁盘缓存目录，从文件名反推回缓存键（P2-23）。
+     *
+     * 为什么要扫四个目录：图库的持久化版本（v4.16.1）把图片统一档写在
+     * `filesDir/gallery_store`、视频首帧写在 `filesDir/gallery_thumbs`，而旧版
+     * 缓存还在 `cacheDir/gallery_cache` 与 `cacheDir/gallery_thumb`。修复前只扫
+     * `gallery_cache`，一旦图库索引丢失，最值钱的 720 档持久化图片反而补不回来。
+     *
+     * 各目录的命名规则一致（`{keyString}.{扩展名}`），只是扩展名不同：
+     * - gallery_cache：`.png`（图）/ `.mp4`（视频）
+     * - gallery_thumb / gallery_store / gallery_thumbs：`.jpg`
+     *
+     * 键的格式见 [MediaCacheKey.parseKeyString]：新格式 `v2_{serverId}_{type}_{promptId}_{filename}`，
+     * 旧格式 `{promptId}_{filename}`。两种都认。
+     *
+     * @param serverId 非空时只返回**这台服务器**（以及旧格式无法判定的文件）的键。
+     *   不按服务器过滤会把 B 服务器的缓存恢复进 A 服务器的图库，点开就是 404
+     *   —— 与 P2-2 要解决的跨服务器串数据是同一类问题。
+     */
+    fun listCachedKeys(context: Context, serverId: String? = null): List<MediaCacheKey> {
+        val dirs = listOf(
+            getDiskCacheDir(context),
+            getThumbDir(context),
+            File(context.filesDir, PERSIST_STORE_DIR),
+            File(context.filesDir, PERSIST_THUMB_DIR)
+        )
+        val result = LinkedHashMap<String, MediaCacheKey>()
+        val extensions = listOf(".png", ".mp4", ".jpg", ".jpeg", ".webp")
+        for (dir in dirs) {
+            val files = try {
+                dir.listFiles()
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            for (file in files) {
+                if (!file.isFile) continue
+                val name = file.name
+                val ext = extensions.firstOrNull { name.endsWith(it, ignoreCase = true) } ?: continue
+                val stem = name.dropLast(ext.length)
+                val key = MediaCacheKey.parseKeyString(stem) ?: continue
+                if (serverId != null && key.serverId.isNotEmpty() && key.serverId != serverId) continue
+                result.putIfAbsent(key.keyString, key)
+            }
         }
+        // R2-N1：同一条目可能同时有旧名文件（serverId 空）与新名文件（v2_…），
+        // keyString 不同但媒体身份相同；必须按 (promptId, filename) 去重，
+        // 否则 GalleryRepository 会生成重复 GalleryItem，图库 LazyGrid 的
+        // `${promptId}_${filename}` key 撞车会直接抛异常。
+        return MediaCacheFileNames.dedupeByIdentity(result.values.toList())
     }
 
     /**
      * Check if an item exists in disk cache.
      */
     private fun existsInDiskCache(context: Context, key: MediaCacheKey, isVideo: Boolean): Boolean {
-        return getDiskCacheFile(context, key, isVideo).exists()
+        return resolveDiskCacheFile(context, key, isVideo) != null
     }
 
     /**
      * Read a bitmap from disk cache.
+     *
+     * 解码后按 EXIF 方向摆正（P1-26）：缓存目录里可能有历史版本直接落盘的 JPEG 原图，
+     * BitmapFactory 不读 Orientation，带方向的照片会躺倒。
+     *
+     * 文件名解析走 [resolveDiskCacheFile]（F1：新键名未命中时回退旧版本文件名）。
      */
     private fun readBitmapFromDisk(context: Context, key: MediaCacheKey): Bitmap? {
         return try {
-            val file = getDiskCacheFile(context, key, false)
-            if (file.exists()) {
-                BitmapFactory.decodeFile(file.absolutePath)
-            } else null
+            val file = resolveDiskCacheFile(context, key, false) ?: return null
+            BitmapFactory.decodeFile(file.absolutePath)
+                ?.let { ExifOrientation.applyFromFile(file, it) }
         } catch (_: Exception) {
             null
         }
@@ -368,10 +558,7 @@ object MediaCache {
      */
     private fun readVideoBytesFromDisk(context: Context, key: MediaCacheKey): ByteArray? {
         return try {
-            val file = getDiskCacheFile(context, key, true)
-            if (file.exists()) {
-                file.readBytes()
-            } else null
+            resolveDiskCacheFile(context, key, true)?.readBytes()
         } catch (_: Exception) {
             null
         }
@@ -401,8 +588,7 @@ object MediaCache {
     fun readCachedBytes(key: MediaCacheKey, isVideo: Boolean): ByteArray? {
         val context = applicationContext ?: return null
         return try {
-            val file = getDiskCacheFile(context, key, isVideo)
-            if (file.exists()) file.readBytes() else null
+            resolveDiskCacheFile(context, key, isVideo)?.readBytes()
         } catch (_: Exception) {
             null
         }
@@ -424,6 +610,33 @@ object MediaCache {
     // Cache of video URIs (lightweight - just stores Uri references)
     private val videoUriCache = ConcurrentHashMap<String, Uri>()
 
+    /**
+     * 正在播放的视频 key（F7，见 [registerPlayingVideo]）。
+     *
+     * 播放临时文件清理必须跳过这些 key：极端时序下视频 A 已 prepare、
+     * ExoPlayer 还没真正打开文件，此时为视频 B 生成 URI 会触发清理 ——
+     * 没有保护就会把 A 的文件删掉，播放失败且不会自愈。
+     * 与 MediaStateHolder.playingVideoBaseNames 同一设计，但这里存的是 **keyString**。
+     */
+    private val playingVideoKeys: MutableSet<String> =
+        java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    /** 登记"这个视频正在播放"（由 VideoPlayer 在组合期注册，页面销毁时注销）。 */
+    fun registerPlayingVideo(key: MediaCacheKey) {
+        playingVideoKeys.add(key.keyString)
+    }
+
+    /** 注销播放登记；之后清理可以正常回收它的临时文件。 */
+    fun unregisterPlayingVideo(key: MediaCacheKey) {
+        playingVideoKeys.remove(key.keyString)
+    }
+
+    /** 正在播放的 keyString → 磁盘临时文件名集合（清理保护的判据）。 */
+    private fun protectedPlaybackTempNames(): Set<String> =
+        synchronized(playingVideoKeys) {
+            playingVideoKeys.mapTo(HashSet()) { MediaCachePlaybackTempPolicy.fileNameFor(it) }
+        }
+
     // Cache of video dimensions for VideoPlayer
     private val videoDimensionsCache = ConcurrentHashMap<String, VideoDimensions>()
 
@@ -435,6 +648,10 @@ object MediaCache {
     private const val MAX_CONCURRENT_PREFETCH = 3
 
     // Active view tracking - MediaViewer takes precedence when open
+    // 写方在界面线程（GalleryScreen 切换图库/查看器）；读取走公开访问器 isActiveView，
+    // 任何线程都可调用，与 isMemoryFirstMode 同一判定标准加 volatile，
+    // 免得将来有人从 worker 里读优先级判定时踩可见性坑
+    @Volatile
     private var activeView = ActiveView.GALLERY
 
     /**
@@ -458,9 +675,10 @@ object MediaCache {
         if (applicationContext == null) {
             applicationContext = context.applicationContext
         }
-        if (!isPrefetchWorkersStarted) {
+        // 只有抢到 false -> true 的线程启动 worker 组（见 [isPrefetchWorkersStarted]）；
+        // 并发调用的其余线程直接返回，不会起第二组
+        if (isPrefetchWorkersStarted.compareAndSet(false, true)) {
             startPrefetchWorkers()
-            isPrefetchWorkersStarted = true
         }
     }
 
@@ -879,9 +1097,11 @@ object MediaCache {
             return null
         }
 
-        // 磁盘层（filesDir 新目录）：图片读统一档，视频读首帧
-        val diskFile = if (isVideo) persistThumbFile(context, key) else persistStoreFile(context, key)
-        val cached = withContext(Dispatchers.IO) { readPersistBitmap(context, diskFile) }
+        // 磁盘层（filesDir 新目录）：图片读统一档，视频读首帧。
+        // F1：新键名未命中时回退旧版本 `{promptId}_{filename}.jpg`，避免升级后旧缓存全部失效。
+        val cached = withContext(Dispatchers.IO) {
+            readPersistBitmap(context, resolvePersistFile(context, key, isVideo))
+        }
         if (cached != null) {
             thumbnailCache.put(keyStr, cached)
             DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr disk -> HIT")
@@ -1082,8 +1302,9 @@ object MediaCache {
      * 同一上限），这里同样按上限采样。
      */
     private fun readThumbFromDisk(context: Context, key: MediaCacheKey): Bitmap? = try {
-        val file = thumbFile(context, key)
-        if (file.isFile && file.length() > 0) {
+        // F1：新键名未命中时回退旧版本 `{promptId}_{filename}.jpg`
+        val file = resolveThumbFile(context, key)
+        if (file != null && file.isFile && file.length() > 0) {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
             val longest = maxOf(bounds.outWidth, bounds.outHeight)
@@ -1182,8 +1403,8 @@ object MediaCache {
      * 落盘前已采样到长边 720，正常文件解码后约 2 MB；但防御目录里出现异常大文件
      * （例如旧版本数据或手改），仍按 bounds 检查 + 采样解码，与 readThumbFromDisk 同模式。
      */
-    private fun readPersistBitmap(context: Context, file: File): Bitmap? = try {
-        if (file.isFile && file.length() > 0) {
+    private fun readPersistBitmap(context: Context, file: File?): Bitmap? = try {
+        if (file != null && file.isFile && file.length() > 0) {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
             val longest = maxOf(bounds.outWidth, bounds.outHeight)
@@ -1233,6 +1454,32 @@ object MediaCache {
         try {
             persistStoreFile(context, key).delete()
             persistThumbFile(context, key).delete()
+            // F1：旧版本命名的文件也要删，否则删图后旧的 `{promptId}_{filename}.jpg`
+            // 仍会被读路径的兼容回退重新读出来（"删了又回来"）。
+            File(context.filesDir, PERSIST_STORE_DIR).let {
+                File(it, legacyCacheFileName(key, "jpg")).delete()
+            }
+            File(context.filesDir, PERSIST_THUMB_DIR).let {
+                File(it, legacyCacheFileName(key, "jpg")).delete()
+            }
+        } catch (_: Exception) {
+            // 忽略删除失败
+        }
+    }
+
+    /** 删掉某个键的播放临时文件（P2-3，见 [MediaCachePlaybackTempPolicy]）。 */
+    private fun deletePlaybackTempFile(context: Context, keyStr: String) {
+        try {
+            File(context.cacheDir, MediaCachePlaybackTempPolicy.fileNameFor(keyStr)).delete()
+        } catch (_: Exception) {
+            // 忽略删除失败
+        }
+    }
+
+    /** 删掉本模块在 cacheDir 留下的全部播放临时文件（只认 `playback_` 前缀）。 */
+    private fun clearPlaybackTempFiles(context: Context) {
+        try {
+            MediaCachePlaybackTempPolicy.cleanupDirectory(context.cacheDir, keepName = "")
         } catch (_: Exception) {
             // 忽略删除失败
         }
@@ -1274,6 +1521,31 @@ object MediaCache {
         // Check if thumbnail is already cached - avoid redundant extraction
         bitmapCache.get(keyStr)?.let { return it }
 
+        // 已经下载过的字节优先用本地字节抽帧：不再多打一次网络
+        videoCache.get(keyStr)?.let { bytes ->
+            val (dimensions, thumbnail) = extractVideoData(keyStr, bytes, context)
+            dimensions?.let { videoDimensionsCache[keyStr] = it }
+            thumbnail?.let { bitmapCache.put(keyStr, it, priority) }
+            return thumbnail
+        }
+
+        // P2-5：先让 MediaMetadataRetriever 直接读远程 URL 抽一帧。
+        // 修复前为了列表里的一个首帧会把整段视频（常见几十 MB）下载下来再解码，
+        // 内存优先模式下这是纯浪费 —— 播放时还会再下一次。
+        val remote = extractVideoDataFromUrl(
+            url = client.viewUrl(key.filename, subfolder, type),
+            keyStr = keyStr
+        )
+        if (remote != null) {
+            val (dimensions, thumbnail) = remote
+            dimensions?.let { videoDimensionsCache[keyStr] = it }
+            thumbnail?.let { bitmapCache.put(keyStr, it, priority) }
+            return thumbnail
+        }
+
+        // 回退：远程抽帧失败（服务器要求 Basic/Bearer/Cookie 认证，或自签证书只有
+        // OkHttp 的自定义 TrustManager 认得，而 MediaMetadataRetriever 走系统 TLS），
+        // 仍按原逻辑整段下载后用临时文件抽帧。
         // Check if we have video bytes cached
         var videoBytes = videoCache.get(keyStr)
 
@@ -1335,7 +1607,21 @@ object MediaCache {
     ): Bitmap? {
         val keyStr = key.keyString
 
-        // Fetch video bytes
+        // P2-5：磁盘优先模式同样先远程抽帧。修复前这里必然 client.fetchVideo 整段下载
+        // 再 writeVideoToDisk —— 用户关掉「内存优先缓存」后，图库每格的视频首帧都要
+        // 先拉几十 MB，与"只有播放才整段下载"的目标不符。
+        // 远程抽帧成功时不落视频字节：真需要播放时 fetchVideoBytes 会按磁盘优先链路
+        // 下载并缓存，下载时机推迟到播放。
+        val remote = extractVideoDataFromUrl(
+            url = client.viewUrl(key.filename, subfolder, type),
+            keyStr = keyStr
+        )
+        if (remote != null) {
+            // 与原实现保持一致：磁盘优先不把尺寸放进内存缓存
+            return remote.second
+        }
+
+        // 回退：远程抽帧失败（认证 / 自签证书 / 协议不支持）时按原链路整段下载并落盘
         val videoBytes = suspendCancellableCoroutine<ByteArray?> { continuation ->
             client.fetchVideo(key.filename, subfolder, type) { bytes, _ ->
                 continuation.resume(bytes)
@@ -1550,14 +1836,34 @@ object MediaCache {
             return withContext(Dispatchers.IO) {
                 try {
                     // Create temp file for playback
-                    val tempFile = File(context.cacheDir, "playback_${keyStr.hashCode()}.mp4")
+                    val tempFile = File(context.cacheDir, MediaCachePlaybackTempPolicy.fileNameFor(keyStr))
+
+                    // P2-3：写新文件前清掉上一轮留下的同前缀临时文件（旧实现只写不删，
+                    // 连续看视频会把 cacheDir 一直堆到系统回收）。保留本次这份；
+                    // `state_playback_*`（MediaStateHolder）与这里前缀不重叠，不会被误删。
+                    // F7：正在播放的视频（VideoPlayer 已登记）同样保留 —— 视频 A 已 prepare
+                    // 但 ExoPlayer 尚未打开文件时，为 B 生成 URI 不能删掉 A 的文件。
+                    // 被删文件的 URI 一并从缓存里摘掉，否则 getVideoUri 会返回指向已删文件的死 URI。
+                    val deleted = MediaCachePlaybackTempPolicy.cleanupDirectory(
+                        cacheDir = context.cacheDir,
+                        keepName = tempFile.name,
+                        protectedNames = protectedPlaybackTempNames()
+                    )
+                    if (deleted.isNotEmpty()) {
+                        val deletedNames = deleted.toHashSet()
+                        val staleKeys = videoUriCache.filterValues {
+                            it.lastPathSegment in deletedNames
+                        }.keys.toList()
+                        videoUriCache.keys.removeAll(staleKeys.toSet())
+                        DebugLogger.d(TAG, "清理播放临时文件 ${deleted.size} 个（保留 ${tempFile.name}）")
+                    }
+
                     tempFile.writeBytes(bytes)
 
-                    val uri = FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.fileprovider",
-                        tempFile
-                    )
+                    // P2-12：播放方就在本进程（ExoPlayer），file:// 足够，不需要 FileProvider。
+                    // 只有这样 file_paths.xml 才能把整个 cacheDir 从可共享根里去掉；
+                    // 对外分享一律走 util/ShareFileStore.kt（cacheDir/share/）。
+                    val uri = Uri.fromFile(tempFile)
 
                     // Cache the URI for future use
                     videoUriCache[keyStr] = uri
@@ -1570,13 +1876,11 @@ object MediaCache {
             // Disk-first: return URI directly to the cached file
             return withContext(Dispatchers.IO) {
                 try {
-                    val file = getDiskCacheFile(context, key, true)
-                    if (file.exists()) {
-                        FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.fileprovider",
-                            file
-                        )
+                    // F1：新键名未命中时回退旧版本 `{promptId}_{filename}.mp4`
+                    val file = resolveDiskCacheFile(context, key, true)
+                    if (file != null && file.exists()) {
+                        // P2-12：播放 URI 用 file://（进程内播放），不经过 FileProvider
+                        Uri.fromFile(file)
                     } else null
                 } catch (_: Exception) {
                     null
@@ -1762,13 +2066,12 @@ object MediaCache {
                                 }
 
                                 if (request.isVideo) {
-                                    // Fetch bytes and create URI so video is ready to play
-                                    val context = applicationContext
-                                    if (context != null) {
-                                        fetchVideoUri(request.key, request.subfolder, request.type, context)
-                                    } else {
-                                        fetchVideoBytes(request.key, request.subfolder, request.type)
-                                    }
+                                    // P2-3：预取只拉字节，**不再预生成播放临时文件**。
+                                    // 修复前这里走 fetchVideoUri → getVideoUri，会给每个预取到的
+                                    // 视频都在 cacheDir 写一份 playback_*.mp4，而预取窗口有 3 个方向，
+                                    // 光滑动列表就能攒出一堆永远不播的临时文件。真正要播放时
+                                    // getVideoUri 会从内存里的字节按需创建。
+                                    fetchVideoBytes(request.key, request.subfolder, request.type)
                                 } else {
                                     fetchImage(request.key, request.subfolder, request.type, cachePriority)
                                 }
@@ -1807,11 +2110,16 @@ object MediaCache {
         videoCache.remove(keyStr)
         videoUriCache.remove(keyStr)
         videoDimensionsCache.remove(keyStr)
+        playingVideoKeys.remove(keyStr)
 
         // v4.16.1 删图连带清（规格 B3）：缩略图内存缓存此前永不清（删图后列表缩略图仍挂着），
         // 与 filesDir 新目录里的统一档/首帧文件一起清掉。**旧 cacheDir 维持原状**（见下方注释）
         thumbnailCache.remove(keyStr)
-        applicationContext?.let { context -> deletePersistFiles(context, key) }
+        applicationContext?.let { context ->
+            deletePersistFiles(context, key)
+            // P2-3：删条目时把它的播放临时文件一并删掉（否则永远留在 cacheDir）
+            deletePlaybackTempFile(context, keyStr)
+        }
 
         // In disk-first mode, also remove from disk
         if (!isMemoryFirstMode) {
@@ -1819,6 +2127,10 @@ object MediaCache {
                 try {
                     getDiskCacheFile(context, key, false).delete()
                     getDiskCacheFile(context, key, true).delete()
+                    // F1：旧名字的文件也删，否则读路径的兼容回退会把删掉的条目读回来
+                    val dir = getDiskCacheDir(context)
+                    File(dir, legacyCacheFileName(key, "png")).delete()
+                    File(dir, legacyCacheFileName(key, "mp4")).delete()
                 } catch (_: Exception) {
                     // Ignore deletion failures
                 }
@@ -1834,6 +2146,7 @@ object MediaCache {
         videoCache.evictAll()
         videoUriCache.clear()
         videoDimensionsCache.clear()
+        playingVideoKeys.clear()
         prefetchQueue.clear()
         inProgressKeys.clear()
         completionCallbacks.clear()
@@ -1858,6 +2171,8 @@ object MediaCache {
             } catch (_: Exception) {
                 // Ignore deletion failures
             }
+            // P2-3：播放临时文件也是"缓存"，用户点清缓存时必须一并清掉
+            clearPlaybackTempFiles(context)
         }
     }
 
@@ -1909,9 +2224,14 @@ object MediaCache {
         videoCache.evictAll()
         videoUriCache.clear()
         videoDimensionsCache.clear()
+        playingVideoKeys.clear()
         prefetchQueue.clear()
         inProgressKeys.clear()
         completionCallbacks.clear()
+
+        // P2-3：断线/切服务器/退出登录时，内存里的 URI 已清空；对应的播放临时文件
+        // 也一并删掉（它们是本模块自己的产物，不属于离线读取所需的磁盘缓存）。
+        applicationContext?.let { context -> clearPlaybackTempFiles(context) }
 
         // **不清 applicationContext**：它是进程级 application context（与进程同生命周期，
         // 不存在泄漏），而所有读取入口（fetchBitmap / fetchImage / fetchVideoBytes …）
@@ -1928,6 +2248,47 @@ object MediaCache {
         //
         // Don't reset isMemoryFirstMode - it's a user preference loaded from AppSettings
         // Don't delete disk cache - it's needed for offline mode
+    }
+
+    /**
+     * 直接从远程 URL 抽视频首帧与尺寸（P2-5）。
+     *
+     * MediaMetadataRetriever 支持 `setDataSource(http/https URL)`，由它自己按需读取
+     * 容器头部与首帧附近的数据，**不需要把整段视频下载到本地**。
+     *
+     * 失败（返回 null）的典型原因，调用方必须回退到整段下载：
+     * - 服务器要求 Basic/Bearer/Cookie 认证：这个 API 无法附加请求头；
+     * - 自签证书：应用的自定义 TrustManager 只装在 OkHttp 上，系统 TLS 不认；
+     * - 服务端 Range/头部行为不符合 MMR 预期、文件损坏等。
+     *
+     * @return (尺寸, 首帧)；URL 为空、抽取失败或首帧为空时返回 null
+     */
+    private fun extractVideoDataFromUrl(
+        url: String?,
+        keyStr: String
+    ): Pair<VideoDimensions?, Bitmap?>? {
+        if (url == null) return null
+        var retriever: MediaMetadataRetriever? = null
+        return try {
+            val r = MediaMetadataRetriever()
+            retriever = r
+            r.setDataSource(url)
+            val thumbnail = r.getFrameAtTime(0) ?: return null
+            val width = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+                ?: thumbnail.width
+            val height = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+                ?: thumbnail.height
+            DebugLogger.d(TAG, "fetchVideoBitmap: $keyStr 远程抽帧成功 ${width}x$height")
+            Pair(VideoDimensions(width, height), thumbnail)
+        } catch (_: Exception) {
+            // 认证 / TLS / 协议不支持：交给调用方回退整段下载
+            DebugLogger.d(TAG, "fetchVideoBitmap: $keyStr 远程抽帧失败，回退整段下载")
+            null
+        } catch (_: OutOfMemoryError) {
+            null
+        } finally {
+            runCatching { retriever?.release() }
+        }
     }
 
     // Utilities

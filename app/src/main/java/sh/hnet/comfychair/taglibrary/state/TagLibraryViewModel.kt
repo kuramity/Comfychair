@@ -25,6 +25,7 @@ import sh.hnet.comfychair.taglibrary.data.TagRepository
 import sh.hnet.comfychair.taglibrary.model.AppliedTag
 import sh.hnet.comfychair.taglibrary.model.Tag
 import sh.hnet.comfychair.taglibrary.model.TagCategory
+import sh.hnet.comfychair.taglibrary.search.TagSearcher
 
 /**
  * 标签库 ViewModel。
@@ -71,6 +72,9 @@ class TagLibraryViewModel(application: Application) : AndroidViewModel(applicati
         /** 复制到剪贴板失败。 */
         data object CopyFailed : Event()
 
+        /** 收藏/最近使用的本地文件损坏，写入被拒绝（原文件已备份）。 */
+        data object StorageCorrupted : Event()
+
         /** 数据库初始化失败。 */
         data class InitFailed(val message: String) : Event()
     }
@@ -78,7 +82,7 @@ class TagLibraryViewModel(application: Application) : AndroidViewModel(applicati
     private val repository = TagRepository.getInstance()
 
     /** 收藏 / 最近使用（纯本地文件，不依赖标签库数据库）。 */
-    private val favoritesStore by lazy { TagFavoritesStore(getApplication()) }
+    private val favoritesStore by lazy { TagFavoritesStore(getApplication<Application>()) }
 
     private val _uiState = MutableStateFlow(TagLibraryUiState())
     val uiState: StateFlow<TagLibraryUiState> = _uiState.asStateFlow()
@@ -240,16 +244,19 @@ class TagLibraryViewModel(application: Application) : AndroidViewModel(applicati
 
     /** 搜索框内容变化（防抖 120ms）。 */
     fun onKeywordChange(value: String) {
-        _uiState.update { it.copy(keyword = value) }
+        // 超长输入没有检索意义，只会放大后续 LIKE 全表扫描的代价；在这里直接截断，
+        // 输入框绑定 uiState.keyword，因此用户看到的就是截断后的内容。
+        val limited = value.take(TagSearcher.MAX_KEYWORD_LENGTH)
+        _uiState.update { it.copy(keyword = limited) }
         searchJob?.cancel()
-        if (value.isBlank()) {
+        if (limited.isBlank()) {
             searchSequence++  // 使进行中的请求结果失效
             _uiState.update { it.copy(results = emptyList(), isSearching = false) }
             return
         }
         searchJob = viewModelScope.launch {
             delay(DEBOUNCE_MS)
-            performSearch(value)
+            performSearch(limited)
         }
     }
 
@@ -384,7 +391,12 @@ class TagLibraryViewModel(application: Application) : AndroidViewModel(applicati
     fun toggleFavorite(tagName: String) {
         val current = _uiState.value.favorites
         val next = if (tagName in current) current - tagName else current + tagName
-        favoritesStore.saveFavorites(next)
+        // 本地文件损坏时 saveFavorites 会拒绝写入：此时不能把星标写进内存状态，
+        // 否则界面显示已收藏、重启后却消失，等于「假成功」
+        if (!favoritesStore.saveFavorites(next)) {
+            _events.tryEmit(Event.StorageCorrupted)
+            return
+        }
         _uiState.update { it.copy(favorites = next) }
     }
 

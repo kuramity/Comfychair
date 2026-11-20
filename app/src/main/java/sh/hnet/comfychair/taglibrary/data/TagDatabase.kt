@@ -2,9 +2,11 @@ package sh.hnet.comfychair.taglibrary.data
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import android.os.StatFs
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.zip.GZIPInputStream
 
 /**
@@ -38,8 +40,27 @@ object TagDatabase {
     /** 解压缓冲区大小（64KB，平衡内存与速度）。 */
     private const val BUFFER_SIZE = 64 * 1024
 
+    /** 解压后数据库的预期大小（约 103MB，见类注释）。 */
+    internal const val EXPECTED_DB_BYTES = 103L * 1024 * 1024
+
+    /**
+     * 空间预留倍数（P2-21）。
+     *
+     * 解压期间 `.tmp` 与旧库会同时存在（2 份），再留约 10% 余量给文件系统元数据与
+     * 其他写入，所以按目标大小的 2.2 倍预检。
+     */
+    internal const val SPACE_HEADROOM_FACTOR = 2.2
+
     @Volatile
     private var database: SQLiteDatabase? = null
+
+    /** 解压前需要的最小可用空间（字节）。纯函数，便于单测。 */
+    internal fun requiredSpaceBytes(expectedBytes: Long = EXPECTED_DB_BYTES): Long =
+        (expectedBytes * SPACE_HEADROOM_FACTOR).toLong()
+
+    /** 可用空间是否足够解压。纯函数，便于单测。 */
+    internal fun hasEnoughSpace(availableBytes: Long, requiredBytes: Long): Boolean =
+        availableBytes >= requiredBytes
 
     /**
      * 确保数据库就绪并返回只读实例。
@@ -63,10 +84,6 @@ object TagDatabase {
             if (needExtract) {
                 Log.i(TAG, "解压标签库: asset=$assetVersion local=$localVersion")
                 extractDatabase(context, dbFile)
-                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                    .edit()
-                    .putString(KEY_DB_VERSION, assetVersion)
-                    .apply()
             }
 
             val db = SQLiteDatabase.openDatabase(
@@ -75,9 +92,24 @@ object TagDatabase {
                 SQLiteDatabase.OPEN_READONLY
             )
             database = db
+
+            // P2-22：版本号必须等**打开成功之后**才写。
+            // 修复前是先写版本号再 openDatabase —— 打开失败时版本号已经对上，
+            // 下次启动不会再解压，那个坏库就被永久保留（标签库从此一直报错）。
+            // 写版本号本身失败不算致命（库已可用），下次启动只是多解压一次。
+            if (needExtract) {
+                runCatching {
+                    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                        .edit()
+                        .putString(KEY_DB_VERSION, assetVersion)
+                        .apply()
+                }.onFailure { Log.w(TAG, "写入标签库版本号失败（下次启动会重新解压）", it) }
+            }
             Result.success(db)
         } catch (e: Exception) {
             Log.e(TAG, "标签库打开失败", e)
+            // 失败即清掉版本号：下次启动强制重新解压，坏文件 / 半截文件能自愈
+            clearVersion(context)
             Result.failure(e)
         }
     }
@@ -104,6 +136,48 @@ object TagDatabase {
         }
     }
 
+    /** 清除本地记录的数据库版本号（打开失败后调用，下次启动强制重新解压）。 */
+    private fun clearVersion(context: Context) {
+        try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_DB_VERSION)
+                .apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "清除标签库版本号失败", e)
+        }
+    }
+
+    /**
+     * 解压前的空间预检（P2-21）。
+     *
+     * 修复前直接往私有目录写 103MB：空间不足时会在写到一半时抛 IOException，
+     * 用户只看到「标签库打开失败」，完全不知道是磁盘满了。现在先量可用空间，
+     * 不足就抛一条**带数字的可读错误**，经 [open] 的 Result.failure 送到 UI。
+     *
+     * @throws IOException 可用空间低于 [requiredSpaceBytes]
+     */
+    private fun ensureEnoughSpaceForExtract(target: File) {
+        val dir = target.parentFile ?: return
+        // StatFs 只能量已存在的目录；首次使用时 database 目录可能还没建
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.w(TAG, "数据库目录创建失败，跳过空间预检: $dir")
+            return
+        }
+        val available = try {
+            StatFs(dir.path).availableBytes
+        } catch (e: Exception) {
+            Log.w(TAG, "读取可用空间失败，跳过预检", e)
+            return
+        }
+        val required = requiredSpaceBytes()
+        if (!hasEnoughSpace(available, required)) {
+            val requiredMb = required / (1024 * 1024)
+            val availableMb = available / (1024 * 1024)
+            throw IOException("存储空间不足：解压标签库需要约 ${requiredMb}MB 可用空间，当前仅 ${availableMb}MB")
+        }
+    }
+
     /**
      * 从 assets 解压/复制数据库到应用私有目录（原子落盘）。
      *
@@ -114,6 +188,8 @@ object TagDatabase {
      */
     private fun extractDatabase(context: Context, target: File) {
         target.parentFile?.mkdirs()
+        // P2-21：写之前先确认空间够（不足直接抛带数字的 IOException）
+        ensureEnoughSpaceForExtract(target)
         val tmp = File(target.parentFile, "$DB_NAME.tmp")
         try {
             val plainAsset = runCatching { context.assets.open(ASSET_DB) }.getOrNull()

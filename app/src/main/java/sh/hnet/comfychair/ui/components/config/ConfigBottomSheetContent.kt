@@ -269,7 +269,9 @@ private fun RenderModelField(field: ModelField) {
         label = stringResource(field.label),
         selectedValue = field.selectedValue,
         options = field.filteredOptions ?: field.options,
-        onValueChange = field.onValueChange
+        onValueChange = field.onValueChange,
+        // G8 指令 1：UNET / VAE / CLIP 把类别透传给下拉，四态按这一类判定
+        category = field.category
     )
     // 主 LoRA 下拉的权重滑块（仅该字段带 strength/onStrengthChange 时出现）
     RenderFieldStrength(field)

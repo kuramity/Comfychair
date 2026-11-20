@@ -3,9 +3,10 @@ package sh.hnet.comfychair.ui.components.config
 import android.graphics.Bitmap
 import android.net.Uri
 import androidx.compose.runtime.Stable
+import sh.hnet.comfychair.connection.CoreCategory
 import sh.hnet.comfychair.model.LoraSelection
 import sh.hnet.comfychair.model.SeedMode
-import sh.hnet.comfychair.ui.components.shared.WorkflowItemBase
+import sh.hnet.comfychair.model.contract.WorkflowItemBase
 import sh.hnet.comfychair.viewmodel.ImageToImageMode
 
 /**
@@ -102,6 +103,12 @@ data class ModelConfig(
  * [strength] / [onStrengthChange] 是给"主 LoRA 下拉"用的可选权重滑块：
  * 两者都非空时在模型下拉下方渲染一条 0~2 的强度滑块，
  * 其余模型下拉不传（保持原样）。
+ *
+ * [category] 是 G8 指令 1 的接线：**UNET / VAE / CLIP 三类各传自己的类别**，
+ * 下拉因此能读「这一类」的终态与失败原因，而不是整体 isLoading / lastError。
+ * 于是「UNET 来源缺失、VAE/CLIP 正常」时，只有 UNET 行显示失败并可单独重试，
+ * 另外两行照常出候选；UNET 也不会因为整体加载态没收敛而被拖成「正在加载」（E7）。
+ * 其余下拉（LoRA / Checkpoint / 采样器 / 分辨率…）传 null = 沿用整体四态口径，行为不变。
  */
 @Stable
 data class ModelField(
@@ -112,7 +119,8 @@ data class ModelField(
     val onValueChange: (String) -> Unit,
     val isVisible: Boolean = true,
     val strength: Float? = null,
-    val onStrengthChange: ((Float) -> Unit)? = null
+    val onStrengthChange: ((Float) -> Unit)? = null,
+    val category: CoreCategory? = null
 )
 
 /**

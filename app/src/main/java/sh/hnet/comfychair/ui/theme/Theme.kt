@@ -11,7 +11,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
@@ -185,7 +185,7 @@ fun ComfyChairTheme(
 
     // 从磁盘恢复用户自定义配色（进程内只做一次，之后由 ThemeController 广播维持）
     LaunchedEffect(Unit) { ThemeController.restore(context) }
-    val customization by ThemeController.customization.collectAsState()
+    val customization by ThemeController.customization.collectAsStateWithLifecycle()
 
     // 用户调过色 → 在原色板基础上按规则重算；没调过就用原色板（少一次 HSL 往返，颜色更准）
     val themedScheme = remember(customization, darkTheme) {

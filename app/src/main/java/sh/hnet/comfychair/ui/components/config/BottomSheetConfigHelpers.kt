@@ -1,9 +1,11 @@
 package sh.hnet.comfychair.ui.components.config
 
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.connection.CoreCategory
 import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.SeedMode
 import sh.hnet.comfychair.model.VideoOptions
+import sh.hnet.comfychair.model.contract.CommonGenerationState
 
 /**
  * Shared helper functions for building BottomSheetConfig components.
@@ -56,7 +58,9 @@ internal fun buildCommonModelConfig(
             options = state.availableUnets,
             filteredOptions = state.filteredUnets,
             onValueChange = callbacks.onUnetChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            // G8 指令 1：UNET 下拉按「UNET 这一类」的终态显示四态，不被整体标志掩盖
+            category = CoreCategory.UNET
         ) else null,
 
         vae = if (caps.hasVaeName) ModelField(
@@ -65,7 +69,8 @@ internal fun buildCommonModelConfig(
             options = state.availableVaes,
             filteredOptions = state.filteredVaes,
             onValueChange = callbacks.onVaeChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.VAE
         ) else null,
 
         clip = if (caps.hasClipName) ModelField(
@@ -74,7 +79,8 @@ internal fun buildCommonModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips,
             onValueChange = callbacks.onClipChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
 
         clip1 = if (caps.hasClipName1) ModelField(
@@ -83,7 +89,8 @@ internal fun buildCommonModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips1,
             onValueChange = callbacks.onClip1Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
 
         clip2 = if (caps.hasClipName2) ModelField(
@@ -92,7 +99,8 @@ internal fun buildCommonModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips2,
             onValueChange = callbacks.onClip2Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
 
         clip3 = if (caps.hasClipName3) ModelField(
@@ -101,7 +109,8 @@ internal fun buildCommonModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips3,
             onValueChange = callbacks.onClip3Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
 
         clip4 = if (caps.hasClipName4) ModelField(
@@ -110,7 +119,8 @@ internal fun buildCommonModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips4,
             onValueChange = callbacks.onClip4Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
 
         textEncoder = if (caps.hasTextEncoderName) ModelField(

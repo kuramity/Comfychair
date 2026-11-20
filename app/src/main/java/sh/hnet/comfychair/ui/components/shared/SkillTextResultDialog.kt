@@ -23,7 +23,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -40,8 +40,8 @@ import sh.hnet.comfychair.prompt.SkillTextResult
  */
 @Composable
 fun SkillTextResultDialog(modifier: Modifier = Modifier) {
-    val visible by SkillTextResult.dialogVisible.collectAsState()
-    val text by SkillTextResult.text.collectAsState()
+    val visible by SkillTextResult.dialogVisible.collectAsStateWithLifecycle()
+    val text by SkillTextResult.text.collectAsStateWithLifecycle()
     val result = text ?: return
     if (!visible) return
     val context = LocalContext.current
@@ -85,8 +85,8 @@ fun SkillTextResultDialog(modifier: Modifier = Modifier) {
  */
 @Composable
 fun SkillTextResultButton(workflowName: String, modifier: Modifier = Modifier) {
-    val hasHidden by SkillTextResult.hasHiddenResult.collectAsState()
-    val owner by SkillTextResult.ownerWorkflow.collectAsState()
+    val hasHidden by SkillTextResult.hasHiddenResult.collectAsStateWithLifecycle()
+    val owner by SkillTextResult.ownerWorkflow.collectAsStateWithLifecycle()
 
     // 结果刚出现时把它绑定到当时的工作流；已绑定过的不再改动，
     // 否则用户切一次工作流就会把归属改走

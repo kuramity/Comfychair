@@ -39,6 +39,7 @@
     <string name="button_browser_auth_done">Fertig</string>
     <string name="button_reauthenticate">Erneut anmelden</string>
     <string name="error_browser_auth_cancelled">Anmeldung wurde nicht abgeschlossen</string>
+    <string name="error_browser_auth_insecure_host">Sicherheitswarnung: Das Zertifikat von %1$s ist nicht vertrauenswürdig. Verbindung blockiert.</string>
 
     <!-- Connection alert dialog -->
     <string name="title_connection_lost">Verbindung verloren</string>
@@ -234,6 +235,11 @@
     <!-- Error and status messages -->
     <string name="error_not_comfyui_server">Kein ComfyUI-Server</string>
     <string name="error_invalid_server_response">Ungültige Serverantwort</string>
+    <string name="error_https_connection_failed">HTTPS-Verbindung fehlgeschlagen: Wenn der Server nur HTTP unterstützt, ändern Sie die Adresse so, dass sie mit http:// beginnt, und versuchen Sie es erneut</string>
+    <string name="action_retrust_certificate">Serverzertifikat erneut vertrauen</string>
+    <string name="action_trust_certificate_first_time">Diesem Serverzertifikat vertrauen und erneut versuchen</string>
+    <string name="error_certificate_trust_failed">Zertifikatsvertrauen konnte nicht gespeichert werden, bitte erneut versuchen</string>
+    <string name="error_server_list_corrupted">Die Serverliste ist beschädigt, die Änderung wurde nicht gespeichert. Die Originaldatei wurde gesichert.</string>
     <string name="error_failed_load_workflow">Workflow konnte nicht geladen werden</string>
     <string name="error_generation_failed">Generierung fehlgeschlagen</string>
     <string name="error_job_lost">Aufgabe verloren: Der Server hat diesen Auftrag nicht mehr (Neustart oder geleerte Warteschlange). Bitte erneut generieren.</string>
@@ -655,6 +661,9 @@
     <string name="update_action_now">Jetzt aktualisieren</string>
     <string name="update_action_later">Spaeter</string>
     <string name="update_action_install">Installieren</string>
+    <string name="update_error_verify_missing">Die Aktualisierungsliste enthaelt keine gueltige SHA-256-Pruefsumme. Update abgelehnt.</string>
+    <string name="update_error_redirect">Der Download wurde auf einen nicht vertrauenswuerdigen Host umgeleitet (%1$s). Update abgebrochen.</string>
+    <string name="update_error_install_invalid">Paketname oder Signatur des Downloads passt nicht zu dieser App. Installation blockiert.</string>
     <string name="update_action_retry">Wiederholen</string>
     <string name="update_manual_check_failed">Pruefung fehlgeschlagen: %1$s</string>
     <string name="update_already_latest">Bereits die neueste Version.</string>
@@ -670,4 +679,6 @@
     <!-- Q3-3 (v4.16.5): Modell-Dropdown vier Zustände — fehlgeschlagen (wiederholbar) vs. wirklich leer -->
     <string name="model_list_load_failed">Modellliste konnte nicht geladen werden – zum Wiederholen tippen</string>
     <string name="model_list_empty">Keine Modelle auf dem Server verfügbar</string>
+    <!-- P3-10: kein Gerät/keine App kann den externen Link öffnen -->
+    <string name="error_open_link_failed">Keine App zum Öffnen dieses Links gefunden</string>
 </resources>

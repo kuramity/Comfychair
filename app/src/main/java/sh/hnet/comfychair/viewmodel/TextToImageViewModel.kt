@@ -1,12 +1,9 @@
 package sh.hnet.comfychair.viewmodel
 
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
-import android.provider.MediaStore
-import androidx.core.content.FileProvider
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
@@ -26,22 +23,23 @@ import sh.hnet.comfychair.model.PositivePromptPolicy
 import sh.hnet.comfychair.model.SeedMode
 import sh.hnet.comfychair.model.WorkflowCapabilities
 import sh.hnet.comfychair.model.nextSeed
-import sh.hnet.comfychair.ui.components.config.CommonGenerationState
+import sh.hnet.comfychair.model.contract.CommonGenerationState
 import sh.hnet.comfychair.model.WorkflowValues
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.taglibrary.state.PromptBridge
 import sh.hnet.comfychair.taglibrary.state.PromptTargetFactory
-import sh.hnet.comfychair.ui.components.shared.WorkflowItemBase
+import sh.hnet.comfychair.model.contract.WorkflowItemBase
 import sh.hnet.comfychair.util.DebugLogger
-import sh.hnet.comfychair.util.LoraChainManager
+import sh.hnet.comfychair.util.ShareFileStore
+import sh.hnet.comfychair.lora.LoraChainManager
 import sh.hnet.comfychair.util.Obfuscator
+import sh.hnet.comfychair.util.PhotoManager
 import sh.hnet.comfychair.util.SeasonalPrompts
 import sh.hnet.comfychair.util.ValidationUtils
 import sh.hnet.comfychair.workflow.ImageSlotDetector
 import sh.hnet.comfychair.workflow.WorkflowConstraintsProvider
 import sh.hnet.comfychair.workflow.dynamic.DynamicParam
 import sh.hnet.comfychair.viewmodel.base.BaseGenerationViewModel
-import java.io.File
 import java.io.IOException
 
 /**
@@ -240,6 +238,17 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
         )
     }
 
+    /**
+     * P2-20：ViewModel 销毁时从标签库桥接注销。
+     *
+     * 修复前只注册不注销，[PromptBridge] 的静态 map 一直钉着已销毁的 ViewModel
+     * （连同它的 uiState），页面来回切换时条目越积越多，标签库还可能读到旧页面。
+     */
+    override fun onCleared() {
+        super.onCleared()
+        PromptBridge.unregister(OWNER_ID)
+    }
+
     // Constants
     companion object {
         private const val TAG = "TextToImage"
@@ -263,6 +272,18 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
         viewModelScope.launch {
             ConnectionManager.modelCache.collect { cache ->
                 _uiState.update { state ->
+                    // P1-7：断线/重连的 invalidateAll() 会把 ModelCache 整体置空
+                    //（isLoaded=false、所有列表为空）。那份快照不是"服务器上没有模型"的证据，
+                    // 照常校验会把已选模型/LoRA 全部清空、deferred 恢复值一并抹掉并写回磁盘。
+                    // 直接跳过本次更新：保留现有选择与 deferred 值，等真实列表回来再校验。
+                    if (!ValidationUtils.isUsableModelCache(cache)) {
+                        DebugLogger.d(
+                            TAG,
+                            "跳过空模型缓存快照（isLoaded=${cache.isLoaded}），保留已选模型与 deferred 值"
+                        )
+                        // 原样返回当前状态（不写状态 = 不触发重组、不落盘空选择）
+                        return@update state
+                    }
                     // CLIP 候选按「格式门控」过滤：工作流带 `clip_gguf` 开关时，打开只留 .gguf、
                     // 关闭只留非 .gguf（两种加载器互斥，见 filterClipsByGate 注释）；无开关则原样。
                     val clipOptions = filterClipsByGate(cache.clips, state.dynamicParamValues)
@@ -1465,27 +1486,13 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
         val ctx = applicationContext ?: run { onResult(false); return }
         val bitmap = _uiState.value.previewBitmap ?: run { onResult(false); return }
 
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.png")
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/ComfyChair")
-        }
-
-        val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        uri?.let {
-            try {
-                ctx.contentResolver.openOutputStream(it)?.use { outputStream ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-                }
-                DebugLogger.i(TAG, "saveToGallery: Image saved successfully")
-                onResult(true)
-            } catch (e: IOException) {
-                DebugLogger.e(TAG, "saveToGallery: Failed to save image - ${e.message}")
-                onResult(false)
+        // P1-22：IS_PENDING 写入 + 真实结果。修复前 insert/openOutputStream 失败也会报成功
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                PhotoManager.saveBitmap(ctx, bitmap)
             }
-        } ?: run {
-            DebugLogger.e(TAG, "saveToGallery: Failed to create media URI")
-            onResult(false)
+            DebugLogger.i(TAG, "saveToGallery: saved=$saved")
+            onResult(saved)
         }
     }
 
@@ -1507,20 +1514,16 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
         val ctx = applicationContext ?: return null
         val bitmap = _uiState.value.previewBitmap ?: return null
 
-        val cachePath = ctx.cacheDir
+        // P2-12：分享载荷只能写进 cacheDir/share/（FileProvider 唯一声明的缓存子目录）
         val filename = "share_image_${System.currentTimeMillis()}.png"
-        val file = File(cachePath, filename)
+        val file = ShareFileStore.file(ctx, filename)
 
         return try {
             file.outputStream().use { outputStream ->
                 bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
             }
 
-            val uri = FileProvider.getUriForFile(
-                ctx,
-                "${ctx.packageName}.fileprovider",
-                file
-            )
+            val uri = ShareFileStore.uriFor(ctx, file)
 
             Intent(Intent.ACTION_SEND).apply {
                 type = "image/png"

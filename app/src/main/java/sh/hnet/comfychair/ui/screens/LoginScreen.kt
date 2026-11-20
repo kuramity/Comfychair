@@ -54,6 +54,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -74,6 +75,7 @@ import sh.hnet.comfychair.ui.components.ConnectionSplitButton
 import sh.hnet.comfychair.ui.components.ServerDialog
 import sh.hnet.comfychair.ui.components.ServerDropdown
 import sh.hnet.comfychair.util.LoginBackgroundStore
+import sh.hnet.comfychair.util.NetworkPolicy
 import sh.hnet.comfychair.util.ServerUrlUtils
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -99,6 +101,19 @@ fun LoginScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    /**
+     * P3-13：登录成功进主容器必须清空任务栈。
+     *
+     * 原来裸 startActivity 会把 MainContainerActivity 压在本页（MainActivity）之上：
+     * 返回键直接退回登录页，反复登录还会堆叠出多个主容器实例（各自跑着一套
+     * 连接/缓存恢复逻辑）。NEW_TASK + CLEAR_TASK 让主容器成为新任务栈的唯一根。
+     */
+    fun launchMainContainer() {
+        val intent = Intent(context, MainContainerActivity::class.java)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        context.startActivity(intent)
+    }
+
     // Server and credential storage
     val serverStorage = remember { ServerStorage(context.applicationContext) }
     val credentialStorage = remember { CredentialStorage(context.applicationContext) }
@@ -118,6 +133,10 @@ fun LoginScreen() {
     var warningMessage by remember { mutableStateOf<String?>(null) }
     var comfyUIClient by remember { mutableStateOf<ComfyUIClient?>(null) }
     var hasAutoConnected by remember { mutableStateOf(false) }
+    // 私网证书指纹不一致时提供「重新信任」入口；公网不提供（必须失败）
+    var retrustServer by remember { mutableStateOf<Server?>(null) }
+    // 公网自签证书首次连接：必须由用户显式确认后才能信任
+    var trustFirstServer by remember { mutableStateOf<Server?>(null) }
 
     // 连接页背景照片（用户自选，重编码后存在私有目录）
     var backgroundBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -203,6 +222,8 @@ fun LoginScreen() {
     fun attemptConnection(server: Server, isRetryAfterAuth: Boolean = false) {
         connectionState = ConnectionState.CONNECTING
         warningMessage = null
+        retrustServer = null
+        trustFirstServer = null
 
         scope.launch {
             // Load credentials for the server
@@ -216,7 +237,7 @@ fun LoginScreen() {
             ) {
                 pendingBrowserAuthServer = server
                 pendingBrowserAuthUrl =
-                    ServerUrlUtils.buildServerUrl("https", server.hostname, server.port)
+                    ServerUrlUtils.buildServerUrl(server.protocol ?: "https", server.hostname, server.port)
                 connectionState = ConnectionState.IDLE
                 return@launch
             }
@@ -225,7 +246,9 @@ fun LoginScreen() {
                 context.applicationContext,
                 server.hostname,
                 server.port,
-                credentials
+                credentials,
+                server.id,
+                preferredProtocol = server.protocol
             )
             comfyUIClient = client
 
@@ -252,12 +275,16 @@ fun LoginScreen() {
                         1000L
                     }
                     CertificateIssue.NONE -> 500L
+                    // 成功路径不会出现这两种问题；保留分支只为穷举
+                    CertificateIssue.PIN_MISMATCH,
+                    CertificateIssue.UNTRUSTED_PUBLIC -> 0L
                 }
 
                 delay(navigateDelay)
 
                 // Establish connection via ConnectionManager
-                val detectedProtocol = client.getWorkingProtocol() ?: "http"
+                // 兜底用 https：只有探测成功或用户显式选择 http 才会得到明文
+                val detectedProtocol = client.getWorkingProtocol() ?: "https"
 
                 // Save selected server
                 serverStorage.setSelectedServerId(server.id)
@@ -272,8 +299,7 @@ fun LoginScreen() {
                 )
 
                 // Navigate to main activity
-                val intent = Intent(context, MainContainerActivity::class.java)
-                context.startActivity(intent)
+                launchMainContainer()
             } else if (server.authType == AuthType.BROWSER && !isRetryAfterAuth) {
                 // Connection failed with browser auth and WebView hasn't been tried yet.
                 // The server may be reachable but behind an SSO that blocked the request.
@@ -284,6 +310,26 @@ fun LoginScreen() {
                 connectionState = ConnectionState.IDLE
             } else {
                 connectionState = ConnectionState.FAILED
+
+                // 证书指纹不一致：私网允许用户清除指纹后重连一次；公网不提供该入口
+                retrustServer = if (
+                    certIssue == CertificateIssue.PIN_MISMATCH &&
+                    NetworkPolicy.isPrivateHost(server.hostname.trim())
+                ) {
+                    server
+                } else {
+                    null
+                }
+
+                // 公网自签证书（系统不信任且从未信任过）：必须用户显式确认才能建立信任
+                trustFirstServer = if (
+                    certIssue == CertificateIssue.UNTRUSTED_PUBLIC &&
+                    client.getPendingCertificateFingerprint() != null
+                ) {
+                    server
+                } else {
+                    null
+                }
 
                 // 自动切换：有可用缓存就直接进离线，不再弹窗询问用户
                 // （无缓存时不进离线——进去也是空白，明确报连接失败即可）
@@ -299,6 +345,8 @@ fun LoginScreen() {
                 }
 
                 if (enteredOffline) {
+                    retrustServer = null
+                    trustFirstServer = null
                     connectionState = ConnectionState.CONNECTED
                     delay(500)
 
@@ -306,8 +354,7 @@ fun LoginScreen() {
                     serverStorage.setSelectedServerId(server.id)
 
                     // Navigate to main activity (offline: reads from cache only)
-                    val intent = Intent(context, MainContainerActivity::class.java)
-                    context.startActivity(intent)
+                    launchMainContainer()
                     return@launch
                 }
 
@@ -359,8 +406,7 @@ fun LoginScreen() {
                 serverStorage.setSelectedServerId(server.id)
 
                 // Navigate to main activity (no actual connection established)
-                val intent = Intent(context, MainContainerActivity::class.java)
-                context.startActivity(intent)
+                launchMainContainer()
             } else {
                 connectionState = ConnectionState.FAILED
                 Toast.makeText(context, R.string.error_no_offline_cache, Toast.LENGTH_LONG).show()
@@ -437,42 +483,56 @@ fun LoginScreen() {
                 showServerDialog = false
                 serverToEdit = null
             },
-            onSave = { name, hostname, port, authType, credentials ->
-                if (serverToEdit != null) {
+            onSave = { name, hostname, port, authType, credentials, protocol ->
+                val saved = if (serverToEdit != null) {
                     // Update existing server
                     val updatedServer = serverToEdit!!.copy(
                         name = name,
                         hostname = hostname,
                         port = port,
-                        authType = authType
+                        authType = authType,
+                        protocol = protocol
                     )
-                    serverStorage.updateServer(updatedServer)
+                    val ok = serverStorage.updateServer(updatedServer)
+                    if (ok) {
+                        // Save credentials
+                        credentialStorage.saveCredentials(updatedServer.id, credentials)
 
-                    // Save credentials
-                    credentialStorage.saveCredentials(updatedServer.id, credentials)
+                        servers = serverStorage.getServers()
 
-                    servers = serverStorage.getServers()
-
-                    // If editing the selected server, update selection
-                    if (selectedServer?.id == updatedServer.id) {
-                        selectedServer = updatedServer
+                        // If editing the selected server, update selection
+                        if (selectedServer?.id == updatedServer.id) {
+                            selectedServer = updatedServer
+                        }
                     }
+                    ok
                 } else {
                     // Add new server
-                    val newServer = Server.create(name, hostname, port, authType)
-                    serverStorage.addServer(newServer)
+                    val newServer = Server.create(name, hostname, port, authType, protocol)
+                    val ok = serverStorage.addServer(newServer)
+                    if (ok) {
+                        // Save credentials
+                        credentialStorage.saveCredentials(newServer.id, credentials)
 
-                    // Save credentials
-                    credentialStorage.saveCredentials(newServer.id, credentials)
+                        servers = serverStorage.getServers()
 
-                    servers = serverStorage.getServers()
-
-                    // Select the new server
-                    selectedServer = newServer
-                    serverStorage.setSelectedServerId(newServer.id)
+                        // Select the new server
+                        selectedServer = newServer
+                        serverStorage.setSelectedServerId(newServer.id)
+                    }
+                    ok
                 }
-                showServerDialog = false
-                serverToEdit = null
+                if (saved) {
+                    showServerDialog = false
+                    serverToEdit = null
+                } else {
+                    // 服务器列表已损坏：写入被拒绝，必须让用户看到
+                    Toast.makeText(
+                        context,
+                        R.string.error_server_list_corrupted,
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         )
     }
@@ -487,7 +547,17 @@ fun LoginScreen() {
                 Button(
                     onClick = {
                         val serverToDelete = selectedServer!!
-                        serverStorage.deleteServer(serverToDelete.id)
+                        showDeleteConfirmation = false
+
+                        if (!serverStorage.deleteServer(serverToDelete.id)) {
+                            // 服务器列表已损坏：写入被拒绝，必须让用户看到
+                            Toast.makeText(
+                                context,
+                                R.string.error_server_list_corrupted,
+                                Toast.LENGTH_LONG
+                            ).show()
+                            return@Button
+                        }
 
                         // Also delete credentials for the server
                         credentialStorage.deleteCredentials(serverToDelete.id)
@@ -498,7 +568,6 @@ fun LoginScreen() {
                         selectedServer = servers.firstOrNull()
                         selectedServer?.let { serverStorage.setSelectedServerId(it.id) }
 
-                        showDeleteConfirmation = false
                         Toast.makeText(context, R.string.msg_server_deleted_success, Toast.LENGTH_SHORT).show()
                     },
                     colors = ButtonDefaults.buttonColors(
@@ -594,9 +663,14 @@ fun LoginScreen() {
             )
             Text(
                 text = stringResource(R.string.app_name),
-                fontSize = 36.sp,
+                // 大标题走 Typography.displaySmall（36sp，字号与原先手写值一致），
+                // 并限制两行 + 省略号：系统字号放大到 1.3x、或语言文案变长（如德语）时，
+                // 标题不会撑破 Row 或被裁掉半行。
+                style = MaterialTheme.typography.displaySmall,
                 fontFamily = FontFamily.Serif,
                 color = MaterialTheme.colorScheme.primary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.offset(x = (-16).dp)
             )
         }
@@ -609,6 +683,8 @@ fun LoginScreen() {
             selectedServer = selectedServer,
             onServerSelected = { server ->
                 selectedServer = server
+                retrustServer = null
+                trustFirstServer = null
                 serverStorage.setSelectedServerId(server.id)
             },
             modifier = Modifier.fillMaxWidth()
@@ -648,6 +724,45 @@ fun LoginScreen() {
             },
             modifier = Modifier.fillMaxWidth()
         )
+
+        // 私网证书指纹不一致：清除旧指纹后重连一次（TOFU 会记录新指纹）
+        retrustServer?.let { server ->
+            Spacer(modifier = Modifier.height(16.dp))
+            OutlinedButton(
+                onClick = {
+                    serverStorage.clearCertificatePin(server.id)
+                    retrustServer = null
+                    attemptConnection(server)
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(text = stringResource(R.string.action_retrust_certificate))
+            }
+        }
+
+        // 公网自签证书首次连接：用户显式确认后才写入信任存储并重试
+        trustFirstServer?.let { server ->
+            Spacer(modifier = Modifier.height(16.dp))
+            OutlinedButton(
+                onClick = {
+                    val client = comfyUIClient
+                    val trusted = client?.trustPendingCertificate() == true
+                    trustFirstServer = null
+                    if (trusted) {
+                        attemptConnection(server)
+                    } else {
+                        Toast.makeText(
+                            context,
+                            R.string.error_certificate_trust_failed,
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(text = stringResource(R.string.action_trust_certificate_first_time))
+            }
+        }
 
         // Warning message
         warningMessage?.let { message ->

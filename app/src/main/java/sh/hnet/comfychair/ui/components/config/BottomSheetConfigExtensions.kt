@@ -3,6 +3,7 @@ package sh.hnet.comfychair.ui.components.config
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.WorkflowManager
 import sh.hnet.comfychair.WorkflowType
+import sh.hnet.comfychair.connection.CoreCategory
 import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.SeedMode
 import sh.hnet.comfychair.viewmodel.ImageToImageMode
@@ -139,7 +140,8 @@ fun TextToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): BottomS
                 options = availableUnets,
                 filteredOptions = filteredUnets,
                 onValueChange = callbacks.onHighnoiseUnetChange ?: noOpString,
-                isVisible = true
+                isVisible = true,
+                category = CoreCategory.UNET
             ) else null,
             lownoiseUnet = if (capabilities.hasLownoiseUnetName) ModelField(
                 label = R.string.label_lownoise_unet,
@@ -147,7 +149,8 @@ fun TextToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): BottomS
                 options = availableUnets,
                 filteredOptions = filteredUnets,
                 onValueChange = callbacks.onLownoiseUnetChange ?: noOpString,
-                isVisible = true
+                isVisible = true,
+                category = CoreCategory.UNET
             ) else null,
             highnoiseLora = if (capabilities.hasHighnoiseLoraName) ModelField(
                 label = R.string.label_highnoise_lora,
@@ -295,7 +298,8 @@ fun ImageToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): Bottom
                 options = availableUnets,
                 filteredOptions = filteredUnets,
                 onValueChange = callbacks.onHighnoiseUnetChange ?: noOpString,
-                isVisible = true
+                isVisible = true,
+                category = CoreCategory.UNET
             ) else null,
             lownoiseUnet = if (capabilities.hasLownoiseUnetName) ModelField(
                 label = R.string.label_lownoise_unet,
@@ -303,7 +307,8 @@ fun ImageToVideoUiState.toBottomSheetConfig(callbacks: UnifiedCallbacks): Bottom
                 options = availableUnets,
                 filteredOptions = filteredUnets,
                 onValueChange = callbacks.onLownoiseUnetChange ?: noOpString,
-                isVisible = true
+                isVisible = true,
+                category = CoreCategory.UNET
             ) else null,
             highnoiseLora = if (capabilities.hasHighnoiseLoraName) ModelField(
                 label = R.string.label_highnoise_lora,
@@ -533,7 +538,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableUnets,
             filteredOptions = state.filteredUnets,
             onValueChange = callbacks.onEditingUnetChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.UNET
         ) else null,
         vae = if (caps.hasVaeName) ModelField(
             label = R.string.label_vae,
@@ -541,7 +547,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableVaes,
             filteredOptions = state.filteredVaes,
             onValueChange = callbacks.onEditingVaeChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.VAE
         ) else null,
         clip = if (caps.hasClipName) ModelField(
             label = R.string.label_clip,
@@ -549,7 +556,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips,
             onValueChange = callbacks.onEditingClipChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
         clip1 = if (caps.hasClipName1) ModelField(
             label = R.string.label_clip1,
@@ -557,7 +565,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips1,
             onValueChange = callbacks.onEditingClip1Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
         clip2 = if (caps.hasClipName2) ModelField(
             label = R.string.label_clip2,
@@ -565,7 +574,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips2,
             onValueChange = callbacks.onEditingClip2Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
         clip3 = if (caps.hasClipName3) ModelField(
             label = R.string.label_clip3,
@@ -573,7 +583,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips3,
             onValueChange = callbacks.onEditingClip3Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
         clip4 = if (caps.hasClipName4) ModelField(
             label = R.string.label_clip4,
@@ -581,7 +592,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableClips,
             filteredOptions = state.filteredClips4,
             onValueChange = callbacks.onEditingClip4Change ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.CLIP
         ) else null,
         textEncoder = if (caps.hasTextEncoderName) ModelField(
             label = R.string.label_text_encoder,
@@ -614,7 +626,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableUnets,
             filteredOptions = null,
             onValueChange = callbacks.onEditingHighnoiseUnetChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.UNET
         ) else null,
         lownoiseUnet = if (caps.hasLownoiseUnetName) ModelField(
             label = R.string.label_lownoise_unet,
@@ -622,7 +635,8 @@ private fun buildEditingModeModelConfig(
             options = state.availableUnets,
             filteredOptions = null,
             onValueChange = callbacks.onEditingLownoiseUnetChange ?: noOpString,
-            isVisible = true
+            isVisible = true,
+            category = CoreCategory.UNET
         ) else null,
         highnoiseLora = if (caps.hasHighnoiseLoraName) ModelField(
             label = R.string.label_highnoise_lora,

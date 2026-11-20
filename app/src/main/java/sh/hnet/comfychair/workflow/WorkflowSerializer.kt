@@ -287,18 +287,30 @@ class WorkflowSerializer {
 
     /**
      * Serialize a literal value to the appropriate JSON type.
+     *
+     * NaN / ±Infinity 在最后一层被拦下：org.json 对这两个值会抛
+     * `JSONException: Forbidden numeric value`，整份导出会直接失败。
+     * 兜底成 0.0 并留日志——比导出崩溃或写出非法 JSON 更容易被发现和修正。
      */
     private fun serializeLiteralValue(value: Any): Any {
         return when (value) {
             is String -> value
             is Int -> value
             is Long -> value
-            is Float -> value.toDouble()  // JSON uses double
-            is Double -> value
+            is Float -> if (value.isFinite()) value.toDouble() else nonFiniteFallback(value)
+            is Double -> if (value.isFinite()) value else nonFiniteFallback(value)
             is Boolean -> value
-            is Number -> value.toDouble()
+            is Number -> {
+                val doubleValue = value.toDouble()
+                if (doubleValue.isFinite()) doubleValue else nonFiniteFallback(doubleValue)
+            }
             else -> value.toString()
         }
+    }
+
+    private fun nonFiniteFallback(value: Number): Double {
+        DebugLogger.w(TAG, "serializeLiteralValue: 丢弃非有限数值 $value，写回 0.0")
+        return 0.0
     }
 
     /**

@@ -48,7 +48,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -89,6 +89,7 @@ import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.previewSurfaceBackground
 import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
 import sh.hnet.comfychair.ui.components.shared.FreeMemoryButton
+import sh.hnet.comfychair.ui.components.shared.bottomSheetSafeDrawingInsets
 import sh.hnet.comfychair.ui.components.shared.SettingsGearButton
 import sh.hnet.comfychair.ui.components.shared.rememberSpellCheckVisualTransformation
 import sh.hnet.comfychair.ui.components.config.ConfigBottomSheetContent
@@ -119,11 +120,14 @@ fun ImageToVideoScreen(
 
     // State and effects
     // Collect state
-    val generationState by generationViewModel.generationState.collectAsState()
-    val uiState by imageToVideoViewModel.uiState.collectAsState()
-    val presetUiState by presetViewModel.uiState.collectAsState()
-    val queueState by JobRegistry.queueState.collectAsState()
-    val isConnecting by ConnectionManager.isConnecting.collectAsState()
+    val generationState by generationViewModel.generationState.collectAsStateWithLifecycle()
+    val uiState by imageToVideoViewModel.uiState.collectAsStateWithLifecycle()
+    val presetUiState by presetViewModel.uiState.collectAsStateWithLifecycle()
+    val queueState by JobRegistry.queueState.collectAsStateWithLifecycle()
+    val isConnecting by ConnectionManager.isConnecting.collectAsStateWithLifecycle()
+    // P1-4：提交在途（闸门持有中）。并入按钮 enabled 条件，连点时按钮本身即禁用，
+    // 不再依赖 ViewModel 层静默丢弃来兜底。
+    val isSubmitting by generationViewModel.isSubmitting.collectAsStateWithLifecycle()
 
     // Check if THIS screen owns the currently executing job (for progress bar)
     val isThisScreenExecuting = queueState.executingOwnerId == ImageToVideoViewModel.OWNER_ID
@@ -590,7 +594,9 @@ fun ImageToVideoScreen(
                 canCancelCurrent = queueState.executingOwnerId == ImageToVideoViewModel.OWNER_ID ||
                     queueState.ownJobs.values.any { it.ownerId == ImageToVideoViewModel.OWNER_ID },
                 isEnabled = imageToVideoViewModel.hasValidConfiguration() &&
-                    (!uiState.capabilities.hasPositivePrompt || uiState.positivePrompt.isNotBlank()),
+                    (!uiState.capabilities.hasPositivePrompt || uiState.positivePrompt.isNotBlank()) &&
+                    // P1-4：上一次提交还没回来时禁用，避免连点重复提交
+                    !isSubmitting,
                 isUploading = uiState.isUploading,
                 // v4.6.1 模块 D：上传进度（-1 = 无上传）
                 uploadProgress = uiState.uploadProgress,
@@ -679,7 +685,8 @@ fun ImageToVideoScreen(
         ModalBottomSheet(
             onDismissRequest = { showOptionsSheet = false },
             sheetState = configSheetState,
-            contentWindowInsets = { WindowInsets(0, 0, 0, 0) }
+            // 统一安全区：底部让开手势条 / 三键导航栏与输入法，左右让开横屏刘海
+            contentWindowInsets = { bottomSheetSafeDrawingInsets() }
         ) {
             val callbacks = remember(imageToVideoViewModel) {
                 UnifiedCallbacks(

@@ -17,6 +17,7 @@ import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Deque
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
@@ -60,6 +61,14 @@ class UpdateDownloadWorker(
         const val PART_FILE_NAME = "update.apk.part"
         const val FINAL_FILE_NAME = "update.apk"
 
+        /**
+         * 清单 sha256 旁车文件（P2-11）。
+         *
+         * 与 update.apk 同目录：冷启动恢复时内存里没有清单，只能靠它复验磁盘文件的完整性。
+         * 写完安装包就写它，删包时一起删。
+         */
+        const val SHA_FILE_NAME = "update.apk.sha256"
+
         /** 单次读写的 buffer 大小（硬性约束 14：8KB–64KB 区间内取 64KB） */
         private const val BUFFER_SIZE = 64 * 1024
 
@@ -91,11 +100,55 @@ class UpdateDownloadWorker(
                 // callTimeout 必须为 0（不限）：公网隧道实测 33~90KB/s，152.8MB 需要
                 // 28~77 分钟（A-R1.5），任何有限的整体超时都会在下载中段误杀慢速传输
                 .callTimeout(0, TimeUnit.SECONDS)
+                // P0-7：禁止自动跟随重定向。OkHttp 默认会自动跟随并**重新校验不了**目标主机，
+                // 清单里的 https 地址只要 302 到任意主机，载荷就能绕过白名单进安装链路。
+                // 改为逐跳校验（见 [redirectGuardInterceptor]）。
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .addInterceptor(redirectGuardInterceptor())
                 .build()
+        }
+
+        /** 手动跟随重定向的最大跳数（防止 A→B→A 之类的跳转死循环） */
+        private const val MAX_REDIRECT_HOPS = 5
+
+        /**
+         * 重定向白名单拦截器（P0-7）。
+         *
+         * 客户端已关闭自动跟随，由这里逐跳处理 3xx：每一跳的新地址都必须仍命中
+         * [UpdateChecker.isApkUrlAllowed]（https + 清单同域白名单），任一跳越界立即抛
+         * [DownloadPolicy.InsecureRedirectException]，请求不会发到越界主机上。
+         * 请求头（含 Range）随 builder 一路保留，续传语义不受影响。
+         */
+        internal fun redirectGuardInterceptor(): Interceptor = Interceptor { chain ->
+            var request = chain.request()
+            var response = chain.proceed(request)
+            var hops = 0
+            while (response.isRedirect) {
+                val location = response.header("Location")
+                val nextUrl = DownloadPolicy.resolveRedirect(request.url.toString(), location)
+                // 先关掉上一跳响应体，避免连接泄漏
+                response.close()
+                if (nextUrl == null) {
+                    throw IOException("重定向地址无法解析（Location=$location）")
+                }
+                if (!UpdateChecker.isApkUrlAllowed(nextUrl)) {
+                    DebugLogger.w(TAG, "重定向目标越界，已拒绝：$nextUrl")
+                    throw DownloadPolicy.InsecureRedirectException(nextUrl)
+                }
+                if (hops >= MAX_REDIRECT_HOPS) {
+                    throw IOException("重定向次数过多（超过 $MAX_REDIRECT_HOPS 跳）")
+                }
+                hops++
+                request = request.newBuilder().url(nextUrl).build()
+                response = chain.proceed(request)
+            }
+            response
         }
 
         fun partFile(context: Context): File = File(updateDir(context), PART_FILE_NAME)
         fun finalFile(context: Context): File = File(updateDir(context), FINAL_FILE_NAME)
+        fun shaFile(context: Context): File = File(updateDir(context), SHA_FILE_NAME)
 
         /**
          * 从 Content-Range 头解析总长度：`bytes 123-456789/456790` → 456790。
@@ -182,7 +235,22 @@ class UpdateDownloadWorker(
                 // 进度条切成"校验中"的不确定态，用户不会误以为卡在 99%
                 UpdateNotifier.updateProgress(applicationContext, repository.state.value, versionName)
                 val actualSha = sha256Of(part)
-                if (expectedSha256.isEmpty() || actualSha.equals(expectedSha256, ignoreCase = true)) break
+                // P0-7：清单缺校验值必须判失败。原判据是
+                // `if (expectedSha256.isEmpty() || actualSha.equals(expectedSha256)) break`，
+                // 只要清单不写 sha256 就能让完整性校验直接通过 —— 等于把开关交给攻击者。
+                when (DownloadPolicy.verifySha256(expectedSha256, actualSha)) {
+                    DownloadPolicy.Sha256Verdict.MATCH -> break
+                    DownloadPolicy.Sha256Verdict.MISSING -> {
+                        DebugLogger.w(TAG, "清单缺少有效 SHA-256（raw=$expectedSha256）→ 拒绝安装")
+                        val message = applicationContext.getString(R.string.update_error_verify_missing)
+                        repository.publishFailed(message)
+                        UpdateNotifier.notifyFailed(applicationContext, message)
+                        UpdateNotifier.cancelProgress(applicationContext)
+                        return@withContext Result.failure()
+                    }
+                    // 不匹配：落到下面既有的自愈/失败处理
+                    DownloadPolicy.Sha256Verdict.MISMATCH -> Unit
+                }
 
                 if (skipDownload && !legacy && !healedPart) {
                     DebugLogger.w(TAG, "SHA-256 mismatch on pre-complete .part → full redownload once")
@@ -211,6 +279,20 @@ class UpdateDownloadWorker(
                 // rename 失败（跨卷/占用）退化为拷贝
                 part.copyTo(final, overwrite = true)
                 part.delete()
+            }
+
+            // P2-11：把清单 sha256 与安装包一起落盘。冷启动恢复时清单已不在内存，
+            // 没有这份旁车就无法复验，而「无法复验」必须按不可信处理（见 UpdateRestorePolicy）。
+            try {
+                val normalizedSha = DownloadPolicy.normalizeSha256(expectedSha256)
+                if (normalizedSha != null) {
+                    shaFile(applicationContext).writeText(normalizedSha)
+                } else {
+                    // 走到这里说明上面的校验分支已判过 MISSING，正常不会发生；防御性记一条
+                    DebugLogger.w(TAG, "写入 sha256 旁车失败：清单校验值为空，恢复时将按不可信处理")
+                }
+            } catch (e: Exception) {
+                DebugLogger.w(TAG, "写入 sha256 旁车失败：${e.javaClass.simpleName} ${e.message}")
             }
 
             repository.publishReady(final.length())
@@ -304,6 +386,11 @@ class UpdateDownloadWorker(
                     UpdateFormat.formatBytes(disk?.neededBytes ?: 0L)
                 )
             }
+            // P0-7：重定向越界属于安全拒绝，必须给出明确原因而不是笼统的"未知错误"
+            DownloadPolicy.FailureKind.INSECURE_REDIRECT -> ctx.getString(
+                R.string.update_error_redirect,
+                (e as? DownloadPolicy.InsecureRedirectException)?.targetUrl ?: ""
+            )
             DownloadPolicy.FailureKind.UNKNOWN -> ctx.getString(R.string.update_error_unknown)
         }
     }

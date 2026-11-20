@@ -112,14 +112,19 @@ fun MaskPreview(
 
             // Draw all paths in order - this allows paint after erase to work correctly
             maskPaths.forEach { pathData ->
-                if (pathData.isEraser) {
-                    clearPaint.strokeWidth = pathData.brushSize
-                    drawContext.canvas.nativeCanvas.drawPath(pathData.path, clearPaint)
+                val paint = if (pathData.isEraser) clearPaint else maskPaint
+                // P1-25：反相的整图覆盖笔是填充语义（与 MaskPaintCanvas / 蒙版生成同口径）
+                paint.style = if (pathData.isFill) {
+                    android.graphics.Paint.Style.FILL
                 } else {
-                    maskPaint.strokeWidth = pathData.brushSize
-                    drawContext.canvas.nativeCanvas.drawPath(pathData.path, maskPaint)
+                    android.graphics.Paint.Style.STROKE
                 }
+                paint.strokeWidth = pathData.brushSize
+                drawContext.canvas.nativeCanvas.drawPath(pathData.path, paint)
             }
+
+            maskPaint.style = android.graphics.Paint.Style.STROKE
+            clearPaint.style = android.graphics.Paint.Style.STROKE
 
             drawContext.canvas.nativeCanvas.restore()
         }

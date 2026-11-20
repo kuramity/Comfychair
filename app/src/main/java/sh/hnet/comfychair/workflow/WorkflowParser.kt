@@ -11,6 +11,24 @@ class WorkflowParser {
 
     companion object {
         private const val TAG = "WorkflowParser"
+
+        /** 画布/列表里字面量预览的最大字符数（仅用于显示，绝不写回磁盘） */
+        const val DISPLAY_MAX_LENGTH = 30
+
+        /**
+         * 把字面量格式化成**仅供显示**的短文本。
+         *
+         * 与 [parseInputs] 里的字面量归一化严格区分：本函数的结果只允许出现在 UI 上，
+         * 不得回填到 `InputValue.Literal` 或序列化路径（否则又变成把截断值写回磁盘）。
+         */
+        fun formatLiteralValueForDisplay(value: Any): String {
+            val text = value.toString()
+            return if (text.length > DISPLAY_MAX_LENGTH) {
+                text.take(DISPLAY_MAX_LENGTH - 3) + "..."
+            } else {
+                text
+            }
+        }
     }
 
     /**
@@ -315,18 +333,18 @@ class WorkflowParser {
     }
 
     /**
-     * Format a literal value for display
+     * 归一化字面量值，**保留完整原文**。
+     *
+     * 这里曾经把超过 30 字符的字符串截成 `前 27 字符 + "..."`，那是给画布显示做的缩进处理，
+     * 却落在了图模型上：`WorkflowSerializer` 再把 `WorkflowNode.inputs` 写回文件时，磁盘上
+     * 的长提示词就永久变成了 `...`（用户没编辑过的内容也会丢）。显示侧的截断本来就该由
+     * 渲染层按可用宽度做（见 `WorkflowGraphCanvas` 的 `TextMeasureCache.truncate`），
+     * 所以模型层只做类型归一化，不做任何长度裁剪。需要纯文本预览请用
+     * [formatLiteralValueForDisplay]。
      */
     private fun formatLiteralValue(value: Any): Any {
         return when (value) {
-            is String -> {
-                // Truncate long strings
-                if (value.length > 30) {
-                    value.take(27) + "..."
-                } else {
-                    value
-                }
-            }
+            is String -> value
             is Number -> value
             is Boolean -> value
             else -> value.toString()

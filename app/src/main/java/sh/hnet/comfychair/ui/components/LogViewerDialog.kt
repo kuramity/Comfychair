@@ -8,7 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
 import androidx.compose.material.icons.Icons
@@ -46,6 +46,8 @@ import sh.hnet.comfychair.R
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.LogEntry
 import sh.hnet.comfychair.util.LogLevel
+import sh.hnet.comfychair.ui.util.KeyedItem
+import sh.hnet.comfychair.ui.util.withStableKeys
 
 /**
  * A fullscreen dialog for viewing debug logs.
@@ -58,7 +60,10 @@ fun LogViewerDialog(
     onDismiss: () -> Unit,
     onSave: () -> Unit
 ) {
-    val entries = remember { mutableStateListOf<LogEntry>() }
+    // 列表行 = 日志条目 + 由条目内容派生的稳定 key（见 logEntryIdentity）。
+    // 不能拿下标当 key：日志到 1000 条上限后是"头删尾插"的滚动窗口，每来一条新日志
+    // 所有下标都会平移一格，行槽位会整体串行。
+    val rows = remember { mutableStateListOf<KeyedItem<LogEntry>>() }
     val listState = rememberLazyListState()
     var isFollowing by remember { mutableStateOf(true) }
     val scope = rememberCoroutineScope()
@@ -89,11 +94,11 @@ fun LogViewerDialog(
             if (currentVersion != seenVersion) {
                 seenVersion = currentVersion
                 val newEntries = DebugLogger.getEntries()
-                entries.clear()
-                entries.addAll(newEntries)
+                rows.clear()
+                rows.addAll(newEntries.withStableKeys(::logEntryIdentity))
 
-                if (isFollowing && entries.isNotEmpty()) {
-                    listState.scrollToItem(entries.size - 1)
+                if (isFollowing && rows.isNotEmpty()) {
+                    listState.scrollToItem(rows.size - 1)
                 }
             }
             delay(500)
@@ -102,7 +107,7 @@ fun LogViewerDialog(
 
     // Detect user scrolling up (away from bottom)
     LaunchedEffect(listState.firstVisibleItemIndex) {
-        if (!isAtBottom && entries.isNotEmpty()) {
+        if (!isAtBottom && rows.isNotEmpty()) {
             isFollowing = false
         }
     }
@@ -141,8 +146,8 @@ fun LogViewerDialog(
                             onClick = {
                                 scope.launch {
                                     isFollowing = true
-                                    if (entries.isNotEmpty()) {
-                                        listState.scrollToItem(entries.size - 1)
+                                    if (rows.isNotEmpty()) {
+                                        listState.scrollToItem(rows.size - 1)
                                     }
                                 }
                             },
@@ -169,7 +174,7 @@ fun LogViewerDialog(
                 )
 
                 // Log entries
-                if (entries.isEmpty()) {
+                if (rows.isEmpty()) {
                     Box(
                         modifier = Modifier.fillMaxSize(),
                         contentAlignment = Alignment.Center
@@ -188,11 +193,11 @@ fun LogViewerDialog(
                                 .fillMaxSize()
                                 .padding(horizontal = 8.dp)
                         ) {
-                            itemsIndexed(
-                                items = entries,
-                                key = { index, entry -> "${index}_${entry.timestamp}" }
-                            ) { _, entry ->
-                                LogEntryItem(entry)
+                            items(
+                                items = rows,
+                                key = { it.key }
+                            ) { row ->
+                                LogEntryItem(row.value)
                             }
                         }
                     }
@@ -219,3 +224,13 @@ private fun LogEntryItem(entry: LogEntry) {
         modifier = Modifier.padding(vertical = 2.dp)
     )
 }
+
+/**
+ * 日志行的业务标识：时间戳 + 级别 + tag + 正文。
+ *
+ * [LogEntry] 没有自增 id（DebugLogger 只存内容，且达到 1000 条上限后是头删尾插的滚动窗口），
+ * 所以用「整条日志内容」当标识；同一毫秒内出现完全相同的两行时，由
+ * [withStableKeys] 追加 `#dupN` 后缀区分，保证 key 不重复。
+ */
+private fun logEntryIdentity(entry: LogEntry): String =
+    "${entry.timestamp}|${entry.level.name}|${entry.tag}|${entry.message}"

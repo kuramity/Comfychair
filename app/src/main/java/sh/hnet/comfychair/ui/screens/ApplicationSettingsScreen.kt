@@ -32,7 +32,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.ToggleButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -68,16 +68,16 @@ fun ApplicationSettingsScreen(
     onNavigateToAppearance: () -> Unit = {}
 ) {
     val context = LocalContext.current
-    val isLivePreviewEnabled by viewModel.isLivePreviewEnabled.collectAsState()
-    val isMemoryFirstCache by viewModel.isMemoryFirstCache.collectAsState()
-    val isMediaCacheDisabled by viewModel.isMediaCacheDisabled.collectAsState()
-    val isDebugLoggingEnabled by viewModel.isDebugLoggingEnabled.collectAsState()
-    val isAutoConnectEnabled by viewModel.isAutoConnectEnabled.collectAsState()
-    val isShowBuiltInWorkflows by viewModel.isShowBuiltInWorkflows.collectAsState()
-    val isOfflineMode by viewModel.isOfflineMode.collectAsState()
-    val edgeRouterId by viewModel.edgeRouterId.collectAsState()
-    val isPromptSpellCheckEnabled by viewModel.isPromptSpellCheckEnabled.collectAsState()
-    val isPromptExpandEnabled by viewModel.isPromptExpandEnabled.collectAsState()
+    val isLivePreviewEnabled by viewModel.isLivePreviewEnabled.collectAsStateWithLifecycle()
+    val isMemoryFirstCache by viewModel.isMemoryFirstCache.collectAsStateWithLifecycle()
+    val isMediaCacheDisabled by viewModel.isMediaCacheDisabled.collectAsStateWithLifecycle()
+    val isDebugLoggingEnabled by viewModel.isDebugLoggingEnabled.collectAsStateWithLifecycle()
+    val isAutoConnectEnabled by viewModel.isAutoConnectEnabled.collectAsStateWithLifecycle()
+    val isShowBuiltInWorkflows by viewModel.isShowBuiltInWorkflows.collectAsStateWithLifecycle()
+    val isOfflineMode by viewModel.isOfflineMode.collectAsStateWithLifecycle()
+    val edgeRouterId by viewModel.edgeRouterId.collectAsStateWithLifecycle()
+    val isPromptSpellCheckEnabled by viewModel.isPromptSpellCheckEnabled.collectAsStateWithLifecycle()
+    val isPromptExpandEnabled by viewModel.isPromptExpandEnabled.collectAsStateWithLifecycle()
 
     // State and effects
     // Backup/restore state
@@ -123,6 +123,13 @@ fun ApplicationSettingsScreen(
             when (event) {
                 is SettingsEvent.ShowToast -> {
                     Toast.makeText(context, event.messageResId, Toast.LENGTH_SHORT).show()
+                }
+                is SettingsEvent.ShowToastWithCount -> {
+                    Toast.makeText(
+                        context,
+                        context.getString(event.messageResId, event.count),
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
                 is SettingsEvent.RefreshNeeded -> {
                     // Handled by SettingsContainerActivity

@@ -1,7 +1,7 @@
 package sh.hnet.comfychair.connection
 
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 
 /**
@@ -34,6 +34,6 @@ object OfflineUiState {
  */
 @Composable
 fun rememberIsOffline(): Boolean {
-    val state by ConnectionManager.connectionState.collectAsState()
+    val state by ConnectionManager.connectionState.collectAsStateWithLifecycle()
     return OfflineUiState.isOffline(state)
 }

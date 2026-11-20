@@ -1,9 +1,10 @@
 package sh.hnet.comfychair
 
 import okhttp3.OkHttpClient
+import sh.hnet.comfychair.util.NetworkPolicy
 import java.security.KeyStore
-import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.TrustManagerFactory
@@ -13,9 +14,11 @@ import javax.net.ssl.X509TrustManager
  * Certificate issue types that can be detected
  */
 enum class CertificateIssue {
-    NONE,           // No issue - certificate is valid and trusted
-    SELF_SIGNED,    // Certificate is self-signed (issuer == subject)
-    UNKNOWN_CA      // Certificate is signed by an unknown/untrusted CA
+    NONE,               // No issue - certificate is valid and trusted
+    SELF_SIGNED,        // Certificate is self-signed (issuer == subject)
+    UNKNOWN_CA,         // Certificate is signed by an unknown/untrusted CA
+    PIN_MISMATCH,       // 证书与此前信任过的指纹不一致（证书更换或中间人劫持）
+    UNTRUSTED_PUBLIC    // 公网主机的证书系统不信任且从未信任过：必须用户显式确认，不得静默放行
 }
 
 /**
@@ -33,6 +36,10 @@ enum class CertificateIssue {
  * "证书有问题"并进入兼容模式。此前的实现在自定义 TrustManager 里直接把"非自签名"一律
  * 判成 UNKNOWN_CA，于是 Cloudflare 这类**完全合法的公开 CA 证书也会每次误报**
  * "未知的证书颁发机构"（用户反馈的现象），根因就在这里。
+ *
+ * **分场景信任（v4.17.0）**：信任管理器改为 [PinnedTrustManager]（系统校验 → 指纹匹配 →
+ * TOFU 三选一）；主机名校验只对私网放行，公网必须通过系统默认校验 —— 不再"任意证书 +
+ * 任意主机名全放行"。
  */
 object SelfSignedCertHelper {
 
@@ -54,89 +61,20 @@ object SelfSignedCertHelper {
     }
 
     /**
-     * Create a TrustManager that accepts certificates the system would reject
-     * (self-signed / private CA), while still reporting them as an issue.
+     * 创建分场景信任管理器（无指纹固定版本，供单测与无持久化的调用方使用）。
      *
-     * SECURITY NOTE: 系统不信任的证书仍会被放行——这是为局域网自签名 ComfyUI 服务的
-     * 既有设计。区别在于：**合法证书现在会正常通过系统校验**，不再被误判。
+     * 系统信任的证书直接放行；系统拒绝的自签/私有 CA 证书按 TOFU 放行并记录问题类型。
      */
     internal fun createTrustManager(): X509TrustManager {
-        return object : X509TrustManager {
-            /**
-             * Check if client certificates are trusted
-             * For our use case, we accept all client certificates
-             */
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-                // Accept all client certificates
-            }
-
-            /**
-             * Check if server certificates are trusted
-             *
-             * @param chain The certificate chain from the server
-             * @param authType The authentication type (e.g., "RSA", "ECDSA")
-             */
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-                if (chain == null || chain.isEmpty()) return
-
-                // 1) 先走系统校验：链合法（公开 CA 签发的正式证书）就直接放行，
-                //    不记录任何问题 —— 域名连接不会再弹出莫须有的证书警告。
-                if (verifyWithSystem(chain, authType)) {
-                    certificateIssue = CertificateIssue.NONE
-                    return
-                }
-
-                // 2) 系统不信任（自签名 / 私有 CA）——仍然接受连接，但记录问题类型，
-                //    由界面提示"无法验证证书，仍然继续连接"。
-                val cert = chain[0]
-                certificateIssue = if (cert.issuerDN.name == cert.subjectDN.name) {
-                    CertificateIssue.SELF_SIGNED
-                } else {
-                    CertificateIssue.UNKNOWN_CA
-                }
-            }
-
-            /**
-             * Return the list of accepted certificate issuers
-             * We accept all, so return empty array
-             */
-            override fun getAcceptedIssuers(): Array<X509Certificate> {
-                return arrayOf()
-            }
-        }
-    }
-
-    /**
-     * 用系统信任库校验证书链。
-     *
-     * `authType` 由调用方的 TLS 栈给出，**各家取值并不一致**（JSSE 传 "ECDHE_ECDSA"，
-     * 部分实现传 "EC"/"RSA"，JDK 甚至会对不认识的值直接抛 "Unknown authType"）。
-     * 所以这里按证书公钥类型补齐候选值逐个试：只要有一个通过就算系统信任；
-     * 只有当系统**明确判定证书不受信**（而非"不认识 authType"）时才返回 false。
-     */
-    private fun verifyWithSystem(chain: Array<out X509Certificate>, authType: String?): Boolean {
-        val system = systemTrustManager ?: return false
-
-        val candidates = LinkedHashSet<String>()
-        if (!authType.isNullOrEmpty()) candidates.add(authType)
-        when (chain[0].publicKey.algorithm.uppercase()) {
-            "EC", "ECDSA" -> candidates.addAll(listOf("ECDHE_ECDSA", "EC"))
-            "RSA" -> candidates.addAll(listOf("RSA", "ECDHE_RSA", "DHE_RSA"))
-            else -> candidates.add("RSA")
-        }
-
-        for (candidate in candidates) {
-            try {
-                system.checkServerTrusted(chain, candidate)
-                return true
-            } catch (e: CertificateException) {
-                // "Unknown authType" 只是取值不被该系统实现接受，换下一个候选继续试；
-                // 其它异常（找不到信任路径、过期、域名不匹配…）即"确实不受信"。
-                if (e.message?.startsWith("Unknown authType") == true) continue
-                return false
-            }
-        }
-        return false
+        return PinnedTrustManager(
+            systemTrustManager = systemTrustManager,
+            pinnedFingerprint = { null },
+            onFirstSeen = { },
+            onIssue = { certificateIssue = it },
+            // 该入口只用于单测/无持久化场景，保持原有 TOFU 语义；
+            // 生产路径一律走 configureToAcceptSelfSigned，由 hostname 决定 allowTofu
+            allowTofu = true
+        )
     }
 
     /**
@@ -144,27 +82,48 @@ object SelfSignedCertHelper {
      * (self-signed certificates and unknown CA certificates)
      *
      * @param builder The OkHttpClient.Builder to configure
+     * @param hostname 目标主机名/IP：私网主机允许 TOFU，公网主机必须由用户显式确认
+     * @param pinnedFingerprint 已保存的证书指纹（SHA-256 十六进制）；null 表示尚未信任过
+     * @param onFirstSeen 首次见到证书时的回调，用于把指纹交给上层持久化（TOFU）
+     * @param onUntrusted 公网主机的证书不被系统信任且无指纹时的回调：只交指纹，不写盘
      * @return The configured builder (for method chaining)
      */
-    fun configureToAcceptSelfSigned(builder: OkHttpClient.Builder): OkHttpClient.Builder {
+    fun configureToAcceptSelfSigned(
+        builder: OkHttpClient.Builder,
+        hostname: String = "",
+        pinnedFingerprint: () -> String? = { null },
+        onFirstSeen: (String) -> Unit = { },
+        onUntrusted: (String) -> Unit = { }
+    ): OkHttpClient.Builder {
         try {
             // Reset the certificate issue before each connection attempt
             certificateIssue = CertificateIssue.NONE
 
             // Create our custom trust manager
-            val trustManager = createTrustManager()
-            val trustManagers = arrayOf<TrustManager>(trustManager)
+            val trustManager = PinnedTrustManager(
+                systemTrustManager = systemTrustManager,
+                pinnedFingerprint = pinnedFingerprint,
+                onFirstSeen = onFirstSeen,
+                onIssue = { certificateIssue = it },
+                // 私网沿用 TOFU；公网一律要求用户显式确认（A5-1）
+                allowTofu = NetworkPolicy.isPrivateHost(hostname),
+                onUntrusted = onUntrusted
+            )
 
             // Create an SSL context with our trust manager
             val sslContext = SSLContext.getInstance("TLS")
-            sslContext.init(null, trustManagers, java.security.SecureRandom())
+            sslContext.init(null, arrayOf<TrustManager>(trustManager), java.security.SecureRandom())
 
             // Configure the builder to use our SSL context
             builder.sslSocketFactory(sslContext.socketFactory, trustManager)
 
-            // 主机名校验保持放行：局域网里用的是 IP（192.168.x.x），
-            // 而证书 CN 通常是域名，严格校验会让内网连接全部失败。
-            builder.hostnameVerifier { _, _ -> true }
+            // 主机名校验分场景：私网主机（局域网 IP / localhost / 短名）放行 —— 内网证书的
+            // CN 通常是域名，严格校验会让内网连接全部失败；公网主机必须走系统默认校验，
+            // 与私网区分开，避免任意自签证书冒充公网域名。
+            builder.hostnameVerifier { hostname, session ->
+                NetworkPolicy.isPrivateHost(hostname) ||
+                    HttpsURLConnection.getDefaultHostnameVerifier().verify(hostname, session)
+            }
 
         } catch (e: Exception) {
             // If SSL configuration fails, the builder will use default SSL settings

@@ -10,7 +10,8 @@ import sh.hnet.comfychair.taglibrary.model.Tag
  * 启动时（标签库页面首次打开）在 IO 线程构建，供中文/日文/英文的高速子串检索：
  * - `hotTags`：count > 100 的高频标签（约 7.1 万条），用于别名命中后回填与子串检索
  * - `aliasExact`：全部别名的精确索引（约 3.5 万键），中文/英文/日文均可精确命中
- * - `cjkAliasEntries`：含中日韩字符的别名条目，用于中文/日文子串匹配
+ * - `cjkAliasEntries`：含中日韩字符的别名条目，**按标签热度降序**（`loadAliasRows`
+ *   已 `ORDER BY count DESC`），子串检索命中上限即 break，等价于「最热命中优先」
  * - `nameEntries`：高频标签名条目，用于英文子串匹配（避免 170 万行 SQL LIKE 全扫）
  *
  * 内存开销估算：别名条目约 10 万条 × 约 100 字节 ≈ 10MB，对现代手机可接受；
@@ -54,6 +55,9 @@ class TagMemoryIndex private constructor(
 
     /**
      * 中日韩别名子串匹配（中文/日文搜索主力，约 10 万条扫描，5-15ms）。
+     *
+     * [cjkAliasEntries] 按热度降序灌入，因此达到 [limit] 提前退出时留下的
+     * 是「最热的命中」，不会因为库文件物理行序不同而给出另一批结果。
      *
      * @param limit 命中上限，避免极端输入拖慢
      */

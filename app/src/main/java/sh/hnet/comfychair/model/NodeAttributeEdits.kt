@@ -66,8 +66,8 @@ data class NodeAttributeEdits(
                     is String -> nodeJson.put(inputName, value)
                     is Int -> nodeJson.put(inputName, value)
                     is Long -> nodeJson.put(inputName, value)
-                    is Float -> nodeJson.put(inputName, value.toDouble())
-                    is Double -> nodeJson.put(inputName, value)
+                    is Float -> if (value.isFinite()) nodeJson.put(inputName, value.toDouble())
+                    is Double -> if (value.isFinite()) nodeJson.put(inputName, value)
                     is Boolean -> nodeJson.put(inputName, value)
                     else -> nodeJson.put(inputName, value.toString())
                 }

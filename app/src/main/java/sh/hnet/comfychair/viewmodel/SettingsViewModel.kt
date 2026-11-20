@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,6 +36,7 @@ import sh.hnet.comfychair.storage.ServerStorage
 import sh.hnet.comfychair.storage.PromptPresetStorage
 import sh.hnet.comfychair.storage.WorkflowValuesStorage
 import sh.hnet.comfychair.util.DebugLogger
+import sh.hnet.comfychair.util.ShareFileStore
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 
@@ -77,6 +79,9 @@ data class GpuInfo(
  */
 sealed class SettingsEvent {
     data class ShowToast(val messageResId: Int) : SettingsEvent()
+
+    /** 带一个整数参数的提示（如「N 个服务器被跳过」）—— [messageResId] 里含 %1$d 占位 */
+    data class ShowToastWithCount(val messageResId: Int, val count: Int) : SettingsEvent()
     data object RefreshNeeded : SettingsEvent()
     data class ShowRestoreDialog(val uri: Uri) : SettingsEvent()
     data object NavigateToLogin : SettingsEvent()
@@ -132,8 +137,21 @@ class SettingsViewModel : ViewModel() {
     private val _isPromptExpandEnabled = MutableStateFlow(false)
     val isPromptExpandEnabled: StateFlow<Boolean> = _isPromptExpandEnabled.asStateFlow()
 
-    private val _events = MutableSharedFlow<SettingsEvent>()
+    // P3-11：事件流必须有缓冲并允许丢弃最旧事件。
+    // 原配置 replay=0 + extraBufferCapacity=0 时，没有收集者（页面切走、或因配置变更
+    // 尚未重新订阅）的 emit 会永久挂起，把它后面的语句一起卡住 —— 比如清缓存成功后
+    // 发不出 RefreshNeeded、备份恢复流程停在中途。带缓冲的 DROP_OLDEST 保证 emit 永不挂起。
+    private val _events = createSettingsEventFlow()
     val events: SharedFlow<SettingsEvent> = _events.asSharedFlow()
+
+    /**
+     * 仅供单元测试：内部事件流本身。
+     *
+     * P3-11 的回归点是「没有收集者时 emit 不能挂起」，必须在真实的流上验证；
+     * 业务方法都需要 [Context]，无法在纯 JVM 单测里调用。
+     */
+    internal val eventFlowForTest: MutableSharedFlow<SettingsEvent>
+        get() = _events
 
     fun initialize(context: Context) {
         _serverSettingsState.value = _serverSettingsState.value.copy(
@@ -192,6 +210,10 @@ class SettingsViewModel : ViewModel() {
 
     /**
      * Start auto-refreshing resource stats every 2 seconds
+     *
+     * P2-9：本方法只负责"开始轮询"，**生命周期由调用方把关** ——
+     * 设置页在宿主 ON_START 时调用本方法、ON_STOP 时调用 [stopResourceAutoRefresh]。
+     * 修复前调用方只在离开组合时停，Activity 退后台仍在每 2 秒打一次 /system_stats。
      */
     fun startResourceAutoRefresh() {
         stopResourceAutoRefresh()
@@ -342,6 +364,16 @@ class SettingsViewModel : ViewModel() {
                         } catch (e: Exception) {
                             // Failed to delete cache file
                         }
+                    }
+                }
+
+                // P2-12：分享载荷已挪到 cacheDir/share/（FileProvider 唯一声明的子目录），
+                // 上面的根目录扫描覆盖不到子目录，这里单独清一次。
+                ShareFileStore.dir(context).listFiles()?.forEach { file ->
+                    try {
+                        file.delete()
+                    } catch (e: Exception) {
+                        // Failed to delete share file
                     }
                 }
 
@@ -632,7 +664,14 @@ class SettingsViewModel : ViewModel() {
         val credentialStorage = CredentialStorage(context)
         val credentials = credentialStorage.getCredentials(server.id, server.authType)
 
-        val tempClient = ComfyUIClient(context.applicationContext, server.hostname, server.port, credentials)
+        val tempClient = ComfyUIClient(
+            context.applicationContext,
+            server.hostname,
+            server.port,
+            credentials,
+            server.id,
+            preferredProtocol = server.protocol
+        )
         return try {
             withContext(Dispatchers.IO) {
                 kotlin.coroutines.suspendCoroutine { continuation ->
@@ -741,7 +780,15 @@ class SettingsViewModel : ViewModel() {
                     DebugLogger.d(TAG, "Reloading AppSettings into ViewModel...")
                     reloadAppSettings(context, preserveDebugLogging = wasDebugLoggingEnabled)
 
-                    if (result.skippedWorkflows > 0) {
+                    if (result.skippedServers > 0) {
+                        // P2-24：不合法服务器条目被整条跳过 —— 带个数提示，用户知道少了什么
+                        _events.emit(
+                            SettingsEvent.ShowToastWithCount(
+                                R.string.msg_backup_restore_skipped_servers,
+                                result.skippedServers
+                            )
+                        )
+                    } else if (result.skippedWorkflows > 0) {
                         _events.emit(SettingsEvent.ShowToast(R.string.msg_backup_restore_partial))
                     } else {
                         _events.emit(SettingsEvent.ShowToast(R.string.msg_backup_restore_success))
@@ -812,3 +859,17 @@ class SettingsViewModel : ViewModel() {
         // Client is managed by ConnectionManager, don't shutdown here
     }
 }
+
+/**
+ * 设置页事件流（P3-11）。
+ *
+ * 关键契约：emit 永不挂起 —— 没有收集者时事件直接丢弃，而不是把发布方卡死。
+ *
+ * 缓冲容量取 16 而不是 1：业务代码有多处「连续两次 emit」（ShowToast + RefreshNeeded、
+ * 备份恢复的四连发），而 UI 收集者（Compose 的 AndroidUiDispatcher）要到下一帧才消费。
+ * 实测容量 1 + DROP_OLDEST 时，同一个协程里背靠背发的两条事件会在收集者尚未推进索引时
+ * 把第一条挤掉（toast 丢失）；16 足以容纳所有已知突发序列，真积压时仍按 DROP_OLDEST
+ * 丢最旧，不会无限增长。
+ */
+internal fun createSettingsEventFlow(): MutableSharedFlow<SettingsEvent> =
+    MutableSharedFlow(extraBufferCapacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)

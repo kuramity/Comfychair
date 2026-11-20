@@ -39,6 +39,7 @@
     <string name="button_browser_auth_done">Terminé</string>
     <string name="button_reauthenticate">Se reconnecter</string>
     <string name="error_browser_auth_cancelled">La connexion n\'a pas été effectuée</string>
+    <string name="error_browser_auth_insecure_host">Avertissement de sécurité : le certificat de %1$s n\'est pas approuvé. Connexion bloquée.</string>
 
     <!-- Connection alert dialog -->
     <string name="title_connection_lost">Connexion perdue</string>
@@ -217,6 +218,11 @@
     <!-- Error and status messages -->
     <string name="error_not_comfyui_server">Ce n\'est pas un serveur ComfyUI</string>
     <string name="error_invalid_server_response">Réponse du serveur invalide</string>
+    <string name="error_https_connection_failed">Échec de la connexion HTTPS : si le serveur ne prend en charge que HTTP, modifiez l\'adresse pour qu\'elle commence par http:// puis réessayez</string>
+    <string name="action_retrust_certificate">Refaire confiance au certificat du serveur</string>
+    <string name="action_trust_certificate_first_time">Faire confiance à ce certificat de serveur et réessayer</string>
+    <string name="error_certificate_trust_failed">Impossible d\'enregistrer la confiance dans le certificat, veuillez réessayer</string>
+    <string name="error_server_list_corrupted">La liste des serveurs est corrompue, la modification n\'a pas été enregistrée. Le fichier d\'origine a été sauvegardé.</string>
     <string name="error_failed_load_workflow">Échec du chargement du workflow</string>
     <string name="error_generation_failed">Échec de la génération</string>
     <string name="error_job_lost">Tâche perdue : le serveur n\'a plus ce travail (redémarrage ou file vidée). Relance la génération.</string>
@@ -657,6 +663,9 @@
     <string name="update_action_now">Mettre a jour</string>
     <string name="update_action_later">Plus tard</string>
     <string name="update_action_install">Installer</string>
+    <string name="update_error_verify_missing">Le manifeste de mise a jour ne contient pas de somme SHA-256 valide. Mise a jour refusee.</string>
+    <string name="update_error_redirect">Le telechargement a ete redirige vers un hote non approuve (%1$s). Mise a jour interrompue.</string>
+    <string name="update_error_install_invalid">Le nom ou la signature du paquet telecharge ne correspond pas a cette application. Installation bloquee.</string>
     <string name="update_action_retry">Reessayer</string>
     <string name="update_manual_check_failed">Echec de la verification : %1$s</string>
     <string name="update_already_latest">Deja la derniere version.</string>
@@ -672,4 +681,6 @@
     <!-- Q3-3 (v4.16.5) : menu de modèles quatre états — échec (réessayable) vs. réellement vide -->
     <string name="model_list_load_failed">Impossible de charger la liste des modèles — toucher pour réessayer</string>
     <string name="model_list_empty">Aucun modèle disponible sur le serveur</string>
+    <!-- P3-10 : aucune application ne peut ouvrir le lien externe -->
+    <string name="error_open_link_failed">Aucune application capable d\'ouvrir ce lien</string>
 </resources>

@@ -435,6 +435,40 @@ class NodeTypeRegistry {
     }
 
     /**
+     * 该输入字段名在**任意**节点上是否被声明过（G8 指令 3 的来源诊断）。
+     *
+     * 用途：区分「UNET 来源节点缺失」（这里返回 false —— 服务器上压根没有
+     * 声明 `unet_name` 输入的加载器节点）与「字段缺失 / 服务器真没模型」（返回 true）。
+     * 与 [getOptionsForField] 的区别是本方法**不管** options 是否存在 ——
+     * 只看字段有没有出现在节点定义里。
+     *
+     * @param name 字段名；[matchPrefix] 为 true 时按前缀匹配（CLIP 的 clip_name / clip_name1…）
+     */
+    fun anyNodeDeclaresField(name: String, matchPrefix: Boolean = false): Boolean {
+        return nodeDefinitions.values.any { nodeDef ->
+            nodeDef.inputs.any {
+                if (matchPrefix) it.name.startsWith(name) else it.name == name
+            }
+        }
+    }
+
+    /**
+     * 该输入字段在任意节点上是否至少有一处是**带选项的 COMBO**（options 非 null，
+     * 哪怕是空列表）。G8 指令 3 用它把两种「提不出候选」分开：
+     *
+     * - true  + 候选数为 0 → 字段形态正常、选项为空 = 服务器真的没有这类模型（EMPTY_OK，不该重试）
+     * - false + 候选数为 0 → 字段被声明但拿不到 COMBO 候选 = 字段缺失 / 形态不符（FAILED，可重试）
+     */
+    fun anyNodeFieldHasOptions(name: String, matchPrefix: Boolean = false): Boolean {
+        return nodeDefinitions.values.any { nodeDef ->
+            nodeDef.inputs.any { input ->
+                input.options != null &&
+                    (if (matchPrefix) input.name.startsWith(name) else input.name == name)
+            }
+        }
+    }
+
+    /**
      * Get node types grouped by category.
      */
     fun getNodeTypesByCategory(): Map<String, List<NodeTypeDefinition>> {

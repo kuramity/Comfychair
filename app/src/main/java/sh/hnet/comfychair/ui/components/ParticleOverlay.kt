@@ -324,6 +324,40 @@ internal class ParticleSystem(
 }
 
 /**
+ * 帧循环开关（P2-19）。
+ *
+ * 修复前 `while (true) { withFrameNanos { ... } }` 无条件常驻：没有任何活跃特效时
+ * 也会每帧唤醒一次（60~120Hz 纯空转）。现在循环在 [ParticleSystem.update] 报告
+ * "已无活跃特效"时退出，下一次 `emit` 通过 [requestFrame] 判断要不要重新拉起。
+ *
+ * 纯 Kotlin（只有一个布尔），状态迁移可以在 JVM 单测里直接断言。
+ */
+internal class ParticleFrameLoopGate {
+
+    private var running = false
+
+    /** 循环是否在跑（单测/调试用）。 */
+    val isRunning: Boolean get() = running
+
+    /**
+     * 请求一帧循环。
+     *
+     * @return true = 循环此前已退出，调用方需要递增令牌把它重新拉起；
+     *         false = 循环仍在跑，无需重启
+     */
+    fun requestFrame(): Boolean {
+        if (running) return false
+        running = true
+        return true
+    }
+
+    /** 循环因空闲退出时归位（必须在循环真正退出之后调用）。 */
+    fun onLoopExited() {
+        running = false
+    }
+}
+
+/**
  * 全屏特效覆盖层（**纯绘制，无任何触摸修饰符**）。
  *
  * 挂在 `MainContainerActivity` 内容层 `Box` 的最上方；`AlertDialog` / `ModalBottomSheet`
@@ -345,23 +379,41 @@ fun ParticleOverlay(modifier: Modifier = Modifier) {
     }
     // 重绘计数器：只有它变化才会重跑 Canvas 的 draw
     var frameTick by remember { mutableIntStateOf(0) }
+    // 帧循环开关（P2-19）：空闲时循环退出，下一次点击靠它把循环重新拉起
+    val frameGate = remember { ParticleFrameLoopGate() }
+    // 帧循环令牌：递增即重启 LaunchedEffect（键变化），是"空闲后重新起循环"的唯一入口
+    var frameLoopTicket by remember { mutableIntStateOf(0) }
 
     // 注册坐标接收端：Activity 只转发坐标，不参与事件分发决策。
     // 用 DisposableEffect 而不是 LaunchedEffect，确保离开组合时立刻注销，
     // 不会留下指向已销毁 system 的悬挂引用。
-    DisposableEffect(system) {
-        ParticleTouchRouter.register { x, y -> system.emit(x, y) }
+    DisposableEffect(system, frameGate) {
+        ParticleTouchRouter.register { x, y ->
+            system.emit(x, y)
+            // 空闲时帧循环早已退出，这里把令牌 +1 重新拉起；循环在跑时返回 false，
+            // 不做任何状态写入（避免每次点击都白重启一轮循环）
+            if (frameGate.requestFrame()) frameLoopTicket++
+        }
         onDispose { ParticleTouchRouter.register(null) }
     }
 
-    LaunchedEffect(system) {
+    LaunchedEffect(system, frameGate, frameLoopTicket) {
+        // 首次组合或令牌变化后的重启：标记循环在跑
+        frameGate.requestFrame()
         var last = withFrameNanos { it }
         while (true) {
             val now = withFrameNanos { it }
             val dt = ((now - last) / 1_000_000_000f).coerceIn(0f, 0.05f)
             last = now
-            if (system.update(dt)) frameTick++
+            val alive = system.update(dt)
+            // 先把这一帧画出来（特效归零后要落一次干净画面），再决定是否退出
+            frameTick++
+            // P2-19：没有活跃特效就退出帧循环。
+            // 修复前是 while (true) 常驻，空闲时也每帧唤醒一次（60~120Hz 空转），
+            // 现在退出后完全不占帧回调，下一次 emit 重新起循环。
+            if (!alive) break
         }
+        frameGate.onLoopExited()
     }
 
     // 关键：这里只有 fillMaxSize + 绘制，**没有任何 pointerInput / clickable**，

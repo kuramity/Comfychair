@@ -119,6 +119,13 @@ object UpdateChecker {
             return null
         }
 
+        // P0-7：清单必须带有效 SHA-256 校验值，否则下载完成也无法确认载荷完整性。
+        // 在这里就拒绝，避免白下 150MB 再失败；Worker 侧另有硬闸门兜底。
+        if (DownloadPolicy.normalizeSha256(info.sha256) == null) {
+            onError("清单缺少有效的 sha256 校验值，已拒绝该更新", manualCheck)
+            return null
+        }
+
         return if (shouldUpdate(currentVersionCode, info.versionCode)) {
             DebugLogger.i(TAG, "Update available: code ${info.versionCode} > $currentVersionCode")
             info

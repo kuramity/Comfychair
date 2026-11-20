@@ -33,7 +33,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -79,7 +79,7 @@ fun AppearanceSettingsScreen(
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
-    val stored by ThemeController.customization.collectAsState()
+    val stored by ThemeController.customization.collectAsStateWithLifecycle()
     val mode = if (isSystemInDarkTheme()) ThemeMode.DARK else ThemeMode.LIGHT
 
     // 进页面时以已保存的配色为起点

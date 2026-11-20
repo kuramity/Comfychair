@@ -51,7 +51,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
-import sh.hnet.comfychair.util.ConnectionValidator
+import sh.hnet.comfychair.workflow.validation.ConnectionValidator
 import sh.hnet.comfychair.workflow.NodeTypeDefinition
 
 /** Split category into hierarchy levels (handles both "/" and "\" separators) */

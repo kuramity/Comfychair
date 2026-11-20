@@ -9,11 +9,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.net.Uri
-import android.content.ContentValues
 import android.content.Intent
-import android.provider.MediaStore
-import androidx.core.content.FileProvider
-import java.io.File
 import java.io.IOException
 import androidx.lifecycle.viewModelScope
 import kotlin.coroutines.suspendCoroutine
@@ -36,17 +32,19 @@ import sh.hnet.comfychair.model.PositivePromptPolicy
 import sh.hnet.comfychair.model.SeedMode
 import sh.hnet.comfychair.model.WorkflowCapabilities
 import sh.hnet.comfychair.model.nextSeed
-import sh.hnet.comfychair.ui.components.config.CommonGenerationState
+import sh.hnet.comfychair.model.contract.CommonGenerationState
 import sh.hnet.comfychair.model.WorkflowValues
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.taglibrary.state.PromptBridge
 import sh.hnet.comfychair.taglibrary.state.PromptTargetFactory
-import sh.hnet.comfychair.ui.components.shared.WorkflowItemBase
+import sh.hnet.comfychair.model.contract.WorkflowItemBase
 import sh.hnet.comfychair.util.BitmapDecodeUtils
 import sh.hnet.comfychair.util.DebugLogger
-import sh.hnet.comfychair.util.LoraChainManager
+import sh.hnet.comfychair.lora.LoraChainManager
 import sh.hnet.comfychair.util.Obfuscator
+import sh.hnet.comfychair.util.PhotoManager
 import sh.hnet.comfychair.util.SeasonalPrompts
+import sh.hnet.comfychair.util.ShareFileStore
 import sh.hnet.comfychair.util.UploadImageEncoder
 import sh.hnet.comfychair.util.UuidUtils
 import sh.hnet.comfychair.util.ValidationUtils
@@ -58,11 +56,17 @@ import sh.hnet.comfychair.viewmodel.base.BaseGenerationViewModel
 
 /**
  * Data class representing a path drawn on the mask canvas
+ *
+ * @param isFill 该路径是否**整块填充**而不是描边（P1-25）。
+ *   反相蒙版需要"全图覆盖"这一笔：修复前用一个 1px 笔宽 + STROKE 的整图矩形来表示，
+ *   实际只画出 1px 的边框，图内几乎全是黑色 —— 反相后等于"什么都没蒙"。
+ *   填充笔必须单独标记，绘制与生成两边都按 FILL 处理。
  */
 data class MaskPathData(
     val path: Path,
     val isEraser: Boolean,
-    val brushSize: Float
+    val brushSize: Float,
+    val isFill: Boolean = false
 )
 
 /**
@@ -377,6 +381,17 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         )
     }
 
+    /**
+     * P2-20：ViewModel 销毁时从标签库桥接注销。
+     *
+     * 修复前只注册不注销，[PromptBridge] 的静态 map 一直钉着已销毁的 ViewModel
+     * （连同它的 uiState），页面来回切换时条目越积越多，标签库还可能读到旧页面。
+     */
+    override fun onCleared() {
+        super.onCleared()
+        PromptBridge.unregister(OWNER_ID)
+    }
+
     // ---- 图库导出（v4.9.0）----
     //
     // 图生图此前是四个模式里唯一"出了图却导不出去"的：ViewModel 里连保存/分享方法都没有，
@@ -389,45 +404,27 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         val ctx = applicationContext ?: run { onResult(false); return }
         val bitmap = _uiState.value.previewImage ?: run { onResult(false); return }
 
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.png")
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/ComfyChair")
-        }
-
-        val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        uri?.let {
-            try {
-                ctx.contentResolver.openOutputStream(it)?.use { outputStream ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-                }
-                DebugLogger.i(TAG, "saveToGallery: Image saved successfully")
-                onResult(true)
-            } catch (e: IOException) {
-                DebugLogger.e(TAG, "saveToGallery: Failed to save image - ${e.message}")
-                onResult(false)
+        // P1-22：IS_PENDING 写入 + 真实结果。修复前 insert/openOutputStream 失败也会报成功
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                PhotoManager.saveBitmap(ctx, bitmap)
             }
-        } ?: run {
-            DebugLogger.e(TAG, "saveToGallery: Failed to create media URI")
-            onResult(false)
+            DebugLogger.i(TAG, "saveToGallery: saved=$saved")
+            onResult(saved)
         }
     }
 
-    /** 分享当前预览图：先写进 cacheDir，再经 FileProvider 授时 URI 交给系统选择器 */
+    /** 分享当前预览图：先写进 cacheDir/share/（P2-12 专用子目录），再经 FileProvider 授时 URI 交给系统选择器 */
     fun getShareIntent(): Intent? {
         val ctx = applicationContext ?: return null
         val bitmap = _uiState.value.previewImage ?: return null
 
-        val file = File(ctx.cacheDir, "share_image_${System.currentTimeMillis()}.png")
+        val file = ShareFileStore.file(ctx, "share_image_${System.currentTimeMillis()}.png")
         return try {
             file.outputStream().use { outputStream ->
                 bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
             }
-            val uri = FileProvider.getUriForFile(
-                ctx,
-                "${ctx.packageName}.fileprovider",
-                file
-            )
+            val uri = ShareFileStore.uriFor(ctx, file)
             Intent(Intent.ACTION_SEND).apply {
                 type = "image/png"
                 putExtra(Intent.EXTRA_STREAM, uri)
@@ -465,6 +462,18 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         viewModelScope.launch {
             ConnectionManager.modelCache.collect { cache ->
                 _uiState.update { state ->
+                    // P1-7：断线/重连的 invalidateAll() 会把 ModelCache 整体置空
+                    //（isLoaded=false、所有列表为空）。那份快照不是"服务器上没有模型"的证据，
+                    // 照常校验会把已选模型/LoRA（含编辑页两套）全部清空、deferred 恢复值
+                    // 一并抹掉并写回磁盘。直接跳过本次更新，等真实列表回来再校验。
+                    if (!ValidationUtils.isUsableModelCache(cache)) {
+                        DebugLogger.d(
+                            TAG,
+                            "跳过空模型缓存快照（isLoaded=${cache.isLoaded}），保留已选模型与 deferred 值"
+                        )
+                        // 原样返回当前状态（不写状态 = 不触发重组、不落盘空选择）
+                        return@update state
+                    }
                     // Apply deferred selections first, then validate or fall back to first available
                     val checkpoint = state.deferredCheckpoint?.takeIf { it in cache.checkpoints }
                         ?: validateModelSelection(state.selectedCheckpoint, cache.checkpoints)
@@ -1511,8 +1520,11 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
     }
 
     fun invertMask() {
-        // Mark that mask is inverted - actual inversion happens when generating mask bitmap
-        // For visual feedback, we'll use a special flag
+        // 蒙版取反 = 「全图覆盖」+「原有笔迹转成橡皮」。
+        //
+        // P1-25：整图覆盖这一笔必须是**填充**（isFill=true）。修复前是
+        // MaskPathData(fullPath, false, brushSize = 1f)，生成蒙版时按 STROKE 语义
+        // 只描出 1px 边框 —— 反相后图里几乎没有白色，等于反相失败。
         val sourceImage = _uiState.value.sourceImage ?: return
 
         viewModelScope.launch {
@@ -1521,9 +1533,9 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
                 addRect(RectF(0f, 0f, sourceImage.width.toFloat(), sourceImage.height.toFloat()), Path.Direction.CW)
             }
 
-            // Add inverted background
+            // Add inverted background（整块填充，笔宽无意义）
             val invertedPaths = mutableListOf<MaskPathData>()
-            invertedPaths.add(MaskPathData(fullPath, false, 1f))
+            invertedPaths.add(MaskPathData(fullPath, isEraser = false, brushSize = 0f, isFill = true))
 
             // Add existing paths as erasers (to remove painted areas)
             _uiState.value.maskPaths.forEach { pathData ->
@@ -1572,9 +1584,15 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
 
         _uiState.value.maskPaths.forEach { pathData ->
             val paint = if (pathData.isEraser) erasePaint else paintPaint
+            // P1-25：填充笔按 FILL 画（整块覆盖），描边笔才设 strokeWidth
+            paint.style = if (pathData.isFill) Paint.Style.FILL else Paint.Style.STROKE
             paint.strokeWidth = pathData.brushSize
             canvas.drawPath(pathData.path, paint)
         }
+
+        // 还原共享画笔的默认语义（两支笔在循环间被复用）
+        paintPaint.style = Paint.Style.STROKE
+        erasePaint.style = Paint.Style.STROKE
 
         // Apply feathering
         return applyFeathering(maskBitmap, FEATHER_RADIUS)

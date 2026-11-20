@@ -28,12 +28,15 @@ import sh.hnet.comfychair.connection.WebSocketMessage
 import sh.hnet.comfychair.connection.WebSocketState
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.queue.JobStatus
+import sh.hnet.comfychair.queue.resolveExecutionStartOwner
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.prompt.SkillTextResult
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.Obfuscator
 import sh.hnet.comfychair.workflow.WorkflowPreflight
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Generation state data class
@@ -122,6 +125,80 @@ internal class GalleryRefreshThrottle(private val debounceMs: Long) {
 }
 
 /**
+ * P1-4：提交单飞闸门（纯 JVM 逻辑，供单测钉住）。
+ *
+ * 缺陷：`startGeneration` 没有任何在途标记，连点两次生成、或"生成"和"添加到队首"
+ * 几乎同时按下去，会各自发出一份 `/prompt` —— 服务器上是两个任务，用户只想要一个，
+ * 出图数量翻倍、队列计数也翻倍。
+ *
+ * 闸门的语义刻意做成"**先到者独占，迟到者直接失败**"（而不是排队）：
+ * 用户的第二次点击本来就是一个误触，静默丢弃最符合预期；返回值让调用方可以
+ * 直接忽略而不是再报一次错。
+ *
+ * 线程模型与**持有者令牌**（R2-L4）：
+ * - `tryAcquire` 用 [AtomicLong.compareAndSet] 把"空闲(0) → 本次令牌"一次做成，
+ *   并发调用只有一次能成功；令牌全局单调递增，不会复用。
+ * - `release(ticket)` 只在"当前持有者仍是这个令牌"时才清空。没有令牌时，30 秒看门狗
+ *   或迟到的鉴权失败回调会把**下一次**提交刚抢到的闸门误释放（极端时序下多放行一次
+ *   重复提交）；带令牌后这类迟到调用退化为无害的空操作。
+ * - 同一令牌重复释放仍然幂等（看门狗与正常回调可能都调一次）。
+ */
+internal class SubmitGate {
+
+    /** 0 = 空闲；非 0 = 当前持有者的令牌 */
+    private val holder = AtomicLong(0L)
+
+    /** 令牌发号器（与 holder 分开，保证失败的那次尝试也不会回流票号） */
+    private val ticketSource = AtomicLong(0L)
+
+    /** 当前是否有提交在途（供界面把「提交中」并入 enabled 条件） */
+    val isInFlight: Boolean get() = holder.get() != 0L
+
+    /**
+     * @return 本次持有者令牌（> 0）= 抢到闸门，调用方必须在成功/失败/异常三路
+     *   用同一令牌 [release]；null = 已有提交在途，本次必须放弃
+     */
+    fun tryAcquire(): Long? {
+        val ticket = ticketSource.incrementAndGet()
+        return if (holder.compareAndSet(0L, ticket)) ticket else null
+    }
+
+    /**
+     * 释放闸门。只有令牌仍是当前持有者时才生效（迟到/过期的释放不会误清别人的闸门）。
+     */
+    fun release(ticket: Long) {
+        holder.compareAndSet(ticket, 0L)
+    }
+
+    /** 该令牌是否仍是当前持有者（看门狗用，避免为过期令牌白打日志） */
+    fun isHeldBy(ticket: Long): Boolean = holder.get() == ticket
+}
+
+/**
+ * P1-3 / F5：一条**瞬时**事件（预览、清预览）是否仍属于「当前这一轮生成」。
+ *
+ * 背景：`resetGenerationState` 的缓冲清理与事件投递都是主线程任务，两者入队顺序
+ * 由调用线程决定。若清理先入队、某条上一轮的 `PreviewImage` 投递后入队，那张图会被
+ * 重新写进 `bufferedPreviews` —— 下一次该 owner 注册 handler 时会被当成"缓冲预览"
+ * 再放一帧上一轮的旧画面（界面闪一下，数据无影响）。
+ *
+ * 判定用「当前 GenerationState 是否还在为同一个 owner 生成」：复位后 `GenerationState()`
+ * 的 `isGenerating=false`、`ownerId=null`，上一轮的瞬时事件一律判为残留。
+ *
+ * 注意**只适用于瞬时事件**：完成事件（ImageGenerated / VideoGenerated）的正常路径就是
+ * "先进缓冲、随后状态复位"，它们必须能活到 handler 注册，不能用这条判定丢弃。
+ *
+ * @param isGenerating 当前 GenerationState.isGenerating
+ * @param stateOwnerId 当前 GenerationState.ownerId
+ * @param eventOwnerId 事件产生时定格下来的 owner
+ */
+internal fun isCurrentGenerationEvent(
+    isGenerating: Boolean,
+    stateOwnerId: String?,
+    eventOwnerId: String?,
+): Boolean = isGenerating && stateOwnerId != null && stateOwnerId == eventOwnerId
+
+/**
  * Central ViewModel for managing generation state.
  *
  * WebSocket Architecture:
@@ -176,12 +253,57 @@ class GenerationViewModel : ViewModel() {
     val events: SharedFlow<GenerationEvent> = _events.asSharedFlow()
 
     // Active event handler for screen-specific event delivery
+    //
+    // P1-3：这四个字段会被 OkHttp 线程（`pollForCompletion` / `checkServerForCompletion`
+    // 的回调）读，写入在主线程（Compose 注册处理器、提交回调、状态复位）。
+    // 不加 @Volatile 时读方可能长期看到旧值 —— 典型症状是"轮询明明已经拿到完成，
+    // dispatchEvent 却按旧 owner 判断，事件被塞进错误的缓冲/直接丢弃"。
+    @Volatile
     private var activeEventHandler: ((GenerationEvent) -> Unit)? = null
+    @Volatile
     private var activeEventHandlerOwnerId: String? = null  // Track who registered the handler
+    @Volatile
     private var generationOwnerId: String? = null
+
+    // Content type for current generation (used in submitWorkflow)
+    @Volatile
+    private var generationContentType: ContentType = ContentType.IMAGE
+
+    /**
+     * 主线程 Handler（P1-3）。所有对 [pendingCompletions] / [bufferedPreviews] /
+     * [pendingClearPreviews] 的**写入与排空**都经它串行化到主线程。
+     *
+     * 为什么必须串行：这三个容器是普通 `mutableMap`/`mutableSet`（不是线程安全的）。
+     * OkHttp 回调线程写、主线程（[registerEventHandler]）读并删除，两条线程同时操作
+     * 会让 HashMap 的内部结构错乱（丢条目、甚至死循环）。统一到主线程后：
+     * - `Handler.post` 保证入队前的写入对后续执行可见（happens-before）；
+     * - 主线程单写者，`containsKey → remove` 这类"检查后动作"不再有交错。
+     */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 提交单飞闸门（P1-4） */
+    private val submitGate = SubmitGate()
+
+    /**
+     * 提交在途状态（P1-4），供界面把「提交中」并入 enabled 条件。
+     *
+     * 已接入的消费点（四个生成页的 `GenerationButton`）：
+     * `isEnabled = 参数合法 && !isSubmitting`。两层保护同时存在：
+     * 界面在闸门持有期间禁用按钮（视觉/交互），[submitGate] 在 ViewModel 层兜底
+     *（即使按钮未及时重组，也不会发出第二份 `/prompt`）。
+     */
+    private val _isSubmitting = MutableStateFlow(false)
+    val isSubmitting: StateFlow<Boolean> = _isSubmitting.asStateFlow()
+
+    /** 提交闸门的超时看门狗（P1-4）：网络层回调丢失时兜底释放，避免按钮永久卡死 */
+    private var submitGateWatchdog: Job? = null
 
     // Per-owner buffered events (keyed by ownerId)
     // This prevents events from one owner overwriting another's when jobs overlap
+    //
+    // 线程约束（P1-3）：只允许在主线程读写，入口是 dispatchEvent（经 runOnMain 转到
+    // deliverOrBuffer）/ registerEventHandler / resetGenerationState 的清理段。
+    // 不要在别的线程直接碰这三个容器。
     private val pendingCompletions = mutableMapOf<String, GenerationEvent>()  // ImageGenerated or VideoGenerated
     private val bufferedPreviews = mutableMapOf<String, Bitmap>()  // Preview when no handler registered
     private val pendingClearPreviews = mutableSetOf<String>()  // ClearPreviewForResume when no handler
@@ -227,6 +349,15 @@ class GenerationViewModel : ViewModel() {
 
         /** 生成完成后触发图库刷新的防抖窗口（H5）：批量任务接连完成时合并为一次刷新 */
         private const val GALLERY_REFRESH_DEBOUNCE_MS = 2000L
+
+        /**
+         * 提交闸门的最长持有时间（P1-4）。
+         *
+         * `/prompt` 是一个很快的 POST（服务器收下即返回 promptId），正常在几百毫秒内回来；
+         * 30 秒还没释放只可能是回调丢了（ensureConnection 的 stale 分支、网络层异常）。
+         * 到点强制释放，宁可漏过一次重复提交，也不让生成按钮永久禁用。
+         */
+        private const val SUBMIT_GATE_TIMEOUT_MS = 30_000L
     }
 
     /**
@@ -311,6 +442,9 @@ class GenerationViewModel : ViewModel() {
                     is WebSocketState.Failed -> {
                         _connectionStatus.value = ConnectionStatus.FAILED
                         // Only show dialog if actively generating - otherwise user doesn't need to know
+                        // D10：瞬时失败不会走到这里——ConnectionManager 在排上自动重连时不再写 Failed，
+                        // 所以能到这里的 Failed 都是"没有待重连 job"的终态（认证失败、被阻断、静默重连失败），
+                        // 这时弹窗是用户需要的信号，不做额外屏蔽。
                         if (_generationState.value.isGenerating) {
                             applicationContext?.let { ctx ->
                                 ConnectionManager.showConnectionAlert(ctx, state.failureType)
@@ -373,25 +507,52 @@ class GenerationViewModel : ViewModel() {
             is WebSocketMessage.ExecutionStart -> {
                 val promptId = message.promptId
                 if (promptId.isNotEmpty()) {
-                    // Look up job info from JobRegistry
-                    var owner = JobRegistry.findOwner(promptId)
-                    var contentType = JobRegistry.findContentType(promptId)
-
-                    // Fallback: If not found in JobRegistry but we have a pending submission,
-                    // use the pending owner/contentType (execution_start arrived before registerJob completed)
-                    if (owner == null && generationOwnerId != null) {
-                        val pendingOwner = generationOwnerId!!
-                        val pendingContentType = generationContentType
-                        owner = pendingOwner
-                        contentType = pendingContentType
-                        DebugLogger.w(TAG, "ExecutionStart arrived before registerJob, using pending owner: $pendingOwner")
-
-                        // Register the job now since we know the promptId
-                        JobRegistry.registerJob(promptId, pendingOwner, pendingContentType)
-                        applicationContext?.let { ctx -> JobRegistry.saveState(ctx) }
+                    // P1-1：`execution_start` 是服务器**广播给所有客户端**的，不能靠
+                    // "注册表查不到 + 本机有在途提交"就认领 —— 那样外部客户端的任务会被
+                    // 记到本机名下：本机进度条被外部任务推动、预览串页、外部任务结束时
+                    // 还会把本机的 executing 指针清掉。
+                    //
+                    // 归属只认两条证据（见 resolveExecutionStartOwner）：
+                    // 1. 注册表里有这个 promptId（提交成功时登记的）；
+                    // 2. 这个 promptId 在本机提交记录里（promptId 是服务器返回给我们的）。
+                    //
+                    // R2-L5：第 2 条**覆盖不到**"execution_start 早于 registerJob"这个时序 ——
+                    // 本机提交记录也只在 registerJob 里写入，那时还查不到。该时序由
+                    // `JobRegistry.markExecuting`（先把 executingPromptId 记下来）+
+                    // `registerJob` 的"已在执行则回填 owner"分支补正，最终状态一致。
+                    // 第 2 条真正覆盖的是：条目已被完成/对账清掉之后，同一个 promptId 的
+                    // 事件被重放（WS 重连补发、乱序到达）时仍能认出是自己的。
+                    val registeredOwner = JobRegistry.findOwner(promptId)
+                    val submitted = JobRegistry.findSubmittedPrompt(promptId)
+                    val owner = resolveExecutionStartOwner(
+                        eventPromptId = promptId,
+                        registeredOwnerId = registeredOwner,
+                        submittedOwnerId = submitted?.ownerId,
+                    )
+                    val contentType = if (registeredOwner != null) {
+                        JobRegistry.findContentType(promptId)
+                    } else {
+                        submitted?.contentType
                     }
 
-                    if (owner != null && contentType != null) {
+                    if (owner == null || contentType == null) {
+                        DebugLogger.d(
+                            TAG,
+                            "忽略外部任务的 execution_start (promptId: ${Obfuscator.promptId(promptId)})"
+                        )
+                    } else {
+                        // 注册表条目已被清理（完成/取消/对账），但本机提交记录还在：
+                        // 补登记一次，让后续 progress / completion 事件仍能找到归属。
+                        // 注意这里**不是**在修"早于登记到达"——那个时序走 markExecuting 回填。
+                        if (registeredOwner == null) {
+                            DebugLogger.w(
+                                TAG,
+                                "注册表条目已清理，按本机提交记录补登记 (owner: $owner)"
+                            )
+                            JobRegistry.registerJob(promptId, owner, contentType)
+                            applicationContext?.let { ctx -> JobRegistry.saveState(ctx) }
+                        }
+
                         val previousOwner = generationOwnerId
                         val ownerChanged = previousOwner != null && previousOwner != owner
 
@@ -447,6 +608,12 @@ class GenerationViewModel : ViewModel() {
      * Register an event handler for a specific owner (screen).
      * Only the owner that started generation will receive events.
      * If there's a buffered preview or pending completion, it will be delivered immediately.
+     *
+     * 线程约束（P1-3）：**必须在主线程调用**（Compose 的 DisposableEffect/LaunchedEffect 天然满足）。
+     * 这里对 `pendingCompletions` / `bufferedPreviews` / `pendingClearPreviews` 做
+     * "检查 → 注册处理器 → 排空"三步；只有与 [deliverOrBuffer]（同样在主线程）串行时，
+     * 这三步才是原子的 —— 否则一个在 OkHttp 线程产生的事件可能插在"检查"与"排空"之间，
+     * 既没被排空、又因为处理器已注册而不再重投，等于永久丢失。
      */
     fun registerEventHandler(ownerId: String, handler: (GenerationEvent) -> Unit) {
         val state = _generationState.value
@@ -535,11 +702,6 @@ class GenerationViewModel : ViewModel() {
     }
 
     /**
-     * Dispatch event to active handler, falling back to SharedFlow.
-     * If no handler is active OR handler doesn't match executing owner, buffer events.
-     * Handler is invoked on the main thread to ensure proper UI state updates.
-     */
-    /**
      * 已经向界面发放过完成事件的 promptId（v4.8.2 去重）。
      *
      * 同一个任务有三条完成路径都会走到 [dispatchEvent]：
@@ -552,12 +714,31 @@ class GenerationViewModel : ViewModel() {
      * "添加到队列 (N)"之间跳变），`publishSkillText` 也重复拉 `/history` 并
      * `SkillTextResult.publish`（→ "已保存 N 张图片到…"弹窗反复弹出、需要点两次才能关）。
      * 同一个 promptId 的结果是唯一的，发一次就够。
+     *
+     * P1-3：三条路径可能来自不同线程（WS 协程在主线程、轮询回调在 OkHttp 线程），
+     * 普通 String 的"读 → 比较 → 写"会让两条路径同时通过检查。改用 [AtomicReference]
+     * + getAndSet：并发下只有一条能把值换成自己的 promptId，另一条读到相同值即跳过。
      */
-    private var lastImageGeneratedPromptId: String? = null
+    private val lastImageGeneratedPromptId = AtomicReference<String?>(null)
 
     /** 生成完成后的图库刷新防抖阀（多条完成路径共用一把，规则见 [GalleryRefreshThrottle]） */
     private val galleryRefreshThrottle = GalleryRefreshThrottle(GALLERY_REFRESH_DEBOUNCE_MS)
 
+    /**
+     * Dispatch event to active handler, falling back to SharedFlow.
+     * If no handler is active OR handler doesn't match executing owner, buffer events.
+     * Handler is invoked on the main thread to ensure proper UI state updates.
+     *
+     * P1-3 线程模型：
+     * - **前置副作用**（完成去重、技能流/3D 结果发布、图库刷新）留在调用线程执行；
+     * - **投递 / 入缓冲的判定与写入**统一经 [runOnMain] 串行到主线程
+     *   （[deliverOrBuffer]）。`pendingCompletions` 等都是普通 `mutableMap`，
+     *   原实现里 OkHttp 线程写、主线程读并删除，会出现丢条目/结构错乱；
+     *   统一到主线程后由单写者保证一致性，`Handler.post` 提供入队前的写入可见性。
+     * - `executingOwner` 必须**在调用线程先取好**再投递：延迟到主线程再读的话，
+     *   `dispatchCompletionEvent` 紧随其后的 `resetGenerationState` 可能已经把
+     *   `ownerId` 清空，完成事件就会丢（"轮询拿到了图但界面没反应"）。
+     */
     private fun dispatchEvent(event: GenerationEvent) {
         // 技能流（提示词强化）不出图，结果是一段文本：在这里统一取回来发布给
         // SkillTextResultDialog。必须落在事件分发**之前** —— 两条完成路径（轮询 /
@@ -565,11 +746,10 @@ class GenerationViewModel : ViewModel() {
         // 静默的（实测：服务器已产出 1860 字符提示词，界面上一片空白、用户以为没输出）。
         if (event is GenerationEvent.ImageGenerated) {
             // v4.8.2：同一任务只处理一次，打断"多路径重复完成"引发的界面抖动
-            if (event.promptId == lastImageGeneratedPromptId) {
+            if (lastImageGeneratedPromptId.getAndSet(event.promptId) == event.promptId) {
                 DebugLogger.d(TAG, "Skip duplicate ImageGenerated (${Obfuscator.promptId(event.promptId)})")
                 return
             }
-            lastImageGeneratedPromptId = event.promptId
 
             publishSkillText(event.promptId)
             // 图生3D 的产物是 .glb：与技能流同理，两条完成路径都汇到这里，
@@ -589,10 +769,51 @@ class GenerationViewModel : ViewModel() {
             else -> {}
         }
 
+        // 先在调用线程把 owner 定格（见上方线程模型说明）
+        val executingOwner = _generationState.value.ownerId
+        runOnMain { deliverOrBuffer(event, executingOwner) }
+
+        // Also emit to SharedFlow for backwards compatibility
+        viewModelScope.launch { _events.emit(event) }
+    }
+
+    /**
+     * 把动作串行到主线程执行（P1-3）。
+     *
+     * 已经在主线程时**同步执行**，不改变原有顺序语义（主线程上的 WS 事件仍然是即时投递）；
+     * 否则 post 到主线程队列，由 [mainHandler] 提供 happens-before。
+     */
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
+
+    /**
+     * 投递或缓冲一条事件（**只允许在主线程执行**）。
+     *
+     * @param executingOwner 调用方在事件产生那一刻读到的执行归属；null = 当时没有在执行业务，
+     *   事件无处投递（保持原行为：只走 SharedFlow）
+     */
+    private fun deliverOrBuffer(event: GenerationEvent, executingOwner: String?) {
         val handler = activeEventHandler
-        val state = _generationState.value
         val eventName = event::class.simpleName
-        val executingOwner = state.ownerId
+
+        // F5：预览与"清预览"是瞬时事件。复位之后 state 已被清空，此时再投递或缓冲
+        // 上一轮的预览，界面会闪一帧旧画面；缓冲版更糟 —— 下次该 owner 注册 handler
+        // 时会被当作"缓冲预览"再放一次。完成事件不走这条判定（理由见函数注释）。
+        if (event is GenerationEvent.PreviewImage || event is GenerationEvent.ClearPreviewForResume) {
+            val state = _generationState.value
+            if (!isCurrentGenerationEvent(state.isGenerating, state.ownerId, executingOwner)) {
+                DebugLogger.d(
+                    TAG,
+                    "丢弃上一轮生成的残留 $eventName（已复位，executingOwner=$executingOwner）"
+                )
+                return
+            }
+        }
 
         // Check if handler matches executing job owner
         val handlerMatchesExecuting = activeEventHandlerOwnerId == executingOwner
@@ -633,8 +854,6 @@ class GenerationViewModel : ViewModel() {
                 }
             }
         }
-        // Also emit to SharedFlow for backwards compatibility
-        viewModelScope.launch { _events.emit(event) }
     }
 
     /**
@@ -797,9 +1016,6 @@ class GenerationViewModel : ViewModel() {
         }
     }
 
-    // Content type for current generation (used in submitWorkflow)
-    private var generationContentType: ContentType = ContentType.IMAGE
-
     /**
      * Start generation with the given workflow JSON
      * @param workflowJson The workflow JSON to submit
@@ -815,61 +1031,148 @@ class GenerationViewModel : ViewModel() {
         onResult: (success: Boolean, promptId: String?, errorMessage: String?) -> Unit
     ) {
         DebugLogger.i(TAG, "Starting generation (owner: $ownerId, type: $contentType${if (front) ", front" else ""})")
-        comfyUIClient ?: run {
-            DebugLogger.e(TAG, "Cannot start generation: client not initialized")
-            onResult(false, null, applicationContext?.getString(R.string.error_client_not_initialized) ?: "Client not initialized")
+
+        // P1-4：单飞闸门。重复点击（连点、或"生成"与"添加到队首"同时按下）只放行第一次。
+        //
+        // **被拒时刻意不回调 onResult**：所有生成页的失败回调都是
+        // `errorMessage ?: error_generation_failed` 弹 Toast，传 null 会弹一条
+        // 名为"生成失败"的提示 —— 那是在指责用户误触，而误触本身不该产生任何提示。
+        // 界面侧的「提交中」禁用态由 [isSubmitting] 承担（四个生成页已接入），
+        // 这里只留一条调试日志，静默丢弃。
+        //
+        // R2-L4：拿到的令牌必须沿调用链传下去（finish / 看门狗 / 鉴权失败分支），
+        // 释放带令牌，迟到的释放才不会误释下一次提交刚抢到的闸门。
+        val ticket = submitGate.tryAcquire()
+        if (ticket == null) {
+            DebugLogger.d(TAG, "提交被拒：上一次提交仍在途，静默丢弃（owner=$ownerId）")
             return
         }
+        _isSubmitting.value = true
+        armSubmitGateWatchdog(ticket)
 
-        val context = applicationContext ?: run {
-            DebugLogger.e(TAG, "Cannot start generation: no application context")
-            onResult(false, null, "No application context")
-            return
+        // 释放闸门并回报结果：所有失败/异常路径都汇到这里，保证不会漏释放。
+        val finish: (Boolean, String?, String?) -> Unit = { success, promptId, errorMessage ->
+            releaseSubmitGate(ticket)
+            onResult(success, promptId, errorMessage)
         }
 
-        // Store the owner and content type before starting generation
-        generationOwnerId = ownerId
-        generationContentType = contentType
+        try {
+            comfyUIClient ?: run {
+                DebugLogger.e(TAG, "Cannot start generation: client not initialized")
+                finish(false, null, applicationContext?.getString(R.string.error_client_not_initialized) ?: "Client not initialized")
+                return
+            }
 
-        // v4.6.1（模块 A4）：提交前参数完整性预检。
-        // 放在 ensureConnection 之前：参数本身就不完整时，没必要再走一次网络往返；
-        // 也避免"连接成功但必然 400"这种最让用户困惑的组合。
-        WorkflowPreflight.check(workflowJson)?.let { problem ->
-            DebugLogger.w(TAG, "Preflight rejected: $problem")
-            onResult(false, null, problem)
-            return
+            val context = applicationContext ?: run {
+                DebugLogger.e(TAG, "Cannot start generation: no application context")
+                finish(false, null, "No application context")
+                return
+            }
+
+            // Store the owner and content type before starting generation
+            generationOwnerId = ownerId
+            generationContentType = contentType
+
+            // v4.6.1（模块 A4）：提交前参数完整性预检。
+            // 放在 ensureConnection 之前：参数本身就不完整时，没必要再走一次网络往返；
+            // 也避免"连接成功但必然 400"这种最让用户困惑的组合。
+            WorkflowPreflight.check(workflowJson)?.let { problem ->
+                DebugLogger.w(TAG, "Preflight rejected: $problem")
+                finish(false, null, problem)
+                return
+            }
+
+            // Ensure connection before starting - will try to reconnect if needed
+            // Dialog is shown by ensureConnection if reconnection fails
+            ConnectionManager.ensureConnection(context) { connected ->
+                if (connected) {
+                    submitWorkflow(workflowJson, front, finish, ticket)
+                } else {
+                    // Connection failed - dialog already shown by ensureConnection
+                    // Don't show Toast (no error message) to avoid duplicate notifications
+                    finish(false, null, null)
+                }
+            }
+        } catch (e: Exception) {
+            // 同步抛出的异常（例如 workflowJson 不是合法 JSON 时 submitPrompt 内部
+            // JSONObject(...) 直接抛）也必须释放闸门，否则按钮永久卡在禁用态。
+            DebugLogger.e(TAG, "提交前置阶段异常：${e.message}")
+            finish(false, null, e.message)
         }
+    }
 
-        // Ensure connection before starting - will try to reconnect if needed
-        // Dialog is shown by ensureConnection if reconnection fails
-        ConnectionManager.ensureConnection(context) { connected ->
-            if (connected) {
-                submitWorkflow(workflowJson, front, onResult)
-            } else {
-                // Connection failed - dialog already shown by ensureConnection
-                // Don't show Toast (no error message) to avoid duplicate notifications
-                onResult(false, null, null)
+    /**
+     * 武装提交闸门的超时看门狗（P1-4）。
+     *
+     * 为什么需要：`ensureConnection` 在"另一个重连会话已经开始"的分支里会**不回调**
+     * （见 `ConnectionManager.ensureConnection` 的 stale callback 分支），
+     * 网络层也可能出现回调丢失。没有看门狗时，闸门一旦静默泄漏，生成按钮就永久禁用，
+     * 用户只能杀进程。超时释放的代价是极端情况下可能漏过一次重复提交 —— 远小于按钮卡死。
+     *
+     * R2-L4：看门狗到期只释放**自己那次**的令牌。若期间闸门已经易主（旧提交正常结束、
+     * 新提交又抢到），`isHeldBy` 为 false，这里什么都不做 —— 否则一次迟到的超时
+     * 会把新提交的闸门捅开。
+     */
+    private fun armSubmitGateWatchdog(ticket: Long) {
+        submitGateWatchdog?.cancel()
+        submitGateWatchdog = viewModelScope.launch {
+            delay(SUBMIT_GATE_TIMEOUT_MS)
+            if (submitGate.isHeldBy(ticket)) {
+                DebugLogger.w(TAG, "提交闸门超时（${SUBMIT_GATE_TIMEOUT_MS}ms），强制释放")
+                releaseSubmitGate(ticket)
             }
         }
     }
 
     /**
+     * 释放提交闸门（P1-4）：成功 / 失败 / 异常三路共用。
+     *
+     * R2-L4：**带令牌**释放。令牌过期（闸门已属于下一次提交）时直接忽略，连看门狗
+     * 也不去取消 —— 那个看门狗属于新提交，取消掉会让新提交失去超时兜底。
+     */
+    private fun releaseSubmitGate(ticket: Long) {
+        if (!submitGate.isHeldBy(ticket)) {
+            DebugLogger.d(TAG, "忽略过期的提交闸门释放（ticket=$ticket）")
+            return
+        }
+        submitGate.release(ticket)
+        submitGateWatchdog?.cancel()
+        submitGateWatchdog = null
+        // 用闸门真实状态回写，而不是硬编码 false：极端时序下这里可能刚好又有人在途
+        _isSubmitting.value = submitGate.isInFlight
+    }
+
+    /**
      * Submit workflow to server
+     *
+     * @param ticket P1-4 的提交令牌：鉴权失败分支要显式释放它（该分支不能回调
+     *   onResult，否则页面会叠一个通用失败 Toast）。
      */
     private fun submitWorkflow(
         workflowJson: String,
         front: Boolean = false,
-        onResult: (success: Boolean, promptId: String?, errorMessage: String?) -> Unit
+        onResult: (success: Boolean, promptId: String?, errorMessage: String?) -> Unit,
+        ticket: Long
     ) {
-        val client = comfyUIClient ?: return
+        val client = comfyUIClient ?: run {
+            // 走到这里说明客户端在 ensureConnection 与提交之间被替换/清空：
+            // 必须回报结果，否则 P1-4 的闸门要靠看门狗才能释放。
+            onResult(
+                false,
+                null,
+                applicationContext?.getString(R.string.error_client_not_initialized) ?: "Client not initialized"
+            )
+            return
+        }
 
         DebugLogger.d(TAG, "Submitting workflow to server")
-        val mainHandler = Handler(Looper.getMainLooper())
         client.submitPrompt(workflowJson, front) { success, promptId, errorMessage, failureType ->
             if (success && promptId != null) {
                 DebugLogger.i(TAG, "Workflow submitted successfully (promptId: ${Obfuscator.promptId(promptId)})")
 
-                // Register job with JobRegistry for queue tracking
+                // Register job with JobRegistry for queue tracking.
+                // P1-1：这里同时把"本机提交返回的 promptId"记进注册表，之后 execution_start
+                // 的归属兜底只认这条记录，不再"查不到就当成自己的"。
                 generationOwnerId?.let { ownerId ->
                     JobRegistry.registerJob(promptId, ownerId, generationContentType)
                     // Save JobRegistry state for persistence
@@ -907,6 +1210,12 @@ class GenerationViewModel : ViewModel() {
                 // For authentication errors, show the connection alert dialog instead of Toast
                 if (failureType == ConnectionFailure.AUTHENTICATION) {
                     mainHandler.post {
+                        // P1-4：鉴权失败的提示由弹窗承担，**不能**走 onResult
+                        //（页面收到 !success 会再弹一个通用失败 Toast），
+                        // 但闸门必须在这里显式释放，否则按钮要等看门狗才恢复。
+                        // R2-L4：带本次提交的令牌 —— 这条回调可能迟到，届时闸门
+                        // 已属于下一次提交，过期令牌会被忽略而不是误释。
+                        releaseSubmitGate(ticket)
                         applicationContext?.let { ctx ->
                             ConnectionManager.showConnectionAlert(ctx, ConnectionFailure.AUTHENTICATION)
                         }
@@ -1136,11 +1445,16 @@ class GenerationViewModel : ViewModel() {
         stopCompletionPolling()
 
         // Clear transient buffers (previews can be discarded, completion events cannot)
+        //
+        // P1-3：复位可能从 OkHttp 线程进入（轮询的 handleJobLost / 完成回调），
+        // 而这两个容器只允许主线程改（见字段声明处的线程约束），所以清理也走 runOnMain。
         val currentOwner = generationOwnerId
         if (currentOwner != null) {
-            // DON'T clear pendingCompletions - they must survive until handler retrieves them
-            bufferedPreviews.remove(currentOwner)
-            pendingClearPreviews.remove(currentOwner)
+            runOnMain {
+                // DON'T clear pendingCompletions - they must survive until handler retrieves them
+                bufferedPreviews.remove(currentOwner)
+                pendingClearPreviews.remove(currentOwner)
+            }
         }
 
         _generationState.value = GenerationState()

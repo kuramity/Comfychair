@@ -16,7 +16,11 @@ import org.json.JSONObject
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.model.AuthCredentials
 import sh.hnet.comfychair.model.ModelIntroFetch
+import sh.hnet.comfychair.storage.ServerStorage
+import sh.hnet.comfychair.util.CleartextGuardInterceptor
+import sh.hnet.comfychair.util.ComfyViewUrl
 import sh.hnet.comfychair.util.DebugLogger
+import sh.hnet.comfychair.util.ExifOrientation
 import sh.hnet.comfychair.util.Obfuscator
 import sh.hnet.comfychair.util.ProgressTrackingRequestBody
 import sh.hnet.comfychair.util.ProgressTrackingResponseBody
@@ -46,9 +50,13 @@ import kotlinx.coroutines.launch
  */
 class ComfyUIClient(
     private val context: Context? = null,
-    private val hostname: String,
+    rawHostname: String,
     private val port: Int,
-    credentials: AuthCredentials = AuthCredentials.None
+    credentials: AuthCredentials = AuthCredentials.None,
+    /** 服务器 ID：证书指纹（TOFU）按它持久化；null 时退化为仅本实例内存保存 */
+    private val serverId: String? = null,
+    /** 用户为该服务器显式选择的协议（"http" / "https"）；null 时回落到地址前缀解析 */
+    preferredProtocol: String? = null
 ) {
     companion object {
         private const val TAG = "API"
@@ -60,7 +68,11 @@ class ComfyUIClient(
          *
          * 放大类工作流可能产出上万像素的图片（解码后可达数百 MB），
          * 既容易 OOM，也会触发 "Canvas: trying to draw too large bitmap" 崩溃。
-         * 这里统一按需采样解码，4096 边长足够覆盖手机屏幕显示需求。
+         * 这里统一按需采样解码，6144 边长足够覆盖手机屏幕显示需求（长边超过它的图按比例降采样）。
+         *
+         * 为什么不是 4096：6144 与 [CACHEABLE_BITMAP_BYTES] 的「大图不进内存缓存」预算配套 ——
+         * 6144² × 4B ≈ 151MB，远超 32MB 缓存阈值，所以这个尺寸的图解码后直接交给界面、
+         * 不进 LRU。把常量改小会让这条推理失效，缓存行为也跟着变。
          */
         private const val MAX_DECODE_DIMENSION = 6144
 
@@ -143,13 +155,116 @@ class ComfyUIClient(
             401, 403 -> ConnectionFailure.AUTHENTICATION
             else -> ConnectionFailure.NETWORK
         }
+
+        /**
+         * 统一主机名：去掉用户可能手填的协议前缀与末尾斜杠。
+         * 协议由 [explicitProtocol] 单独解析，这里只留下纯主机名/IP。
+         */
+        internal fun normalizeHostname(raw: String): String {
+            var value = raw.trim()
+            if (value.startsWith("http://", ignoreCase = true)) {
+                value = value.substring(7)
+            } else if (value.startsWith("https://", ignoreCase = true)) {
+                value = value.substring(8)
+            }
+            return value.trimEnd('/')
+        }
     }
+
+    /**
+     * 用户显式选择的协议；null 表示未指定，默认走 HTTPS。
+     *
+     * 取值顺序：服务器配置里持久化的协议 > 地址前缀（`http://` / `https://`）> null。
+     * 明文 HTTP 只能由用户显式选择，不再由 HTTPS 失败后自动降级得到。
+     */
+    private val explicitProtocol: String? =
+        preferredProtocol?.trim()?.lowercase()?.takeIf { it == "http" || it == "https" }
+            ?: when {
+                rawHostname.trim().startsWith("http://", ignoreCase = true) -> "http"
+                rawHostname.trim().startsWith("https://", ignoreCase = true) -> "https"
+                else -> null
+            }
+
+    /** 去掉协议前缀与末尾斜杠后的纯主机名/IP；所有 URL 与 Cookie 作用域都用它 */
+    private val hostname: String = normalizeHostname(rawHostname)
 
     // Auth interceptor for adding auth headers and detecting session expiry
     private val authInterceptor = AuthInterceptor(credentials, hostname)
 
+    /** 证书指纹持久化（按 serverId）；没有 Context 时退化为内存保存 */
+    private val pinStorage: ServerStorage? = context?.applicationContext?.let { ServerStorage(it) }
+    private val memoryPins = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun readPinnedFingerprint(): String? =
+        if (serverId != null && pinStorage != null) pinStorage.getCertificatePin(serverId)
+        else memoryPins[hostname]
+
+    private fun savePinnedFingerprint(fingerprint: String) {
+        if (serverId != null && pinStorage != null) {
+            pinStorage.setCertificatePin(serverId, fingerprint)
+        } else {
+            memoryPins[hostname] = fingerprint
+        }
+    }
+
+    /** 公网自签证书待用户确认的指纹：只留在内存，用户显式确认后才写盘 */
+    @Volatile
+    private var pendingUntrustedFingerprint: String? = null
+
+    /** 待确认的证书指纹（null 表示没有待确认的公网自签证书） */
+    fun getPendingCertificateFingerprint(): String? = pendingUntrustedFingerprint
+
+    /**
+     * 用户显式确认后把待确认指纹写入信任存储。
+     * @return true 表示已保存，false 表示没有待确认指纹或保存失败
+     */
+    fun trustPendingCertificate(): Boolean {
+        val fingerprint = pendingUntrustedFingerprint ?: return false
+        return try {
+            savePinnedFingerprint(fingerprint)
+            pendingUntrustedFingerprint = null
+            true
+        } catch (e: Exception) {
+            DebugLogger.e(TAG, "保存用户确认的证书指纹失败：${e.message}")
+            false
+        }
+    }
+
+    /** 公网主机的证书不被系统信任且无指纹：记录下来等用户确认，绝不自动写盘 */
+    private fun onUntrustedCertificate(fingerprint: String) {
+        pendingUntrustedFingerprint = fingerprint
+        DebugLogger.w(TAG, "公网服务器证书不被系统信任，等待用户确认后重试")
+    }
+
+    /**
+     * 统一的客户端安全配置：Cookie 作用域仓库 + 凭据跨主机兜底 + 分场景 TLS 信任 + 明文出口闸门。
+     *
+     * ⚠️ 新增网络请求必须经本方法构造 client（或自行挂 [CleartextGuardInterceptor]）：
+     * 平台 network_security_config 仍允许明文，明文「只发私网」的边界只在这里，
+     * 绕过它的链路（WebView、未来新增的网络库）不受保护。见仓库根目录 SECURITY.md 第 1 节。
+     */
+    private fun secured(builder: OkHttpClient.Builder): OkHttpClient.Builder {
+        authInterceptor.cookieJar?.let { builder.cookieJar(it) }
+        builder.addNetworkInterceptor(HostScopedAuthGuard(hostname, authInterceptor::getCredentials))
+        // P2-13：平台 network_security_config 无法表达私网网段（不支持 CIDR），
+        // 明文「只发私网」的边界在网络层执行：公网主机走 http/ws 会在这里被拒。
+        //
+        // 必须用 **网络拦截器**（addNetworkInterceptor）而不是应用拦截器（addInterceptor）：
+        // OkHttp 的 30x 跳转在 RetryAndFollowUpInterceptor 内部重新发起，只重走
+        // 「连接 + 网络拦截器」这一段，应用拦截器对初始请求只执行一次。挂在应用层的话，
+        // https 主机 302 到公网 http:// 地址就会绕过闸门。
+        builder.addNetworkInterceptor(CleartextGuardInterceptor)
+        return SelfSignedCertHelper.configureToAcceptSelfSigned(
+            builder,
+            hostname = hostname,
+            pinnedFingerprint = ::readPinnedFingerprint,
+            onFirstSeen = ::savePinnedFingerprint,
+            onUntrusted = ::onUntrustedCertificate
+        )
+    }
+
     // OkHttpClient for HTTP requests - short timeouts are fine
-    private val httpClient = SelfSignedCertHelper.configureToAcceptSelfSigned(
+    private val httpClient = secured(
         OkHttpClient.Builder()
             .addInterceptor(authInterceptor)
             .connectTimeout(10, TimeUnit.SECONDS)  // Max time to establish connection
@@ -160,7 +275,7 @@ class ComfyUIClient(
     // Separate OkHttpClient for WebSocket connections
     // WebSockets need longer timeouts since data may not arrive for extended periods
     // pingInterval keeps the connection alive during long operations
-    private val webSocketClient = SelfSignedCertHelper.configureToAcceptSelfSigned(
+    private val webSocketClient = secured(
         OkHttpClient.Builder()
             .addInterceptor(authInterceptor)
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -171,7 +286,7 @@ class ComfyUIClient(
 
     // Client for large transfers (uploads/downloads) - timeouts disabled, stall detection handles them
     // This allows slow but progressing transfers to complete while detecting truly stalled connections
-    private val transferClient = SelfSignedCertHelper.configureToAcceptSelfSigned(
+    private val transferClient = secured(
         OkHttpClient.Builder()
             .addInterceptor(authInterceptor)
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -190,7 +305,7 @@ class ComfyUIClient(
      * 这里给 15 秒**读空闲**上限（不是总时长）：只要数据还在流动（哪怕经隧道 9KB/s），
      * 两次读的间隔远小于 15 秒，不会误杀；真正断流才失败。上传仍走 [transferClient]。
      */
-    private val downloadClient = SelfSignedCertHelper.configureToAcceptSelfSigned(
+    private val downloadClient = secured(
         OkHttpClient.Builder()
             .addInterceptor(authInterceptor)
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -303,7 +418,9 @@ class ComfyUIClient(
 
     /**
      * Test connection to the ComfyUI server
-     * Tries HTTPS first, then falls back to HTTP if HTTPS fails
+     *
+     * 协议选择：用户地址显式以 `http://` 开头才走明文 HTTP，其余一律先试 HTTPS。
+     * **HTTPS 失败不再静默降级到 HTTP** —— 明文必须由用户显式选择。
      *
      * @param callback Called with the result:
      *                 - success: true if connected, false if failed
@@ -315,8 +432,8 @@ class ComfyUIClient(
         DebugLogger.i(TAG, "Testing connection to ${Obfuscator.hostname(hostname)}")
         // Reset the certificate issue detection
         SelfSignedCertHelper.reset()
-        // Try HTTPS first (more secure)
-        tryConnection("https", callback)
+        // 显式 http:// 地址保持原有明文行为；否则只走 HTTPS，不做任何降级
+        tryConnection(explicitProtocol ?: "https", callback)
     }
 
     /**
@@ -343,12 +460,18 @@ class ComfyUIClient(
         // We use enqueue instead of execute to avoid blocking the UI thread
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: IOException) {
-                // Connection failed with this protocol
                 if (protocol == "https") {
-                    // HTTPS failed, try HTTP as fallback
-                    tryConnection("http", callback)
+                    // 不再降级到 http：明文必须由用户显式选择
+                    DebugLogger.w(TAG, "HTTPS 连接失败，不再降级到 http：${e.message}")
+                    // 带上证书问题类型：指纹不一致时界面据此提供「重新信任」入口
+                    callback(
+                        false,
+                        context?.getString(R.string.error_https_connection_failed)
+                            ?: "HTTPS connection failed: if the server only supports HTTP, change the address to start with http:// and retry",
+                        SelfSignedCertHelper.certificateIssue,
+                        ConnectionFailure.NETWORK
+                    )
                 } else {
-                    // HTTP also failed - both protocols don't work
                     callback(false, "Connection failed: ${e.message}", CertificateIssue.NONE, ConnectionFailure.NETWORK)
                 }
             }
@@ -371,22 +494,14 @@ class ComfyUIClient(
                             } else {
                                 // Response doesn't match ComfyUI format
                                 DebugLogger.w(TAG, "Invalid response: not a ComfyUI server")
-                                if (protocol == "https") {
-                                    tryConnection("http", callback)
-                                } else {
-                                    callback(false, context?.getString(R.string.error_not_comfyui_server)
-                                        ?: "Not a ComfyUI server", CertificateIssue.NONE, ConnectionFailure.INVALID_SERVER)
-                                }
+                                callback(false, context?.getString(R.string.error_not_comfyui_server)
+                                    ?: "Not a ComfyUI server", CertificateIssue.NONE, ConnectionFailure.INVALID_SERVER)
                             }
                         } catch (e: Exception) {
                             // Response is not valid JSON - not a ComfyUI server
                             DebugLogger.w(TAG, "Invalid response: ${e.message}")
-                            if (protocol == "https") {
-                                tryConnection("http", callback)
-                            } else {
-                                callback(false, context?.getString(R.string.error_invalid_server_response)
-                                    ?: "Invalid server response", CertificateIssue.NONE, ConnectionFailure.INVALID_SERVER)
-                            }
+                            callback(false, context?.getString(R.string.error_invalid_server_response)
+                                ?: "Invalid server response", CertificateIssue.NONE, ConnectionFailure.INVALID_SERVER)
                         }
                     } else {
                         // Got response but status code indicates error
@@ -405,8 +520,15 @@ class ComfyUIClient(
                                 ConnectionFailure.AUTHENTICATION
                             )
                         } else if (protocol == "https") {
-                            // Try HTTP as fallback for other errors
-                            tryConnection("http", callback)
+                            // 服务端明确返回错误：同样不降级到 http
+                            DebugLogger.w(TAG, "HTTPS 连接被服务端拒绝（HTTP $code），不再降级到 http")
+                            callback(
+                                false,
+                                (context?.getString(R.string.error_https_connection_failed)
+                                    ?: "HTTPS connection failed: if the server only supports HTTP, change the address to start with http:// and retry") + " (HTTP $code)",
+                                SelfSignedCertHelper.certificateIssue,
+                                ConnectionFailure.NETWORK
+                            )
                         } else {
                             // Both protocols failed
                             DebugLogger.w(TAG, "Connection failed: server error $code")
@@ -506,6 +628,23 @@ class ComfyUIClient(
      */
     fun getBaseUrl(): String? {
         return workingProtocol?.let { "$it://$hostname:$port" }
+    }
+
+    /**
+     * 直接可用的 `/view` 地址（查询参数已编码，P2-4）。
+     *
+     * 供不经过 OkHttp 请求链的下游使用：MediaMetadataRetriever 需要自己打开
+     * 视频流来抽首帧（P2-5）。认证方式较特殊的服务器（Basic/Bearer/Cookie）
+     * 上它可能失败，调用方按"失败即回退到整段下载"处理。
+     */
+    fun viewUrl(
+        filename: String,
+        subfolder: String = "",
+        type: String = "output",
+        preview: String? = null
+    ): String? {
+        val baseUrl = getBaseUrl() ?: return null
+        return ComfyViewUrl.build(baseUrl, filename, subfolder, type, preview)
     }
 
     /**
@@ -635,6 +774,97 @@ class ComfyUIClient(
         })
     }
 
+    // ============================================================
+    // G4（任务书 11.4）：服务器端文件删除（comfyui-browser 插件能力）
+    // ============================================================
+    //
+    // ComfyUI 原生没有删除接口（server.py 只有 GET /view、POST /upload/image、
+    // POST /history、POST /queue、POST /interrupt、POST /free）。删除能力来自
+    // comfyui-browser 插件的 `DELETE /browser/files`，请求体三字段：
+    //   {"filename": "...", "folder_path": "<subfolder>", "folder_type": "outputs|input|temp"}
+    // 服务端按 (folder_type 根, folder_path, filename) 定位文件，**只接受三个根**——
+    // 客户端拼不出绝对路径，天然删不到 output 之外的目录（破坏性硬约束 1）。
+    // 成功返回 201，文件不存在返回 404。两个方法都只回传原始 HTTP 码 + 网络失败标志，
+    // 怎么解释交给纯函数 GalleryTrashLogic（classifyProbe / classifyDeleteAttempt），
+    // 这里绝不提前把"失败"翻成"成功"。
+
+    /**
+     * 探测当前服务器是否安装了提供删除能力的 comfyui-browser 插件。
+     *
+     * 探测方式是 `GET /browser/files`（与删除同一路由）：
+     * 有插件时该路由存在（列表接口返回 2xx；即便 GET 未注册也会得到与"路由不存在"
+     * 不同的响应），无插件时直接 404。判定规则在 GalleryTrashLogic.classifyProbe，
+     * 网络失败回 (null, true)，调用方按 UNKNOWN 处理（下次可重试，不判死）。
+     *
+     * @param callback (httpCode, networkFailed) —— httpCode 仅在拿到响应时非 null
+     */
+    fun probeBrowserDeleteSupport(callback: (httpCode: Int?, networkFailed: Boolean) -> Unit) {
+        val baseUrl = getBaseUrl() ?: run {
+            callback(null, true)
+            return
+        }
+
+        val request = Request.Builder()
+            .url("$baseUrl/browser/files")
+            .get()
+            .build()
+
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: IOException) {
+                callback(null, true)
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: Response) {
+                response.use { callback(it.code, false) }
+            }
+        })
+    }
+
+    /**
+     * 删除服务器输出目录里的一个文件（唯一允许的服务器删除通道）。
+     *
+     * **参数约束**：filename / folderPath / folderType 必须先经
+     * GalleryTrashLogic.isLocatorSafe 与 toBrowserFolderType 白名单过滤，
+     * 调用方拿到的是过滤后的值；本方法只负责发请求，不做路径运算。
+     *
+     * @param callback (httpCode, networkFailed) —— 语义同 [probeBrowserDeleteSupport]
+     */
+    fun deleteBrowserFile(
+        filename: String,
+        folderPath: String,
+        folderType: String,
+        callback: (httpCode: Int?, networkFailed: Boolean) -> Unit
+    ) {
+        val baseUrl = getBaseUrl() ?: run {
+            callback(null, true)
+            return
+        }
+
+        // JSONObject 负责转义：filename 里出现引号等字符不会破坏请求体结构
+        val bodyJson = JSONObject().apply {
+            put("filename", filename)
+            put("folder_path", folderPath)
+            put("folder_type", folderType)
+        }
+        val body = bodyJson.toString()
+            .toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url("$baseUrl/browser/files")
+            .delete(body)
+            .build()
+
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: IOException) {
+                callback(null, true)
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: Response) {
+                response.use { callback(it.code, false) }
+            }
+        })
+    }
+
     /**
      * Fetch the full /object_info response from the ComfyUI server.
      * Returns the complete node type information including inputs/outputs.
@@ -681,326 +911,6 @@ class ComfyUIClient(
                     } else {
                         DebugLogger.w(TAG, "object_info request failed: ${response.code}")
                         callback(null)
-                    }
-                }
-            }
-        })
-    }
-
-    /**
-     * Fetch available checkpoints from the ComfyUI server
-     * Retrieves the list of checkpoint models that can be used for generation
-     *
-     * @param callback Called with the result:
-     *                 - checkpoints: List of checkpoint filenames, or empty list on error
-     */
-    fun fetchCheckpoints(callback: (checkpoints: List<String>) -> Unit) {
-        DebugLogger.d(TAG, "Fetching checkpoints")
-        val baseUrl = getBaseUrl() ?: run {
-            DebugLogger.w(TAG, "Cannot fetch checkpoints: no connection")
-            callback(emptyList())
-            return
-        }
-
-        val url = "$baseUrl/object_info/CheckpointLoaderSimple"
-
-        val request = Request.Builder()
-            .url(url)
-            .get()
-            .build()
-
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: IOException) {
-                DebugLogger.w(TAG, "Failed to fetch checkpoints: ${e.message}")
-                callback(emptyList())
-            }
-
-            override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use {
-                    if (response.isSuccessful) {
-                        try {
-                            val responseBody = response.body?.string() ?: "{}"
-                            val json = JSONObject(responseBody)
-                            // First get the CheckpointLoaderSimple object
-                            val checkpointLoaderJson = json.optJSONObject("CheckpointLoaderSimple")
-                            val inputJson = checkpointLoaderJson?.optJSONObject("input")
-                            val requiredJson = inputJson?.optJSONObject("required")
-                            val ckptNameArray = requiredJson?.optJSONArray("ckpt_name")
-
-                            // The first element is the array of checkpoint names
-                            val optionsArray = ckptNameArray?.optJSONArray(0)
-
-                            val checkpoints = mutableListOf<String>()
-                            if (optionsArray != null) {
-                                for (i in 0 until optionsArray.length()) {
-                                    val checkpoint = optionsArray.getString(i)
-                                    checkpoints.add(checkpoint)
-                                }
-                            }
-                            DebugLogger.d(TAG, "Fetched ${checkpoints.size} checkpoints")
-                            callback(checkpoints)
-                        } catch (e: Exception) {
-                            DebugLogger.w(TAG, "Failed to parse checkpoints: ${e.message}")
-                            callback(emptyList())
-                        }
-                    } else {
-                        DebugLogger.w(TAG, "Checkpoint fetch failed: ${response.code}")
-                        callback(emptyList())
-                    }
-                }
-            }
-        })
-    }
-
-    /**
-     * Fetch available diffusion models (UNET) from the ComfyUI server
-     * Retrieves the list of diffusion models that can be used for generation
-     *
-     * @param callback Called with the result:
-     *                 - unets: List of UNET model filenames, or empty list on error
-     */
-    fun fetchUNETs(callback: (unets: List<String>) -> Unit) {
-        DebugLogger.d(TAG, "Fetching UNETs")
-        val baseUrl = getBaseUrl() ?: run {
-            callback(emptyList())
-            return
-        }
-
-        val url = "$baseUrl/object_info/UNETLoader"
-
-        val request = Request.Builder()
-            .url(url)
-            .get()
-            .build()
-
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: IOException) {
-                DebugLogger.w(TAG, "Failed to fetch UNETs: ${e.message}")
-                callback(emptyList())
-            }
-
-            override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use {
-                    if (response.isSuccessful) {
-                        try {
-                            val responseBody = response.body?.string() ?: "{}"
-                            val json = JSONObject(responseBody)
-                            // Get the UNETLoader object
-                            val unetLoaderJson = json.optJSONObject("UNETLoader")
-                            val inputJson = unetLoaderJson?.optJSONObject("input")
-                            val requiredJson = inputJson?.optJSONObject("required")
-                            val unetNameArray = requiredJson?.optJSONArray("unet_name")
-
-                            // The first element is the array of UNET model names
-                            val optionsArray = unetNameArray?.optJSONArray(0)
-
-                            val unets = mutableListOf<String>()
-                            if (optionsArray != null) {
-                                for (i in 0 until optionsArray.length()) {
-                                    val unet = optionsArray.getString(i)
-                                    unets.add(unet)
-                                }
-                            }
-                            DebugLogger.d(TAG, "Fetched ${unets.size} UNETs")
-                            callback(unets)
-                        } catch (e: Exception) {
-                            DebugLogger.w(TAG, "Failed to parse UNETs: ${e.message}")
-                            callback(emptyList())
-                        }
-                    } else {
-                        callback(emptyList())
-                    }
-                }
-            }
-        })
-    }
-
-    /**
-     * Fetch available VAE models from the ComfyUI server
-     * Retrieves the list of VAE models that can be used for generation
-     *
-     * @param callback Called with the result:
-     *                 - vaes: List of VAE model filenames, or empty list on error
-     */
-    fun fetchVAEs(callback: (vaes: List<String>) -> Unit) {
-        DebugLogger.d(TAG, "Fetching VAEs")
-        val baseUrl = getBaseUrl() ?: run {
-            callback(emptyList())
-            return
-        }
-
-        val url = "$baseUrl/object_info/VAELoader"
-
-        val request = Request.Builder()
-            .url(url)
-            .get()
-            .build()
-
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: IOException) {
-                DebugLogger.w(TAG, "Failed to fetch VAEs: ${e.message}")
-                callback(emptyList())
-            }
-
-            override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use {
-                    if (response.isSuccessful) {
-                        try {
-                            val responseBody = response.body?.string() ?: "{}"
-                            val json = JSONObject(responseBody)
-                            // Get the VAELoader object
-                            val vaeLoaderJson = json.optJSONObject("VAELoader")
-                            val inputJson = vaeLoaderJson?.optJSONObject("input")
-                            val requiredJson = inputJson?.optJSONObject("required")
-                            val vaeNameArray = requiredJson?.optJSONArray("vae_name")
-
-                            // The first element is the array of VAE model names
-                            val optionsArray = vaeNameArray?.optJSONArray(0)
-
-                            val vaes = mutableListOf<String>()
-                            if (optionsArray != null) {
-                                for (i in 0 until optionsArray.length()) {
-                                    val vae = optionsArray.getString(i)
-                                    vaes.add(vae)
-                                }
-                            }
-                            DebugLogger.d(TAG, "Fetched ${vaes.size} VAEs")
-                            callback(vaes)
-                        } catch (e: Exception) {
-                            DebugLogger.w(TAG, "Failed to parse VAEs: ${e.message}")
-                            callback(emptyList())
-                        }
-                    } else {
-                        DebugLogger.w(TAG, "VAE fetch failed: ${response.code}")
-                        callback(emptyList())
-                    }
-                }
-            }
-        })
-    }
-
-    /**
-     * Fetch available CLIP models from the ComfyUI server
-     * Retrieves the list of CLIP models that can be used for generation
-     *
-     * @param callback Called with the result:
-     *                 - clips: List of CLIP model filenames, or empty list on error
-     */
-    fun fetchCLIPs(callback: (clips: List<String>) -> Unit) {
-        DebugLogger.d(TAG, "Fetching CLIPs")
-        val baseUrl = getBaseUrl() ?: run {
-            callback(emptyList())
-            return
-        }
-
-        val url = "$baseUrl/object_info/CLIPLoader"
-
-        val request = Request.Builder()
-            .url(url)
-            .get()
-            .build()
-
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: IOException) {
-                DebugLogger.w(TAG, "Failed to fetch CLIPs: ${e.message}")
-                callback(emptyList())
-            }
-
-            override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use {
-                    if (response.isSuccessful) {
-                        try {
-                            val responseBody = response.body?.string() ?: "{}"
-                            val json = JSONObject(responseBody)
-                            // Get the CLIPLoader object
-                            val clipLoaderJson = json.optJSONObject("CLIPLoader")
-                            val inputJson = clipLoaderJson?.optJSONObject("input")
-                            val requiredJson = inputJson?.optJSONObject("required")
-                            val clipNameArray = requiredJson?.optJSONArray("clip_name")
-
-                            // The first element is the array of CLIP model names
-                            val optionsArray = clipNameArray?.optJSONArray(0)
-
-                            val clips = mutableListOf<String>()
-                            if (optionsArray != null) {
-                                for (i in 0 until optionsArray.length()) {
-                                    val clip = optionsArray.getString(i)
-                                    clips.add(clip)
-                                }
-                            }
-                            DebugLogger.d(TAG, "Fetched ${clips.size} CLIPs")
-                            callback(clips)
-                        } catch (e: Exception) {
-                            DebugLogger.w(TAG, "Failed to parse CLIPs: ${e.message}")
-                            callback(emptyList())
-                        }
-                    } else {
-                        DebugLogger.w(TAG, "CLIP fetch failed: ${response.code}")
-                        callback(emptyList())
-                    }
-                }
-            }
-        })
-    }
-
-    /**
-     * Fetch available LoRA models from the ComfyUI server
-     * Retrieves the list of LoRA models that can be used for generation
-     *
-     * @param callback Called with the result:
-     *                 - loras: List of LoRA model filenames, or empty list on error
-     */
-    fun fetchLoRAs(callback: (loras: List<String>) -> Unit) {
-        DebugLogger.d(TAG, "Fetching LoRAs")
-        val baseUrl = getBaseUrl() ?: run {
-            callback(emptyList())
-            return
-        }
-
-        val url = "$baseUrl/object_info/LoraLoaderModelOnly"
-
-        val request = Request.Builder()
-            .url(url)
-            .get()
-            .build()
-
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: IOException) {
-                DebugLogger.w(TAG, "Failed to fetch LoRAs: ${e.message}")
-                callback(emptyList())
-            }
-
-            override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use {
-                    if (response.isSuccessful) {
-                        try {
-                            val responseBody = response.body?.string() ?: "{}"
-                            val json = JSONObject(responseBody)
-                            // Get the LoraLoaderModelOnly object
-                            val loraLoaderJson = json.optJSONObject("LoraLoaderModelOnly")
-                            val inputJson = loraLoaderJson?.optJSONObject("input")
-                            val requiredJson = inputJson?.optJSONObject("required")
-                            val loraNameArray = requiredJson?.optJSONArray("lora_name")
-
-                            // The first element is the array of LoRA model names
-                            val optionsArray = loraNameArray?.optJSONArray(0)
-
-                            val loras = mutableListOf<String>()
-                            if (optionsArray != null) {
-                                for (i in 0 until optionsArray.length()) {
-                                    val lora = optionsArray.getString(i)
-                                    loras.add(lora)
-                                }
-                            }
-                            DebugLogger.d(TAG, "Fetched ${loras.size} LoRAs")
-                            callback(loras)
-                        } catch (e: Exception) {
-                            DebugLogger.w(TAG, "Failed to parse LoRAs: ${e.message}")
-                            callback(emptyList())
-                        }
-                    } else {
-                        DebugLogger.w(TAG, "LoRA fetch failed: ${response.code}")
-                        callback(emptyList())
                     }
                 }
             }
@@ -1338,10 +1248,19 @@ class ComfyUIClient(
     /**
      * 按最大边长采样解码图片。
      *
+     * 解码后统一做 EXIF 方向校正（P1-26）：BitmapFactory 不读 Orientation，
+     * 手机/相机导出的 JPEG 会躺倒。非 JPEG（PNG/WebP）不额外付 IO。
+     *
      * @param bytes 原始图片字节
      * @param maxDimension 允许的最大边长（<= 0 表示不限制）
      */
     private fun decodeSampled(bytes: ByteArray, maxDimension: Int): Bitmap? {
+        val decoded = decodeSampledRaw(bytes, maxDimension) ?: return null
+        return ExifOrientation.applyFromEncodedBytes(bytes, decoded)
+    }
+
+    /** 纯解码（尺寸采样），EXIF 校正由 [decodeSampled] 统一负责 */
+    private fun decodeSampledRaw(bytes: ByteArray, maxDimension: Int): Bitmap? {
         if (maxDimension <= 0) {
             return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         }
@@ -1411,7 +1330,10 @@ class ComfyUIClient(
             callback(false, ConnectionFailure.NETWORK)
             return
         }
-        val url = "$baseUrl/view?filename=$filename&subfolder=$subfolder&type=$type"
+        val url = ComfyViewUrl.build(baseUrl, filename, subfolder, type) ?: run {
+            callback(false, ConnectionFailure.NETWORK)
+            return
+        }
         val request = Request.Builder().url(url).get().build()
         // 用 [downloadClient] 而不是 [transferClient]：后者 readTimeout=0，
         // 断网时会无限挂起、永不回调失败（实测卡 "Downloading model…" 超过 1 分钟），
@@ -1429,6 +1351,7 @@ class ComfyUIClient(
                         callback(false, ConnectionFailure.NETWORK)
                         return
                     }
+                    var tmpFile: java.io.File? = null
                     try {
                         destFile.parentFile?.mkdirs()
                         // 先写临时文件再改名（v4.1.1 修）。
@@ -1436,30 +1359,39 @@ class ComfyUIClient(
                         // GLB，第二个实例会把"已存在但只写了一半"的文件当成完整缓存 →
                         // 解析失败，且坏文件永久留在缓存目录（30~61MB 的 GLB 下载要几十秒，
                         // 这个窗口很大）。临时文件 + rename 后，只有完整下载才会出现在目标路径。
-                        val tmpFile = java.io.File(destFile.parentFile, destFile.name + ".part")
-                        tmpFile.outputStream().use { out -> body.byteStream().copyTo(out) }
+                        //
+                        // P2-4：临时文件必须**每次下载唯一**（createTempFile）。固定
+                        // `<dest>.part` 时，两个并发下载会同时写同一个临时文件，内容交错后
+                        // rename 出去照样是坏文件 —— 正是上面要避免的那类问题。
+                        val tmp = java.io.File.createTempFile(destFile.name + "-", ".part", destFile.parentFile)
+                        tmpFile = tmp
+                        tmp.outputStream().use { out -> body.byteStream().copyTo(out) }
                         val expected = body.contentLength()
-                        val actual = tmpFile.length()
+                        val actual = tmp.length()
                         if (expected > 0 && actual != expected) {
-                            tmpFile.delete()
+                            tmp.delete()
                             DebugLogger.w(TAG, "Raw file size mismatch: expected=$expected actual=$actual")
                             callback(false, ConnectionFailure.NETWORK)
                             return
                         }
                         if (actual <= 0) {
-                            tmpFile.delete()
+                            tmp.delete()
                             DebugLogger.w(TAG, "Raw file empty, discarded")
                             callback(false, ConnectionFailure.NETWORK)
                             return
                         }
-                        if (!tmpFile.renameTo(destFile)) {
+                        if (!tmp.renameTo(destFile)) {
                             // rename 失败（跨分区/被占用）时退化为拷贝后删临时文件
-                            tmpFile.copyTo(destFile, overwrite = true)
-                            tmpFile.delete()
+                            tmp.copyTo(destFile, overwrite = true)
+                            tmp.delete()
                         }
                         DebugLogger.i(TAG, "Raw file saved: ${destFile.length()} bytes")
                         callback(true, ConnectionFailure.NETWORK)
                     } catch (e: Exception) {
+                        // F4：唯一命名的 .part 可能已经写出几十 MB；异常/中断路径不删的话，
+                        // 每次失败重试都会在 filesDir/model3d 留下一个垃圾文件，而该目录
+                        // 属于"清缓存不碰"的保护目录，只能卸载应用才消失。
+                        tmpFile?.delete()
                         DebugLogger.e(TAG, "Raw file write failed: ${e.message}")
                         callback(false, ConnectionFailure.NETWORK)
                     }
@@ -1483,8 +1415,10 @@ class ComfyUIClient(
             return
         }
 
-        val previewParam = preview?.let { "&preview=$it" } ?: ""
-        val url = "$baseUrl/view?filename=$filename&subfolder=$subfolder&type=$type$previewParam"
+        val url = ComfyViewUrl.build(baseUrl, filename, subfolder, type, preview) ?: run {
+            callback(null, ConnectionFailure.NETWORK)
+            return
+        }
 
         val request = Request.Builder()
             .url(url)
@@ -1558,7 +1492,10 @@ class ComfyUIClient(
             return
         }
 
-        val url = "$baseUrl/view?filename=$filename&subfolder=$subfolder&type=$type"
+        val url = ComfyViewUrl.build(baseUrl, filename, subfolder, type) ?: run {
+            callback(null, false, ConnectionFailure.NETWORK)
+            return
+        }
 
         val request = Request.Builder()
             .url(url)
@@ -1607,7 +1544,10 @@ class ComfyUIClient(
             return
         }
 
-        val url = "$baseUrl/view?filename=$filename&subfolder=$subfolder&type=$type"
+        val url = ComfyViewUrl.build(baseUrl, filename, subfolder, type) ?: run {
+            callback(null, ConnectionFailure.NETWORK)
+            return
+        }
 
         val request = Request.Builder()
             .url(url)
@@ -1732,7 +1672,10 @@ class ComfyUIClient(
             return
         }
 
-        val url = "$baseUrl/view?filename=$filename&subfolder=$subfolder&type=$type"
+        val url = ComfyViewUrl.build(baseUrl, filename, subfolder, type) ?: run {
+            callback(null, ConnectionFailure.NETWORK)
+            return
+        }
 
         val request = Request.Builder()
             .url(url)

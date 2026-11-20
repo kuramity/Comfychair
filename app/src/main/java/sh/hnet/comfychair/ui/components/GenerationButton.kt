@@ -50,14 +50,13 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.activity.compose.BackHandler
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.connection.rememberIsOffline
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.ui.components.ripple.rippleFeedback
 import sh.hnet.comfychair.ui.theme.ColorMath
+import sh.hnet.comfychair.ui.theme.Dimensions
 
 /** 辅色派生规则（决策 1）：强调色色相 +35°，S/V 不变。 */
 private const val ACCENT_HUE_SHIFT_DEG = 35f
@@ -116,7 +115,7 @@ private const val TRAILING_ARROW_TAG = "trailing-arrow"
  * SplitButtonMediumTokens.TrailingIconSize = 26dp（material3 1.5.0-alpha11 反编译确认），
  * 此处刻意不用 26dp —— 数值与改动前视觉一致，且保持与既有图标体系统一。
  */
-private val TRAILING_ICON_SIZE = 24.dp
+private val TRAILING_ICON_SIZE = Dimensions.IconSize24
 
 /**
  * 生成主按钮的本体形状（v4.16.10 N1）：**四角全 28dp 胶囊**。
@@ -128,7 +127,7 @@ private val TRAILING_ICON_SIZE = 24.dp
  * 禁用灰块与白边逐角重合。本体与白边**共用同一个常量**（皮肤层 shape 参数不再写字面量），
  * 两条曲线的同源关系由类型保证、由单测钉住（GenerationButtonShapeAlignmentTest）。
  */
-internal val GENERATION_LEADING_BODY_SHAPE = RoundedCornerShape(28.dp)
+internal val GENERATION_LEADING_BODY_SHAPE = RoundedCornerShape(Dimensions.Radius28)
 
 /**
  * 下拉按钮的本体形状（v4.16.10 N1）：**四角全 18dp**（含按压态与 checked 展开态）。
@@ -138,7 +137,7 @@ internal val GENERATION_LEADING_BODY_SHAPE = RoundedCornerShape(28.dp)
  *（R7 取证）；展开态若落回 CircleShape 还会再错一次。统一传 18dp 后三条状态（静置/按压/
  * 展开）与白边都是同一条曲线。与皮肤层 shape 参数共用本常量（同源由类型保证）。
  */
-internal val GENERATION_TRAILING_BODY_SHAPE = RoundedCornerShape(18.dp)
+internal val GENERATION_TRAILING_BODY_SHAPE = RoundedCornerShape(Dimensions.Radius18)
 
 /**
  * 渐变辅色：强调色在 HSV 口径上色相 +35°。
@@ -324,7 +323,7 @@ fun GenerationButton(
             interactionSource = leadingInteraction,
             modifier = Modifier
                 .weight(1f)
-                .height(56.dp)
+                .height(Dimensions.ButtonHeight)
                 // S2Probe（v4.16.7 取证）：布局摆放回写按钮窗口坐标（见 latestBounds 注释）
                 .onGloballyPositioned { latestBounds = it.boundsInWindow() }
                 .rippleFeedback(
@@ -358,13 +357,17 @@ fun GenerationButton(
         ) {
             Text(
                 text = buttonText,
-                fontSize = 18.sp
+                // 基线用 M3 按钮自身的内容样式 labelLarge（SemiBold / 行高 20sp），只换字号；
+                // bodyLarge 是正文样式（Regular / 行高 24sp），会让主 CTA 文字变细（R2-F1）
+                style = MaterialTheme.typography.labelLarge.copy(
+                    fontSize = Dimensions.ButtonTextSize
+                )
             )
         }
 
         // 主↔下拉间距：v2 皮肤统一 10dp（三层操作行规格：主/下拉/齿轮等距）；
         // 回退态恢复 SplitButtonDefaults.Spacing（2dp）旧观感
-        Spacer(modifier = Modifier.width(if (skinV2) 10.dp else SplitButtonDefaults.Spacing))
+        Spacer(modifier = Modifier.width(if (skinV2) Dimensions.SplitButtonGap else SplitButtonDefaults.Spacing))
 
         // Trailing button with dropdown - square button matching height of leading
         // Animate icon rotation: 0° when closed, 180° when open (arrow points up)
@@ -439,7 +442,10 @@ fun GenerationButton(
                         }
                     )
                     // v2 皮肤 54×56（下拉比主按钮窄一档）；回退态 56×56 方形
-                    .size(width = if (skinV2) 54.dp else 56.dp, height = 56.dp)
+                    .size(
+                        width = if (skinV2) Dimensions.TrailingButtonWidth else Dimensions.ButtonHeight,
+                        height = Dimensions.ButtonHeight
+                    )
                     .rippleFeedback(
                         interactionSource = trailingInteraction,
                         // 决策 8：方形按钮圆角 18dp（对齐基准方形版），不再是胶囊的 28dp

@@ -9,10 +9,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.ui.screens.ConnectionState
+import sh.hnet.comfychair.ui.theme.Dimensions
 
 /**
  * Connect button that displays connection status with appropriate styling.
@@ -58,11 +57,16 @@ fun ServerConnectButton(
         colors = buttonColors,
         modifier = modifier
             .fillMaxWidth()
-            .height(56.dp)
+            .height(Dimensions.ButtonHeight)
     ) {
         Text(
             text = buttonText,
-            fontSize = 18.sp
+            // 基线用 M3 按钮自身的内容样式 labelLarge（本项目 Type.kt 定的是 SemiBold、
+            // 行高 20sp、字距 0.1sp），只把字号换成 token。不要换成 bodyLarge：
+            // 那是正文样式（Regular、行高 24sp），按钮文字会明显变细（R2-F1）
+            style = MaterialTheme.typography.labelLarge.copy(
+                fontSize = Dimensions.ButtonTextSize
+            )
         )
     }
 }

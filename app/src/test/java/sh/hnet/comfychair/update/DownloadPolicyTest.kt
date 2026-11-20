@@ -2,6 +2,7 @@ package sh.hnet.comfychair.update
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
@@ -158,5 +159,124 @@ class DownloadPolicyTest {
     fun `download http exception carries status code for banner`() {
         assertEquals(503, DownloadPolicy.DownloadHttpException(503).code)
         assertEquals(416, DownloadPolicy.DownloadHttpException(416).code)
+    }
+
+    // ---------- 6. SHA-256 完整性校验（P0-7） ----------
+
+    /** 一个格式合法的 64 位十六进制校验值（内容无所谓，只用来看分支） */
+    private val validSha = "0123456789abcdef".repeat(4)
+
+    @Test
+    fun `清单缺少 sha256 时必须判缺失而不是放行`() {
+        // 修复前 Worker 的判据是 `expectedSha256.isEmpty() || equals(...)` → 空串直接通过；
+        // 这里钉住新口径：缺失一律 MISSING，由调用方判失败
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MISSING,
+            DownloadPolicy.verifySha256(null, validSha)
+        )
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MISSING,
+            DownloadPolicy.verifySha256("", validSha)
+        )
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MISSING,
+            DownloadPolicy.verifySha256("   ", validSha)
+        )
+        // 格式不合法（长度不对 / 非十六进制）同样按缺失处理，不能"格式错就跳过"
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MISSING,
+            DownloadPolicy.verifySha256("abc", validSha)
+        )
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MISSING,
+            DownloadPolicy.verifySha256("z".repeat(64), validSha)
+        )
+    }
+
+    @Test
+    fun `sha256 规范化拒绝非法值并统一小写`() {
+        assertNull(DownloadPolicy.normalizeSha256(null))
+        assertNull(DownloadPolicy.normalizeSha256(""))
+        assertNull(DownloadPolicy.normalizeSha256("12345678"))
+        assertEquals(validSha, DownloadPolicy.normalizeSha256("  " + validSha + "  "))
+        assertEquals(validSha, DownloadPolicy.normalizeSha256(validSha.uppercase()))
+    }
+
+    @Test
+    fun `sha256 匹配与不匹配`() {
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MATCH,
+            DownloadPolicy.verifySha256(validSha, validSha)
+        )
+        // 大小写不敏感（服务器有时输出大写）
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MATCH,
+            DownloadPolicy.verifySha256(validSha.uppercase(), validSha)
+        )
+        assertEquals(
+            DownloadPolicy.Sha256Verdict.MISMATCH,
+            DownloadPolicy.verifySha256(validSha, "f".repeat(64))
+        )
+    }
+
+    // ---------- 7. 重定向白名单（P0-7） ----------
+
+    private val allowedHosts = setOf("update.example.com")
+
+    @Test
+    fun `重定向目标必须仍在白名单内`() {
+        assertTrue(
+            DownloadPolicy.isRedirectTargetAllowed(
+                "https://update.example.com/apk/a.apk", allowedHosts
+            )
+        )
+        // 换域名 → 拒绝
+        assertFalse(
+            DownloadPolicy.isRedirectTargetAllowed(
+                "https://evil.example.net/apk/a.apk", allowedHosts
+            )
+        )
+        // 同域名但降级成明文 → 拒绝
+        assertFalse(
+            DownloadPolicy.isRedirectTargetAllowed(
+                "http://update.example.com/apk/a.apk", allowedHosts
+            )
+        )
+        // 白名单为空（未配置更新源）→ 一律拒绝
+        assertFalse(
+            DownloadPolicy.isRedirectTargetAllowed(
+                "https://update.example.com/apk/a.apk", emptySet()
+            )
+        )
+        assertFalse(DownloadPolicy.isRedirectTargetAllowed(null, allowedHosts))
+        assertFalse(DownloadPolicy.isRedirectTargetAllowed("not a url", allowedHosts))
+    }
+
+    @Test
+    fun `相对重定向按基地址解析`() {
+        assertEquals(
+            "https://update.example.com/apk/c.apk",
+            DownloadPolicy.resolveRedirect(
+                "https://update.example.com/apk/dir/a.apk", "../c.apk"
+            )
+        )
+        assertEquals(
+            "https://cdn.example.com/b.apk",
+            DownloadPolicy.resolveRedirect(
+                "https://update.example.com/apk/a.apk", "https://cdn.example.com/b.apk"
+            )
+        )
+        assertNull(DownloadPolicy.resolveRedirect("https://update.example.com/a.apk", null))
+        assertNull(DownloadPolicy.resolveRedirect("https://update.example.com/a.apk", "  "))
+    }
+
+    @Test
+    fun `重定向越界异常不可重试`() {
+        val e = DownloadPolicy.InsecureRedirectException("https://evil.example.net/a.apk")
+        assertEquals(
+            DownloadPolicy.FailureKind.INSECURE_REDIRECT,
+            DownloadPolicy.classifyFailure(e)
+        )
+        assertFalse(DownloadPolicy.isRetryable(e))
     }
 }

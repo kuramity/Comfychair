@@ -7,6 +7,9 @@ import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.viewmodel.GalleryItem
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 /**
  * 图库的**本地持久索引**（每台服务器一个文件：`gallery_metadata_{serverId}.json`）。
@@ -28,6 +31,44 @@ object GalleryMetadataCache {
     private const val CACHE_SUFFIX = ".json"
     private const val TOMBSTONE_PREFIX = "gallery_deleted_"
     private const val TOMBSTONE_SUFFIX = ".json"
+
+    /** 原子写的临时文件后缀：先写 `<目标>.tmp`，fsync 后整体改名覆盖目标 */
+    private const val TMP_SUFFIX = ".tmp"
+
+    /**
+     * 条目身份分隔符（NUL）。
+     *
+     * 用 NUL 而不是 `_`：文件名里 `_` 很常见（`ComfyUI_00001_.png`），
+     * 用 `_` 拼键会让 `(a, b_c)` 与 `(a_b, c)` 撞成同一个键；NUL 不可能出现在
+     * promptId / 文件名里，拼接结果天然无歧义。
+     */
+    private const val IDENTITY_SEPARATOR = '\u0000'
+
+    /**
+     * 条目级身份键：`promptId\0filename`（P1-19）。
+     *
+     * 同一个 promptId 会产出多张图（批量出图 4 张共用一次生成），
+     * 所以"删掉其中一张"必须用**条目**身份，不能拿 promptId 当键整批删。
+     */
+    fun itemIdentityKey(promptId: String, filename: String): String =
+        "$promptId$IDENTITY_SEPARATOR$filename"
+
+    /**
+     * 判断条目是否已被删除（P1-19）。
+     *
+     * 墓碑集合里可能同时存在两种粒度：
+     * - **条目键**（含 NUL，新格式）：只删这一张；
+     * - **裸 promptId**（不含 NUL，旧版本写下的格式）：整批删掉该 prompt 的所有图，
+     *   保持向后兼容 —— 旧墓碑文件里的删除意图不能被新版本解释丢。
+     */
+    fun isDeleted(promptId: String, filename: String, tombstones: Set<String>): Boolean {
+        if (tombstones.isEmpty()) return false
+        return promptId in tombstones || itemIdentityKey(promptId, filename) in tombstones
+    }
+
+    /** [isDeleted] 的条目重载 */
+    fun isDeleted(item: GalleryItem, tombstones: Set<String>): Boolean =
+        isDeleted(item.promptId, item.filename, tombstones)
 
     // ============================================================
     // 本地索引
@@ -118,25 +159,53 @@ object GalleryMetadataCache {
     /**
      * 记住"这些条目已经在手机上删掉"，避免服务器历史刷新时把它们又带回来。
      *
-     * 读的时候会把**所有服务器**的墓碑合并起来：删除是用户的明确意图，
-     * 换个网络、改个地址都不该让删掉的图复活。
+     * @param keys 删除身份键：条目级用 [itemIdentityKey] 拼（只删一张），
+     *             整批删除时也可以直接传裸 promptId（旧语义，兼容保留）
      */
-    fun addTombstones(context: Context, serverId: String, promptIds: Set<String>) {
-        if (promptIds.isEmpty()) return
+    fun addTombstones(context: Context, serverId: String, keys: Set<String>) {
+        if (keys.isEmpty()) return
         try {
-            val merged = loadTombstones(context, serverId) + promptIds
+            val merged = loadTombstones(context, serverId) + keys
             val array = JSONArray()
             merged.forEach { array.put(it) }
-            getTombstoneFile(context, serverId).writeText(array.toString())
-            DebugLogger.i(TAG, "Recorded ${promptIds.size} deletion tombstone(s) for server $serverId")
+            writeTextAtomically(getTombstoneFile(context, serverId), array.toString())
+            DebugLogger.i(TAG, "Recorded ${keys.size} deletion tombstone(s) for server $serverId")
         } catch (e: Exception) {
             DebugLogger.e(TAG, "Failed to record deletion tombstones: ${e.message}")
         }
     }
 
+    /**
+     * 抹掉"已在手机上删掉"的墓碑记录（G4 回收站**恢复**用）。
+     *
+     * [loadTombstones] 是跨文件合并读的（删除意图跨网络成立），所以删除也必须
+     * **遍历全部墓碑文件**逐个改写 —— 只删当前服务器那份的话，旧文件里的同键墓碑
+     * 会把"已恢复"的图再次滤掉，恢复等于没发生。
+     */
+    fun removeTombstones(context: Context, serverId: String, keys: Set<String>) {
+        if (keys.isEmpty()) return
+        for (file in tombstoneFiles(context)) {
+            try {
+                val array = JSONArray(file.readText())
+                val kept = JSONArray()
+                for (i in 0 until array.length()) {
+                    val key = array.optString(i)
+                    if (key.isNotBlank() && key !in keys) kept.put(key)
+                }
+                writeTextAtomically(file, kept.toString())
+            } catch (e: Exception) {
+                DebugLogger.w(TAG, "Failed to remove tombstones from ${file.name}: ${e.message}")
+            }
+        }
+        // serverId 只作日志口径：墓碑读取本来就是全文件合并的，删除同样全文件处理
+        DebugLogger.i(TAG, "Removed ${keys.size} tombstone(s) for server $serverId (restore)")
+    }
+
     fun loadTombstones(context: Context, serverId: String): Set<String> {
         val result = mutableSetOf<String>()
-        // 当前服务器的 + 其它服务器的：删除意图跨网络、跨条目的都成立
+        // 当前服务器的 + 其它服务器的：删除意图跨网络、跨条目的都成立。
+        // 读取的是**原始集合**：既可能是条目键（含 NUL），也可能是旧版本的裸 promptId，
+        // 判定统一走 [isDeleted]（两种粒度都认），这里不做解释。
         val files = tombstoneFiles(context)
         for (file in files) {
             try {
@@ -151,6 +220,23 @@ object GalleryMetadataCache {
         // serverId 形参保留在签名里：将来若要改回"按服务器隔离"，调用方不用动
         @Suppress("UNUSED_EXPRESSION") serverId
         return result
+    }
+
+    /**
+     * 从本地索引里**真正移除**这些条目（G4 阶段二"本地残留清理"）。
+     *
+     * 与墓碑的分工：墓碑是"显示层过滤"（可撤销——回收站恢复就是删墓碑）；
+     * 服务器文件确认删除成功后，索引记录本身已经没有存在意义（文件与服务器历史
+     * 都指向不了它），这时才走这里物理移除。墓碑**保留**：服务器 /history 里
+     * prompt 记录可能还在（ComfyUI 只删文件不删历史），留着它才能防止刷新复活。
+     */
+    fun removeFromIndex(context: Context, serverId: String, keys: Set<String>) {
+        if (keys.isEmpty()) return
+        val existing = loadMetadata(context, serverId) ?: return
+        val kept = existing.filterNot { isDeleted(it, keys) }
+        if (kept.size == existing.size) return
+        writeMetadata(context, serverId, kept.mapIndexed { position, item -> item.copy(index = position) })
+        DebugLogger.i(TAG, "Removed ${existing.size - kept.size} record(s) from gallery index of server $serverId")
     }
 
     // ============================================================
@@ -180,7 +266,46 @@ object GalleryMetadataCache {
     // ============================================================
 
     /** 条目身份：同一个 prompt 可能产出多张图，所以要用 (promptId, filename) 作键 */
-    private fun GalleryItem.identityKey(): String = "$promptId\u0000$filename"
+    private fun GalleryItem.identityKey(): String = itemIdentityKey(promptId, filename)
+
+    /**
+     * 把文本**原子地**写进文件（P1-20）。
+     *
+     * 修复前是 `File.writeText`：它先截断再写，进程在中间被杀（或写到一半 ENOSPC）
+     * 就会留下半截 JSON —— 下次启动解析失败，图库索引整份作废。
+     * 现在写 `.tmp` → flush + fsync → 原子改名覆盖目标：任何时刻目标文件要么是
+     * 旧的完整内容、要么是新的完整内容，不存在"写了一半"的中间态。
+     *
+     * 抽成 internal 是为了 JVM 单测能直接钉住"覆盖写不残留 tmp、旧内容不被截断"。
+     */
+    internal fun writeTextAtomically(file: File, content: String) {
+        val tmp = File(file.parentFile, file.name + TMP_SUFFIX)
+        FileOutputStream(tmp).use { out ->
+            out.write(content.toByteArray(Charsets.UTF_8))
+            out.flush()
+            // fsync：把页缓存刷到磁盘，否则"rename 成功但数据还在缓存里"同样会丢
+            out.fd.sync()
+        }
+        try {
+            Files.move(
+                tmp.toPath(),
+                file.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE
+            )
+        } catch (e: Exception) {
+            // 个别文件系统不支持 ATOMIC_MOVE（或目标被占用）：退化为"先删目标再改名"，
+            // 至少不会留下半截文件；仍失败则整份拷贝兜底
+            DebugLogger.w(TAG, "Atomic move failed for ${file.name}, falling back: ${e.message}")
+            if (!tmp.renameTo(file)) {
+                file.delete()
+                if (!tmp.renameTo(file)) {
+                    tmp.copyTo(file, overwrite = true)
+                    tmp.delete()
+                }
+            }
+        }
+    }
 
     private fun writeMetadata(context: Context, serverId: String, items: List<GalleryItem>) {
         try {
@@ -202,7 +327,7 @@ object GalleryMetadataCache {
                 })
             }
             val cacheFile = getCacheFile(context, serverId)
-            cacheFile.writeText(array.toString())
+            writeTextAtomically(cacheFile, array.toString())
             DebugLogger.i(TAG, "Gallery index saved for server $serverId: ${items.size} items")
         } catch (e: Exception) {
             DebugLogger.e(TAG, "Failed to save gallery metadata for server $serverId: ${e.message}")

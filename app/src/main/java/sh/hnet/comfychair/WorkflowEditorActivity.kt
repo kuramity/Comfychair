@@ -9,9 +9,17 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import sh.hnet.comfychair.ui.screens.WorkflowEditorScreen
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme
 import sh.hnet.comfychair.util.DebugLogger
@@ -150,6 +158,10 @@ class WorkflowEditorActivity : ComponentActivity() {
 
         setContent {
             ComfyChairTheme {
+                // 保存失败的提示：只弹错、**不关页面**。编辑页里的画布改动、名字、映射都还在，
+                // 用户改完可以再存一次（把失败当取消会直接丢掉全部未保存的工作）。
+                var saveErrorMessage by remember { mutableStateOf<String?>(null) }
+
                 // Observe events
                 LaunchedEffect(Unit) {
                     viewModel.events.collect { event ->
@@ -185,8 +197,26 @@ class WorkflowEditorActivity : ComponentActivity() {
                                 setResult(Activity.RESULT_CANCELED)
                                 finish()
                             }
+                            is WorkflowEditorEvent.SaveFailed -> {
+                                DebugLogger.w(TAG, "Save failed: ${event.message}")
+                                // 停留在此页，只把失败原因弹出来
+                                saveErrorMessage = event.message
+                            }
                         }
                     }
+                }
+
+                if (saveErrorMessage != null) {
+                    AlertDialog(
+                        onDismissRequest = { saveErrorMessage = null },
+                        title = { Text(stringResource(R.string.button_failed)) },
+                        text = { Text(saveErrorMessage ?: "") },
+                        confirmButton = {
+                            TextButton(onClick = { saveErrorMessage = null }) {
+                                Text(stringResource(R.string.button_ok))
+                            }
+                        }
+                    )
                 }
 
                 Surface(modifier = Modifier.fillMaxSize()) {

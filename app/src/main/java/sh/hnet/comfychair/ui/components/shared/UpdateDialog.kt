@@ -20,7 +20,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -51,7 +51,7 @@ fun UpdateDialog(
 ) {
     if (!showDialog) return
     val context = LocalContext.current
-    val state by UpdateRepository.state.collectAsState()
+    val state by UpdateRepository.state.collectAsStateWithLifecycle()
     val pending = UpdateRepository.pendingUpdate
 
     // v4.9.2：Android 13+ 的 POST_NOTIFICATIONS 全项目从来没请求过 —— 不请求等于默认拒绝，

@@ -1,12 +1,8 @@
 package sh.hnet.comfychair.viewmodel
 
-import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
-import android.os.Environment
-import android.provider.MediaStore
-import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -25,6 +21,8 @@ import sh.hnet.comfychair.cache.MediaCacheKey
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.util.DebugLogger
+import sh.hnet.comfychair.util.PhotoManager
+import sh.hnet.comfychair.util.ShareFileStore
 import java.io.File
 
 /**
@@ -48,8 +46,13 @@ data class GalleryItem(
      */
     val threeD: ThreeDResultHolder.Result? = null
 ) {
-    /** Create a cache key for this item */
-    fun toCacheKey() = MediaCacheKey(promptId, filename)
+    /**
+     * Create a cache key for this item.
+     *
+     * type 与当前服务器 ID 一起进键（P2-2）：前者区分 output/temp 的同名文件，
+     * 后者避免 MediaCache 单例在多台服务器之间串数据。
+     */
+    fun toCacheKey() = MediaCacheKey.of(promptId, filename, type)
 }
 
 /**
@@ -71,6 +74,13 @@ data class GalleryUiState(
 sealed class GalleryEvent {
     data class ShowToast(val messageResId: Int) : GalleryEvent()
     data class ShowMedia(val item: GalleryItem, val bitmap: Bitmap?, val videoUri: Uri?) : GalleryEvent()
+
+    /**
+     * G4：一次"回收站彻底删除"批处理的分路由结果。
+     * 文案由 GalleryScreen 按四类计数拼装（ViewModel 没有 Context，格式化归 UI 层），
+     * 每类各说各话 —— 服务器删了 / 只清了本机 / 待重试 / 没连上那台，绝不混报。
+     */
+    data class TrashPurged(val summary: GalleryRepository.TrashPurgeSummary) : GalleryEvent()
 }
 
 /**
@@ -86,6 +96,10 @@ class GalleryViewModel : ViewModel() {
 
     // State
     private val repository = GalleryRepository.getInstance()
+
+    /** G4：回收站条目（含两阶段状态）。UI 直接 collect 这个流即可。 */
+    val trashEntries: StateFlow<List<sh.hnet.comfychair.storage.GalleryTrashEntry>> =
+        repository.trashEntries
 
     // Selection state (local to this ViewModel)
     private val _selectedItems = MutableStateFlow<Set<String>>(emptySet())
@@ -126,6 +140,9 @@ class GalleryViewModel : ViewModel() {
     fun initialize() {
         // MediaCache is used for all fetch operations
         // Repository is already initialized by GenerationViewModel
+        // G4：回收站列表是 UI 直接观察的流 —— 初始化就把磁盘记录读进来
+        // （repository.initialize 已在 MainContainerActivity 落过 context，幂等安全）
+        repository.ensureTrashLoaded()
     }
 
     /**
@@ -173,9 +190,10 @@ class GalleryViewModel : ViewModel() {
     fun deleteItem(item: GalleryItem) {
         DebugLogger.i(TAG, "Deleting item: ${item.promptId}")
         viewModelScope.launch {
+            // G4：删除 = 移入回收站（阶段一，可恢复）。成功恒为 true（纯本地操作）
             val success = repository.deleteItem(item)
             if (success) {
-                DebugLogger.d(TAG, "Delete successful")
+                DebugLogger.d(TAG, "Moved to trash")
                 _events.emit(GalleryEvent.ShowToast(R.string.msg_history_item_deleted_success))
             } else {
                 DebugLogger.w(TAG, "Delete failed")
@@ -184,10 +202,46 @@ class GalleryViewModel : ViewModel() {
         }
     }
 
+    // ============================================================
+    // G4（任务书 11.4）：回收站操作入口
+    // ============================================================
+
+    /**
+     * 恢复一条回收站条目（阶段一回退）。
+     * 恢复后列表顺序与元数据一致（条目带着原 index 插回；墓碑已抹除）。
+     */
+    fun restoreTrashEntry(identityKey: String) {
+        val restored = repository.restoreFromTrash(identityKey)
+        viewModelScope.launch {
+            _events.emit(
+                GalleryEvent.ShowToast(
+                    if (restored) R.string.msg_trash_restored else R.string.msg_trash_restore_failed
+                )
+            )
+        }
+    }
+
+    /**
+     * 回收站"彻底删除"（阶段二：服务器联动 + 本地残留清理）。
+     *
+     * **首次启用的清单确认由调用方（GalleryScreen）在进入本函数之前完成** ——
+     * 破坏性操作不静默启动。确认状态经 AppSettings 按服务器持久化（只问一次）。
+     * 结果分四类回报（服务器已删 / 仅本机清理 / 待重试 / 属于其它服务器），
+     * 失败条目留在回收站可重试，本地状态绝不谎报成功。
+     */
+    fun purgeTrashEntries(identities: List<String>) {
+        if (identities.isEmpty()) return
+        repository.purgeTrashEntries(identities) { summary ->
+            viewModelScope.launch {
+                _events.emit(GalleryEvent.TrashPurged(summary))
+            }
+        }
+    }
+
     fun saveImageToGallery(context: Context, item: GalleryItem) {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                val key = MediaCacheKey(item.promptId, item.filename)
+                val key = item.toCacheKey()
                 val bitmap = MediaCache.getBitmap(key)
                     ?: MediaCache.fetchImage(key, item.subfolder, item.type)
 
@@ -196,26 +250,13 @@ class GalleryViewModel : ViewModel() {
                     return@withContext
                 }
 
-                try {
-                    val contentValues = ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.png")
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ComfyChair")
-                    }
-
-                    val resolver = context.contentResolver
-                    val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                    uri?.let { outputUri ->
-                        resolver.openOutputStream(outputUri)?.use { outputStream ->
-                            bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-                        }
-                    }
-
-                    _events.emit(GalleryEvent.ShowToast(R.string.msg_image_saved_to_gallery))
-                } catch (e: Exception) {
-                    _events.emit(GalleryEvent.ShowToast(R.string.error_save_image))
-                }
+                // P1-22：成功/失败以真实写入结果为准（IS_PENDING 流程，不再假成功）
+                val saved = PhotoManager.saveBitmap(context, bitmap)
+                _events.emit(
+                    GalleryEvent.ShowToast(
+                        if (saved) R.string.msg_image_saved_to_gallery else R.string.error_save_image
+                    )
+                )
             }
         }
     }
@@ -223,7 +264,7 @@ class GalleryViewModel : ViewModel() {
     fun saveVideoToGallery(context: Context, item: GalleryItem) {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                val key = MediaCacheKey(item.promptId, item.filename)
+                val key = item.toCacheKey()
                 val videoBytes = MediaCache.getVideoBytes(key)
                     ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
 
@@ -232,33 +273,19 @@ class GalleryViewModel : ViewModel() {
                     return@withContext
                 }
 
-                try {
-                    val contentValues = ContentValues().apply {
-                        put(MediaStore.Video.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.mp4")
-                        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                        put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ComfyChair")
-                    }
-
-                    val resolver = context.contentResolver
-                    val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                    uri?.let { outputUri ->
-                        resolver.openOutputStream(outputUri)?.use { outputStream ->
-                            outputStream.write(videoBytes)
-                        }
-                    }
-
-                    _events.emit(GalleryEvent.ShowToast(R.string.msg_video_saved_to_gallery))
-                } catch (e: Exception) {
-                    _events.emit(GalleryEvent.ShowToast(R.string.error_save_video))
-                }
+                val saved = PhotoManager.saveVideoBytes(context, videoBytes)
+                _events.emit(
+                    GalleryEvent.ShowToast(
+                        if (saved) R.string.msg_video_saved_to_gallery else R.string.error_save_video
+                    )
+                )
             }
         }
     }
 
     fun fetchFullImage(item: GalleryItem, onResult: (Bitmap?) -> Unit) {
         viewModelScope.launch {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             val bitmap = MediaCache.getBitmap(key)
                 ?: MediaCache.fetchImage(key, item.subfolder, item.type)
             onResult(bitmap)
@@ -267,7 +294,7 @@ class GalleryViewModel : ViewModel() {
 
     fun fetchVideoUri(context: Context, item: GalleryItem, onResult: (Uri?) -> Unit) {
         viewModelScope.launch {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             // Ensure bytes are cached
             MediaCache.getVideoBytes(key)
                 ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
@@ -280,7 +307,7 @@ class GalleryViewModel : ViewModel() {
 
     fun shareImage(context: Context, item: GalleryItem) {
         viewModelScope.launch {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             val bitmap = MediaCache.getBitmap(key)
                 ?: MediaCache.fetchImage(key, item.subfolder, item.type)
 
@@ -291,18 +318,15 @@ class GalleryViewModel : ViewModel() {
 
             try {
                 // Save to cache for sharing
-                val shareFile = File(context.cacheDir, "share_image.png")
+                // P2-12：分享载荷只能写进 cacheDir/share/（FileProvider 唯一声明的缓存子目录）
+                val shareFile = ShareFileStore.file(context, "share_image.png")
                 withContext(Dispatchers.IO) {
                     shareFile.outputStream().use { outputStream ->
                         bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
                     }
                 }
 
-                val uri = FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    shareFile
-                )
+                val uri = ShareFileStore.uriFor(context, shareFile)
 
                 val shareIntent = android.content.Intent().apply {
                     action = android.content.Intent.ACTION_SEND
@@ -325,7 +349,7 @@ class GalleryViewModel : ViewModel() {
 
     fun shareVideo(context: Context, item: GalleryItem) {
         viewModelScope.launch {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             val videoBytes = MediaCache.getVideoBytes(key)
                 ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
 
@@ -335,16 +359,13 @@ class GalleryViewModel : ViewModel() {
             }
 
             try {
-                val shareFile = File(context.cacheDir, "share_video.mp4")
+                // P2-12：分享载荷写进 cacheDir/share/
+                val shareFile = ShareFileStore.file(context, "share_video.mp4")
                 withContext(Dispatchers.IO) {
                     shareFile.writeBytes(videoBytes)
                 }
 
-                val uri = FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    shareFile
-                )
+                val uri = ShareFileStore.uriFor(context, shareFile)
 
                 val shareIntent = android.content.Intent().apply {
                     action = android.content.Intent.ACTION_SEND
@@ -419,10 +440,11 @@ class GalleryViewModel : ViewModel() {
         if (selectedItems.isEmpty()) return
 
         viewModelScope.launch {
-            // Get unique prompt IDs (multiple items can share the same promptId)
-            val promptIds = selectedItems.map { it.promptId }.distinct().toSet()
-            val successCount = repository.deleteItems(promptIds)
-            val failCount = promptIds.size - successCount
+            // P1-19：删除粒度是**条目**（promptId + filename），不是 promptId。
+            // 同一次生成可能产出多张图（批量出图 4 张共用一个 promptId），
+            // 以前按 promptId 去重后整批删，选中一张会连带删掉同批的其它三张。
+            val successCount = repository.deleteItems(selectedItems)
+            val failCount = selectedItems.size - successCount
 
             // Show result toast
             if (failCount == 0) {
@@ -472,61 +494,26 @@ class GalleryViewModel : ViewModel() {
 
     private suspend fun saveImageToGalleryInternal(context: Context, item: GalleryItem): Boolean {
         return withContext(Dispatchers.IO) {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             val bitmap = MediaCache.getBitmap(key)
                 ?: MediaCache.fetchImage(key, item.subfolder, item.type)
 
             if (bitmap == null) return@withContext false
 
-            try {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.png")
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ComfyChair")
-                }
-
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                uri?.let { outputUri ->
-                    resolver.openOutputStream(outputUri)?.use { outputStream ->
-                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-                    }
-                }
-                true
-            } catch (e: Exception) {
-                false
-            }
+            // P1-22：真实写入结果（IS_PENDING → 发布），失败返回 false 让调用方计入失败数
+            PhotoManager.saveBitmap(context, bitmap)
         }
     }
 
     private suspend fun saveVideoToGalleryInternal(context: Context, item: GalleryItem): Boolean {
         return withContext(Dispatchers.IO) {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             val videoBytes = MediaCache.getVideoBytes(key)
                 ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
 
             if (videoBytes == null) return@withContext false
 
-            try {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, "ComfyChair_${System.currentTimeMillis()}.mp4")
-                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ComfyChair")
-                }
-
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
-
-                uri?.let { outputUri ->
-                    resolver.openOutputStream(outputUri)?.use { outputStream ->
-                        outputStream.write(videoBytes)
-                    }
-                }
-                true
-            } catch (e: Exception) {
-                false
-            }
+            PhotoManager.saveVideoBytes(context, videoBytes)
         }
     }
 
@@ -578,23 +565,20 @@ class GalleryViewModel : ViewModel() {
 
     private suspend fun getImageShareUri(context: Context, item: GalleryItem, index: Int): Uri? {
         return withContext(Dispatchers.IO) {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             val bitmap = MediaCache.getBitmap(key)
                 ?: MediaCache.fetchImage(key, item.subfolder, item.type)
 
             if (bitmap == null) return@withContext null
 
             try {
-                val shareFile = File(context.cacheDir, "share_image_$index.png")
+                // P2-12：分享载荷写进 cacheDir/share/
+                val shareFile = ShareFileStore.file(context, "share_image_$index.png")
                 shareFile.outputStream().use { outputStream ->
                     bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
                 }
 
-                FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    shareFile
-                )
+                ShareFileStore.uriFor(context, shareFile)
             } catch (e: Exception) {
                 null
             }
@@ -603,21 +587,17 @@ class GalleryViewModel : ViewModel() {
 
     private suspend fun getVideoShareUri(context: Context, item: GalleryItem, index: Int): Uri? {
         return withContext(Dispatchers.IO) {
-            val key = MediaCacheKey(item.promptId, item.filename)
+            val key = item.toCacheKey()
             val videoBytes = MediaCache.getVideoBytes(key)
                 ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
 
             if (videoBytes == null) return@withContext null
 
             try {
-                val shareFile = File(context.cacheDir, "share_video_$index.mp4")
+                val shareFile = ShareFileStore.file(context, "share_video_$index.mp4")
                 shareFile.writeBytes(videoBytes)
 
-                FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    shareFile
-                )
+                ShareFileStore.uriFor(context, shareFile)
             } catch (e: Exception) {
                 null
             }

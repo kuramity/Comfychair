@@ -9,7 +9,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import sh.hnet.comfychair.connection.ConnectionManager
@@ -56,8 +56,8 @@ class SettingsContainerActivity : ComponentActivity() {
         setContent {
             ComfyChairTheme {
                 // Observe connection alert state from ConnectionManager (single source of truth)
-                val connectionAlertState by ConnectionManager.connectionAlertState.collectAsState()
-                val isReconnecting by ConnectionManager.isReconnecting.collectAsState()
+                val connectionAlertState by ConnectionManager.connectionAlertState.collectAsStateWithLifecycle()
+                val isReconnecting by ConnectionManager.isReconnecting.collectAsStateWithLifecycle()
 
                 // Listen for RefreshNeeded and NavigateToLogin events
                 LaunchedEffect(Unit) {

@@ -29,14 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
-
-/**
- * Interface for workflow items with name and displayName properties.
- */
-interface WorkflowItemBase {
-    val name: String
-    val displayName: String
-}
+import sh.hnet.comfychair.model.contract.WorkflowItemBase
 
 /**
  * Generic workflow dropdown that works with any workflow item type.

@@ -11,6 +11,9 @@ import androidx.work.workDataOf
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.util.DebugLogger
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
@@ -28,6 +31,8 @@ import java.util.concurrent.TimeUnit
  * 更新 StateFlow；[force=true] 的收尾/阶段切换不受节流限制。
  */
 object UpdateRepository {
+
+    private const val TAG = "UpdateRepository"
 
     /** WorkManager 唯一任务名（入队 / 手动取消 / 冷启动恢复共用，必须一致） */
     const val DOWNLOAD_WORK_NAME = "comfychair_update_download"
@@ -174,11 +179,18 @@ object UpdateRepository {
     /**
      * App 冷启动 / 强杀后恢复（硬性约束 16）：
      * 1. WorkManager 里还有这个任务（在跑或排队）→ 若 UI 状态丢了，从 .part 恢复"下载中"；
-     * 2. 完整 update.apk 已存在（上次校验过了但用户没装）→ 直接 READY_TO_INSTALL；
+     * 2. 完整 update.apk 已存在（上次校验过了但用户没装）→ **先复验再恢复**（见下）；
      * 3. .part 存在但任务没了（下载完成前被杀且 WorkManager 没恢复）→ 保留 .part，
      *    状态回 AVAILABLE（用户再点"更新"时 Worker 会从 .part 续传，不会从头下）。
      *
-     * 任何分支都不删除 .part / update.apk —— 文件只由 Worker 生命周期管理。
+     * **P2-11（复验）**：修复前只要 `update.apk` 存在且非空就直接置 READY_TO_INSTALL ——
+     * 等于承认"磁盘上有这个文件"就是可信的。update/ 位于外部私有目录，root 或被篡改的
+     * 环境下可以直接换文件，冷启动时就把任意 APK 当成官方包呈现出来。现在恢复前必须：
+     * 1. 读与 APK 一起落盘的清单 sha256 旁车文件，重新流式计算 `update.apk` 的 SHA-256 比对；
+     * 2. 再走 [AppInstaller.isApkTrusted]（包名 + 签名）——与安装入口同一实现，恢复期就拦一次。
+     * 两条任一不通过：删除该 APK 与旁车文件，不置 READY_TO_INSTALL（下次检查更新会重新下载）。
+     *
+     * .part 分支不删除任何文件（续传价值），文件只由 Worker 生命周期管理。
      */
     fun restoreFromDisk(context: Context) {
         val part = UpdateDownloadWorker.partFile(context)
@@ -193,11 +205,22 @@ object UpdateRepository {
 
         when {
             final.exists() && final.length() > 0 -> {
-                _state.value = UpdateState(
-                    phase = UpdatePhase.READY_TO_INSTALL,
-                    downloadedBytes = final.length(),
-                    totalBytes = final.length()
-                )
+                val expectedSha = readExpectedSha(context)
+                val actualSha = UpdateRestorePolicy.sha256Of(final)
+                val verdict = UpdateRestorePolicy.verify(expectedSha, actualSha)
+                if (verdict == UpdateRestorePolicy.Verdict.VERIFIED &&
+                    AppInstaller.isApkTrusted(context, final)
+                ) {
+                    // 两条闸门都过：sha256 与清单一致 + 包名/签名与本机一致
+                    _state.value = UpdateState(
+                        phase = UpdatePhase.READY_TO_INSTALL,
+                        downloadedBytes = final.length(),
+                        totalBytes = final.length()
+                    )
+                } else {
+                    DebugLogger.w(TAG, "restoreFromDisk: update.apk 未通过恢复复验（$verdict / 签名），丢弃该文件")
+                    discardRestoredApk(context, final)
+                }
             }
             workerActive -> {
                 val total = pendingUpdate?.apkSize ?: _state.value.totalBytes
@@ -211,10 +234,25 @@ object UpdateRepository {
         }
     }
 
+    /** 复验失败的 update.apk：连同 sha256 旁车一起删掉，避免下次冷启动再走一遍同样的判定 */
+    private fun discardRestoredApk(context: Context, apk: File) {
+        apk.delete()
+        UpdateDownloadWorker.shaFile(context).delete()
+    }
+
+    /** 读取与 APK 同目录的清单 sha256（缺失/读取失败返回 null → 按不可复验处理） */
+    private fun readExpectedSha(context: Context): String? = try {
+        val file = UpdateDownloadWorker.shaFile(context)
+        if (file.isFile) file.readText().trim() else null
+    } catch (_: Exception) {
+        null
+    }
+
     /** 安装完成后清理（磁盘上不留 153MB 的旧安装包） */
     fun clearDownloadedFiles(context: Context) {
         UpdateDownloadWorker.finalFile(context).delete()
         UpdateDownloadWorker.partFile(context).delete()
+        UpdateDownloadWorker.shaFile(context).delete()
         _state.value = UpdateState()
         pendingUpdate = null
     }
@@ -223,6 +261,14 @@ object UpdateRepository {
 
     /** 上次自动检查的时间戳（毫秒）；0 = 本次进程还没查过 */
     private var lastAutoCheckAt = 0L
+
+    /**
+     * 自动检查更新是否被离线态拦下（P2-10）。
+     *
+     * 用 [ConnectionManager.isOffline]（**实际状态**：用户强制离线或网络断开自动切换都算）
+     * 而不是设置项：只要当前处于离线态，就不该再向更新服务器发请求。
+     */
+    internal fun isOfflineBlocked(): Boolean = ConnectionManager.isOffline
 
     /**
      * 回前台 / 重连后自动检查更新（节流 30 分钟）。
@@ -236,10 +282,16 @@ object UpdateRepository {
      *    尤其 `READY_TO_INSTALL` 时再 publishAvailable 会把界面打回 AVAILABLE，
      *    让用户以为要重下 150MB；
      * 3. **阻塞调用**：内部走 `checkForUpdate` 同步网络请求，**必须在 IO 线程调用**。
+     * 4. **离线不联网**（P2-10）：离线态直接返回，不发任何请求。
      *
      * 发现新版本时只 `publishAvailable`（弹窗等用户确认），不自动下载。
      */
     fun autoCheckIfDue(currentVersionCode: Int) {
+        // P2-10：用户强制离线（或网络已断进入离线态）时不得访问更新服务器。
+        // 修复前这里没有任何离线判断，回前台/重连都会照常打一次清单请求 ——
+        // 与「强制离线」的语义直接冲突（离线态下其它网络链路都已被拦）。
+        if (isOfflineBlocked()) return
+
         val now = System.currentTimeMillis()
         if (now - lastAutoCheckAt < AUTO_CHECK_INTERVAL_MS) return
 

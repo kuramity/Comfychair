@@ -2,7 +2,7 @@
 
 An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 
-**Current version**: v4.16.0（二次开发版 / Community Edition）
+**Current version**: v4.16.13（二次开发版 / Community Edition）
 
 > **This project is a fork of [ComfyChair](https://github.com/legal-hkr/comfychair),
 > originally developed by Legal HKr, licensed under GPL-3.0.
@@ -221,6 +221,44 @@ Civitai 与 HuggingFace，未命中的会列成清单方便你手工补。
 - Android 13 (API level 33) or higher
 - Access to a running ComfyUI server instance
 - Network connectivity to reach your ComfyUI server
+- **仅面向手机**（详见下节「设备适配」）：平板与折叠屏展开态未做适配
+
+## 设备适配（仅手机）
+
+本应用**只面向手机**（竖屏）。平板、折叠屏展开态等最小宽度 ≥ 600dp 的设备
+**未做适配**，不保证可用：
+
+- 所有页面的尺寸都按手机宽度（约 320–430dp）设计，布局里是硬编码 dp，
+  没有使用 `WindowSizeClass`，也没有响应式/双栏布局。
+- 所有 Activity 都在 `AndroidManifest.xml` 里声明了 `screenOrientation="portrait"`。
+- 清单里的 `<supports-screens>`（`largeScreens` / `xlargeScreens` 为 `false`，
+  `requiresSmallestWidthDp=320`）在 API 13+ 上**只是声明，不是安装过滤**：
+  `largeScreens=false` 的实际效果是启用屏幕兼容模式，`requiresSmallestWidthDp`
+  也不再被系统用于筛选。**平板仍然可以安装本应用**，只是界面没有为它适配。
+- 竖屏锁定同样不是绝对的：从 Android 16（API 36）起，targetSdk ≥ 36 的应用在
+  smallest width ≥ 600dp 的屏幕上会被系统忽略 `screenOrientation`、`resizeableActivity`
+  与宽高比限制（官方行为变更 “Adaptive layouts”）。本应用因此在 `<application>`
+  里声明了 `android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY`
+  作为**临时** opt-out，把大屏拉回兼容模式；官方说明该 opt-out 在升到 API 37 后
+  失效，届时必须真正做响应式适配。
+
+这是产品决策（方案 B：明确只支持手机），不是遗漏 —— 后续若要支持平板 / 折叠屏展开态，
+需要单独做响应式适配（WindowSizeClass + 去掉硬编码 dp），不在当前范围内。
+
+## 安全边界（已知残余风险）
+
+网络、分享与更新链路的强制约束，以及**尚未全域收口的残余面**统一记录在
+[SECURITY.md](SECURITY.md)。重点提醒（不要误以为已全域收口）：
+
+- **明文策略**：平台 `network_security_config` 仍允许明文（Android 的 `<domain>` 不支持
+  CIDR 网段，改成禁止会让所有局域网 IP 服务器连不上）；「明文只发私网」由
+  `NetworkPolicy` + `CleartextGuardInterceptor` 在 OkHttp 层执行。
+  **WebView 登录页、以及任何不走 `ComfyUIClient.secured()` 的新网络链路不在闸门内。**
+- **分享**：FileProvider 只声明 `cacheDir/share/` 与 `update/`，新增分享必须走 `ShareFileStore`。
+- **更新**：冷启动恢复安装包前会复验 sha256 与包名/签名；sha256 只防损坏/低成本替换，
+  认证性由签名校验承担。
+
+新增网络 / 分享 / 更新代码前请先读 [SECURITY.md](SECURITY.md)。
 
 ## Development setup
 
@@ -279,7 +317,7 @@ To connect to your ComfyUI server, you'll need:
 - **Architecture**: MVVM with ViewModels and StateFlow
 - **Navigation**: Jetpack Compose Navigation
 - **Build system**: Gradle with Kotlin DSL
-- **Testing**: 681+ JVM unit tests (pure-logic extraction keeps effects, gestures, download policy and viewer logic testable without a device)
+- **Testing**: 1435 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
 
 ## Contributing
 

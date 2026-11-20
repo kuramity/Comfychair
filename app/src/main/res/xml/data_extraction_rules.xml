@@ -1,21 +1,49 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Data extraction rules for Android 12+ (API 31+)
-    See: https://developer.android.com/about/versions/12/backup-restore#xml-changes
--->
-<data-extraction-rules>
-    <!-- Cloud backup configuration (Google Drive backup) -->
-    <cloud-backup>
-        <!-- Include shared preferences for backup -->
-        <include domain="sharedpref" path="." />
+    数据提取规则（API 31+）
+    参考：https://developer.android.com/about/versions/12/backup-restore#xml-changes
 
-        <!-- Exclude connection settings (hostname/port) for security -->
-        <exclude domain="sharedpref" path="ComfyChairPrefs.xml" />
+    云端备份与设备间迁移都采用同一份白名单：换机后必须重新登录，
+    凭据 / 服务器配置 / 任务队列不得随数据迁移。
+-->
+<data-extraction-rules xmlns:tools="http://schemas.android.com/tools">
+    <!-- 云端备份（Google Drive） -->
+    <cloud-backup>
+        <include domain="sharedpref" path="AppSettings.xml" />
+        <include domain="sharedpref" path="PromptPresetPrefs.xml" />
+        <include domain="sharedpref" path="WorkflowValuesPrefs.xml" />
+        <include domain="sharedpref" path="TextToImageFragmentPrefs.xml" />
+        <include domain="sharedpref" path="ImageToImageFragmentPrefs.xml" />
+        <include domain="sharedpref" path="TextToVideoFragmentPrefs.xml" />
+        <include domain="sharedpref" path="ImageToVideoFragmentPrefs.xml" />
+        <include domain="sharedpref" path="GenerationViewModelPrefs.xml" />
+        <include domain="sharedpref" path="tag_library_state.xml" />
+        <include domain="sharedpref" path="tag_library_prefs.xml" />
+        <include domain="sharedpref" path="UserWorkflowsPrefs.xml" />
+        <include domain="sharedpref" path="SkillPromptPrefs.xml" />
+
+        <exclude domain="sharedpref" path="CredentialPrefs.xml" tools:ignore="FullBackupContent" />
+        <exclude domain="sharedpref" path="ServerPrefs.xml" tools:ignore="FullBackupContent" />
+        <exclude domain="sharedpref" path="JobRegistryPrefs.xml" tools:ignore="FullBackupContent" />
     </cloud-backup>
 
-    <!-- Device-to-device transfer configuration -->
+    <!-- 设备间迁移：同样排除敏感数据，换机必须重新登录 -->
     <device-transfer>
-        <!-- Include all preferences for device transfer (more trusted) -->
-        <include domain="sharedpref" path="." />
+        <include domain="sharedpref" path="AppSettings.xml" />
+        <include domain="sharedpref" path="PromptPresetPrefs.xml" />
+        <include domain="sharedpref" path="WorkflowValuesPrefs.xml" />
+        <include domain="sharedpref" path="TextToImageFragmentPrefs.xml" />
+        <include domain="sharedpref" path="ImageToImageFragmentPrefs.xml" />
+        <include domain="sharedpref" path="TextToVideoFragmentPrefs.xml" />
+        <include domain="sharedpref" path="ImageToVideoFragmentPrefs.xml" />
+        <include domain="sharedpref" path="GenerationViewModelPrefs.xml" />
+        <include domain="sharedpref" path="tag_library_state.xml" />
+        <include domain="sharedpref" path="tag_library_prefs.xml" />
+        <include domain="sharedpref" path="UserWorkflowsPrefs.xml" />
+        <include domain="sharedpref" path="SkillPromptPrefs.xml" />
+
+        <exclude domain="sharedpref" path="CredentialPrefs.xml" tools:ignore="FullBackupContent" />
+        <exclude domain="sharedpref" path="ServerPrefs.xml" tools:ignore="FullBackupContent" />
+        <exclude domain="sharedpref" path="JobRegistryPrefs.xml" tools:ignore="FullBackupContent" />
     </device-transfer>
 </data-extraction-rules>

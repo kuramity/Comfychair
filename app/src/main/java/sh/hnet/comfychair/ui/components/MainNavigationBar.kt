@@ -21,7 +21,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -68,7 +68,7 @@ fun MainNavigationBar(
     val currentRoute = navBackStackEntry?.destination?.route
 
     // Observe gallery items to show latest thumbnail in FAB
-    val galleryItems by GalleryRepository.getInstance().galleryItems.collectAsState()
+    val galleryItems by GalleryRepository.getInstance().galleryItems.collectAsStateWithLifecycle()
     val latestItem = galleryItems.firstOrNull()
 
     // Lazy load thumbnail for FAB - keep previous thumbnail until new one is ready

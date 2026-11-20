@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -70,6 +71,25 @@ sealed class ConnectionState {
 }
 
 /**
+ * WebSocket 二进制预览帧的策略（P1-27）。
+ *
+ * 独立成顶层对象（而不是挂在 [ConnectionManager] 里）是为了让 JVM 单测能直接调用，
+ * 不必初始化整个连接管理器（它会建协程作用域、状态流等）。
+ */
+internal object PreviewFramePolicy {
+
+    /** 预览图片数据的字节上限：超过直接丢弃（见 ConnectionManager.MAX_PREVIEW_BYTES 的说明） */
+    const val MAX_PREVIEW_BYTES = 8 * 1024 * 1024
+
+    /** 解码后的最大边长：预览只用于进度展示，1024 已足够清晰 */
+    const val DECODE_DIMENSION = 1024
+
+    /** 去掉 8 字节帧头后的图片数据是否在可解码范围内 */
+    fun shouldDecode(payloadBytes: Int, maxBytes: Int = MAX_PREVIEW_BYTES): Boolean =
+        payloadBytes in 1..maxBytes
+}
+
+/**
  * Central manager for ComfyUI server connection.
  *
  * This singleton provides:
@@ -96,6 +116,37 @@ object ConnectionManager {
 
     /** 重连退避封顶：2s→4s→8s→16s→30s，之后保持 30s 一次，直到连上或被显式阻断。 */
     private const val MAX_RECONNECT_BACKOFF_MS = 30_000L
+
+    /**
+     * WS 二进制预览的**字节上限**（P1-27）。
+     *
+     * 二进制帧 = 8 字节头 + 图片数据。修复前对图片数据无任何上限，
+     * 直接 `decodeByteArray` 全尺寸展开：服务端在放大类工作流下推送的预览可达几十 MB，
+     * 几千像素的图一解码就是上百 MB 位图 —— 内存不足时整个进程被系统杀掉。
+     *
+     * 预览只用于生成过程中的进度展示，8MB 压缩数据足够覆盖 1024 长边的高质量图；
+     * 超过上限的帧直接丢弃（下一帧马上会到），不值得为它冒 OOM 风险。
+     */
+    internal const val MAX_PREVIEW_BYTES = PreviewFramePolicy.MAX_PREVIEW_BYTES
+
+    /**
+     * 预览解码后的最大边长（P1-27）：预览显示区域最大也就全屏宽度量级，
+     * 1024 足够清晰；按 2 的幂采样比原图省一个数量级的内存。
+     */
+    internal const val PREVIEW_DECODE_DIMENSION = 1024
+
+    /** 二进制帧头长度（ComfyUI 自定义预览协议） */
+    private const val BINARY_HEADER_BYTES = 8
+
+    /**
+     * 二进制预览帧是否值得解码（P1-27 纯判定，便于单测）。
+     *
+     * @param payloadBytes 去掉 8 字节头之后的图片数据长度
+     */
+    internal fun shouldDecodePreview(
+        payloadBytes: Int,
+        maxBytes: Int = MAX_PREVIEW_BYTES
+    ): Boolean = PreviewFramePolicy.shouldDecode(payloadBytes, maxBytes)
 
     // Connection state
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
@@ -175,6 +226,86 @@ object ConnectionManager {
     private val objectInfoFetchGate = SingleFlight()
 
     /**
+     * 模型列表装配的**连接会话代次**（G7 指令 3 / G8 指令 2，v4.16.10 起）。
+     *
+     * 每次连接建立 / 断开都自增。网络回调与磁盘预填协程都捕获发起时的代次，
+     * 回来后若代次已变（用户退出重连 / 切了服务器 / 看门狗已判失败），
+     * **直接丢弃、不写 [\_modelCache]**：
+     * - 防止「过渡态 / 上一台服务器」的迟到响应把新连接刚铺好的列表盖回去（再次被吞）；
+     * - 防止磁盘预填的 IO 协程把已经被网络结果收敛掉的 isLoading 又顶回 true
+     *   （这正是 E7「UNET 长期正在加载不收敛」的一条真实路径：网络先回、置 isLoading=false，
+     *   随后读盘协程 `_modelCache.value = models.copy(isLoaded = true, isLoading = true)`
+     *   把加载态重新点亮，而这条链路上再也没有第二个回调来熄灭它）。
+     */
+    @Volatile
+    private var modelListGeneration = 0L
+
+    /** 看门狗：`isLoading` 的最长驻留时间。超过即强制三类进入 FAILED 终态，杜绝「正在加载」不收敛。 */
+    internal const val MODEL_LIST_WATCHDOG_MS = 60_000L
+
+    /**
+     * 看门狗协程句柄（同一时刻至多一个；每次发起拉取重建，回调/代次变化时取消）。
+     *
+     * 跨线程读写：`armModelListWatchdog` 由发起线程调用、`cancelModelListWatchdog` 由
+     * OkHttp 回调线程调用，不加 @Volatile 时后者可能读到旧句柄、取消不掉已收敛的看门狗。
+     */
+    @Volatile
+    private var modelListWatchdog: Job? = null
+
+    /**
+     * 自增模型列表会话代次并取消看门狗。
+     *
+     * 在 [connect] 建立新会话与 [disconnect] 断开时调用：此后任何在飞的 `/object_info`
+     * 回调与磁盘预填协程都会因代次不符被丢弃。
+     */
+    private fun bumpModelListGeneration() {
+        modelListGeneration += 1
+        modelListWatchdog?.cancel()
+        modelListWatchdog = null
+    }
+
+    /**
+     * 启动模型列表加载看门狗（G8 指令 2「正在加载不得长期驻留」的最后防线）。
+     *
+     * 回调正常返回时会先于看门狗把三类置终态；看门狗只在「代次未变但 [\_modelCache]
+     * 仍处于 isLoading」时触发，把三类统一落到 `FAILED(REQUEST_FAILED)`，
+     * **保留已有列表**（不清数据），让界面从「正在加载」变成「加载失败，可重试」。
+     */
+    private fun armModelListWatchdog(generationAtStart: Long) {
+        modelListWatchdog?.cancel()
+        modelListWatchdog = scope.launch {
+            delay(MODEL_LIST_WATCHDOG_MS)
+            // 代次变了说明已有新的连接/拉取接管，本看门狗作废（新会话会各自起看门狗）
+            if (generationAtStart != modelListGeneration) return@launch
+            if (!_modelCache.value.isLoading) return@launch
+            DebugLogger.w(
+                TAG,
+                "模型列表加载看门狗超时（${MODEL_LIST_WATCHDOG_MS}ms 未收敛），" +
+                        "强制三类落 FAILED(请求失败)，保留已有列表"
+            )
+            // 失败态可见 + 三类终态 + 清除 isLoading（禁静默留空 / 禁「正在加载」驻留），不清列表
+            _modelCache.value = _modelCache.value.copy(
+                isLoading = false,
+                lastError = "模型列表加载超时",
+                unetState = CategoryLoadState.FAILED,
+                vaeState = CategoryLoadState.FAILED,
+                clipState = CategoryLoadState.FAILED,
+                unetFailure = CategoryFailureReason.REQUEST_FAILED,
+                vaeFailure = CategoryFailureReason.REQUEST_FAILED,
+                clipFailure = CategoryFailureReason.REQUEST_FAILED
+            )
+            // 看门狗触发即视为本次拉取结束，释放闸门，让手点/补拉不被永久拦
+            objectInfoFetchGate.exit()
+        }
+    }
+
+    /** 取消模型列表看门狗（回调已自行收敛三类终态时调用）。 */
+    private fun cancelModelListWatchdog() {
+        modelListWatchdog?.cancel()
+        modelListWatchdog = null
+    }
+
+    /**
      * 介绍数据热更新的执行编排（闸门 + 异常兜底 + 收尾都在里面）。
      *
      * 为什么不直接在 [syncModelIntros] 里写 try/catch：`fetchModelIntros` 是异步的，
@@ -189,6 +320,14 @@ object ConnectionManager {
     )
 
     // WebSocket management
+    /**
+     * 自动重连的尝试计数（仅用于状态描述与退避时长，界面不读）。
+     *
+     * 跨线程读写（NEW-5）：onOpen（OkHttp 线程）与 scheduleReconnect（可能由
+     * onFailure/onClosed 的 OkHttp 线程进入）会写，retrySingleAttempt 等主线程流程也会写。
+     * 不加 @Volatile 时主线程可能一直读到旧值，退避时长计算与状态描述会滞后。
+     */
+    @Volatile
     private var reconnectAttempts = 0
 
     /**
@@ -198,7 +337,12 @@ object ConnectionManager {
      * 移动网络与隧道环境下 WebSocket 可能被中断较久，原来 3 次上限（约 12 秒）
      * 会在网络抖动期用完后彻底放弃，用户回来时就没有实时预览了。
      * 现在只有上述三种明确终止条件才停；网络恢复后自动接上。
+     *
+     * 跨线程读写（NEW-5）：onFailure（OkHttp 线程）写 true，onOpen / 手动重连（主线程或
+     * OkHttp 回调线程）写 false，scheduleReconnect 读。不加 @Volatile 时可能漏看阻断标记，
+     * 401 之后仍多排一轮自动重连。
      */
+    @Volatile
     private var reconnectBlocked = false
     private var keepaliveJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -206,6 +350,34 @@ object ConnectionManager {
     // Reconnection coordination - prevents race conditions between multiple reconnection paths
     private var reconnectionSessionId = 0L
     private var pendingReconnectJob: Job? = null
+
+    /**
+     * 本轮 Connecting 的起始时刻（elapsedRealtime）；未处于 Connecting 时为 0。
+     *
+     * 用于识别"握手永远不回调"的僵尸状态：旧实现只要看到 Connecting 就直接跳过，
+     * 一旦 OkHttp 在弱网/隧道半开时既不 onOpen 也不 onFailure，状态就永久卡住
+     * （条目 4.1）。超过 [WebSocketRecoveryPolicy.CONNECTING_TIMEOUT_MS] 即强制重建。
+     *
+     * 跨线程读写（D2）：写侧在主线程的连接/断开流程，读侧在 OkHttp 回调线程
+     * （onOpen/onFailure/onClosed）与入口判定里。没有 happens-before 时可能读到旧值，
+     * 把刚重建的连接误判成"仍在握手"或把僵尸判定漏掉，因此加 @Volatile。
+     */
+    @Volatile
+    private var connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+
+    /**
+     * WebSocket 监听代次：只有最新一次 [openWebSocket] 创建的监听器能改状态。
+     *
+     * 强制重建僵尸连接时，旧 socket 被 close 后仍可能回调 onFailure/onClosed；
+     * 没有代次校验的话，这些迟到回调会把刚建立的新连接状态又打回 Failed/Disconnected。
+     *
+     * 跨线程读写（D2/NEW-2）：写侧既可能在主线程，也可能在 OkHttp 回调线程
+     * （`attemptSilentReconnect` / `reconnectWebSocket` 的 `testConnection` 回调会直接
+     * 调 [openWebSocket]），而递增本身是"读-改-写"。所以这里用
+     * [WebSocketGenerationCounter]：递增在锁内完成（并发调用拿到的代次两两不同），
+     * 字段本身是 @Volatile（读侧无锁也能看到最新值）。
+     */
+    private val webSocketGeneration = WebSocketGenerationCounter()
 
     // ── 离线自动切换 ────────────────────────────────────────────────────
     // 判定逻辑刻意抽到 ConnectionStability（零 Android 依赖，可在 JVM 单测里钉住）：
@@ -311,13 +483,14 @@ object ConnectionManager {
     /**
      * 当前协议（"http" 或 "https"）。
      *
-     * 同样按「当前连接 → 上次会话 → 已保存配置」回退；已保存的 Server 没有协议字段，
-     * 因此最后一级只能是 "http"（与项目原有默认一致）。
+     * 同样按「当前连接 → 上次会话 → 已保存配置」回退；已保存配置里的协议为空（自动）时
+     * 最后一级用 "https"（安全默认：明文只应来自探测成功或用户显式选择）。
      */
     val protocol: String
         get() = (connectionState.value as? ConnectionState.Connected)?.protocol
             ?: lastSession?.protocol
-            ?: "http"
+            ?: _applicationContext?.let { ServerStorage(it).getSelectedServer()?.protocol }
+            ?: "https"
 
     /**
      * Current server ID, or null if not connected (includes offline mode).
@@ -383,6 +556,9 @@ object ConnectionManager {
         DebugLogger.i(TAG, "Connecting to ${Obfuscator.hostname(hostname)} (protocol: $protocol, serverId: $serverId)")
         // 主动连接入口：解除此前因登出/认证失败/离线设下的重连阻断
         reconnectBlocked = false
+        // G7/G8：进入新会话即推进模型列表代次 —— 上一个会话（含退出登录前）任何在飞的
+        // /object_info 回调与磁盘预填都会因代次不符被丢弃，不会把新会话的列表盖回旧数据
+        bumpModelListGeneration()
         val current = connectionState.value
 
         // Check if already connected to the same server
@@ -410,7 +586,14 @@ object ConnectionManager {
         _applicationContext = context.applicationContext
 
         // Create shared client with detected protocol, shared client ID, and credentials
-        _client = ComfyUIClient(context.applicationContext, hostname, port, credentials).apply {
+        _client = ComfyUIClient(
+            context.applicationContext,
+            hostname,
+            port,
+            credentials,
+            serverId,
+            preferredProtocol = protocol
+        ).apply {
             setWorkingProtocol(protocol)
             setClientId(_clientId!!)
             setOnSessionExpired {
@@ -448,6 +631,8 @@ object ConnectionManager {
         }
 
         DebugLogger.i(TAG, "Disconnecting")
+        // 断开即作废当前模型列表会话：在飞的 /object_info 回调与磁盘预填都按代次丢弃
+        bumpModelListGeneration()
         pendingReconnectJob?.cancel()
         pendingReconnectJob = null
         stopOfflineProbe()
@@ -605,17 +790,50 @@ object ConnectionManager {
                     } else {
                         DebugLogger.i(TAG, "ensureConnection: opening WebSocket")
                         openWebSocket()
-                        val finalState = withTimeoutOrNull(10000L) {
+                        val finalState = withTimeoutOrNull(WebSocketRecoveryPolicy.CONNECT_WAIT_TIMEOUT_MS) {
                             _webSocketState.first { it is WebSocketState.Connected || it is WebSocketState.Failed }
                         }
                         _isConnecting.value = false
-                        when (finalState) {
-                            is WebSocketState.Connected -> {
-                                DebugLogger.i(TAG, "ensureConnection: WebSocket connected")
+                        // NEW-1：这 10 秒等待期间可能已有新的重连会话接手（startNewReconnectionSession
+                        // 只取消 pendingReconnectJob，不会取消本协程）。旧协程若继续写，会把新会话
+                        // 刚建立的 Connecting 收敛成 Failed、清掉它的握手起始时刻，并对已被取代的
+                        // 请求弹告警/回调 false。所以等待结束后必须重新校验会话，再做任何写入。
+                        if (!isSessionValid(sessionId)) {
+                            DebugLogger.d(
+                                TAG,
+                                "ensureConnection: 等待结束后会话已变更，忽略旧结果（session $sessionId）"
+                            )
+                            return@launch
+                        }
+                        if (finalState is WebSocketState.Connected) {
+                            DebugLogger.i(TAG, "ensureConnection: WebSocket connected")
+                            onResult(true)
+                        } else {
+                            // D4：超时（finalState == null）时没有任何自治定时器会再来收尾，
+                            // 状态会永久停在 Connecting。这里收敛成失败终态：已 Failed 的保持
+                            // 原对象（可能带更具体的失败原因），仍在 Connecting 的落 NETWORK 失败。
+                            //
+                            // NEW-3：必须用 StateFlow 的原子 update，不能"读到 Connecting 再写回"。
+                            // onOpen 可能在读与写之间把状态改成 Connected（OkHttp 线程），
+                            // 检查-写入会把刚连上的状态又打回 Failed。update 的 lambda 拿到的是
+                            // 最新值，afterConnectTimeout 对非 Connecting 原样返回，天然免疫这个竞态。
+                            val before = _webSocketState.value
+                            _webSocketState.update { WebSocketRecoveryPolicy.afterConnectTimeout(it) }
+                            val after = _webSocketState.value
+                            connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+                            if (after is WebSocketState.Connected) {
+                                // 原子 update 生效后才连上的情况：按成功处理，不能再弹失败对话框
+                                DebugLogger.i(TAG, "ensureConnection: 超时判定期间 WebSocket 已连上")
                                 onResult(true)
-                            }
-                            else -> {
-                                DebugLogger.w(TAG, "ensureConnection: WebSocket failed")
+                            } else {
+                                if (after != before) {
+                                    DebugLogger.w(
+                                        TAG,
+                                        "ensureConnection: WebSocket 等待超时，收敛状态 $before -> $after"
+                                    )
+                                } else {
+                                    DebugLogger.w(TAG, "ensureConnection: WebSocket failed（状态保持 $after）")
+                                }
                                 showConnectionAlert(context, ConnectionFailure.NETWORK)
                                 onResult(false)
                             }
@@ -625,6 +843,14 @@ object ConnectionManager {
                     _isConnecting.value = false
                     DebugLogger.w(TAG, "ensureConnection: server unreachable, failureType=$failureType")
                     reportConnectivityFailure(failureType)
+                    // 本次探测已失败；若状态还停在 Connecting/Reconnecting（上一轮重连留下的
+                    // 过渡态，其 pending job 已被 startNewReconnectionSession 取消），必须收尾，
+                    // 否则会永久停在"连接中/重连中"（条目 4.1）
+                    val collapsed = WebSocketRecoveryPolicy.collapseTransitional(_webSocketState.value)
+                    if (collapsed != _webSocketState.value) {
+                        DebugLogger.d(TAG, "ensureConnection: 收敛过渡态 ${_webSocketState.value} -> $collapsed")
+                        _webSocketState.value = collapsed
+                    }
                     // 已自动切到离线时不再弹"连接失败"对话框（离线看缓存是正常状态）
                     if (!isOffline) {
                         showConnectionAlert(context, failureType)
@@ -650,13 +876,17 @@ object ConnectionManager {
         val client = _client ?: run {
             DebugLogger.w(TAG, "retrySingleAttempt: aborting - client is null")
             _isReconnecting.value = false
+            // 待重连 job 已在上一步被取消，若状态还是 Reconnecting 就没人收尾了
+            _webSocketState.value = WebSocketRecoveryPolicy.collapseTransitional(_webSocketState.value)
             Toast.makeText(context, R.string.msg_reconnect_failed, Toast.LENGTH_SHORT).show()
             return
         }
 
         DebugLogger.i(TAG, "User initiated single retry attempt (session $sessionId)")
+        // D1：先作废旧监听器（递增代次）再改状态、关 socket，
+        // 旧 socket 的迟到 onFailure/onClosed 不会再把状态打回 Failed
+        invalidateWebSocketCallbacks()
         _webSocketState.value = WebSocketState.Disconnected
-
         client.closeWebSocket()
         DebugLogger.d(TAG, "retrySingleAttempt: closed WebSocket, calling testConnection")
         client.testConnection { success, errorMessage, _, failureType ->
@@ -664,6 +894,9 @@ object ConnectionManager {
                 // Ignore stale callback if session has changed
                 if (!isSessionValid(sessionId)) {
                     DebugLogger.d(TAG, "retrySingleAttempt: ignoring stale callback (session $sessionId)")
+                    // 本次调用留在 _isReconnecting 上的 true 必须清掉：scheduleReconnect 见到它
+                    // 会一直跳过，"重连中"标记若无人复位，自动重连就永久停摆。
+                    _isReconnecting.value = false
                     return@launch
                 }
 
@@ -676,17 +909,46 @@ object ConnectionManager {
                     openWebSocket()
 
                     // Wait for WebSocket to actually connect before clearing dialog
-                    val finalState = withTimeoutOrNull(10000L) {
+                    val finalState = withTimeoutOrNull(WebSocketRecoveryPolicy.CONNECT_WAIT_TIMEOUT_MS) {
                         _webSocketState.first { it is WebSocketState.Connected || it is WebSocketState.Failed }
                     }
 
                     _isReconnecting.value = false
+                    // NEW-1：10 秒等待期间可能已有新的重连会话接手（startNewReconnectionSession
+                    // 只取消 pendingReconnectJob，不会取消本协程）。旧协程若继续写，会把新会话
+                    // 刚建立的 Connecting 收敛成 Failed、清掉握手起始时刻并弹失败 Toast。
+                    if (!isSessionValid(sessionId)) {
+                        DebugLogger.d(
+                            TAG,
+                            "retrySingleAttempt: 等待结束后会话已变更，忽略旧结果（session $sessionId）"
+                        )
+                        return@launch
+                    }
                     if (finalState is WebSocketState.Connected) {
                         DebugLogger.i(TAG, "WebSocket connected, clearing dialog")
                         clearConnectionAlert()
                     } else {
-                        DebugLogger.w(TAG, "WebSocket failed to connect after successful HTTP test")
-                        Toast.makeText(context, R.string.msg_reconnect_failed, Toast.LENGTH_SHORT).show()
+                        // D4：等待超时时状态还停在 Connecting，必须收敛，否则界面永久"连接中"
+                        // NEW-3：同上，用原子 update 避免把并发 onOpen 写好的 Connected 打回 Failed
+                        val before = _webSocketState.value
+                        _webSocketState.update { WebSocketRecoveryPolicy.afterConnectTimeout(it) }
+                        val after = _webSocketState.value
+                        connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+                        if (after is WebSocketState.Connected) {
+                            // 原子 update 生效后才连上的情况：按成功处理，不弹失败 Toast
+                            DebugLogger.i(TAG, "retrySingleAttempt: 超时判定期间 WebSocket 已连上")
+                            clearConnectionAlert()
+                        } else {
+                            if (after != before) {
+                                DebugLogger.w(
+                                    TAG,
+                                    "retrySingleAttempt: WebSocket 等待超时，收敛状态 $before -> $after"
+                                )
+                            } else {
+                                DebugLogger.w(TAG, "WebSocket failed to connect after successful HTTP test（状态保持 $after）")
+                            }
+                            Toast.makeText(context, R.string.msg_reconnect_failed, Toast.LENGTH_SHORT).show()
+                        }
                     }
                 } else {
                     _isReconnecting.value = false
@@ -710,10 +972,22 @@ object ConnectionManager {
      * - If reconnect fails, sets Failed state (dialog will appear via normal ViewModel flow)
      */
     fun attemptSilentReconnect() {
-        // Already connected or connecting - don't interfere
-        if (_webSocketState.value is WebSocketState.Connected ||
-            _webSocketState.value is WebSocketState.Connecting) {
-            DebugLogger.d(TAG, "attemptSilentReconnect: state=${_webSocketState.value}, skipping")
+        // 已连接：不打扰。
+        val state = _webSocketState.value
+        if (state is WebSocketState.Connected) {
+            DebugLogger.d(TAG, "attemptSilentReconnect: state=$state, skipping")
+            return
+        }
+        // Connecting：只在 20 秒握手窗口内跳过。超过窗口的僵尸 Connecting 必须放行到
+        // 下面的重建流程，否则 onResume 是这条状态唯一的自愈机会（条目 4.1）。
+        if (state is WebSocketState.Connecting &&
+            WebSocketRecoveryPolicy.openDecision(
+                state = state,
+                connectingSinceMs = connectingSinceElapsedMs,
+                nowMs = SystemClock.elapsedRealtime()
+            ) == OpenWebSocketDecision.STILL_CONNECTING
+        ) {
+            DebugLogger.d(TAG, "attemptSilentReconnect: still connecting, skipping")
             return
         }
 
@@ -725,9 +999,11 @@ object ConnectionManager {
         val sessionId = startNewReconnectionSession()  // Cancel any pending auto-reconnect
 
         DebugLogger.i(TAG, "Attempting silent reconnect on resume")
+        // D1：自愈僵尸 Connecting 时旧监听器还活着，不先作废代次的话，它的迟到回调
+        // 会把状态写成 Failed 并再排一次重连，随后又把下面新建的连接关掉
+        invalidateWebSocketCallbacks()
         // Set to Disconnected so openWebSocket() will work and StateFlow will emit on failure
         _webSocketState.value = WebSocketState.Disconnected
-
         client.closeWebSocket()
         client.testConnection { success, errorMessage, _, failureType ->
             // Ignore stale callback if another reconnection started
@@ -792,63 +1068,178 @@ object ConnectionManager {
             return false
         }
 
-        // Already connected or connecting
-        if (_webSocketState.value is WebSocketState.Connected ||
-            _webSocketState.value is WebSocketState.Connecting) {
-            DebugLogger.d(TAG, "WebSocket already connected/connecting - skipping open")
-            return true
+        // 已连接 / 仍在握手窗口内的 Connecting：不重复建连。
+        // 超过 20 秒（或没有起始时刻）的 Connecting 视为僵尸状态，强制重建（条目 4.1）。
+        val decision = WebSocketRecoveryPolicy.openDecision(
+            state = _webSocketState.value,
+            connectingSinceMs = connectingSinceElapsedMs,
+            nowMs = SystemClock.elapsedRealtime()
+        )
+        when (decision) {
+            OpenWebSocketDecision.ALREADY_CONNECTED -> {
+                DebugLogger.d(TAG, "WebSocket already connected - skipping open")
+                return true
+            }
+            OpenWebSocketDecision.STILL_CONNECTING -> {
+                DebugLogger.d(TAG, "WebSocket still connecting - skipping open")
+                return true
+            }
+            OpenWebSocketDecision.REBUILD_STALE -> {
+                DebugLogger.w(
+                    TAG,
+                    "检测到陈旧 Connecting（超过 ${WebSocketRecoveryPolicy.CONNECTING_TIMEOUT_MS}ms），强制重建 WebSocket"
+                )
+            }
+            OpenWebSocketDecision.OPEN -> Unit
         }
 
+        // 先递增代次让旧监听器的回调作废，再关掉旧 socket：
+        // close() 可能立刻触发旧监听器的 onFailure，不先作废会把刚写的新状态打回去。
+        val generation = invalidateWebSocketCallbacks()
+        if (decision == OpenWebSocketDecision.REBUILD_STALE) {
+            client.closeWebSocket()
+        }
+        connectingSinceElapsedMs = SystemClock.elapsedRealtime()
         DebugLogger.i(TAG, "Opening WebSocket connection")
         _webSocketState.value = WebSocketState.Connecting
 
         val listener = object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                DebugLogger.i(TAG, "WebSocket connected")
-                reconnectAttempts = 0
-                reconnectBlocked = false
-                reportConnectivitySuccess()
-                _webSocketState.value = WebSocketState.Connected
+            /** 旧连接（或已被强制重建的连接）的迟到回调：直接丢弃，不得改状态。 */
+            private fun isStaleCallback(): Boolean {
+                // 只读一次：判断与日志必须是同一个快照，否则日志可能自相矛盾
+                val currentGeneration = webSocketGeneration.current
+                if (!WebSocketRecoveryPolicy.isStaleCallback(generation, currentGeneration)) return false
+                DebugLogger.d(TAG, "忽略旧 WebSocket 回调（代次 $generation / 当前 $currentGeneration）")
+                return true
+            }
 
-                // Clear any pending connection dialog and reset flags
-                // This handles the case where auto-reconnect succeeds while dialog is open
-                if (_connectionAlertState.value != null) {
-                    DebugLogger.i(TAG, "WebSocket connected, clearing dialog")
-                    _connectionAlertState.value = null
+            /**
+             * NEW-2：把"判代次 + 写状态"合成一个原子步骤（锁与代次递增共用）。
+             *
+             * 只做 [isStaleCallback] 再写是不够的：通过检查之后、写状态之前，另一线程
+             * （例如 retrySingleAttempt 作废代次并关闭 socket）可以把这条监听器作废，
+             * 旧 onOpen 仍会把状态写回 Connected 并启动 keepalive —— UI 显示已连接、
+             * 底层 socket 却已经没了。
+             */
+            private fun runIfCurrent(block: () -> Unit): Boolean {
+                val applied = webSocketGeneration.runIfCurrent(generation, block)
+                if (!applied) {
+                    DebugLogger.d(TAG, "忽略旧 WebSocket 回调（代次 $generation / 已被作废）")
                 }
-                _isReconnecting.value = false
-                _isConnecting.value = false
+                return applied
+            }
 
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                val applied = runIfCurrent {
+                    DebugLogger.i(TAG, "WebSocket connected")
+                    connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+                    reconnectAttempts = 0
+                    reconnectBlocked = false
+                    _webSocketState.value = WebSocketState.Connected
+
+                    // Clear any pending connection dialog and reset flags
+                    // This handles the case where auto-reconnect succeeds while dialog is open
+                    if (_connectionAlertState.value != null) {
+                        DebugLogger.i(TAG, "WebSocket connected, clearing dialog")
+                        _connectionAlertState.value = null
+                    }
+                    _isReconnecting.value = false
+                    _isConnecting.value = false
+                }
+                if (!applied) return
+
+                // 下面两步只影响心跳与预加载，代次在此之后被推进也无害：
+                // keepalive 循环每轮都会检查状态，状态被改走后自动退出。
+                reportConnectivitySuccess()
                 startKeepalive()
                 GalleryRepository.getInstance().startBackgroundPreload()
+                // G7 指令 1/3：此刻连接状态机已收敛到 Connected —— 这是「长时间后台后
+                // 静默重连成功」路径里模型列表必检的正确时机。onResume 那次很可能撞在
+                // 过渡态上被判 SKIP_TRANSIENT_CONNECTION，没有这一步，E5/E6/E7 就再也
+                // 没有人来救（历史 Q3「修了但没生效」缺的正是这条收敛后的复查）。
+                ensureModelListLoadedAfterResume()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (isStaleCallback()) return
                 parseAndEmitMessage(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (isStaleCallback()) return
                 parseAndEmitBinaryMessage(bytes)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                DebugLogger.e(TAG, "WebSocket connection failed: ${t::class.simpleName}")
-                stopKeepalive()
-                scheduleReconnect()
+                // NEW-2：判代次与整段状态机写入在同一个锁内完成，避免"通过检查后又被作废"
+                val applied = runIfCurrent {
+                    DebugLogger.e(TAG, "WebSocket connection failed: ${t::class.simpleName}")
+                    // 顺序很重要（条目 4.1）：先停心跳 → 再落终态或排重连。
+                    // 若先排重连，scheduleReconnect 在离线/手动重连中/被阻断时会提前 return，
+                    // 状态就永久停在 Connecting（界面一直显示"连接中"）。
+                    stopKeepalive()
+                    connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+
+                    val failureType = WebSocketRecoveryPolicy.failureTypeFor(response?.code)
+                    if (!WebSocketRecoveryPolicy.isRecoverableFailure(failureType)) {
+                        // D10：认证失败等不可恢复的失败——重试没有意义，阻断自动重连并落失败终态，
+                        // 这种 Failed 才是该弹模态告警的
+                        DebugLogger.w(TAG, "onFailure: 不可恢复失败（$failureType），阻断自动重连")
+                        reconnectBlocked = true
+                        _webSocketState.value = WebSocketRecoveryPolicy.afterFailure(
+                            current = _webSocketState.value,
+                            responseCode = response?.code,
+                            reason = t.message
+                        )
+                    } else if (scheduleReconnect()) {
+                        // D10：能自动重连时**不写 Failed**。否则 GenerationViewModel 会先弹一次
+                        // 模态告警，紧接着 scheduleReconnect 又把状态写成 Reconnecting，
+                        // 一次瞬时失败就闪一下对话框（StateFlow 合并下时有时无）。
+                        DebugLogger.d(TAG, "onFailure: 已排自动重连，跳过模态失败态")
+                    } else {
+                        // 排不上重连（离线 / 手动重连中 / 被阻断）：这才是需要用户知道的失败终态
+                        DebugLogger.w(TAG, "onFailure: 自动重连被跳过，落失败终态")
+                        _webSocketState.value = WebSocketRecoveryPolicy.afterFailure(
+                            current = _webSocketState.value,
+                            responseCode = response?.code,
+                            reason = t.message
+                        )
+                    }
+                }
+                if (!applied) return
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                DebugLogger.i(TAG, "WebSocket closed (code: $code)")
-                stopKeepalive()
-                if (code != 1000) {
-                    scheduleReconnect()
-                } else {
-                    _webSocketState.value = WebSocketState.Disconnected
+                // NEW-2：同上，判代次 + 收尾 + 排重连整体在锁内
+                runIfCurrent {
+                    DebugLogger.i(TAG, "WebSocket closed (code: $code)")
+                    stopKeepalive()
+                    connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+                    // 无论 code 是多少都先收尾为 Disconnected，再决定要不要重连（条目 4.1）
+                    val outcome = WebSocketRecoveryPolicy.afterClosed(
+                        current = _webSocketState.value,
+                        code = code
+                    )
+                    _webSocketState.value = outcome.state
+                    if (outcome.reconnect) {
+                        scheduleReconnect()
+                    }
                 }
             }
         }
 
-        return client.openWebSocket(id, listener)
+        val started = client.openWebSocket(id, listener)
+        if (!started) {
+            // 没建起来（例如没有可用协议）也必须收尾，不能把状态丢在 Connecting
+            DebugLogger.w(TAG, "WebSocket 启动失败（无可用协议），收敛为 Failed")
+            connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+            _webSocketState.value = WebSocketRecoveryPolicy.afterFailure(
+                current = _webSocketState.value,
+                responseCode = null,
+                reason = "无法建立 WebSocket（无可用协议）"
+            )
+        }
+        return started
     }
 
     /**
@@ -860,10 +1251,34 @@ object ConnectionManager {
     }
 
     /**
+     * 主动关闭/重建前作废旧监听器（D1）。
+     *
+     * 只有 [openWebSocket]（新建）与 [closeWebSocketInternal]（主动关闭）会在代次上留痕
+     * 是不够的：`retrySingleAttempt` / `attemptSilentReconnect` / `reconnectWebSocket`
+     * 也会直接 `client.closeWebSocket()`，旧 socket 的 onFailure/onClosed 仍可能在
+     * close() 之后才回调。没有递增代次时，这些迟到回调会被当成"当前连接"的失败，
+     * 把状态写成 Failed 并再排一次重连，随后把刚建立的新连接关掉 —— 多跑一整轮重连、
+     * 界面状态闪断。
+     *
+     * 写侧可能来自主线程，也可能来自 OkHttp 回调线程（见字段 KDoc），因此递增走
+     * [WebSocketGenerationCounter.next]（锁内"读-改-写"），保证并发调用两两不同号。
+     *
+     * @return 本次递增后的代次（交给新监听器捕获）
+     */
+    private fun invalidateWebSocketCallbacks(): Long {
+        val generation = webSocketGeneration.next()
+        connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
+        return generation
+    }
+
+    /**
      * Internal close without logging (used during disconnect)
      */
     private fun closeWebSocketInternal() {
         stopKeepalive()
+        // 主动关闭：先让当前监听器的回调作废，避免 close() 触发的 onFailure
+        // 又把状态写成 Failed 并排一次多余的重连
+        invalidateWebSocketCallbacks()
         _client?.closeWebSocket()
         _webSocketState.value = WebSocketState.Disconnected
     }
@@ -959,19 +1374,55 @@ object ConnectionManager {
 
     /**
      * Parse binary WebSocket message (preview images) and emit
+     *
+     * P1-27：数据量有上限、解码有采样。修复前这里是无条件
+     * `BitmapFactory.decodeByteArray` 全尺寸解码 —— 大图预览会直接把内存打爆。
      */
     private fun parseAndEmitBinaryMessage(bytes: ByteString) {
-        if (bytes.size > 8) {
-            try {
-                val pngBytes = bytes.substring(8).toByteArray()
-                val bitmap = BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
-                if (bitmap != null) {
-                    scope.launch { _webSocketMessages.emit(WebSocketMessage.PreviewImage(bitmap)) }
-                }
-            } catch (e: Exception) {
-                DebugLogger.w(TAG, "WS: failed to decode preview: ${e.message}")
-            }
+        if (bytes.size <= BINARY_HEADER_BYTES) return
+
+        val payloadSize = bytes.size - BINARY_HEADER_BYTES
+        if (!shouldDecodePreview(payloadSize)) {
+            DebugLogger.w(
+                TAG,
+                "WS: 丢弃超限预览帧（${payloadSize / (1024 * 1024)}MB > " +
+                    "${MAX_PREVIEW_BYTES / (1024 * 1024)}MB）"
+            )
+            return
         }
+
+        try {
+            val pngBytes = bytes.substring(BINARY_HEADER_BYTES).toByteArray()
+            val bitmap = decodePreviewSampled(pngBytes)
+            if (bitmap != null) {
+                scope.launch { _webSocketMessages.emit(WebSocketMessage.PreviewImage(bitmap)) }
+            }
+        } catch (e: Exception) {
+            DebugLogger.w(TAG, "WS: failed to decode preview: ${e.message}")
+        } catch (e: OutOfMemoryError) {
+            // 采样之后仍然 OOM：这一帧放弃，绝不让预览链路把进程拖垮
+            DebugLogger.w(TAG, "WS: preview decode OOM, frame dropped")
+        }
+    }
+
+    /**
+     * 预览图按长边上限采样解码（P1-27）。
+     *
+     * 两步走：先只读尺寸（inJustDecodeBounds），再按 2 的幂采样解码，
+     * 保证解码后长边不超过 [PREVIEW_DECODE_DIMENSION]。
+     */
+    private fun decodePreviewSampled(imageBytes: ByteArray): android.graphics.Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bounds)
+        val longest = maxOf(bounds.outWidth, bounds.outHeight)
+        if (longest <= 0) return null
+
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sh.hnet.comfychair.util.BitmapDecodeUtils.sampleSizeFor(
+                longest, PREVIEW_DECODE_DIMENSION
+            )
+        }
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
     }
 
     /**
@@ -998,24 +1449,36 @@ object ConnectionManager {
     }
 
     /**
-     * Schedule WebSocket reconnection with exponential backoff
+     * Schedule WebSocket reconnection with exponential backoff.
+     *
+     * @return true 表示本次已排上重连（状态已写成 [WebSocketState.Reconnecting]）；
+     *         false 表示被离线/手动重连中/被阻断拦下，**没有**任何状态写入，
+     *         调用方需要自己收尾（见 [onFailure] 的失败终态）。
      */
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(): Boolean {
+        // 收尾过渡态（条目 4.1）：下面三个提前 return 分支都不写状态，
+        // 若此时还停在 Connecting / Reconnecting，界面会永久显示"连接中/重连中"。
+        val collapsed = WebSocketRecoveryPolicy.collapseTransitional(_webSocketState.value)
+        if (collapsed != _webSocketState.value) {
+            DebugLogger.d(TAG, "scheduleReconnect: 收敛过渡态 ${_webSocketState.value} -> $collapsed")
+            _webSocketState.value = collapsed
+        }
+
         // 已切到离线态：不重连（离线由看门狗负责探测恢复）
         if (isOffline) {
             DebugLogger.d(TAG, "scheduleReconnect: skipped (offline mode)")
-            return
+            return false
         }
 
         // Don't auto-reconnect if manual retry or ensureConnection is in progress
         if (_isReconnecting.value || _isConnecting.value) {
             DebugLogger.d(TAG, "scheduleReconnect: skipped (manual reconnection in progress)")
-            return
+            return false
         }
 
         if (reconnectBlocked) {
             DebugLogger.d(TAG, "scheduleReconnect: skipped (blocked: logout / auth failure / offline)")
-            return
+            return false
         }
 
         reconnectAttempts++
@@ -1036,6 +1499,7 @@ object ConnectionManager {
                 DebugLogger.d(TAG, "scheduleReconnect: cancelled (session invalidated)")
             }
         }
+        return true
     }
 
     /**
@@ -1043,8 +1507,32 @@ object ConnectionManager {
      * @param sessionId The reconnection session ID for stale callback detection
      */
     private fun reconnectWebSocket(sessionId: Long) {
-        val client = _client ?: return
+        val client = _client ?: run {
+            // 没有客户端就没法重连；不能把状态丢在 Reconnecting 里等一个永远不会来的回调
+            DebugLogger.w(TAG, "reconnectWebSocket: client 为空，收敛状态")
+            _webSocketState.value = WebSocketRecoveryPolicy.collapseTransitional(_webSocketState.value)
+            return
+        }
 
+        // NEW-1：退避期间可能已有别的入口把 WebSocket 建好（图库/主容器的
+        // generationViewModel.initialize 会直接 openWebSocket，且不取消这个退避 job）。
+        // 重连目标已经达成，绝不能再走下面的"作废代次 + 关 socket"：本次关闭触发的
+        // onClosed 会因代次已作废被丢弃，状态永久停在 Connected，而 openWebSocket
+        // 又会因 ALREADY_CONNECTED 拒绝重建 —— 不重启 App 无法自愈。
+        if (WebSocketRecoveryPolicy.shouldSkipReconnect(_webSocketState.value)) {
+            DebugLogger.d(TAG, "reconnectWebSocket: 已处于 Connected，跳过本轮重连")
+            return
+        }
+
+        // D1：每次重连都会换一条 socket，先作废旧监听器再关，避免旧回调把新一轮的
+        // 结果打回去（否则会多跑一整轮重连并造成状态闪断）
+        invalidateWebSocketCallbacks()
+        // NEW-1：代次已作废，本次关闭的 onClosed/onFailure 都会被丢弃，所以必须由这里
+        // 自己把状态从原值挪开。写 Reconnecting（而不是留给后面）有两个作用：
+        // 1) 后续 openWebSocket 不会命中 ALREADY_CONNECTED，一定会重建；
+        // 2) 即使 testConnection 回调被 session 校验丢掉，界面也停在"重连中"而不是
+        //    "已连接"这种假象（transitional 由调用方/下一轮收敛）。
+        _webSocketState.value = WebSocketState.Reconnecting(reconnectAttempts, 0)
         client.closeWebSocket()
 
         client.testConnection { success, errorMessage, _, failureType ->
@@ -1076,14 +1564,20 @@ object ConnectionManager {
     /**
      * Poll the server queue and update JobRegistry.
      * Used to validate jobs on app restart and sync state.
+     *
+     * P1-5：`/queue` 的响应是**请求发出那一刻**的快照。必须先取登记水位再发请求，
+     * 否则请求在飞期间刚 registerJob 的任务（必然不在这份快照里）会被对账逻辑
+     * 当成"服务器上已不存在"删掉 —— 表现就是"刚提交的任务从本地列表消失、
+     * 按钮计数回退，而服务器其实正在跑"。
      */
     fun pollQueueStatus() {
         val client = _client ?: return
+        val snapshotSeq = JobRegistry.beginQueueSnapshot()
         client.fetchQueue { queueJson ->
             if (queueJson != null) {
                 val running = queueJson.optJSONArray("queue_running")
                 val pending = queueJson.optJSONArray("queue_pending")
-                JobRegistry.updateFromServerQueue(running, pending)
+                JobRegistry.updateFromServerQueue(running, pending, snapshotSeq)
             }
         }
     }
@@ -1134,13 +1628,42 @@ object ConnectionManager {
         }
 
         DebugLogger.i(TAG, "Fetching server data from /object_info")
-        _modelCache.value = _modelCache.value.copy(isLoading = true, lastError = null)
+        // 本次拉取的会话代次：回调与磁盘预填都按它判新旧（G7 指令 3「不得在过渡态下
+        // 发起而再次被吞」的落点 —— 过渡态/旧会话的迟到响应一律丢弃）
+        val generationAtStart = modelListGeneration
+        // G8 指令 1：三类分别置 PENDING，让「加载态仅在全部类型进入终态后清除」有据可依；
+        // 这里只置状态、绝不清空列表（G7 指令 1「已有数据不得被清空」）
+        _modelCache.value = _modelCache.value.copy(
+            isLoading = true,
+            lastError = null,
+            unetState = CategoryLoadState.PENDING,
+            vaeState = CategoryLoadState.PENDING,
+            clipState = CategoryLoadState.PENDING,
+            unetFailure = CategoryFailureReason.NONE,
+            vaeFailure = CategoryFailureReason.NONE,
+            clipFailure = CategoryFailureReason.NONE,
+            generation = generationAtStart
+        )
+        // G8 指令 2 的兜底：回调若因任何原因没回来（隧道挂起、进程被冻结后网络悬空），
+        // 看门狗到点强制三类落 FAILED，绝不让「正在加载模型列表…」长期驻留
+        armModelListWatchdog(generationAtStart)
 
         // 【秒出】先用磁盘缓存把列表铺上，网络最新版回来后再静默替换
-        primeModelCacheFromDisk()
+        primeModelCacheFromDisk(generationAtStart)
 
         client.fetchFullObjectInfo { objectInfo ->
             try {
+                // 代次已变：这次响应属于上一个连接会话（退出重连 / 切服务器期间到达），
+                // 丢掉即可 —— 新会话自己会发起拉取，绝不能用旧列表把新界面盖回去
+                if (generationAtStart != modelListGeneration) {
+                    DebugLogger.i(
+                        TAG,
+                        "丢弃迟到的 /object_info 响应：会话代次 $generationAtStart 已作废" +
+                                "（当前 $modelListGeneration）"
+                    )
+                    // 只跳过响应处理；finally 仍会释放闸门（本回调确实已结束）
+                    return@fetchFullObjectInfo
+                }
                 if (objectInfo != null) {
                     // Q3-1：解析 + 就绪信号 + 列表提取收成原子段（见 [applyObjectInfo]）
                     val models = applyObjectInfo(objectInfo)
@@ -1153,7 +1676,7 @@ object ConnectionManager {
                     // 模型介绍**热更新**：把服务器上的介绍数据取回来（新下载的模型不必等发版）。
                     // 必须排在 ensureLoaded 之后 —— 同步要用刚装好的本地表做比对基准；
                     // 放在回调里而不是 fetchServerData 开头，是为了不跟 8MB 的 /object_info 抢带宽，
-                    // 也避免列表拉取失败时白拉一次介绍。
+                    // 也避免列表列表拉取失败时白拉一次介绍。
                     syncModelIntros()
 
                     // Cache object_info to disk for offline mode
@@ -1163,7 +1686,14 @@ object ConnectionManager {
                         ObjectInfoCache.saveObjectInfo(ctx, serverId, objectInfo)
                     }
 
-                    _modelCache.value = models.copy(isLoaded = true, isLoading = false)
+                    cancelModelListWatchdog()
+                    // 三类终态已在 extractModelLists 里逐类算好（G8 指令 1），这里只收整体标志：
+                    // 加载态仅在全部类型进入终态后清除（G8 指令 2）
+                    _modelCache.value = models.copy(
+                        isLoaded = true,
+                        isLoading = false,
+                        generation = generationAtStart
+                    )
                     DebugLogger.i(TAG, "Server data loaded: ${models.checkpoints.size} checkpoints, " +
                             "${models.unets.size} unets, ${models.vaes.size} vaes, " +
                             "${models.clips.size} clips, ${models.loras.size} loras")
@@ -1175,20 +1705,43 @@ object ConnectionManager {
                                 "ckpt=${models.checkpoints.size}, unet=${models.unets.size}, " +
                                 "vae=${models.vaes.size}, clip=${models.clips.size}, lora=${models.loras.size}"
                     )
+                    // G8 指令 1/3：单类提取失败必须可见、带原因 —— 整体成功不等于三类都成功
+                    logCategoryFailures(models)
                 } else {
                     DebugLogger.w(TAG, "Failed to fetch server data")
+                    cancelModelListWatchdog()
                     // 失败不清已加载列表（可能还有磁盘预填的旧数据可显示），只置错误
-                    // 供 UI 区分「失败（可重试）」与「空（服务器真没模型）」（Q3-3）
-                    _modelCache.value = _modelCache.value.copy(
-                        isLoading = false,
-                        lastError = "Failed to fetch server data"
-                    )
+                    // 供 UI 区分「失败（可重试）」与「空（服务器真没模型）」（Q3-3）；
+                    // 三类一并落 FAILED(请求失败)，不再让某一类独自停在 PENDING 变成「正在加载」
+                    markCategoriesFailed("Failed to fetch server data")
                 }
             } finally {
                 // 成功、失败、回调内异常三条路径都必须释放闸门——忘记复位会让
                 // 之后所有补拉/手点被永久跳过（见 [SingleFlight] 类注释）
                 objectInfoFetchGate.exit()
             }
+        }
+    }
+
+    /**
+     * 把「某一类模型提取失败」写进日志（G8 指令 3：UNET 提取失败需带原因）。
+     *
+     * 现场排查全靠这几行 logcat：整体 isLoaded=true 时，界面上只有那一类是空的，
+     * 没有日志根本分不清是节点没装、字段改名，还是服务器真没放模型。
+     */
+    private fun logCategoryFailures(models: ModelCache) {
+        CoreCategory.entries.forEach { category ->
+            val state = models.stateOf(category)
+            if (state != CategoryLoadState.FAILED) return@forEach
+            android.util.Log.w(
+                "ComfyChairModels",
+                "模型提取失败: 类别=${category.name}, 原因=${models.failureOf(category).name}, " +
+                        "候选数=${when (category) {
+                            CoreCategory.UNET -> models.unets.size
+                            CoreCategory.VAE -> models.vaes.size
+                            CoreCategory.CLIP -> models.clips.size
+                        }}"
+            )
         }
     }
 
@@ -1231,7 +1784,7 @@ object ConnectionManager {
      * 只填一次（当前已有数据就跳过，也防旧缓存覆盖刚回来的新数据）；`isLoading` 保持 true，
      * 界面据此知道后台仍在刷新。
      */
-    private fun primeModelCacheFromDisk() {
+    private fun primeModelCacheFromDisk(generation: Long = modelListGeneration) {
         if (_modelCache.value.isLoaded) return
         val ctx = _applicationContext ?: return
         val serverId = currentServerId ?: return
@@ -1247,12 +1800,32 @@ object ConnectionManager {
             }
             // 读盘期间网络可能已经回来了 —— 别用旧缓存盖掉新数据
             if (_modelCache.value.isLoaded) return@launch
+            // 代次已变（用户在这期间退出重连 / 切了服务器）：这份缓存属于旧会话，
+            // 铺上去会盖掉新会话的结果，直接丢弃
+            if (generation != modelListGeneration) {
+                DebugLogger.i(TAG, "磁盘预填作废：会话代次 $generation 已不再是当前代次")
+                return@launch
+            }
 
             // Q3-1：parse + 就绪信号 + 提取走与网络回调同一把锁的原子段，
             // 两条链路不再交错清空/覆盖同一份节点表
             val models = applyObjectInfo(cached)
             ModelIntroTable.ensureLoaded(ctx)
-            _modelCache.value = models.copy(isLoaded = true, isLoading = true)
+            // 预填后的加载标志（G8 指令 2）：
+            // 三类终态由 applyObjectInfo → extractModelLists 逐类算好（磁盘那份同样是终态，
+            // 因为它是上次成功拉取的完整 /object_info），因此预填**不**把整体 isLoading 强设为 true。
+            //
+            // 旧实现无条件 `copy(isLoaded = true, isLoading = true)`，含义是「后台仍在拉最新」；
+            // 保留这个含义的唯一正确依据是**闸门是否还占着**（真有请求在飞）：
+            // - 在飞 → isLoading=true，界面继续显示加载语义，网络版回来后静默替换；
+            // - 已不占（网络回调先跑完并释放了闸门）→ 必须写 false。旧写法在这种交错下会把
+            //   已经收敛的加载态重新点亮，而这条链路上再没有第二个回调来熄灭它 ——
+            //   这正是 E7「UNET 长期显示正在加载模型列表…」不收敛的一条真实成因。
+            _modelCache.value = models.copy(
+                isLoaded = true,
+                isLoading = objectInfoFetchGate.isInFlight,
+                generation = generation
+            )
             android.util.Log.i(
                 "ComfyChairModels",
                 "已用磁盘缓存预填模型列表（后台仍在拉最新）: ckpt=${models.checkpoints.size}, " +
@@ -1272,6 +1845,63 @@ object ConnectionManager {
             return
         }
         DebugLogger.i(TAG, "Refreshing server data")
+        fetchServerData()
+    }
+
+    /**
+     * G7 指令 1 的「必检」入口：后台返回 / 重连收敛后，按纯函数判定要不要重拉模型列表。
+     *
+     * 调用点有两个，缺一不可（这正是历史 Q3「修了没生效」的补位）：
+     * 1. [MainContainerActivity] 的 onResume —— 进程存活、连接没断的普通回前台；
+     * 2. WebSocket `onOpen`（重连收敛后）—— 长时间后台后 WebSocket 被掐、需要静默重连的路径。
+     *    只在 onResume 检会有时序洞：此刻连接状态机常常还在过渡态（重连在飞），
+     *    直接发请求要么被闸门挡掉、要么打到即将被 [connect] 重建的旧 client 上（再次被吞）。
+     *    所以过渡态下这里**不发起**，留到 onOpen 收敛后再检一次。
+     *
+     * 判据全部交给 [decideModelListReload]（纯函数、有单测）：
+     * - 已有数据且三类健康 → SKIP_HEALTHY，**绝不清空已有列表**；
+     * - 三类未全终态（E7 僵尸加载）或任一 FAILED 或核心列表全空 → RELOAD 一次。
+     */
+    fun ensureModelListLoadedAfterResume() {
+        // 连接是否收敛到稳定态：离线态不算（它靠离线缓存填充，不该打在线请求）
+        val connectionSettled = _client != null &&
+            _connectionState.value is ConnectionState.Connected
+        // 是否真有 /object_info 在飞：闸门占用即视为在飞
+        val inFlight = objectInfoFetchGate.isInFlight
+
+        val cache = _modelCache.value
+        when (cache.reloadDecision(connectionSettled = connectionSettled, inFlight = inFlight)) {
+            ModelListReloadDecision.RELOAD -> {
+                DebugLogger.i(
+                    TAG,
+                    "模型列表必检：触发重拉（unet=${cache.unetState}, vae=${cache.vaeState}, " +
+                            "clip=${cache.clipState}, isLoaded=${cache.isLoaded}, 核心有数据=${cache.hasAnyCoreModel()}）"
+                )
+                fetchServerData()
+            }
+            ModelListReloadDecision.SKIP_TRANSIENT_CONNECTION ->
+                DebugLogger.d(TAG, "模型列表必检：连接未收敛，跳过（等 onOpen 再检）")
+            ModelListReloadDecision.SKIP_IN_FLIGHT ->
+                DebugLogger.d(TAG, "模型列表必检：已有 /object_info 在飞，跳过叠加")
+            ModelListReloadDecision.SKIP_HEALTHY ->
+                DebugLogger.d(TAG, "模型列表必检：三类均已终态且有数据，保留现状不重拉")
+        }
+    }
+
+    /**
+     * 单独重试某一类核心模型（G8 指令 1「任一失败必须可见并可单独重试」）。
+     *
+     * 三类同源（都来自同一次 /object_info 提取），因此「单独重试 UNET」在实现上等价于
+     * 重新拉一次 /object_info —— 但**调用语义是单类**：UI 只在 UNET 行给出重试入口，
+     * 拉取成功后三类各自按 [diagnoseCategory] 重新上报终态，UNET 若仍失败会带着
+     * 节点缺失/字段缺失的原因继续可见。用 [refreshServerData] 相同的连接前置条件。
+     */
+    fun retryCoreCategory(category: CoreCategory?) {
+        DebugLogger.i(TAG, "单独重试模型类别：$category")
+        if (_client == null) {
+            DebugLogger.w(TAG, "retryCoreCategory: Not connected")
+            return
+        }
         fetchServerData()
     }
 
@@ -1310,7 +1940,7 @@ object ConnectionManager {
                 serverId = server.id,
                 hostname = server.hostname,
                 port = server.port,
-                protocol = protocol ?: _client?.getWorkingProtocol() ?: "https",
+                protocol = protocol ?: server.protocol ?: _client?.getWorkingProtocol() ?: "https",
                 credentials = credentials
             )
         }
@@ -1467,7 +2097,14 @@ object ConnectionManager {
         }
 
         _clientId = _clientId ?: "comfychair_android_${UUID.randomUUID()}"
-        _client = ComfyUIClient(context, session.hostname, session.port, session.credentials).apply {
+        _client = ComfyUIClient(
+            context,
+            session.hostname,
+            session.port,
+            session.credentials,
+            session.serverId,
+            preferredProtocol = session.protocol
+        ).apply {
             setWorkingProtocol(session.protocol)
             setClientId(_clientId!!)
             setOnSessionExpired {
@@ -1493,7 +2130,7 @@ object ConnectionManager {
             serverId = server.id,
             hostname = server.hostname,
             port = server.port,
-            protocol = _client?.getWorkingProtocol() ?: "https",
+            protocol = server.protocol ?: _client?.getWorkingProtocol() ?: "https",
             credentials = credentials
         )
     }
@@ -1679,7 +2316,7 @@ object ConnectionManager {
      * For example, "text_encoder_name" placeholder maps to "text_encoder" field in LTXAVTextEncoderLoader.
      */
     private fun extractModelLists(): ModelCache {
-        return ModelCache(
+        val base = ModelCache(
             checkpoints = nodeTypeRegistry.getOptionsForField(
                 TemplateKeyRegistry.getJsonKeyForPlaceholder("ckpt_name")
             ),
@@ -1727,5 +2364,63 @@ object ConnectionManager {
             aspectRatios = nodeTypeRegistry.getOptionsForNodeInput("ResolutionSelector", "aspect_ratio"),
             speedModes = nodeTypeRegistry.getOptionsForNodeInput("TESpeedMiniMaxH3", "mode")
         )
+
+        // ── G8 指令 1 / 3：三类核心模型分别上报终态，UNET 失败带原因 ──────────────
+        //
+        // 这里只做「提取层」的诊断（请求已经成功，故 requestFailed=false）。
+        // UNET 与 VAE/CLIP 来源字段不同，单类来源缺失会让 UNET 落 FAILED 而另两类照例 OK，
+        // 不再被整体「成功」掩盖成「UNET 沉默留空」。
+        val unetKey = TemplateKeyRegistry.getJsonKeyForPlaceholder("unet_name")
+        val vaeKey = TemplateKeyRegistry.getJsonKeyForPlaceholder("vae_name")
+        // CLIP 用前缀匹配（clip_name / clip_name1…），诊断口径与之对齐
+        val clipPrefix = TemplateKeyRegistry.getJsonKeyForPlaceholder("clip_name")
+
+        val unetDiag = diagnoseCategory(
+            requestFailed = false,
+            inputFieldExists = nodeTypeRegistry.anyNodeDeclaresField(unetKey),
+            fieldHasOptions = nodeTypeRegistry.anyNodeFieldHasOptions(unetKey),
+            optionCount = base.unets.size
+        )
+        val vaeDiag = diagnoseCategory(
+            requestFailed = false,
+            inputFieldExists = nodeTypeRegistry.anyNodeDeclaresField(vaeKey),
+            fieldHasOptions = nodeTypeRegistry.anyNodeFieldHasOptions(vaeKey),
+            optionCount = base.vaes.size
+        )
+        val clipDiag = diagnoseCategory(
+            requestFailed = false,
+            inputFieldExists = nodeTypeRegistry.anyNodeDeclaresField(clipPrefix, matchPrefix = true),
+            fieldHasOptions = nodeTypeRegistry.anyNodeFieldHasOptions(clipPrefix, matchPrefix = true),
+            optionCount = base.clips.size
+        )
+
+        return base.copy(
+            unetState = unetDiag.state,
+            vaeState = vaeDiag.state,
+            clipState = clipDiag.state,
+            unetFailure = unetDiag.reason,
+            vaeFailure = vaeDiag.reason,
+            clipFailure = clipDiag.reason
+        )
+    }
+
+    /**
+     * 请求失败时把三类统一置为 FAILED(请求失败)（G8 指令 1）。
+     *
+     * **只改状态、不动列表**：磁盘预填或上一次成功可能已经铺了可显示的候选，
+     * 失败只是「这次没拿到最新」，不该把已有数据抹掉（Q3-4 / G7 指令 1 红线）。
+     */
+    private fun markCategoriesFailed(requestError: String) {
+        _modelCache.value = _modelCache.value.copy(
+            isLoading = false,
+            lastError = requestError,
+            unetState = CategoryLoadState.FAILED,
+            vaeState = CategoryLoadState.FAILED,
+            clipState = CategoryLoadState.FAILED,
+            unetFailure = CategoryFailureReason.REQUEST_FAILED,
+            vaeFailure = CategoryFailureReason.REQUEST_FAILED,
+            clipFailure = CategoryFailureReason.REQUEST_FAILED
+        )
     }
 }
+

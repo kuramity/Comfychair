@@ -1,5 +1,6 @@
 import java.io.File
 import java.util.Properties
+import org.gradle.api.GradleException
 
 plugins {
     alias(libs.plugins.android.application)
@@ -20,18 +21,19 @@ val localProperties = Properties().apply {
 val updateManifestUrl: String =
     localProperties.getProperty("comfychair.updateManifestUrl")?.trim().orEmpty()
 
+// release 签名：从 local.properties 读（该文件已被 .gitignore 忽略，不会进仓库）。
+// 四项齐全才创建正式签名配置；缺任何一项时 release 产物保持未签名，
+// 且 assembleRelease / bundleRelease 直接失败（P3-15，杜绝静默套用 debug 签名）。
+// keystore 与口令位置见 E:\Zcode\ZcodeProject\tools\comfychair\keys\README.md
+val releaseStoreFile = localProperties.getProperty("comfychair.storeFile").orEmpty().trim()
+val releaseKeyReady = releaseStoreFile.isNotEmpty() &&
+    File(releaseStoreFile).exists() &&
+    !localProperties.getProperty("comfychair.storePassword").isNullOrBlank() &&
+    !localProperties.getProperty("comfychair.keyAlias").isNullOrBlank()
+
 android {
     namespace = "sh.hnet.comfychair"
     compileSdk = 36
-
-    // release 签名：从 local.properties 读（该文件已被 .gitignore 忽略，不会进仓库）。
-    // 四项齐全才创建正式签名配置，否则回退 debug —— 保证克隆源码的人没有 keystore 也能构建。
-    // keystore 与口令位置见 E:\Zcode\ZcodeProject\tools\comfychair\keys\README.md
-    val releaseStoreFile = localProperties.getProperty("comfychair.storeFile").orEmpty().trim()
-    val releaseKeyReady = releaseStoreFile.isNotEmpty() &&
-        File(releaseStoreFile).exists() &&
-        !localProperties.getProperty("comfychair.storePassword").isNullOrBlank() &&
-        !localProperties.getProperty("comfychair.keyAlias").isNullOrBlank()
 
     signingConfigs {
         if (releaseKeyReady) {
@@ -58,8 +60,8 @@ android {
         // versionCode 与版本名**解耦**：每次发版 +1，只保证单调递增（Android 的硬性要求）。
         // ⚠️ 发版前务必同时改这两行：只 cp 改文件名不改这里，会得到一个 versionCode
         //    与上一版完全相同的包（装不上也分不清，v0.9.33 踩过）。
-        versionCode = 134
-        versionName = "v4.16.10"
+        versionCode = 137
+        versionName = "v4.16.13"
 
         // 更新清单地址注入 BuildConfig（空字符串 = 未配置更新源）
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"$updateManifestUrl\"")
@@ -74,11 +76,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 有正式 keystore 就用它，否则回退 debug（克隆源码的人没 keystore 也能构建）
-            signingConfig = if (releaseKeyReady) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
+            // P3-15：不再静默回退 debug 签名。debug keystore 人人都有，debug 签名的 release
+            // 包可被任意重签伪造（也无法上架/升级覆盖正式包）。没有正式 keystore 时保持未签名
+            // —— 产物名会带 -unsigned，且 assembleRelease / bundleRelease 会在任务启动时直接失败。
+            if (releaseKeyReady) {
+                signingConfig = signingConfigs.getByName("release")
             }
         }
     }
@@ -100,6 +102,25 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+}
+
+// P3-15：缺正式签名配置时，release 打包必须失败，而不是产出 debug 签名的包。
+// 只挂在真正打 release 包的任务上：clone 源码的人照样能 assembleDebug / 跑单测，
+// 但 assembleRelease / bundleRelease 会在开始执行时立刻报错并给出配置指引。
+if (!releaseKeyReady) {
+    tasks.configureEach {
+        if (name == "assembleRelease" || name == "bundleRelease") {
+            doFirst {
+                throw GradleException(
+                    "缺少 release 签名配置，已拒绝产出 debug 签名的 release 包。" +
+                        "请在 local.properties 写入 comfychair.storeFile / " +
+                        "comfychair.storePassword / comfychair.keyAlias / " +
+                        "comfychair.keyPassword（keystore 与口令位置见 " +
+                        "E:\\Zcode\\ZcodeProject\\tools\\comfychair\\keys\\README.md）。"
+                )
+            }
         }
     }
 }

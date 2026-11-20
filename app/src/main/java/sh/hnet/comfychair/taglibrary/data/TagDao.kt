@@ -13,8 +13,8 @@ import sh.hnet.comfychair.taglibrary.search.AliasParser
  * 严禁字符串拼接；LIKE 通配符由 [escapeLike] 转义并配合 ESCAPE 子句，
  * 避免用户输入中的 % / _ 被当作通配符。
  *
- * 性能约束：所有查询走 (category, count) 复合索引或 tag 主键索引；
- * 单次返回条数由调用方限制（默认 200），避免大结果集。
+ * 性能约束：精确/前缀匹配走 tag 主键索引；子串匹配（`%关键词%`）没有可用索引，
+ * 只作为内存索引未就绪时的兜底，调用方必须限制关键词长度与返回条数。
  */
 class TagDao(private val db: SQLiteDatabase) {
 
@@ -57,13 +57,33 @@ class TagDao(private val db: SQLiteDatabase) {
 
     /**
      * 前缀匹配标签名（走主键索引范围扫描，避免全表扫描）。
+     *
+     * 不用 `LIKE ? ESCAPE '\'`：SQLite 的 LIKE 索引优化在带 ESCAPE 子句时直接放弃
+     * （官方限制），实测 170.7 万行上退化为 `SCAN tags` + 临时排序（约 140ms，
+     * 手机上更慢）。库内标签名全部是小写（实测 `tag != lower(tag)` 为 0 行），
+     * 因此把关键词转小写后用 `tag >= 前缀 AND tag < 前缀上界` 走主键自动索引
+     * （实测 `SEARCH tags USING INDEX sqlite_autoindex_tags_1`，约 15ms），
+     * 且范围比较是字面量语义，`%` / `_` 无需再转义。
      */
     fun searchByNamePrefix(keyword: String, limit: Int = DEFAULT_LIMIT): List<Tag> {
-        val sql = "SELECT $COLUMNS FROM tags WHERE tag LIKE ? ESCAPE '\\' " +
+        val prefix = keyword.lowercase()
+        if (prefix.isEmpty()) return emptyList()
+        val sql = "SELECT $COLUMNS FROM tags WHERE tag >= ? AND tag < ? " +
                 "ORDER BY count DESC LIMIT ?"
-        return db.rawQuery(sql, arrayOf(escapeLike(keyword) + "%", limit.toString())).use { c ->
-            c.toTagList()
-        }
+        return db.rawQuery(
+            sql,
+            arrayOf(prefix, prefixUpperBound(prefix), limit.toString())
+        ).use { c -> c.toTagList() }
+    }
+
+    /**
+     * 前缀的排他上界：把最后一个字符加一（如 `ab` → `ac`），
+     * 这样 `[前缀, 上界)` 恰好覆盖所有以前缀开头的字符串，不依赖字符编码细节。
+     */
+    private fun prefixUpperBound(prefix: String): String {
+        val last = prefix.last()
+        if (last == Char.MAX_VALUE) return prefix + Char.MAX_VALUE
+        return prefix.dropLast(1) + (last + 1)
     }
 
     /**
@@ -127,11 +147,18 @@ class TagDao(private val db: SQLiteDatabase) {
     }
 
     /**
-     * 预载全部有别名标签（构建内存别名索引用）。
-     * 仅取 tag + alias 两列，减少内存开销。
+     * 预载全部有别名标签（构建内存别名索引用）。**按热度降序**返回：
+     *
+     * 内存索引在这些行上顺序灌入中文子串条目，检索时命中上限一到就 break。
+     * 若按 rowid（物理写入顺序）返回，截断结果会是「最先存进库的标签」而不是
+     * 「最热门的标签」，同一个关键词在不同设备/不同库版本上给出的前几条会不一样，
+     * 冷门标签也可能挤掉热门标签。排序后截断即等于「最热命中优先」。
+     *
+     * 排序代价：仅 70,977 行（实测 `alias != ''` 的行数），一次性建索引时约 230ms，
+     * 相对整个索引构建（数秒）可忽略。
      */
     fun loadAliasRows(): List<Pair<String, String>> {
-        val sql = "SELECT tag, alias FROM tags WHERE alias != ''"
+        val sql = "SELECT tag, alias FROM tags WHERE alias != '' ORDER BY count DESC"
         return db.rawQuery(sql, null).use { c ->
             val out = ArrayList<Pair<String, String>>(c.count)
             while (c.moveToNext()) out.add(c.getString(0) to c.getString(1))

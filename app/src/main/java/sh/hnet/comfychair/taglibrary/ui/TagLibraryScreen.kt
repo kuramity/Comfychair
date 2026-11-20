@@ -47,7 +47,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -107,6 +106,8 @@ fun TagLibraryScreen(
                     context.getString(R.string.tag_copied)
                 is TagLibraryViewModel.Event.CopyFailed ->
                     context.getString(R.string.tag_copy_failed)
+                is TagLibraryViewModel.Event.StorageCorrupted ->
+                    context.getString(R.string.error_local_store_corrupted)
                 is TagLibraryViewModel.Event.InitFailed ->
                     context.getString(R.string.tag_error_init, event.message)
             }

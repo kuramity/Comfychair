@@ -51,6 +51,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.compose.PlayerSurface
@@ -125,6 +128,15 @@ fun VideoPlayer(
     }
     var videoWidth by remember(cacheKey) { mutableStateOf(cachedDimensions?.width ?: 0) }
     var videoHeight by remember(cacheKey) { mutableStateOf(cachedDimensions?.height ?: 0) }
+
+    // F7：播放期间向 MediaCache 登记"正在使用"，否则为其它视频生成 URI 时的临时文件
+    // 清理可能把本视频的文件删掉（A 已 prepare、ExoPlayer 尚未打开文件的窗口）。
+    // 只有带 cacheKey 的调用（图库/查看器）需要；生成页走 MediaStateHolder 的独立登记。
+    DisposableEffect(cacheKey) {
+        val key = cacheKey
+        if (key != null) MediaCache.registerPlayingVideo(key)
+        onDispose { if (key != null) MediaCache.unregisterPlayingVideo(key) }
+    }
 
     // Zoom/pan state
     val scaleAnimatable = remember { Animatable(1f) }
@@ -528,6 +540,9 @@ fun VideoPlayer(
                 // Use shared ExoPlayer instance with reference counting
                 val exoPlayer = remember { SharedVideoPlayer.registerConsumer(context) }
 
+                // P1-30：宿主退后台暂停、回前台恢复（修复前视频在后台继续播）
+                BindSharedVideoPlayerToLifecycle()
+
                 // Unregister when leaving composition
                 DisposableEffect(Unit) {
                     onDispose {
@@ -704,6 +719,9 @@ fun FullscreenVideoPlayer(
     // Use shared ExoPlayer instance with reference counting
     val exoPlayer = remember { SharedVideoPlayer.registerConsumer(context) }
 
+    // P1-30：宿主退后台暂停、回前台恢复（修复前视频在后台继续播）
+    BindSharedVideoPlayerToLifecycle()
+
     // Unregister when leaving composition
     DisposableEffect(Unit) {
         onDispose {
@@ -785,5 +803,34 @@ fun FullscreenVideoPlayer(
                 )
             }
         }
+    }
+}
+
+/**
+ * 把共享播放器的播放状态绑到**宿主生命周期**（P1-30）。
+ *
+ * 修复前 `SharedVideoPlayer` 只按"组件是否在组合中"计数：Activity 退到后台时
+ * Compose 树仍然在（只是不可见），消费者计数不变，ExoPlayer 的 playWhenReady
+ * 也保持 true —— 视频退后台继续播、继续解码。
+ *
+ * 这里用宿主的 Lifecycle 兜住：
+ * - ON_STOP  → 暂停（并记住"本来在播"）；
+ * - ON_START → 仅当之前是在播时才恢复。
+ *
+ * 重复注册（同页多个 VideoPlayer）是安全的：暂停/恢复在 SharedVideoPlayer 内幂等。
+ */
+@Composable
+private fun BindSharedVideoPlayerToLifecycle() {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> SharedVideoPlayer.onHostStopped()
+                Lifecycle.Event.ON_START -> SharedVideoPlayer.onHostStarted()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 }

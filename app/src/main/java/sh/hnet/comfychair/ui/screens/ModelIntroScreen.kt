@@ -42,6 +42,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.model.LoraEffectTable
 import sh.hnet.comfychair.model.ModelIntro
@@ -132,11 +134,17 @@ fun ModelIntroScreen(onBack: () -> Unit) {
     var archiveJoined by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
 
     LaunchedEffect(Unit) {
-        ModelIntroTable.ensureLoaded(context)
-        entries = ModelIntroTable.all()
-        // 效果档案在介绍表之后装载：orphans 的判定要先拿到介绍表收录的文件名集合
-        LoraEffectTable.ensureLoaded(context)
-        val effects = LoraEffectTable.all()
+        // P2-17：模型介绍表是 513KB 的 JSON，读取 + 解析原先在主线程同步执行，
+        // 进页面时会卡住首帧。整段装载（含效果档案）放到 IO 线程，只回主线程写状态。
+        val loaded = withContext(Dispatchers.IO) {
+            ModelIntroTable.ensureLoaded(context)
+            val introList = ModelIntroTable.all()
+            // 效果档案在介绍表之后装载：orphans 的判定要先拿到介绍表收录的文件名集合
+            LoraEffectTable.ensureLoaded(context)
+            introList to LoraEffectTable.all()
+        }
+        entries = loaded.first
+        val effects = loaded.second
         if (effects.isNotEmpty()) {
             val known = entries.map { it.file.lowercase() }.toSet()
             val (joined, orphans) = splitArchiveKeys(effects.keys.toList().sorted(), known)

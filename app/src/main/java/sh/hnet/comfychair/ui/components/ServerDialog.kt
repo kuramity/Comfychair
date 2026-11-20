@@ -49,6 +49,7 @@ import sh.hnet.comfychair.R
 import sh.hnet.comfychair.model.AuthCredentials
 import sh.hnet.comfychair.model.AuthType
 import sh.hnet.comfychair.model.Server
+import sh.hnet.comfychair.util.ServerUrlUtils
 
 /**
  * Dialog for adding or editing a server configuration.
@@ -66,32 +67,27 @@ fun ServerDialog(
     existingCredentials: AuthCredentials = AuthCredentials.None,
     isNameTaken: (name: String, excludeServerId: String?) -> Boolean,
     onDismiss: () -> Unit,
-    onSave: (name: String, hostname: String, port: Int, authType: AuthType, credentials: AuthCredentials) -> Unit
+    onSave: (name: String, hostname: String, port: Int, authType: AuthType, credentials: AuthCredentials, protocol: String?) -> Unit
 ) {
     val isEditMode = server != null
 
+    // P3-6：对话框在切换编辑对象时并不会离开组合（宿主只改 server 参数），
+    // 无 key 的 remember 会保留上一台服务器的字段 —— 尤其是账号/密码/token，
+    // 保存时就会被写到当前这一台上。所有字段必须按「服务器 id + 已存凭据」重建。
+    val formKey = server?.id to existingCredentials
+    val initial = remember(formKey) { serverDialogInitialState(server, existingCredentials) }
+
     // Form state
-    var name by remember { mutableStateOf(server?.name ?: "") }
-    var hostname by remember { mutableStateOf(server?.hostname ?: "") }
-    var port by remember { mutableStateOf(server?.port?.toString() ?: "8188") }
+    var name by remember(formKey) { mutableStateOf(initial.name) }
+    // 编辑时把已保存的协议显示出来，让用户看得见当前选择（可改前缀或改回自动）
+    var hostname by remember(formKey) { mutableStateOf(initial.hostname) }
+    var port by remember(formKey) { mutableStateOf(initial.port) }
 
     // Authentication state
-    var authType by remember { mutableStateOf(server?.authType ?: AuthType.NONE) }
-    var username by remember {
-        mutableStateOf(
-            (existingCredentials as? AuthCredentials.Basic)?.username ?: ""
-        )
-    }
-    var password by remember {
-        mutableStateOf(
-            (existingCredentials as? AuthCredentials.Basic)?.password ?: ""
-        )
-    }
-    var token by remember {
-        mutableStateOf(
-            (existingCredentials as? AuthCredentials.Bearer)?.token ?: ""
-        )
-    }
+    var authType by remember(formKey) { mutableStateOf(initial.authType) }
+    var username by remember(formKey) { mutableStateOf(initial.username) }
+    var password by remember(formKey) { mutableStateOf(initial.password) }
+    var token by remember(formKey) { mutableStateOf(initial.token) }
     var passwordVisible by remember { mutableStateOf(false) }
     var tokenVisible by remember { mutableStateOf(false) }
 
@@ -106,17 +102,8 @@ fun ServerDialog(
     // Focus requester for name field
     val nameFocusRequester = remember { FocusRequester() }
 
-    // Regex patterns for validation
-    val ipAddressPattern = remember {
-        Regex("^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$")
-    }
-    val hostnamePattern = remember {
-        Regex("^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9])\\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\\-]*[A-Za-z0-9])$")
-    }
-
-    fun isValidHostname(value: String): Boolean {
-        return ipAddressPattern.matches(value) || hostnamePattern.matches(value)
-    }
+    // 允许用户输入带 scheme 的地址（http://host），校验只针对剥离后的纯主机名
+    fun isValidHostname(value: String): Boolean = ServerUrlUtils.isValidHostname(value)
 
     // String resources
     val errorRequired = stringResource(R.string.error_required)
@@ -476,12 +463,14 @@ fun ServerDialog(
             Button(
                 onClick = {
                     if (validate()) {
+                        val (explicitProtocol, bareHostname) = ServerUrlUtils.splitProtocol(hostname.trim())
                         onSave(
                             name.trim(),
-                            hostname.trim(),
+                            bareHostname,
                             port.trim().toInt(),
                             authType,
-                            buildCredentials()
+                            buildCredentials(),
+                            explicitProtocol
                         )
                     }
                 }
@@ -494,5 +483,42 @@ fun ServerDialog(
                 Text(stringResource(R.string.button_cancel))
             }
         }
+    )
+}
+
+/**
+ * ServerDialog 表单的初始值（P3-6）。
+ *
+ * 抽成纯函数是为了让单元测试能直接钉住「字段由哪台服务器/哪份凭据决定」这一契约：
+ * 切换编辑对象时，账号、密码、token 必须跟着换，绝不能把上一台的值留在输入框里。
+ * 组合层用 `remember(server?.id to existingCredentials)` 调用它来重建状态。
+ */
+internal data class ServerDialogInitialState(
+    val name: String,
+    val hostname: String,
+    val port: String,
+    val authType: AuthType,
+    val username: String,
+    val password: String,
+    val token: String
+)
+
+/** 按服务器与已保存凭据推导表单初值；新增服务器（server == null）时用默认值。 */
+internal fun serverDialogInitialState(
+    server: Server?,
+    existingCredentials: AuthCredentials
+): ServerDialogInitialState {
+    // 新增分支必须给出空表单：即使调用方还持有上一台的凭据对象，也不能预填，
+    // 否则同样会把旧账号带到新服务器上（P3-6 的另一种触发路径）。
+    val credentials = if (server == null) AuthCredentials.None else existingCredentials
+    return ServerDialogInitialState(
+        name = server?.name ?: "",
+        // 编辑时把已保存的协议一并显示出来，让用户看得见当前选择（可改前缀或改回自动）
+        hostname = server?.protocol?.let { "$it://${server.hostname}" } ?: server?.hostname ?: "",
+        port = server?.port?.toString() ?: "8188",
+        authType = server?.authType ?: AuthType.NONE,
+        username = (credentials as? AuthCredentials.Basic)?.username ?: "",
+        password = (credentials as? AuthCredentials.Basic)?.password ?: "",
+        token = (credentials as? AuthCredentials.Bearer)?.token ?: ""
     )
 }

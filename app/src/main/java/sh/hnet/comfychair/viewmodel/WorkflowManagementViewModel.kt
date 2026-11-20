@@ -29,10 +29,10 @@ import sh.hnet.comfychair.workflow.WorkflowMappingState
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
-import sh.hnet.comfychair.util.FieldMappingAnalyzer
-import sh.hnet.comfychair.util.LiteGraphConverter
 import sh.hnet.comfychair.util.ValidationUtils
-import sh.hnet.comfychair.util.WorkflowJsonAnalyzer
+import sh.hnet.comfychair.workflow.convert.LiteGraphConverter
+import sh.hnet.comfychair.workflow.mapping.FieldMappingAnalyzer
+import sh.hnet.comfychair.workflow.validation.WorkflowJsonAnalyzer
 
 /**
  * Export format options

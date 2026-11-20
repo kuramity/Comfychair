@@ -13,6 +13,34 @@
     <!-- 下载完成通知（Android 13+ 运行时权限；被拒时静默跳过，弹窗仍是主入口） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 屏幕适配（7.3，方案 B：明确只支持手机）。
+
+         各 Activity 上的 android:screenOrientation="portrait" **保留不动**，它是竖屏
+         约束的主体。但下面两件事必须说清楚，别把“声明”当成“强制”：
+
+         1) 本元素在 targetSdk = 36 上**只是声明，不构成安装过滤**。API 13+ 起系统
+            不再据此过滤分发：largeScreens=false 的官方效果是「generally enables
+            screen compatibility mode」，requiresSmallestWidthDp 官方明确
+            “The Android system doesn't pay attention to this attribute... Google Play
+            currently doesn't support this attribute for filtering”。
+            也就是说：**平板 / 折叠屏展开态仍然可以安装本应用**，只是没做适配。
+         2) 竖屏锁定也有边界。Android 16（API 36）行为变更「Ignore orientation,
+            resizability, and aspect ratio restrictions」写明：targetSdk >= 36 的应用
+            在 smallest width >= 600dp 的屏幕上，screenOrientation、resizeableActivity、
+            min/maxAspectRatio 全部被忽略。因此单靠本元素 + portrait 并不能保证大屏竖屏。
+            为此在 <application> 里加了 PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY
+            的**临时** opt-out（见下），把大屏拉回兼容模式。
+
+         结论：本应用只面向手机，平板 / 折叠屏展开态未适配（600 处硬编码 dp、无
+         WindowSizeClass、无响应式布局）。等 opt-out 在 API 37 失效后若要继续锁竖屏，
+         必须改做真正的响应式适配（另行立项），本元素届时仍然只是声明。 -->
+    <supports-screens
+        android:smallScreens="true"
+        android:normalScreens="true"
+        android:largeScreens="false"
+        android:xlargeScreens="false"
+        android:requiresSmallestWidthDp="320" />
+
     <application
         android:allowBackup="true"
         android:largeHeap="true"
@@ -25,6 +53,20 @@
         android:networkSecurityConfig="@xml/network_security_config"
         android:localeConfig="@xml/locales_config"
         android:theme="@style/Theme.ComfyChair">
+
+        <!-- Android 16（API 36）起，targetSdk >= 36 的应用在 smallest width >= 600dp
+             的屏幕上会被系统忽略 screenOrientation / resizeableActivity / 宽高比限制
+             （官方行为变更 "Adaptive layouts"）。本应用只做手机竖屏，故用这个
+             **临时** opt-out 保住上面的 portrait 锁定，让大屏回到兼容模式。
+
+             官方原文：该 opt-out 在「targeting API level 37」后不再生效 ——
+             升 targetSdk 37 之前必须真正做响应式适配（或接受大屏可旋转、手机宽度
+             布局被拉伸），不能指望它长期兜底。 -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"
+            android:value="true"
+            tools:targetApi="36" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -59,9 +101,15 @@
             android:windowSoftInputMode="adjustResize" />
 
         <!-- MediaViewerActivity - Fullscreen media viewer -->
+        <!-- configChanges 是有意声明的（R2-F3）：单图模式的图片经静态 BitmapCache
+             一次性传入，取出即清（MediaViewerActivity.onCreate），Activity 一旦重建就再也
+             取不到，已生成的图会从查看器里消失。语言 / 布局方向 / 深色模式切换不重建本
+             Activity，Compose 会通过 LocalConfiguration 自行重组；屏幕方向已由
+             screenOrientation="portrait" 锁死。 -->
         <activity
             android:name=".MediaViewerActivity"
             android:exported="false"
+            android:configChanges="locale|layoutDirection|uiMode"
             android:screenOrientation="portrait"
             android:theme="@style/Theme.ComfyChair.Fullscreen" />
 
@@ -84,6 +132,18 @@
             android:exported="false"
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustResize" />
+
+        <!-- UpdateInstallActivity - 通知栏「安装」的无界面中转（P0-7 复核 R2-L1）。
+             点击通知时先落到这里，由它在点击的这一刻重新做包名/签名校验
+             （AppInstaller.install → isApkTrusted）再拉起系统安装器，消除
+             「通知已发出、尚未点击」期间替换 update.apk 的 TOCTOU 窗口。
+             透明主题保证不闪界面；校验完立即 finish()。 -->
+        <activity
+            android:name=".update.UpdateInstallActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- 内置更新模块（v4.7.1）：WorkManager 前台服务承载长时间下载。
              Android 14+ 要求显式声明 foregroundServiceType，且必须与

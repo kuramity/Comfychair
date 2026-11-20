@@ -13,12 +13,13 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import sh.hnet.comfychair.ui.components.SharedVideoPlayer
 import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.screens.MediaViewerScreen
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme
@@ -93,6 +94,9 @@ class MediaViewerActivity : ComponentActivity() {
     private var gallerySnapshot: Bitmap? = null
     private var galleryCellRect: ViewerRect? = null
 
+    /** P1-29：本次查看器使用的条目会话 id（销毁时据此释放，不误清后来新开的会话） */
+    private var gallerySessionId: String? = null
+
     companion object {
         // Intent extras
         const val EXTRA_MODE = "mode"
@@ -102,6 +106,16 @@ class MediaViewerActivity : ComponentActivity() {
         // Gallery mode extras
         const val EXTRA_HOSTNAME = "hostname"
         const val EXTRA_PORT = "port"
+
+        /** 图库条目列表的**会话 id**（P1-29：列表本体走 [MediaViewerSession]，Intent 只带 id） */
+        const val EXTRA_GALLERY_SESSION_ID = "gallery_session_id"
+
+        /**
+         * 旧版的整份 JSON 条目（已不再写入）。
+         *
+         * 保留读取分支只为兼容：极少数场景（旧版本发出的 Intent 还在栈里）仍能打开；
+         * 新代码一律走 [EXTRA_GALLERY_SESSION_ID]，不再把列表塞进 Binder 事务。
+         */
         const val EXTRA_GALLERY_ITEMS_JSON = "gallery_items_json"
         const val EXTRA_INITIAL_INDEX = "initial_index"
 
@@ -138,11 +152,14 @@ class MediaViewerActivity : ComponentActivity() {
             items: List<MediaViewerItem>,
             initialIndex: Int
         ): Intent {
+            // P1-29：列表本体留在进程内存（MediaViewerSession），Intent 只带一个短 id。
+            // 修复前这里 putExtra 整份 JSON：条目上千后必然超过 Binder 的 1MB 事务上限。
+            val sessionId = MediaViewerSession.put(items)
             return Intent(context, MediaViewerActivity::class.java).apply {
                 putExtra(EXTRA_MODE, MODE_GALLERY)
                 putExtra(EXTRA_HOSTNAME, hostname)
                 putExtra(EXTRA_PORT, port)
-                putExtra(EXTRA_GALLERY_ITEMS_JSON, MediaViewerItem.listToJson(items))
+                putExtra(EXTRA_GALLERY_SESSION_ID, sessionId)
                 putExtra(EXTRA_INITIAL_INDEX, initialIndex)
             }
         }
@@ -220,12 +237,16 @@ class MediaViewerActivity : ComponentActivity() {
         val mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_SINGLE
 
         when (mode) {
-            MODE_GALLERY -> initializeGalleryMode()
+            MODE_GALLERY -> {
+                // 列表无法恢复（P1-29 进程重建路径）时 initializeGalleryMode 已 finish()，
+                // 不要再建 content —— 直接收尾返回
+                if (!initializeGalleryMode()) return
+            }
             MODE_SINGLE -> initializeSingleMode()
         }
 
         setContent {
-            val uiState by viewModel.uiState.collectAsState()
+            val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
             // Control system bars based on UI visibility
             LaunchedEffect(uiState.isUiVisible) {
@@ -283,10 +304,9 @@ class MediaViewerActivity : ComponentActivity() {
         }
     }
 
-    private fun initializeGalleryMode() {
+    private fun initializeGalleryMode(): Boolean {
         val hostname = intent.getStringExtra(EXTRA_HOSTNAME) ?: ""
         val port = intent.getIntExtra(EXTRA_PORT, 8188)
-        val itemsJson = intent.getStringExtra(EXTRA_GALLERY_ITEMS_JSON) ?: "[]"
         val initialIndex = intent.getIntExtra(EXTRA_INITIAL_INDEX, 0)
 
         // B-23b 第三批（E1~E5）：取出图库截图与格子矩形。这里不清缓存——旋转重建时
@@ -294,7 +314,22 @@ class MediaViewerActivity : ComponentActivity() {
         gallerySnapshot = BitmapCache.getGallerySnapshot()
         galleryCellRect = BitmapCache.getGalleryCellRect()
 
-        val items = MediaViewerItem.listFromJson(itemsJson)
+        // P1-29：条目列表从进程内会话取（Intent 里只有 id）。
+        // 取不到 = 进程被系统回收后重建（或旧版本遗留的 Intent）：退回旧 JSON 兼容读取
+        val sessionId = intent.getStringExtra(EXTRA_GALLERY_SESSION_ID)
+        gallerySessionId = sessionId
+        val items = MediaViewerSession.get(sessionId)
+            ?: MediaViewerItem.listFromJson(intent.getStringExtra(EXTRA_GALLERY_ITEMS_JSON) ?: "[]")
+
+        if (items.isEmpty()) {
+            // 列表无法恢复：直接关闭查看器，而不是展示一个空白查看器（用户会以为图没了）
+            android.util.Log.w(
+                "ComfyChairViewer",
+                "图库条目会话已失效且无兼容数据，关闭查看器（P1-29 进程重建路径）"
+            )
+            finish()
+            return false
+        }
 
         viewModel.initialize(
             context = this,
@@ -304,6 +339,19 @@ class MediaViewerActivity : ComponentActivity() {
             items = items,
             initialIndex = initialIndex
         )
+        return true
+    }
+
+    override fun onDestroy() {
+        // P1-29：查看器真正关闭时释放会话里的列表；旋转重建（isFinishing=false）
+        // 必须保留——重建后的 Activity 还要按同一个 id 取回列表
+        if (isFinishing) {
+            MediaViewerSession.clear(gallerySessionId)
+            // P1-30：查看器是真关闭时，等组合树销毁完（消费者归零）再释放共享播放器。
+            // 修复前 release() 全仓零调用点，ExoPlayer 与解码器一直活到进程结束。
+            SharedVideoPlayer.releaseWhenIdle()
+        }
+        super.onDestroy()
     }
 
     private fun initializeSingleMode() {

@@ -32,10 +32,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.ui.screens.ConnectionState
+import sh.hnet.comfychair.ui.theme.Dimensions
 
 /**
  * Split button for the connection screen with server management dropdown.
@@ -109,11 +108,15 @@ fun ConnectionSplitButton(
             ),
             modifier = Modifier
                 .weight(1f)
-                .height(56.dp)
+                .height(Dimensions.ButtonHeight)
         ) {
             Text(
                 text = buttonText,
-                fontSize = 18.sp
+                // 基线用 M3 按钮自身的内容样式 labelLarge（SemiBold / 行高 20sp），只换字号；
+                // bodyLarge 是正文样式（Regular / 行高 24sp），会让按钮文字变细（R2-F1）
+                style = MaterialTheme.typography.labelLarge.copy(
+                    fontSize = Dimensions.ButtonTextSize
+                )
             )
         }
 
@@ -136,7 +139,7 @@ fun ConnectionSplitButton(
                     containerColor = containerColor,
                     contentColor = contentColor
                 ),
-                modifier = Modifier.size(56.dp)
+                modifier = Modifier.size(Dimensions.ButtonHeight)
             ) {
                 Icon(
                     Icons.Default.AirplanemodeInactive,
@@ -154,7 +157,7 @@ fun ConnectionSplitButton(
                         containerColor = containerColor,
                         contentColor = contentColor
                     ),
-                    modifier = Modifier.size(56.dp)
+                    modifier = Modifier.size(Dimensions.ButtonHeight)
                 ) {
                     Icon(
                         Icons.Default.KeyboardArrowDown,

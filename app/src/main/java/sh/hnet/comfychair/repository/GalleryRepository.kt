@@ -10,7 +10,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 import org.json.JSONObject
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.cache.MediaCache
@@ -19,8 +23,11 @@ import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.GalleryMetadataCache
+import sh.hnet.comfychair.storage.GalleryTrashEntry
+import sh.hnet.comfychair.storage.GalleryTrashStorage
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.viewmodel.GalleryItem
+import java.util.UUID
 
 /**
  * Repository for managing gallery data with background preloading and caching.
@@ -250,17 +257,21 @@ class GalleryRepository private constructor() {
             //   否则一次服务器重启就会把之前攒下的记录全冲掉，连离线退路一起断。
             //
             // 已在手机上删掉的条目（持久墓碑 + 本次待删）在最后统一滤掉。
-            val visible = if (context != null && serverId != null) {
+            val visible = (if (context != null && serverId != null) {
                 withContext(Dispatchers.IO) {
                     val tombstones = GalleryMetadataCache.loadTombstones(context, serverId) + deletionsSnapshot
                     recoverFromDiskCache(
                         context,
                         GalleryMetadataCache.mergeMetadata(context, serverId, serverItems)
-                    ).filterNot { it.promptId in tombstones }
+                    ).filterNot { GalleryMetadataCache.isDeleted(it, tombstones) }
                 }
             } else {
-                serverItems.filterNot { it.promptId in deletionsSnapshot }
-            }
+                serverItems.filterNot { GalleryMetadataCache.isDeleted(it, deletionsSnapshot) }
+            })
+                // R2-N1 最终护栏：图库 LazyGrid 的 key 是 (promptId, filename)，
+                // 列表里只要出现重复二元组就会抛 IllegalArgumentException。
+                // 服务器解析、索引合并、磁盘恢复任一路带来重复都在这里收敛。
+                .distinctBy { "${it.promptId}\u0000${it.filename}" }
 
             val previousCount = _galleryItems.value.size
             _galleryItems.value = visible
@@ -295,7 +306,11 @@ class GalleryRepository private constructor() {
         val cachedItems = GalleryMetadataCache.loadMetadataWithFallback(context, serverId)
         if (cachedItems != null) {
             val tombstones = GalleryMetadataCache.loadTombstones(context, serverId)
-            val visible = recoverFromDiskCache(context, cachedItems).filterNot { it.promptId in tombstones }
+            val visible = recoverFromDiskCache(context, cachedItems)
+                .filterNot { GalleryMetadataCache.isDeleted(it, tombstones) }
+                // R2-N1 最终护栏：离线路径同样按 (promptId, filename) 收敛，
+                // 与图库 LazyGrid 的 key 口径一致。
+                .distinctBy { "${it.promptId}\u0000${it.filename}" }
             _galleryItems.value = visible
             _lastRefreshTime.value = GalleryMetadataCache.getCacheTimestamp(context, serverId)
             hasLoadedOnce = true
@@ -320,14 +335,19 @@ class GalleryRepository private constructor() {
      */
     private fun recoverFromDiskCache(context: Context, known: List<GalleryItem>): List<GalleryItem> {
         val knownKeys = known.mapTo(mutableSetOf()) { "${it.promptId}\u0000${it.filename}" }
-        val recovered = MediaCache.listCachedKeys(context)
+        val recovered = MediaCache.listCachedKeys(context, ConnectionManager.currentServerId)
             .filterNot { "${it.promptId}\u0000${it.filename}" in knownKeys }
+            // R2-N1：recovered 内部也要按条目去重。listCachedKeys 已按同一身份合并，
+            // 这里再兜一层，保证不会把重复 (promptId, filename) 送进图库 LazyGrid
+            // （它的 key 是该二元组，撞 key 会抛 IllegalArgumentException）。
+            .distinctBy { "${it.promptId}\u0000${it.filename}" }
             .map { key ->
                 GalleryItem(
                     promptId = key.promptId,
                     filename = key.filename,
                     subfolder = "",
-                    type = "output",
+                    // 新键格式带 type：按写入时的目录恢复（output/temp）；旧格式解析为 output
+                    type = key.type,
                     isVideo = VIDEO_EXTENSIONS.any { key.filename.lowercase().endsWith(it) },
                     index = 0
                 )
@@ -344,39 +364,325 @@ class GalleryRepository private constructor() {
     fun hasData(): Boolean = hasLoadedOnce && _galleryItems.value.isNotEmpty()
 
     /**
-     * 按 promptId 从手机图库移除。
+     * 从手机图库删除一个条目（G4 后语义 = **移入回收站**，阶段一，可恢复）。
      *
-     * 供媒体查看器使用 —— 它手上是 `MediaViewerItem` 而不是 `GalleryItem`，
-     * 但删除语义与 [deleteItem] 完全相同：只影响手机端，并落下删除墓碑
-     * （否则下次刷新服务器历史时这条记录会复活）。
+     * 历史沿革：改回收站之前这里是"只影响手机端的直接删除"（服务器不知情 → 必须落
+     * 持久墓碑防复活）。回收站接管后墓碑语义原样保留（恢复 = 删墓碑），
+     * 服务器文件的处理挪到了阶段二（[purgeTrashEntries]）。
      */
-    fun removeItemLocally(promptId: String) {
-        val items = _galleryItems.value.filter { it.promptId == promptId }
-        removeFromGallery(setOf(promptId), items)
+    suspend fun deleteItem(item: GalleryItem): Boolean =
+        moveToTrash(listOf(item)).isNotEmpty()
+
+    /**
+     * 从手机图库批量删除**选中的条目**（G4 后语义 = 逐条移入回收站）。
+     *
+     * 返回实际进入回收站的条目数。参数是条目而不是 promptId 集合（P1-19）：
+     * 批量出图的 4 张共用同一个 promptId，按 promptId 删会"删一张、掉四张"。
+     */
+    suspend fun deleteItems(items: List<GalleryItem>): Int {
+        if (items.isEmpty()) return 0
+        return moveToTrash(items).size
     }
 
     /**
-     * 从手机图库移除一个条目。
+     * 查看器删除入口（G4 后语义 = **移入回收站**，阶段一）。
      *
-     * **只影响手机端**：服务器的历史记录与 output 目录里的文件都不动（这是明确的产品选择）。
-     * 正因为服务器不知情，这里必须落一份持久墓碑 —— 否则下次刷新服务器历史时，
-     * 这条记录会原样复活（用户会觉得"删了又回来了"）。
+     * 保留旧函数名是因为媒体查看器手上是 `MediaViewerItem` 而不是 `GalleryItem`。
+     * 粒度仍是**条目**（promptId + filename，P1-19）：同批出图共用 promptId，
+     * 只按 promptId 会把整批一起删掉。
      */
-    suspend fun deleteItem(item: GalleryItem): Boolean {
-        removeFromGallery(setOf(item.promptId), listOf(item))
+    fun removeItemLocally(promptId: String, filename: String): Boolean {
+        val target = _galleryItems.value.firstOrNull {
+            it.promptId == promptId && it.filename == filename
+        } ?: return false
+        return moveToTrash(listOf(target)).isNotEmpty()
+    }
+
+    // ============================================================
+    // G4（任务书 11.4）：回收站与两阶段删除
+    // ============================================================
+    //
+    // 阶段一 = App 内删除：条目移入回收站（[moveToTrash]），列表消失但**本地媒体
+    //         缓存保留**（可恢复、回收站里还能看缩略图），可逐条恢复回原位置。
+    // 阶段二 = 回收站内删除（[purgeTrashEntries]）：联动删服务器文件
+    //         （只走 DELETE /browser/files 三元组定位）+ 本地残留清理。
+    //         服务器删除失败 → 条目**留在**回收站标记待重试；探测不到能力 →
+    //         UNKNOWN 保持可再探。两阶段状态在 [GalleryTrashEntry] 上可观测。
+    //
+    // 回收站**没有**任何自动清空路径（硬约束 4）：条目只在用户显式恢复/删除/清空时消失。
+
+    private val _trashEntries = MutableStateFlow<List<GalleryTrashEntry>>(emptyList())
+    val trashEntries: StateFlow<List<GalleryTrashEntry>> = _trashEntries.asStateFlow()
+
+    private var trashLoaded = false
+
+    /** 首次访问时从磁盘加载回收站（幂等；purge/restore 内部会自触发，UI 打开回收站前也应调用一次）。 */
+    fun ensureTrashLoaded() {
+        if (trashLoaded) return
+        val context = applicationContext ?: return
+        _trashEntries.value = GalleryTrashStorage.loadAll(context)
+        trashLoaded = true
+    }
+
+    /**
+     * 阶段一：把条目移入回收站。
+     *
+     * 与旧的"直接删除"相比有两个刻意差别：
+     * 1. **不 evict 媒体缓存** —— 本地资源保留才谈得上恢复；
+     * 2. 返回回收站身份键 —— 查看器的撤销条 / 单测按它定位刚进站的那条。
+     *
+     * 幂等：同一 (serverId, promptId, filename) 已在回收站时不再重复进站，
+     * 但仍保证列表与墓碑里有它（删两次不会出现两条记录）。
+     */
+    fun moveToTrash(items: List<GalleryItem>): List<String> {
+        if (items.isEmpty()) return emptyList()
+        ensureTrashLoaded()
+        val serverId = ConnectionManager.currentServerId.orEmpty()
+        val now = System.currentTimeMillis()
+        val fresh = items.map { item ->
+            GalleryTrashEntry(
+                id = UUID.randomUUID().toString(),
+                serverId = serverId,
+                item = item,
+                deletedAt = now
+            )
+        }
+        val merged = dedupeTrash(_trashEntries.value, fresh) { it.identityKey }
+        _trashEntries.value = merged
+        applicationContext?.let { GalleryTrashStorage.saveAll(it, merged) }
+        // 列表、墓碑立刻生效；evictMedia = false 是"可恢复"的前提
+        removeFromGallery(
+            keys = items.mapTo(mutableSetOf()) {
+                GalleryMetadataCache.itemIdentityKey(it.promptId, it.filename)
+            },
+            items = items,
+            evictMedia = false
+        )
+        val identities = items.mapTo(mutableSetOf()) {
+            "$serverId\u0000${it.promptId}\u0000${it.filename}"
+        }
+        return merged.filter { it.identityKey in identities }.map { it.identityKey }
+    }
+
+    /**
+     * 从回收站恢复一个条目（阶段一回退）。
+     *
+     * 三处一起回滚，缺一不可：墓碑（显示层过滤）、会话墓碑（刷新窗口期拦截）、
+     * 列表内存（界面立刻可见）。索引记录在阶段一从未删过，所以恢复后
+     * **列表顺序与元数据天然一致**（原 index 随条目一起带回）。
+     */
+    fun restoreFromTrash(identityKey: String): Boolean {
+        ensureTrashLoaded()
+        val entry = _trashEntries.value.firstOrNull { it.identityKey == identityKey } ?: return false
+        _trashEntries.value = _trashEntries.value.filterNot { it.identityKey == identityKey }
+        applicationContext?.let { GalleryTrashStorage.saveAll(it, _trashEntries.value) }
+
+        val key = GalleryMetadataCache.itemIdentityKey(entry.item.promptId, entry.item.filename)
+        synchronized(pendingDeletions) { pendingDeletions.remove(key) }
+        applicationContext?.let { context ->
+            GalleryMetadataCache.removeTombstones(context, entry.serverId, setOf(key))
+        }
+
+        val items = _galleryItems.value.toMutableList()
+        if (items.none { it.promptId == entry.item.promptId && it.filename == entry.item.filename }) {
+            // 按保存的 index 找回原位置：列表里第一个"排得比它晚"的条目之前。
+            // 期间进了新图的话位置会顺移，但它仍在同一时间段的邻居之间 —— 这就是
+            // "恢复至原位置（列表顺序与元数据一致）"在活列表上的可实现语义。
+            val insertAt = items.indexOfFirst { it.index > entry.item.index }
+                .let { if (it >= 0) it else items.size }
+            items.add(insertAt, entry.item)
+            _galleryItems.value = items
+        }
+        DebugLogger.i(TAG, "回收站恢复: ${entry.item.filename}")
         return true
     }
 
+    /** 一次"彻底删除"批处理的分路由结果（UI 据此说清楚每一类条目发生了什么）。 */
+    data class TrashPurgeSummary(
+        /** 服务器确认删除（或已不存在）且本机残留已清理 */
+        val removedWithServer: Int,
+        /** 服务器不支持删除接口：只清了本机记录（服务器文件保留，必须提示） */
+        val removedLocalOnly: Int,
+        /** 服务器删除失败/探测不通，已标记待重试、留在回收站 */
+        val queuedForRetry: Int,
+        /** 属于其它服务器的条目：未动，连上那台后再处理 */
+        val keptForOtherServer: Int
+    ) {
+        val touched: Int get() = removedWithServer + removedLocalOnly
+    }
+
     /**
-     * 从手机图库批量移除。
+     * 阶段二：回收站内"彻底删除"（服务器联动 + 本地残留清理）。
      *
-     * 返回实际移除的条目数（promptId 数）。语义与单条删除一致：不动服务器。
+     * 硬约束的代码化：
+     * - 服务器删除**只**经 [ComfyUIClient.deleteBrowserFile]，定位符先过
+     *   [toBrowserFolderType] 白名单与 [isLocatorSafe] 守卫，拼不出也发不出路径；
+     * - 能力必须先探测（[capabilityOf]），UNKNOWN 不发删除请求、下次可再探；
+     * - 删除请求失败/超时 → [ServerDeleteAttempt.RETRYABLE] → 条目保留 + 标记
+     *   pendingRetry，**本地一个文件都不清**，绝不谎报成功；
+     * - 405（能力判断过期，插件被卸载等）→ 改缓存为 UNSUPPORTED，走本机清理并说明。
+     *
+     * 首次启用的清单确认由 UI 层在进入本函数之前完成（确认状态经 AppSettings 持久化）。
      */
-    suspend fun deleteItems(promptIds: Set<String>): Int {
-        if (promptIds.isEmpty()) return 0
-        val removedItems = _galleryItems.value.filter { it.promptId in promptIds }
-        removeFromGallery(promptIds, removedItems)
-        return promptIds.size
+    fun purgeTrashEntries(identities: List<String>, onResult: (TrashPurgeSummary) -> Unit) {
+        ensureTrashLoaded()
+        scope.launch {
+            var removedWithServer = 0
+            var removedLocalOnly = 0
+            var queuedForRetry = 0
+            var keptForOtherServer = 0
+            var unsupportedAnnounced = false
+
+            val context = applicationContext
+            val currentServerId = ConnectionManager.currentServerId.orEmpty()
+            val client = comfyUIClient
+
+            // 待处理条目快照：执行期间的状态变更都基于这份列表
+            val targets = _trashEntries.value.filter { it.identityKey in identities.toSet() }
+
+            for (entry in targets) {
+                val tombstoneKey =
+                    GalleryMetadataCache.itemIdentityKey(entry.item.promptId, entry.item.filename)
+                val onCurrentServer = entry.serverId == currentServerId
+                // 路由决策全走纯函数 planPurgeRoute（能力 × 归属 × 在线三因子矩阵，
+                // 单测 GalleryTrashLogicTest 钉住），这里只执行路由结果 ——
+                // 分支判定不留第二份，杜绝"改了一处漏一处"的谎报空间
+                val capability = if (onCurrentServer && client != null) {
+                    capabilityOf(client, entry.serverId)
+                } else {
+                    ServerDeleteCapability.UNKNOWN
+                }
+                when (
+                    planPurgeRoute(
+                        capability = capability,
+                        entryOnCurrentServer = onCurrentServer,
+                        clientAvailable = client != null
+                    )
+                ) {
+                    PurgeRoute.KEEP_OTHER_SERVER -> {
+                        // 别家服务器的条目：原样保留，不动这台服务器的一切东西
+                        keptForOtherServer++
+                    }
+                    PurgeRoute.KEEP_FOR_RETRY -> {
+                        // 离线 / 探测不通：说不清服务器侧现状 → 标待重试、条目保留，
+                        // 本地一个字节都不清（硬约束 3）
+                        queuedForRetry++
+                        markEntry(
+                            entry.identityKey, true,
+                            if (client == null) "离线，未发起服务器删除"
+                            else "无法连接服务器，未能确认删除能力"
+                        )
+                    }
+                    PurgeRoute.LOCAL_ONLY -> {
+                        // 服务器无删除接口：降级只清本机记录并明确提示（不报错、不假装删了）
+                        removedLocalOnly++
+                        if (!unsupportedAnnounced) {
+                            unsupportedAnnounced = true
+                            DebugLogger.w(TAG, "服务器 ${entry.serverId} 无 browser 删除插件，回收站按本机清理")
+                        }
+                        finishLocalCleanup(context, currentServerId, entry, tombstoneKey)
+                    }
+                    PurgeRoute.SERVER_DELETE -> {
+                        val activeClient = client
+                        if (activeClient == null) {
+                            // 防御位：纯函数保证走到这里时 client 非空，理论不可达
+                            queuedForRetry++
+                            markEntry(entry.identityKey, true, "客户端不可用")
+                        } else {
+                        val folderType = toBrowserFolderType(entry.item.type)
+                        if (folderType == null || !isLocatorSafe(entry.item.filename, entry.item.subfolder)) {
+                            // 定位符不合法（文件名里带路径分隔等异常数据）：宁可不删。
+                            // 标待重试并留证据，绝不把可疑字符串送进服务端的路径拼接。
+                            queuedForRetry++
+                            markEntry(entry.identityKey, true, "条目定位符异常，未发起服务器删除")
+                            continue
+                        }
+                        val (code, networkFailed) = activeClient.deleteBrowserFileAwait(
+                            entry.item.filename, entry.item.subfolder, folderType
+                        )
+                            when (classifyDeleteAttempt(code, networkFailed)) {
+                                ServerDeleteAttempt.REMOVED, ServerDeleteAttempt.ALREADY_GONE -> {
+                                    // 2xx = 服务器确认删除；404 = 文件本就不在了（幂等收敛，
+                                    // 能力已由探测确认在位，这个 404 来自插件的"未找到文件"）
+                                    removedWithServer++
+                                    finishLocalCleanup(context, currentServerId, entry, tombstoneKey)
+                                }
+                                ServerDeleteAttempt.UNSUPPORTED_FALLBACK -> {
+                                    removedLocalOnly++
+                                    capabilityCache[entry.serverId] = ServerDeleteCapability.UNSUPPORTED
+                                    finishLocalCleanup(context, currentServerId, entry, tombstoneKey)
+                                }
+                                ServerDeleteAttempt.RETRYABLE -> {
+                                    queuedForRetry++
+                                    markEntry(
+                                        entry.identityKey, true,
+                                        if (networkFailed) "网络失败" else "服务器返回 HTTP $code"
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            onResult(
+                TrashPurgeSummary(
+                    removedWithServer = removedWithServer,
+                    removedLocalOnly = removedLocalOnly,
+                    queuedForRetry = queuedForRetry,
+                    keptForOtherServer = keptForOtherServer
+                )
+            )
+        }
+    }
+
+    /** 阶段二成功 / 降级路径的"本地残留清理"：媒体缓存 + 索引记录。墓碑**保留**（防历史复活）。 */
+    private fun finishLocalCleanup(
+        context: Context?,
+        serverId: String,
+        entry: GalleryTrashEntry,
+        tombstoneKey: String
+    ) {
+        // serverId 显式给键：条目属于哪台服务器，就清哪台服务器的缓存文件
+        MediaCache.evict(MediaCacheKey.of(entry.item.promptId, entry.item.filename, entry.item.type, serverId))
+        if (context != null) {
+            GalleryMetadataCache.removeFromIndex(context, serverId, setOf(tombstoneKey))
+        }
+        _trashEntries.value = _trashEntries.value.filterNot { it.identityKey == entry.identityKey }
+        applicationContext?.let { GalleryTrashStorage.saveAll(it, _trashEntries.value) }
+    }
+
+    /** 更新单条回收站记录的重试标记并落盘（条目**留在**回收站，列表不减）。 */
+    private fun markEntry(identityKey: String, pendingRetry: Boolean, error: String?) {
+        _trashEntries.value = _trashEntries.value.map {
+            if (it.identityKey == identityKey) it.copy(pendingRetry = pendingRetry, lastError = error) else it
+        }
+        applicationContext?.let { GalleryTrashStorage.saveAll(it, _trashEntries.value) }
+    }
+
+    // ---- 服务器删除能力缓存（会话内，UNKNOWN 不缓存、下次必再探） ----
+
+    private val capabilityCache = mutableMapOf<String, ServerDeleteCapability>()
+    private val capabilityMutex = Mutex()
+
+    private suspend fun capabilityOf(client: ComfyUIClient, serverId: String): ServerDeleteCapability {
+        capabilityCache[serverId]?.let { return it }
+        return capabilityMutex.withLock {
+            capabilityCache[serverId]?.let { return it }
+            val (code, networkFailed) = client.probeBrowserDeleteSupportAwait()
+            classifyProbe(code, networkFailed).also {
+                // UNKNOWN（网络失败 / 5xx / 认证抖动）不落缓存：保持"下次再探"的重试能力，
+                // 探明 SUPPORTED / UNSUPPORTED 这两种确定结论才缓存
+                if (it != ServerDeleteCapability.UNKNOWN) capabilityCache[serverId] = it
+            }
+        }
+    }
+
+    /** 强制重探（"服务器不支持"但用户装好插件后想刷新结论时用）。 */
+    suspend fun refreshCapability(serverId: String): ServerDeleteCapability {
+        val client = comfyUIClient ?: return ServerDeleteCapability.UNKNOWN
+        capabilityCache.remove(serverId)
+        return capabilityOf(client, serverId)
     }
 
     /**
@@ -388,25 +694,36 @@ class GalleryRepository private constructor() {
      * - **会话墓碑**（[pendingDeletions]）→ 堵住"刷新已拿到服务器响应、还没写回列表"这个
      *   窗口期：那次刷新的合并结果会绕过磁盘墓碑，得靠内存这份兜住。
      *   它只在会话内存活，进程结束由磁盘那份接管，因此不会无限增长。
+     *
+     * @param keys 条目身份键（[GalleryMetadataCache.itemIdentityKey]）
+     * @param evictMedia 是否连带清除媒体缓存。阶段一（移入回收站）传 **false**：
+     *                   本地资源保留才能恢复；阶段二确认删除后再由
+     *                   [finishLocalCleanup] 显式清残留。旧的"直接删除"路径仍传 true。
      */
-    private fun removeFromGallery(promptIds: Set<String>, items: List<GalleryItem>) {
-        if (promptIds.isEmpty()) return
+    private fun removeFromGallery(keys: Set<String>, items: List<GalleryItem>, evictMedia: Boolean) {
+        if (keys.isEmpty()) return
 
         synchronized(pendingDeletions) {
-            pendingDeletions.addAll(promptIds)
+            pendingDeletions.addAll(keys)
         }
 
-        _galleryItems.value = _galleryItems.value.filterNot { it.promptId in promptIds }
+        _galleryItems.value = _galleryItems.value.filterNot {
+            GalleryMetadataCache.isDeleted(it, keys)
+        }
 
         val context = applicationContext
         val serverId = ConnectionManager.currentServerId
         if (context != null && serverId != null) {
-            GalleryMetadataCache.addTombstones(context, serverId, promptIds)
+            GalleryMetadataCache.addTombstones(context, serverId, keys)
         } else {
             DebugLogger.w(TAG, "Deletion tombstones not persisted (no context/serverId)")
         }
 
-        items.forEach { MediaCache.evict(MediaCacheKey(it.promptId, it.filename)) }
+        if (evictMedia) {
+            items.forEach {
+                MediaCache.evict(MediaCacheKey.of(it.promptId, it.filename, it.type))
+            }
+        }
     }
 
     /**
@@ -443,6 +760,28 @@ class GalleryRepository private constructor() {
     private fun parseHistoryToGalleryItems(historyJson: JSONObject): List<GalleryItem> {
         return GalleryHistoryParser.parse(historyJson)
     }
+
+    // ---- G4：ComfyUIClient 回调式网络接口的挂起适配（回调语义原样透传，不改判定） ----
+
+    /** @return (HTTP 码 or null, 是否网络失败) */
+    private suspend fun ComfyUIClient.probeBrowserDeleteSupportAwait(): Pair<Int?, Boolean> =
+        suspendCancellableCoroutine { cont ->
+            probeBrowserDeleteSupport { code, networkFailed ->
+                cont.resume(Pair(code, networkFailed))
+            }
+        }
+
+    /** @return (HTTP 码 or null, 是否网络失败) */
+    private suspend fun ComfyUIClient.deleteBrowserFileAwait(
+        filename: String,
+        folderPath: String,
+        folderType: String
+    ): Pair<Int?, Boolean> =
+        suspendCancellableCoroutine { cont ->
+            deleteBrowserFile(filename, folderPath, folderType) { code, networkFailed ->
+                cont.resume(Pair(code, networkFailed))
+            }
+        }
 }
 
 /**

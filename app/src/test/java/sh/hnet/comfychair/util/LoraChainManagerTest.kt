@@ -6,6 +6,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import sh.hnet.comfychair.model.LoraSelection
+import sh.hnet.comfychair.lora.LoraChainManager
 
 /**
  * LoRA 链条编辑的纯逻辑（新增 / 改名 / 列表刷新后的过滤）。

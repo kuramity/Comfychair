@@ -15,7 +15,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -62,8 +62,8 @@ class GalleryContainerActivity : ComponentActivity() {
         setContent {
             ComfyChairTheme {
                 // Observe connection alert state from ConnectionManager (single source of truth)
-                val connectionAlertState by ConnectionManager.connectionAlertState.collectAsState()
-                val isReconnecting by ConnectionManager.isReconnecting.collectAsState()
+                val connectionAlertState by ConnectionManager.connectionAlertState.collectAsStateWithLifecycle()
+                val isReconnecting by ConnectionManager.isReconnecting.collectAsStateWithLifecycle()
 
                 Surface(modifier = Modifier.fillMaxSize()) {
                     // 共享 Filament Engine（v4.5.0）：图库的 3D 条目查看器与主页面

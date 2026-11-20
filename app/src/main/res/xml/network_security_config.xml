@@ -1,22 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Network Security Configuration for ComfyChair
+    Network Security Configuration for ComfyChair（P2-13 复核后重写）
 
-    This app requires cleartext (HTTP) traffic to be permitted because:
-    1. ComfyUI servers are typically self-hosted on local networks
-    2. Local servers often don't have SSL/TLS certificates configured
-    3. Users connect to arbitrary IP addresses on their private networks
+    为什么不把 base-config 改成 cleartextTrafficPermitted="false"：
+    Android 的 <domain> 只接受**具体主机名或 IP 字面量**，不支持 CIDR 网段
+    （不能写 10.0.0.0/8、192.168.0.0/16）。本应用的核心场景是连接用户自建的
+    ComfyUI —— 地址是任意局域网 IP，通常没有 TLS。一旦平台层禁止明文，
+    OkHttp 4.12 在建立连接时会抛
+    `CLEARTEXT communication to <host> not permitted by network security policy`，
+    所有用 IP 访问局域网服务器的用户都会直接连不上。因此这里保持平台层放行，
+    真正的「明文只允许私网」边界由应用层执行：
 
-    The app supports and prefers HTTPS when available (auto-detection in ComfyUIClient).
-    Self-signed certificates are also supported with user notification.
+        util/CleartextGuardInterceptor（接在 ComfyUIClient 的全部 OkHttp client 上）
+          → util/NetworkPolicy.isCleartextAllowed(host)
+          → 私网/本机放行（10/8、172.16/12、192.168/16、127/8、169.254/16、
+            IPv6 链路本地/ULA、localhost、*.local、*.lan、无点短名）
+          → 公网主机走 http/ws 直接拒绝，必须 https
+
+    信任锚只保留系统证书：不信任用户安装的 CA（Android 7+ 对 targetSdk ≥ 24 的
+    应用本来也不默认信任用户 CA，这里显式写明，防止后续有人加 <certificates src="user"/>）。
+    自签证书场景由 SelfSignedCertHelper 按私网/公网分场景处理（含用户显式确认的指纹固定）。
+
+    另：base-config 的明文放行只影响 OkHttp 之外的链路（如 WebView）；
+    WebView 的 SSL 处理另有独立校验（BrowserAuthActivity）。
+
+    ⚠️ 已知残余风险（不要误以为已全域收口）：平台层仍是「允许明文」，
+    WebView 与任何不走 ComfyUIClient.secured() 的新网络链路都不经过上面的闸门。
+    完整清单与新增链路的正确做法见仓库根目录 SECURITY.md 第 1 节。
 
     See: https://developer.android.com/training/articles/security-config
 -->
 <network-security-config>
-    <!--
-        Base configuration: Allow cleartext traffic for local ComfyUI server connections.
-        The app performs automatic HTTP/HTTPS detection and prefers HTTPS when available.
-    -->
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />

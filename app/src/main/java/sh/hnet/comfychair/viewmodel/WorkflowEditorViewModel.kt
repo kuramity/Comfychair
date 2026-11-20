@@ -20,12 +20,12 @@ import sh.hnet.comfychair.WorkflowType
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.NodeAttributeEdits
 import sh.hnet.comfychair.storage.WorkflowValuesStorage
-import sh.hnet.comfychair.util.ConnectionValidator
 import sh.hnet.comfychair.util.DebugLogger
-import sh.hnet.comfychair.util.FieldMappingAnalyzer
-import sh.hnet.comfychair.util.GraphMutationUtils
-import sh.hnet.comfychair.util.GraphViewportCalculator
-import sh.hnet.comfychair.util.WorkflowJsonAnalyzer
+import sh.hnet.comfychair.workflow.graph.GraphMutationUtils
+import sh.hnet.comfychair.workflow.layout.GraphViewportCalculator
+import sh.hnet.comfychair.workflow.mapping.FieldMappingAnalyzer
+import sh.hnet.comfychair.workflow.validation.ConnectionValidator
+import sh.hnet.comfychair.workflow.validation.WorkflowJsonAnalyzer
 import sh.hnet.comfychair.workflow.ConnectionDirection
 import sh.hnet.comfychair.workflow.ConnectionModeState
 import sh.hnet.comfychair.workflow.DiscardAction
@@ -63,6 +63,15 @@ sealed class WorkflowEditorEvent {
     data class WorkflowCreated(val workflowId: String) : WorkflowEditorEvent()
     data class WorkflowUpdated(val workflowId: String) : WorkflowEditorEvent()
     object CreateCancelled : WorkflowEditorEvent()
+
+    /**
+     * 保存失败（磁盘写入、重名、未知异常……）。
+     *
+     * 与 [CreateCancelled] 严格区分：取消是「用户主动放弃」，调用方可以安全地关页面；
+     * 保存失败时用户填的名字、映射、画布上的改动**都还在**，必须留在编辑页并弹错，
+     * 让人能改完再存一次。曾经这里误发 CreateCancelled，等于保存失败即丢掉全部工作。
+     */
+    data class SaveFailed(val message: String) : WorkflowEditorEvent()
 }
 
 /**
@@ -289,6 +298,10 @@ class WorkflowEditorViewModel : ViewModel() {
 
         DebugLogger.i(TAG, "initializeForCreation: Starting create mode")
         _uiState.value = _uiState.value.copy(isLoading = true, errorMessage = null)
+
+        // 节点属性编辑的存储容器：创建模式下工作流还没有 ID，这里先把容器建好，
+        // 保存成功回填 currentWorkflowId 后就能立即把编辑落盘（见 confirmMappingAndSave）。
+        workflowValuesStorage = WorkflowValuesStorage(context)
 
         // Fetch object_info first for node definitions
         fetchObjectInfo { success ->
@@ -1127,8 +1140,21 @@ class WorkflowEditorViewModel : ViewModel() {
         if (result.isSuccess) {
             val savedWorkflow = result.getOrThrow()
             DebugLogger.i(TAG, "confirmMappingAndSave: Workflow saved successfully with id=${savedWorkflow.id}")
+            val wasCreateMode = state.editingWorkflowId == null
+            // 回填当前工作流 ID。创建模式下 currentWorkflowId 此前一直是 null，
+            // 导致之后每次关掉节点属性侧栏时 saveNodeAttributeEdits() 都在第一行早退，
+            // 用户在新建流程里调过的节点参数从来不会落盘。
+            currentWorkflowId = savedWorkflow.id
+            if (workflowValuesStorage == null) {
+                workflowValuesStorage = WorkflowValuesStorage(context)
+            }
             // Return to view mode instead of exiting
             returnToViewMode(savedWorkflow.id, context)
+            if (wasCreateMode) {
+                // 新建流程在保存前没有 ID，那时的节点属性编辑无法落盘：这里补存一次。
+                // （空集合时会走「清空」分支，不会写垃圾数据。）
+                saveNodeAttributeEdits()
+            }
             // Emit event to notify Activity (triggers list refresh in caller)
             viewModelScope.launch {
                 if (state.editingWorkflowId != null) {
@@ -1139,9 +1165,13 @@ class WorkflowEditorViewModel : ViewModel() {
             }
         } else {
             val error = result.exceptionOrNull()
-            DebugLogger.e(TAG, "confirmMappingAndSave: Save failed: ${error?.message}")
+            val message = error?.message ?: "Save failed"
+            DebugLogger.e(TAG, "confirmMappingAndSave: Save failed: $message")
+            // 保存失败不能当「取消」：编辑页、画布改动和已确认的映射都要原样留着，
+            // 只把失败原因交给界面弹出来（由 Activity 弹错并停留在此页）。
+            _uiState.value = _uiState.value.copy(isSaveValidating = false)
             viewModelScope.launch {
-                _events.emit(WorkflowEditorEvent.CreateCancelled)
+                _events.emit(WorkflowEditorEvent.SaveFailed(message))
             }
         }
     }
@@ -1932,6 +1962,13 @@ class WorkflowEditorViewModel : ViewModel() {
         if (workflow == null) {
             DebugLogger.e(TAG, "returnToViewMode: Workflow not found")
             return
+        }
+
+        // 回填当前工作流 ID 与存储容器（创建模式保存成功后这里才有值）。
+        // 不回填的话，后续的节点属性编辑会因为 currentWorkflowId == null 静默不落盘。
+        currentWorkflowId = workflowId
+        if (workflowValuesStorage == null) {
+            workflowValuesStorage = WorkflowValuesStorage(context)
         }
 
         // Parse and layout the workflow

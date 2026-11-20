@@ -59,6 +59,9 @@ class PromptPresetViewModel : ViewModel() {
     private var storage: PromptPresetStorage? = null
     private var currentScreenType: ScreenType = ScreenType.TEXT_TO_IMAGE
 
+    /** 本次 ViewModel 生命周期内是否已提示过「存储损坏」，避免每次刷新都重复弹 toast。 */
+    private var corruptionNoticeShown = false
+
     private val _uiState = MutableStateFlow(PromptPresetUiState())
     val uiState: StateFlow<PromptPresetUiState> = _uiState.asStateFlow()
 
@@ -96,6 +99,13 @@ class PromptPresetViewModel : ViewModel() {
                 availableTags = storage.getTagsForScreen(currentScreenType),
                 activePresetId = validActivePresetId
             )
+        }
+        // 存储损坏时列表会显示为空：主动说明一次原因，避免用户以为预设被清空了
+        if (storage.didLastParseFail() && !corruptionNoticeShown) {
+            corruptionNoticeShown = true
+            viewModelScope.launch {
+                _events.emit(PromptPresetEvent.ShowToast(R.string.error_local_store_corrupted))
+            }
         }
     }
 
@@ -186,10 +196,20 @@ class PromptPresetViewModel : ViewModel() {
      * Toggle favorite status of a preset.
      */
     fun onToggleFavorite(presetId: String) {
-        val success = storage?.toggleFavorite(presetId) ?: return
+        val storage = storage ?: return
+        val success = storage.toggleFavorite(presetId)
         if (!success) {
+            // 失败有两种原因：收藏已满 / 存储损坏导致写入被拒绝；两者的提示不能混用
+            val corrupted = storage.didLastParseFail()
+            if (corrupted) corruptionNoticeShown = true
             viewModelScope.launch {
-                _events.emit(PromptPresetEvent.MaxFavoritesReached)
+                _events.emit(
+                    if (corrupted) {
+                        PromptPresetEvent.ShowToast(R.string.error_local_store_corrupted)
+                    } else {
+                        PromptPresetEvent.MaxFavoritesReached
+                    }
+                )
             }
         }
         refreshPresets()
@@ -203,6 +223,7 @@ class PromptPresetViewModel : ViewModel() {
     fun onSavePreset(name: String, prompt: String, negativePrompt: String, tags: List<String>) {
         val storage = storage ?: return
         val editing = _uiState.value.editingPreset
+        val saved: Boolean
 
         if (editing != null) {
             // Update existing preset
@@ -212,7 +233,7 @@ class PromptPresetViewModel : ViewModel() {
                 negativePrompt = negativePrompt,
                 tags = tags
             )
-            storage.updatePreset(updated)
+            saved = storage.updatePreset(updated)
         } else {
             // Create new preset
             val preset = PromptPreset.create(
@@ -222,7 +243,18 @@ class PromptPresetViewModel : ViewModel() {
                 tags = tags,
                 negativePrompt = negativePrompt
             )
-            storage.addPreset(preset)
+            saved = storage.addPreset(preset)
+        }
+
+        if (!saved) {
+            // 存储损坏时写入被拒绝：绝不弹「已保存」，也不关闭对话框，
+            // 让用户明确知道内容没有落盘（原数据已备份，修复后仍可找回）
+            corruptionNoticeShown = true
+            refreshPresets()
+            viewModelScope.launch {
+                _events.emit(PromptPresetEvent.ShowToast(R.string.error_local_store_corrupted))
+            }
+            return
         }
 
         _uiState.update { it.copy(showSaveDialog = false, editingPreset = null) }
@@ -237,7 +269,8 @@ class PromptPresetViewModel : ViewModel() {
      * Duplicate a preset with a "(n)" suffix where n is the next available number.
      */
     fun onDuplicatePreset(presetId: String) {
-        val original = storage?.getPreset(presetId) ?: return
+        val storage = storage ?: return
+        val original = storage.getPreset(presetId) ?: return
         val existingNames = _uiState.value.allPresets.map { it.name }.toSet()
         val duplicateName = generateUniqueName(original.name, existingNames)
 
@@ -249,7 +282,15 @@ class PromptPresetViewModel : ViewModel() {
             // 副本要连负面一起复制：只复制正面会让"另存为副本"变成半个提示词
             negativePrompt = original.negativePrompt
         )
-        storage?.addPreset(duplicate)
+        val saved = storage.addPreset(duplicate)
+        if (!saved) {
+            corruptionNoticeShown = true
+            refreshPresets()
+            viewModelScope.launch {
+                _events.emit(PromptPresetEvent.ShowToast(R.string.error_local_store_corrupted))
+            }
+            return
+        }
         refreshPresets()
 
         viewModelScope.launch {
@@ -281,7 +322,17 @@ class PromptPresetViewModel : ViewModel() {
      * Delete a preset.
      */
     fun onDeletePreset(presetId: String) {
-        storage?.deletePreset(presetId)
+        val storage = storage ?: return
+        val deleted = storage.deletePreset(presetId)
+        if (!deleted) {
+            // 删除同样可能被「存储损坏」拦下：不更新选中态、不弹「已删除」
+            corruptionNoticeShown = true
+            refreshPresets()
+            viewModelScope.launch {
+                _events.emit(PromptPresetEvent.ShowToast(R.string.error_local_store_corrupted))
+            }
+            return
+        }
         if (_uiState.value.activePresetId == presetId) {
             _uiState.update { it.copy(activePresetId = null) }
         }

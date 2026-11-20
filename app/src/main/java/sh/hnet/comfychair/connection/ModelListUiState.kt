@@ -51,3 +51,27 @@ fun resolveModelListUiState(
     isLoaded && optionCount == 0 -> ModelListUiState.EMPTY
     else -> ModelListUiState.LOADED
 }
+
+/**
+ * 分类态 → 四态（G8 指令 1/2 的 UI 侧口径）。
+ *
+ * 与 [resolveModelListUiState] 的区别只有一个但很关键：判定输入从「整体
+ * isLoading / isLoaded / lastError」换成「**这一类**是否已进入终态 + 它的失败原因」。
+ * 于是 UNET 因来源节点缺失而失败时，UNET 下拉显示「加载失败（可重试）」，
+ * 而 VAE / CLIP 各自照常显示候选 —— 单类失败不再被整体的「成功」掩盖（G8 的现象），
+ * 也不会让一个类别的未收敛把别的类别拖成「正在加载」（E7）。
+ *
+ * @param state 该类别的终态（[CategoryLoadState]）
+ * @param optionCount 该下拉当前可显示的选项数（与分类态交叉校验：状态说 OK 但列表空，
+ *   说明缓存与选项来源不同步，按 EMPTY 处理比假装正常安全）
+ */
+fun resolveModelListUiState(
+    state: CategoryLoadState,
+    optionCount: Int
+): ModelListUiState = when (state) {
+    CategoryLoadState.PENDING -> ModelListUiState.LOADING
+    CategoryLoadState.FAILED -> ModelListUiState.FAILED
+    CategoryLoadState.EMPTY_OK -> ModelListUiState.EMPTY
+    CategoryLoadState.OK ->
+        if (optionCount > 0) ModelListUiState.LOADED else ModelListUiState.EMPTY
+}

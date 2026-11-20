@@ -52,23 +52,38 @@ object PromptBridge {
     /** 当前活动生成页面归属 ID（标签库据此选择同步目标）。 */
     val activeOwnerId: StateFlow<String> = _activeOwnerId.asStateFlow()
 
+    /**
+     * Log 包装。
+     *
+     * `android.util.Log` 在 JVM 单测里是 stub（调用即抛 RuntimeException），而注册/注销
+     * 恰恰是 P2-20 要测的路径——不包一层的话，一个日志调用会把"注销逻辑"变成"直接崩溃"。
+     * 与 [sh.hnet.comfychair.model.ModelIntroTable] 的处理方式一致。
+     */
+    private fun logI(message: String) {
+        try {
+            android.util.Log.i("PromptBridge", message)
+        } catch (_: Throwable) {
+            // 测试环境无 Log 实现，忽略
+        }
+    }
+
     /** 生成页面注册适配器（ViewModel 初始化时调用）。 */
     fun register(target: Target) {
         targets[target.ownerId] = target
-        android.util.Log.i("PromptBridge", "register: ${target.ownerId} (total=${targets.size})")
+        logI("register: ${target.ownerId} (total=${targets.size})")
     }
 
     /** 生成页面注销适配器（ViewModel 销毁时调用）。 */
     fun unregister(ownerId: String) {
         targets.remove(ownerId)
         if (_activeOwnerId.value == ownerId) _activeOwnerId.value = ""
-        android.util.Log.i("PromptBridge", "unregister: $ownerId (total=${targets.size})")
+        logI("unregister: $ownerId (total=${targets.size})")
     }
 
     /** 更新当前活动页面（页面切换时由宿主调用）。 */
     fun setActive(ownerId: String) {
         _activeOwnerId.value = ownerId
-        android.util.Log.i("PromptBridge", "setActive: $ownerId (registered=${targets.keys})")
+        logI("setActive: $ownerId (registered=${targets.keys})")
     }
 
     /** 当前活动目标（未注册或未激活时返回 null）。 */
@@ -159,23 +174,36 @@ object PromptBridge {
      * - 带权重：`(long_hair:1.2)` / `( long_hair : 1.2 )`
      * - 无权重：`long_hair`（前后为非单词字符或首尾）
      *
+     * 标签名含 CLIP 特殊字符时，提示词里可能出现两种形态：新插入的已转义写法
+     * （`papyrus_\(salon_pixiv\)`）与历史数据/用户手写的原始写法
+     * （`papyrus_(salon_pixiv)`），因此两种形态都要尝试匹配。
+     *
      * @return 替换后的文本；未找到匹配时返回 null
      */
-    private fun replaceFirstWeight(text: String, tag: String, newWeight: Float): String? {
+    internal fun replaceFirstWeight(text: String, tag: String, newWeight: Float): String? {
         if (tag.isEmpty()) return null
-        val escaped = Regex.escape(tag)
         val token = AppliedTag(tag, newWeight).toPromptToken()
 
+        // 已转义写法优先（新插入的标签都是这种），再回退到原始写法（历史数据）
+        val namePatterns = listOf(
+            Regex.escape(AppliedTag.escapeForPrompt(tag)),
+            Regex.escape(tag)
+        ).distinct()
+
         // 1) 优先替换带权重的写法
-        val weighted = Regex("""\(\s*$escaped\s*:\s*[\d.]+\s*\)""")
-        if (weighted.containsMatchIn(text)) {
-            return weighted.replaceFirst(text, Regex.escapeReplacement(token))
+        for (name in namePatterns) {
+            val weighted = Regex("""\(\s*$name\s*:\s*[\d.]+\s*\)""")
+            if (weighted.containsMatchIn(text)) {
+                return weighted.replaceFirst(text, Regex.escapeReplacement(token))
+            }
         }
 
         // 2) 再替换裸标签写法（词边界：前后不能是字母/数字/下划线，避免误伤长标签）
-        val plain = Regex("""(?<![\w])$escaped(?![\w])""")
-        if (plain.containsMatchIn(text)) {
-            return plain.replaceFirst(text, Regex.escapeReplacement(token))
+        for (name in namePatterns) {
+            val plain = Regex("""(?<![\w])$name(?![\w])""")
+            if (plain.containsMatchIn(text)) {
+                return plain.replaceFirst(text, Regex.escapeReplacement(token))
+            }
         }
         return null
     }

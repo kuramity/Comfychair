@@ -39,6 +39,7 @@
     <string name="button_browser_auth_done">Gotowe</string>
     <string name="button_reauthenticate">Zaloguj ponownie</string>
     <string name="error_browser_auth_cancelled">Logowanie nie zostało ukończone</string>
+    <string name="error_browser_auth_insecure_host">Ostrzeżenie bezpieczeństwa: certyfikat %1$s nie jest zaufany. Połączenie zablokowane.</string>
 
     <!-- Connection alert dialog -->
     <string name="title_connection_lost">Utracono połączenie</string>
@@ -217,6 +218,11 @@
     <!-- Error and status messages -->
     <string name="error_not_comfyui_server">To nie jest serwer ComfyUI</string>
     <string name="error_invalid_server_response">Nieprawidłowa odpowiedź serwera</string>
+    <string name="error_https_connection_failed">Połączenie HTTPS nie powiodło się: jeśli serwer obsługuje tylko HTTP, zmień adres tak, aby zaczynał się od http:// i spróbuj ponownie</string>
+    <string name="action_retrust_certificate">Zaufaj ponownie certyfikatowi serwera</string>
+    <string name="action_trust_certificate_first_time">Zaufaj temu certyfikatowi serwera i spróbuj ponownie</string>
+    <string name="error_certificate_trust_failed">Nie udało się zapisać zaufania do certyfikatu, spróbuj ponownie</string>
+    <string name="error_server_list_corrupted">Lista serwerów jest uszkodzona, zmiana nie została zapisana. Oryginalny plik został zapisany w kopii.</string>
     <string name="error_failed_load_workflow">Nie udało się załadować przepływu pracy</string>
     <string name="error_generation_failed">Generowanie nie powiodło się</string>
     <string name="error_job_lost">Zadanie utracone: serwer nie ma już tego zadania (restart lub wyczyszczona kolejka). Wygeneruj ponownie.</string>
@@ -657,6 +663,9 @@
     <string name="update_action_now">Aktualizuj teraz</string>
     <string name="update_action_later">Pozniej</string>
     <string name="update_action_install">Zainstaluj</string>
+    <string name="update_error_verify_missing">Lista aktualizacji nie zawiera prawidlowego skrotu SHA-256. Aktualizacja odrzucona.</string>
+    <string name="update_error_redirect">Pobieranie przekierowano do niezaufanego hosta (%1$s). Aktualizacja przerwana.</string>
+    <string name="update_error_install_invalid">Nazwa lub podpis pobranego pakietu nie pasuje do tej aplikacji. Instalacja zablokowana.</string>
     <string name="update_action_retry">Ponow</string>
     <string name="update_manual_check_failed">Sprawdzanie nie powiodlo sie: %1$s</string>
     <string name="update_already_latest">Mas juz najnowsza wersje.</string>
@@ -672,4 +681,6 @@
     <!-- Q3-3 (v4.16.5): lista modeli cztery stany — niepowodzenie (mozna ponowic) vs. faktycznie pusta -->
     <string name="model_list_load_failed">Nie udało się wczytać listy modeli — dotknij, aby spróbować ponownie</string>
     <string name="model_list_empty">Brak dostępnych modeli na serwerze</string>
+    <!-- P3-10: żadna aplikacja nie może otworzyć linku zewnętrznego -->
+    <string name="error_open_link_failed">Brak aplikacji, która może otworzyć ten link</string>
 </resources>

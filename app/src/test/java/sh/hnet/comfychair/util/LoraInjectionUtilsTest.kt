@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Test
 import sh.hnet.comfychair.WorkflowType
+import sh.hnet.comfychair.lora.LoraInjectionUtils
 import sh.hnet.comfychair.model.LoraSelection
 
 /**

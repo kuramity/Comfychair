@@ -10,6 +10,7 @@ import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.Obfuscator
 import sh.hnet.comfychair.viewmodel.ContentType
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Status of a tracked job in the queue system.
@@ -70,6 +71,72 @@ data class QueueState(
 }
 
 /**
+ * 本机提交过的任务记录（P1-1 归属兜底用）。
+ *
+ * 为什么不能只看 `ownJobs`：那份表会被"完成 / 失败 / 取消 / 队列对账"删条目，
+ * 删掉之后再收到同一个 promptId 的 `execution_start`（WS 重连补发、事件乱序）
+ * 就查不到归属了。而 `execution_start` 是服务器广播给**所有客户端**的，
+ * 一旦"查不到就当成自己的"，外部任务就会被记到本机名下。
+ */
+data class SubmittedPrompt(
+    val promptId: String,
+    val ownerId: String,
+    val contentType: ContentType
+)
+
+/**
+ * P1-1：`execution_start` 的归属判定（纯函数，供 JVM 单测钉住）。
+ *
+ * 判定只有两条成立路径：
+ * 1. 注册表里已有这个 promptId（提交成功时 [JobRegistry.registerJob] 登记的）；
+ * 2. 这个 promptId 是本机提交返回过的（[SubmittedPrompt] 记录在案）。
+ *
+ * 两条都不满足 = 外部客户端的任务。绝不能因为"本机恰好有在途提交"就认领：
+ * 那正是"外部客户端出的图跑到本机页面、本机进度条被外部任务推动"的根因。
+ *
+ * **覆盖边界（R2-L5）**：本机提交记录同样只在 [JobRegistry.registerJob] 里写入，
+ * 所以"`execution_start` 早于 `registerJob` 到达"这个时序**不在**第 2 条的覆盖范围内
+ *（那时注册表与本机提交记录都还没有这个 promptId，事件会被当成外部任务忽略）。
+ * 该时序不会丢状态：[JobRegistry.markExecuting] 会先把 `executingPromptId` 记下来，
+ * 随后 `registerJob` 的"已在执行则回填 owner/contentType"分支把归属补齐。
+ * 第 2 条真正覆盖的是：条目已被完成/取消/对账清掉之后，同一个 promptId 的事件被重放。
+ *
+ * @param eventPromptId 事件里带的 promptId
+ * @param registeredOwnerId 注册表查到的归属；null = 查不到
+ * @param submittedOwnerId 本机提交记录里的归属；null = 本机没提交过这个 promptId
+ * @return 应采用的 ownerId；null = 不属于本机（调用方必须原样忽略）
+ */
+internal fun resolveExecutionStartOwner(
+    eventPromptId: String,
+    registeredOwnerId: String?,
+    submittedOwnerId: String?,
+): String? {
+    if (eventPromptId.isEmpty()) return null
+    if (registeredOwnerId != null) return registeredOwnerId
+    return submittedOwnerId
+}
+
+/**
+ * P1-5：`/queue` 对账时，一个本机任务是否该被判"服务器上已不存在"并删除。
+ *
+ * `/queue` 的响应是**请求发出那一刻**服务器状态的快照。请求在飞期间新登记的任务
+ * 必然不在那份快照里，原实现把它们一并删掉，于是刚提交的任务从本地列表消失
+ *（按钮计数回退、进度条丢失，而服务器其实正在跑）。所以只删
+ *「快照发出前就已登记」且不在响应里的活跃任务；快照之后登记的给一个宽限期。
+ *
+ * @param isActive 本地状态是否 PENDING/EXECUTING（完成/失败的条目另有清理路径）
+ * @param presentInResponse 该 promptId 是否出现在 /queue 响应里
+ * @param registeredSeq 该任务的登记序号
+ * @param snapshotSeq 请求发出前的登记序号水位
+ */
+internal fun shouldDropFromQueueSnapshot(
+    isActive: Boolean,
+    presentInResponse: Boolean,
+    registeredSeq: Long,
+    snapshotSeq: Long,
+): Boolean = isActive && !presentInResponse && registeredSeq <= snapshotSeq
+
+/**
  * Central singleton for tracking jobs and server queue state.
  *
  * JobRegistry provides:
@@ -87,6 +154,34 @@ object JobRegistry {
     private const val TAG = "JobRegistry"
     private const val PREFS_NAME = "JobRegistryPrefs"
     private const val PREF_JOBS_JSON = "jobs"
+
+    /**
+     * 本机提交记录的上限。
+     *
+     * 这份记录只用于"归属兜底"，不需要完整历史；无上限的话长时间运行会一直涨。
+     * 超出后按插入顺序丢最旧的（[LinkedHashMap] 默认访问顺序 = 插入顺序）。
+     */
+    private const val MAX_REMEMBERED_SUBMISSIONS = 64
+
+    /**
+     * 本机提交返回过的 promptId → 归属（P1-1）。
+     *
+     * 所有读写都在 [Synchronized] 方法里（与 [_queueState] 的更新同一把锁），
+     * 保证「登记一条任务」与「判定一条 execution_start 归属」看到同一份记录。
+     */
+    private val submittedPrompts = LinkedHashMap<String, SubmittedPrompt>()
+
+    /**
+     * 任务登记序号水位（P1-5）。
+     *
+     * [registerJob] 每登记一条 +1；`/queue` 请求发出前取一次水位 [beginQueueSnapshot]，
+     * 响应回来只删"水位之前登记、且不在响应里"的任务。用 [AtomicLong] 而不是普通 var：
+     * 提交回调在 OkHttp 线程、对账回调也在 OkHttp 线程，两者可能并发。
+     */
+    private val registrationSeq = AtomicLong(0L)
+
+    /** promptId → 登记时的序号；仅 [shouldDropFromQueueSnapshot] 用得上 */
+    private val jobRegistrationSeq = mutableMapOf<String, Long>()
 
     private val _queueState = MutableStateFlow(QueueState())
     val queueState: StateFlow<QueueState> = _queueState.asStateFlow()
@@ -114,6 +209,17 @@ object JobRegistry {
     @Synchronized
     fun registerJob(promptId: String, ownerId: String, contentType: ContentType) {
         DebugLogger.i(TAG, "Registering job: ${Obfuscator.promptId(promptId)} (owner: $ownerId, type: $contentType)")
+
+        // P1-1：promptId 只有在提交成功（服务器把 prompt id 返回给我们）时才会到这里，
+        // 所以这条记录就是"本机确实提交过它"的证据，供归属兜底使用。
+        // P1-5：同时记下登记序号，供 /queue 快照对账判断"这条是不是请求发出后才出现的"。
+        val seq = registrationSeq.incrementAndGet()
+        submittedPrompts[promptId] = SubmittedPrompt(promptId, ownerId, contentType)
+        while (submittedPrompts.size > MAX_REMEMBERED_SUBMISSIONS) {
+            val oldest = submittedPrompts.keys.firstOrNull() ?: break
+            submittedPrompts.remove(oldest)
+        }
+        jobRegistrationSeq[promptId] = seq
 
         val currentState = _queueState.value
 
@@ -163,6 +269,23 @@ object JobRegistry {
     fun findContentType(promptId: String): ContentType? {
         return _queueState.value.ownJobs[promptId]?.contentType
     }
+
+    /**
+     * 查"本机提交返回过这个 promptId 吗"（P1-1 归属兜底的唯一依据）。
+     *
+     * 与 [findOwner] 的区别：条目被完成/对账清掉后这里仍然查得到，
+     * 因此调用方**必须**用 [resolveExecutionStartOwner] 组合两者，
+     * 不能把这里的命中直接当成"任务还在队列里"。
+     */
+    @Synchronized
+    fun findSubmittedPrompt(promptId: String): SubmittedPrompt? = submittedPrompts[promptId]
+
+    /**
+     * 取当前登记水位（P1-5）。`/queue` 请求**发出前**调用，响应回来时原样传给
+     * [updateFromServerQueue]，用于区分"请求发出前就存在"与"请求在飞期间新登记"。
+     */
+    @Synchronized
+    fun beginQueueSnapshot(): Long = registrationSeq.get()
 
     /**
      * Mark a job as executing when execution_start is received.
@@ -220,6 +343,7 @@ object JobRegistry {
 
         // Remove the job from tracking
         val newJobs = currentState.ownJobs - promptId
+        jobRegistrationSeq.remove(promptId)
 
         _queueState.value = currentState.copy(
             executingPromptId = if (isCurrentlyExecuting) null else currentState.executingPromptId,
@@ -253,6 +377,7 @@ object JobRegistry {
 
             // Remove the failed job
             val newJobs = currentState.ownJobs - promptId
+            jobRegistrationSeq.remove(promptId)
 
             // Clear executing state if this was the executing job
             val isCurrentlyExecuting = currentState.executingPromptId == promptId
@@ -283,6 +408,7 @@ object JobRegistry {
         if (currentState.ownJobs.containsKey(promptId)) {
             DebugLogger.i(TAG, "Job cancelled by user: ${Obfuscator.promptId(promptId)}")
         }
+        jobRegistrationSeq.remove(promptId)
         _queueState.value = currentState.copy(
             executingPromptId = if (isCurrentlyExecuting) null else currentState.executingPromptId,
             executingOwnerId = if (isCurrentlyExecuting) null else currentState.executingOwnerId,
@@ -303,6 +429,7 @@ object JobRegistry {
         if (currentState.ownJobs.containsKey(promptId)) {
             DebugLogger.d(TAG, "Removing job: ${Obfuscator.promptId(promptId)}")
             val newJobs = currentState.ownJobs - promptId
+            jobRegistrationSeq.remove(promptId)
             _queueState.value = currentState.copy(ownJobs = newJobs)
             persist()
         }
@@ -344,9 +471,15 @@ object JobRegistry {
      *
      * @param running The queue_running array from /queue endpoint
      * @param pending The queue_pending array from /queue endpoint
+     * @param snapshotSeq 请求发出前的登记水位（[beginQueueSnapshot]）。缺省 [Long.MAX_VALUE] =
+     *   没有快照信息，按旧语义删除所有"不在响应里的活跃任务"（保守：宁可少保留，不做宽限）。
      */
     @Synchronized
-    fun updateFromServerQueue(running: JSONArray?, pending: JSONArray?) {
+    fun updateFromServerQueue(
+        running: JSONArray?,
+        pending: JSONArray?,
+        snapshotSeq: Long = Long.MAX_VALUE,
+    ) {
         val runningCount = running?.length() ?: 0
         val pendingCount = pending?.length() ?: 0
         val totalCount = runningCount + pendingCount
@@ -400,16 +533,27 @@ object JobRegistry {
             }
         }
 
-        // Remove jobs that are no longer in the server queue (completed or removed)
+        // Remove jobs that are no longer in the server queue (completed or removed).
+        //
+        // P1-5：只删「快照发出前就已登记」的条目。请求在飞期间刚 registerJob 的任务
+        // 必然不在那份快照里，若照删就会出现"刚提交的任务从本地列表消失、按钮计数回退，
+        // 而服务器其实正在跑"。宽限只针对新登记的条目，旧条目该删照删。
         val validJobs = newState.ownJobs.filter { (promptId, job) ->
             val isInQueue = serverPromptIds.contains(promptId)
             val isPendingOrExecuting = job.status == JobStatus.PENDING || job.status == JobStatus.EXECUTING
-            // Keep jobs that are in the queue OR are not pending/executing (completed/failed awaiting cleanup)
-            isInQueue || !isPendingOrExecuting
+            val registeredSeq = jobRegistrationSeq[promptId] ?: Long.MIN_VALUE
+            !shouldDropFromQueueSnapshot(
+                isActive = isPendingOrExecuting,
+                presentInResponse = isInQueue,
+                registeredSeq = registeredSeq,
+                snapshotSeq = snapshotSeq,
+            )
         }
 
         if (validJobs.size != newState.ownJobs.size) {
-            val removedCount = newState.ownJobs.size - validJobs.size
+            val removedIds = newState.ownJobs.keys - validJobs.keys
+            removedIds.forEach { jobRegistrationSeq.remove(it) }
+            val removedCount = removedIds.size
             DebugLogger.d(TAG, "Removed $removedCount stale jobs not found in server queue")
             newState = newState.copy(ownJobs = validJobs)
         }
@@ -515,6 +659,8 @@ object JobRegistry {
     @Synchronized
     fun clear() {
         DebugLogger.i(TAG, "Clearing all job state")
+        submittedPrompts.clear()
+        jobRegistrationSeq.clear()
         _queueState.value = QueueState()
     }
 

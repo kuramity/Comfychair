@@ -39,6 +39,7 @@
     <string name="button_browser_auth_done">Hecho</string>
     <string name="button_reauthenticate">Iniciar sesión de nuevo</string>
     <string name="error_browser_auth_cancelled">El inicio de sesión no se completó</string>
+    <string name="error_browser_auth_insecure_host">Aviso de seguridad: el certificado de %1$s no es de confianza. Conexión bloqueada.</string>
 
     <!-- Connection alert dialog -->
     <string name="title_connection_lost">Conexión perdida</string>
@@ -217,6 +218,11 @@
     <!-- Error and status messages -->
     <string name="error_not_comfyui_server">No es un servidor ComfyUI</string>
     <string name="error_invalid_server_response">Respuesta del servidor inválida</string>
+    <string name="error_https_connection_failed">Error de conexión HTTPS: si el servidor solo admite HTTP, cambie la dirección para que empiece por http:// y vuelva a intentarlo</string>
+    <string name="action_retrust_certificate">Volver a confiar en el certificado del servidor</string>
+    <string name="action_trust_certificate_first_time">Confiar en este certificado del servidor y reintentar</string>
+    <string name="error_certificate_trust_failed">No se pudo guardar la confianza en el certificado, inténtalo de nuevo</string>
+    <string name="error_server_list_corrupted">La lista de servidores está dañada, el cambio no se guardó. El archivo original se ha respaldado.</string>
     <string name="error_failed_load_workflow">Error al cargar el workflow</string>
     <string name="error_generation_failed">La generación falló</string>
     <string name="error_job_lost">Tarea perdida: el servidor ya no tiene este trabajo (pudo reiniciarse o vaciarse la cola). Vuelve a generar.</string>
@@ -657,6 +663,9 @@
     <string name="update_action_now">Actualizar ahora</string>
     <string name="update_action_later">Mas tarde</string>
     <string name="update_action_install">Instalar</string>
+    <string name="update_error_verify_missing">La lista de actualizacion no contiene una suma SHA-256 valida. Actualizacion rechazada.</string>
+    <string name="update_error_redirect">La descarga se redirigio a un host no confiable (%1$s). Actualizacion cancelada.</string>
+    <string name="update_error_install_invalid">El nombre o la firma del paquete descargado no coincide con esta app. Instalacion bloqueada.</string>
     <string name="update_action_retry">Reintentar</string>
     <string name="update_manual_check_failed">Fallo la comprobacion: %1$s</string>
     <string name="update_already_latest">Ya tienes la ultima version.</string>
@@ -672,4 +681,6 @@
     <!-- Q3-3 (v4.16.5): menú de modelos cuatro estados — fallido (reintentable) vs. realmente vacío -->
     <string name="model_list_load_failed">No se pudo cargar la lista de modelos — toca para reintentar</string>
     <string name="model_list_empty">No hay modelos disponibles en el servidor</string>
+    <!-- P3-10: ninguna aplicación puede abrir el enlace externo -->
+    <string name="error_open_link_failed">No hay ninguna aplicación que pueda abrir este enlace</string>
 </resources>

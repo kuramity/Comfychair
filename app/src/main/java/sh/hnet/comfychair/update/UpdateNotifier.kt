@@ -8,11 +8,8 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.util.DebugLogger
 
@@ -24,9 +21,12 @@ import sh.hnet.comfychair.util.DebugLogger
  *   下拉通知栏可见实时进度条 —— 因为进度每 400ms 变一次，用 HIGH 会持续骚扰。
  * - [RESULT_CHANNEL_ID] `IMPORTANCE_HIGH`：下载完成 / 失败。弹横幅，点击分别直接安装 / 打开 App。
  *
- * **点击即安装**：完成通知的 PendingIntent 在**发通知时**就按当前状态二选一构造：
- * - 已有「安装未知应用」权限 → 直接 `ACTION_VIEW` + FileProvider 拉起系统安装器；
- * - 没有权限 → 跳到该权限的系统设置页（引导，不静默绕过）。
+ * **点击即安装**：完成通知的 PendingIntent 指向 [UpdateInstallActivity]（无界面中转），
+ * 由它在**点击的那一刻**调用 [AppInstaller.install] —— 内部先过
+ * [AppInstaller.isApkTrusted]（包名 + 签名）才拉起系统安装器；没有「安装未知应用」
+ * 权限则跳该权限的系统设置页（引导，不静默绕过）。
+ * 校验放在点击时而不是发通知时，是因为 PendingIntent 里的 URI 一旦固定，
+ * 到安装器读取正文之间的窗口内文件仍可能被替换（P0-7 复核 R2-L1 的 TOCTOU）。
  * 这样用户从通知栏点一次就能落到正确界面，不必先进 App 再点按钮。
  *
  * Android 13+ 的 POST_NOTIFICATIONS 被拒时全部静默跳过（不崩溃、不阻塞），
@@ -50,9 +50,6 @@ object UpdateNotifier {
 
     private const val REQ_INSTALL = 20011
     private const val REQ_LAUNCH = 20012
-
-    private const val APK_MIME = "application/vnd.android.package-archive"
-    private const val AUTHORITIES_SUFFIX = ".fileprovider"
 
     /**
      * 创建两个通知渠道（App 启动时调用一次，重复调用幂等）。
@@ -249,8 +246,9 @@ object UpdateNotifier {
     }
 
     /**
-     * 安装用的 PendingIntent：能装就直接拉起安装器，没权限就跳设置页。
-     * 任何一步失败（APK 不见了 / FileProvider 路径不匹配）都退化为「打开 App」。
+     * 安装用的 PendingIntent：点击后落到 [UpdateInstallActivity]，由它在**点击那一刻**
+     * 重新做包名/签名校验再拉起安装器（没权限则跳设置页）。
+     * APK 不见了等前置条件不满足时退化为「打开 App」。
      */
     private fun installPendingIntent(context: Context): PendingIntent {
         val intent = runCatching { buildInstallIntent(context) }
@@ -270,22 +268,14 @@ object UpdateNotifier {
         val apk = UpdateDownloadWorker.finalFile(context)
         if (!apk.isFile || apk.length() == 0L) return null
 
-        // 没有「安装未知应用」权限：先把用户送到授权页
-        if (!context.packageManager.canRequestPackageInstalls()) {
-            return Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                data = Uri.parse("package:${context.packageName}")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        }
-
-        val uri = FileProvider.getUriForFile(
-            context,
-            context.packageName + AUTHORITIES_SUFFIX,
-            apk
-        )
-        return Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, APK_MIME)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        // P0-7 / R2-L1：这里**不再**生成 FileProvider 的 content URI。
+        // 通知一旦发出，URI 就固定下来了，而文件内容要等用户点击、系统安装器打开时
+        // 才被读取 —— 中间这段窗口里替换 update.apk 就能让安装器读到未校验的文件（TOCTOU）。
+        // 改为指向中转 Activity：它在点击时调 AppInstaller.install（内部先过
+        // isApkTrusted 包名+签名校验），校验与拉起安装器之间只剩一次函数调用，
+        // 与弹窗按钮完全同构。
+        return Intent(context, UpdateInstallActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
     }
 }

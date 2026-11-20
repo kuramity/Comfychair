@@ -13,17 +13,18 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
@@ -39,7 +40,6 @@ import sh.hnet.comfychair.ui.components.ParticleTouchRouter
 import sh.hnet.comfychair.ui.components.shared.ProvideFilamentEngine
 import sh.hnet.comfychair.ui.navigation.MainNavHost
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme
-import sh.hnet.comfychair.update.UpdateChecker
 import sh.hnet.comfychair.update.UpdateDialogHost
 import sh.hnet.comfychair.update.UpdateNotifier
 import sh.hnet.comfychair.update.UpdateRepository
@@ -189,17 +189,26 @@ class MainContainerActivity : ComponentActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             UpdateNotifier.ensureChannel(this@MainContainerActivity)
             UpdateRepository.restoreFromDisk(this@MainContainerActivity)
-            val info = UpdateChecker.checkForUpdate(BuildConfig.VERSION_CODE, manualCheck = false)
-            if (info != null) {
-                UpdateRepository.publishAvailable(info)
-            }
+            // P2-10：改走 autoCheckIfDue —— 它自带离线短路（强制离线/断网时直接返回，
+            // 不向更新服务器发任何请求）与 30 分钟节流；原先这里直连 checkForUpdate
+            // 绕过了离线判断，onCreate/onResume 两条路径行为也不一致。
+            UpdateRepository.autoCheckIfDue(BuildConfig.VERSION_CODE)
         }
 
         // Load saved media state before screens initialize
+        // 4.3：这里原来是 runBlocking { loadFromDisk() } —— 主线程同步解码所有预览图、读回视频，
+        // 冷启动会卡几百毫秒到数秒。现在投递到后台协程，setContent 立刻执行；
+        // 屏幕等 MediaStateHolder.restored 变 true 后才组合（见 setContent 里的占位分支）。
+        //
+        // 5.2：闩锁按「本次恢复」判断，不再是一次性进程闩锁。必须在 setContent **之前**同步复位：
+        // 同一进程里第二次创建本 Activity（登出→重新登录、切换服务器）时，上一轮留下的 true
+        // 会让占位分支被跳过，而下面的 loadFromDisk 还在异步路上 —— 屏幕初始化一次性读媒体，
+        // 读到的就是空（TextToImageViewModel.restoreLastGeneratedImage 不会重试）。
+        MediaStateHolder.beginRestoreSession()
         if (isMemoryFirst) {
             // Memory-first: load everything from disk into memory
-            DebugLogger.d("MainContainer", "loading media from disk (memory-first mode)")
-            runBlocking {
+            DebugLogger.d("MainContainer", "loading media from disk (memory-first mode, async)")
+            lifecycleScope.launch {
                 MediaStateHolder.loadFromDisk(applicationContext)
             }
         } else {
@@ -221,9 +230,12 @@ class MainContainerActivity : ComponentActivity() {
         setContent {
             ComfyChairTheme {
                 // Observe connection alert state from ConnectionManager (single source of truth)
-                val connectionAlertState by ConnectionManager.connectionAlertState.collectAsState()
-                val isReconnecting by ConnectionManager.isReconnecting.collectAsState()
-                val sessionExpired by ConnectionManager.sessionExpired.collectAsState()
+                val connectionAlertState by ConnectionManager.connectionAlertState.collectAsStateWithLifecycle()
+                val isReconnecting by ConnectionManager.isReconnecting.collectAsStateWithLifecycle()
+                val sessionExpired by ConnectionManager.sessionExpired.collectAsStateWithLifecycle()
+                // 4.3：启动期媒体恢复完成信号。loadFromDisk 改为异步后，未就绪时只组合占位内容，
+                // 否则各屏幕的 onInitialize 会在媒体还没进内存时读到 null，且之后不会再刷新
+                val mediaRestored by MediaStateHolder.restored.collectAsStateWithLifecycle()
 
                 Surface(modifier = Modifier.fillMaxSize()) {
                     // v4.6.1 模块 B：外面包一层 Box，粒子覆盖层曾叠在导航内容之上。
@@ -231,21 +243,33 @@ class MainContainerActivity : ComponentActivity() {
                     // 效果改由按钮内的 ripple 点阵皮肤承载）；开关打开时才组合旧特效层，
                     // 作为一键回退通道。ParticleOverlay 本身零触摸修饰符，不参与命中测试。
                     Box(modifier = Modifier.fillMaxSize()) {
-                        // 共享 Filament Engine（v4.5.0）：整个页面的 3D 内嵌预览与全屏查看器
-                        // 共用一个引擎，避免"点全屏时两个引擎并存"和"反复进出反复重建"。
-                        ProvideFilamentEngine {
-                            MainNavHost(
-                                generationViewModel = generationViewModel,
-                                imageToImageViewModel = imageToImageViewModel,
-                                imageToVideoViewModel = imageToVideoViewModel,
-                                onNavigateToSettings = { openSettings() },
-                                onNavigateToGallery = { openGallery() },
-                                onLogout = { logout() },
-                                startDestination = startDestination
-                            )
-                        }
-                        if (particleOverlayEnabled) {
-                            ParticleOverlay()
+                        if (!mediaRestored) {
+                            // 媒体尚未就绪（仅内存优先模式会出现，通常只有几十到几百毫秒）：
+                            // 只铺主题背景 + 进度指示，不组合导航图 —— 屏幕初始化会一次性读媒体，
+                            // 在读之前组合出来就再也补不上了。这里既不会崩，也不会露出半截空界面。
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CircularProgressIndicator()
+                            }
+                        } else {
+                            // 共享 Filament Engine（v4.5.0）：整个页面的 3D 内嵌预览与全屏查看器
+                            // 共用一个引擎，避免"点全屏时两个引擎并存"和"反复进出反复重建"。
+                            ProvideFilamentEngine {
+                                MainNavHost(
+                                    generationViewModel = generationViewModel,
+                                    imageToImageViewModel = imageToImageViewModel,
+                                    imageToVideoViewModel = imageToVideoViewModel,
+                                    onNavigateToSettings = { openSettings() },
+                                    onNavigateToGallery = { openGallery() },
+                                    onLogout = { logout() },
+                                    startDestination = startDestination
+                                )
+                            }
+                            if (particleOverlayEnabled) {
+                                ParticleOverlay()
+                            }
                         }
                     }
                 }
@@ -339,24 +363,24 @@ class MainContainerActivity : ComponentActivity() {
         // Save generation state when going to background
         generationViewModel.saveGenerationState(this)
 
-        // Persist all dirty media to disk synchronously to ensure completion before process death
-        // Only persist in memory-first mode (disk-first writes immediately, no persistence needed)
-        // Also skip if media cache is disabled
+        // 把残留的脏媒体投递到应用级 IO 作用域落盘，本方法立即返回（**不是**同步写盘）：
+        // 只在内存优先模式需要（磁盘优先模式写入即落盘），且「禁用媒体缓存」时跳过。
+        // 预览本身有 800ms 防抖落盘兜底，这里通常已经没有脏数据；
+        // 代价是进程若在写完前被杀，最多丢这一轮尚未落盘的预览（见 persistInBackground 的注释）。
         val isMemoryFirst = AppSettings.isMemoryFirstCache(this)
         val isCacheDisabled = AppSettings.isMediaCacheDisabled(this)
         DebugLogger.d("MainContainer", "onStop - memoryFirst=$isMemoryFirst, cacheDisabled=$isCacheDisabled")
         if (isMemoryFirst && !isCacheDisabled) {
-            DebugLogger.d("MainContainer", "onStop - persisting media to disk")
-            runBlocking {
-                MediaStateHolder.persistToDisk(applicationContext)
-            }
+            // 4.3：投递到应用级 IO 作用域后立即返回。原先是主线程 runBlocking { persistToDisk() }，
+            // 退到后台要同步等全量 PNG 压缩 + 视频写盘。
+            DebugLogger.d("MainContainer", "onStop - persisting media to disk (async)")
+            MediaStateHolder.persistInBackground(applicationContext)
         }
     }
 
     override fun onResume() {
         super.onResume()
         val isGenerating = generationViewModel.generationState.value.isGenerating
-        val cache = ConnectionManager.modelCache.value
 
         if (!ConnectionManager.isOffline) {
             // 有任务在跑：必须保证实时进度/预览链路可用
@@ -371,24 +395,21 @@ class MainContainerActivity : ComponentActivity() {
                 ConnectionManager.attemptSilentReconnect()
             }
 
-            // v4.6.1（模块 A4）：后台期间 object_info 可能从未拉成功（或首次连接就被挂起），
-            // 回前台时模型列表为空 → 生成时 VAE/CLIP/UNET 被写成空串 → 服务端 400。
-            // 这里补一次主动拉取。Q3-2/Q3-4（v4.16.5）：① 触发条件放宽——不只
-            // "从未加载成功"，"已加载但列表为空"（如后台返回时恰逢请求失败）同样补拉，
-            // 避免"WebSocket 断但 HTTP 在"的中间态什么都不做；② 并发保护是
-            // fetchServerData 内真正的 SingleFlight 闸门（同一时刻至多一个 /object_info
-            // 在飞，失败后可重试），不再依赖旧注释里并不存在的 isLoading 保护。
-            // 断网 / 请求失败不会清空已加载列表（失败回调只置 lastError），已加载的
-            // 非空列表不会反复触发补拉（cacheEmpty 条件拦住）
-            val cacheEmpty = cache.checkpoints.isEmpty() &&
-                cache.unets.isEmpty() &&
-                cache.vaes.isEmpty() &&
-                cache.clips.isEmpty()
-            if (ConnectionManager.isConnected &&
-                !cache.isLoading &&
-                (!cache.isLoaded || cacheEmpty)
-            ) {
-                ConnectionManager.refreshServerData()
+            // v4.6.1（模块 A4）→ G7（v4.16.10 重做）：后台期间 object_info 可能从未拉成功、
+            // 拉失败被吞、或加载态卡在「正在加载」不收敛（E7）。旧实现这里用一份 ad-hoc 的
+            // cacheEmpty 判断，有两个洞：① 只看四类核心列表是否**全空**，「只剩 UNET 空」
+            // 这种部分空不触发补拉（G7「部分空」、G8 E6 复发的直接原因）；② 要求 !isLoading，
+            // 于是「加载态卡住」反而永远不被救回。
+            //
+            // 现在统一交给 ConnectionManager.ensureModelListLoadedAfterResume()：
+            // 判据抽成纯函数 decideModelListReload（有单测覆盖「全空需重拉 / 部分有值且加载中
+            // 不重拉 / 失败态可重拉 / 有数据健康不打扰」），且它会**主动避开过渡态**——
+            // 此刻若正在静默重连/在飞，这里判 SKIP，真正的重拉由 WebSocket onOpen（连接收敛后）
+            // 兜底触发（G7 指令 3「不得在过渡态下发起而再次被吞」）。
+            // 任何一条重拉路径都不会清空已有列表，也不会用空快照去校验、从而清掉用户已保存的
+            // 模型/LoRA 选择（G7 指令 1/4；那层保护在 ValidationUtils.isUsableModelCache）。
+            if (ConnectionManager.isConnected) {
+                ConnectionManager.ensureModelListLoadedAfterResume()
             }
         }
 

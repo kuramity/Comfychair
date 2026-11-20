@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.taglibrary.model.AppliedTag
 import sh.hnet.comfychair.taglibrary.state.PromptBridge
+import sh.hnet.comfychair.ui.util.withStableKeys
 
 /**
  * 底部构建器（需求 4.4）。
@@ -218,11 +219,16 @@ private fun BuilderColumn(
                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp)
             )
         } else {
+            // 行 key 只由标签名派生（同名标签允许重复添加，重复项由 withStableKeys 追加
+            // #dupN 消歧）。不能把下标拼进 key：删/插一个标签会让其后所有行的 key 全变，
+            // 行槽位整体重建 —— 正是 m3 要消除的行状态串位。
+            val keyedTags = remember(tags) { tags.withStableKeys { it.name } }
             LazyColumn(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                itemsIndexed(tags, key = { index, tag -> "$channel-$index-${tag.name}" }) { index, tag ->
+                itemsIndexed(keyedTags, key = { _, item -> "$channel-${item.key}" }) { index, item ->
+                    val tag = item.value
                     AppliedTagRow(
                         tag = tag,
                         onWeightClick = { onWeightClick(index, tag) },

@@ -46,7 +46,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -83,6 +83,7 @@ import sh.hnet.comfychair.ui.components.shared.PromptPresetDropdown
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultButton
 import sh.hnet.comfychair.ui.components.shared.SkillTextResultDialog
 import sh.hnet.comfychair.ui.components.shared.FreeMemoryButton
+import sh.hnet.comfychair.ui.components.shared.bottomSheetSafeDrawingInsets
 import sh.hnet.comfychair.ui.components.shared.SettingsGearButton
 import sh.hnet.comfychair.ui.components.shared.rememberSpellCheckVisualTransformation
 import sh.hnet.comfychair.ui.theme.Dimensions
@@ -140,12 +141,15 @@ fun TextToImageScreen(
     }
 
     // Collect state
-    val generationState by generationViewModel.generationState.collectAsState()
-    val connectionStatus by generationViewModel.connectionStatus.collectAsState()
-    val uiState by textToImageViewModel.uiState.collectAsState()
-    val queueState by JobRegistry.queueState.collectAsState()
-    val isConnecting by ConnectionManager.isConnecting.collectAsState()
-    val presetUiState by presetViewModel.uiState.collectAsState()
+    val generationState by generationViewModel.generationState.collectAsStateWithLifecycle()
+    val connectionStatus by generationViewModel.connectionStatus.collectAsStateWithLifecycle()
+    val uiState by textToImageViewModel.uiState.collectAsStateWithLifecycle()
+    val queueState by JobRegistry.queueState.collectAsStateWithLifecycle()
+    val isConnecting by ConnectionManager.isConnecting.collectAsStateWithLifecycle()
+    // P1-4：提交在途（闸门持有中）。并入按钮 enabled 条件，连点时按钮本身即禁用，
+    // 不再依赖 ViewModel 层静默丢弃来兜底。
+    val isSubmitting by generationViewModel.isSubmitting.collectAsStateWithLifecycle()
+    val presetUiState by presetViewModel.uiState.collectAsStateWithLifecycle()
 
     // 3D 产物（文生3D）。入口的显隐只看工作流类型（`capabilities.is3DWorkflow`），
     // 与有没有生成结果无关 —— 详见 ThreeDResultButton 的 KDoc。
@@ -154,7 +158,7 @@ fun TextToImageScreen(
     // 全局单例，图生图页生成的 glb 在这里同样读得到。不滤的话，文生图页选中 TTI_3D 流
     // 点开顶部按钮，看到的是**图生3D 那个流**的模型（也可反过来：本页还没出结果时，
     // 点开直接显示别人的结果）。判据与图生图页一致：结果必须属于"当前选中的流"。
-    val threeDResult by ThreeDResultHolder.result.collectAsState()
+    val threeDResult by ThreeDResultHolder.result.collectAsStateWithLifecycle()
     val currentWorkflowId = uiState.selectedWorkflowId
     var boundWorkflowId by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(threeDResult?.filename) {
@@ -471,7 +475,9 @@ fun TextToImageScreen(
                 canCancelCurrent = queueState.executingOwnerId == TextToImageViewModel.OWNER_ID ||
                     queueState.ownJobs.values.any { it.ownerId == TextToImageViewModel.OWNER_ID },
                 // 内嵌提示词的工作流不要求填写（是否必填由占位符决定）
-                isEnabled = !uiState.capabilities.hasPositivePrompt || uiState.positivePrompt.isNotBlank(),
+                isEnabled = (!uiState.capabilities.hasPositivePrompt || uiState.positivePrompt.isNotBlank()) &&
+                    // P1-4：上一次提交还没回来时禁用，避免连点重复提交
+                    !isSubmitting,
                 isFetching = uiState.isFetching,
                 isConnecting = isConnecting,
                 onGenerate = {
@@ -575,7 +581,8 @@ fun TextToImageScreen(
         ModalBottomSheet(
             onDismissRequest = { showOptionsBottomSheet = false },
             sheetState = optionsSheetState,
-            contentWindowInsets = { WindowInsets(0, 0, 0, 0) }
+            // 统一安全区：底部让开手势条 / 三键导航栏与输入法，左右让开横屏刘海
+            contentWindowInsets = { bottomSheetSafeDrawingInsets() }
         ) {
             val callbacks = remember(textToImageViewModel) {
                 UnifiedCallbacks(

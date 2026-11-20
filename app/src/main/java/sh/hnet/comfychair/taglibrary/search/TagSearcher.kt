@@ -13,8 +13,8 @@ import sh.hnet.comfychair.taglibrary.model.TagCategory
  * 1. 同义词表精确词条（「巨乳」→ huge_breasts）——精确优先，避免误命中
  * 2. 同义词表包含匹配（补充）
  * 3. 内存别名精确索引
- * 4. 内存别名子串匹配（5-15ms）
- * 5. SQLite 别名包含匹配（低频兜底）
+ * 4. 内存别名子串匹配（5-15ms，已覆盖全部别名的 CJK 子串）
+ * 5. 仅在内存索引尚未就绪时，才回退 SQLite 别名包含匹配（全表扫描，代价高）
  *
  * **英文输入**：
  * 1. SQLite 标签名精确匹配（主键索引）
@@ -39,16 +39,30 @@ class TagSearcher(private val dao: TagDao) {
     /** 单路检索的候选上限，避免中间集合过大。 */
     private val candidateLimit = 120
 
+    companion object {
+        /**
+         * 关键词长度上限（字符数）。
+         *
+         * 标签名本身远短于这个长度（Danbooru 最长标签也只有几十字符），再长的输入
+         * 只会被 `LIKE '%关键词%'` 这类全表扫描白白放大代价；超长输入在部分机型上
+         * 还会因为构造巨大的 LIKE 模式串而拖垮 UI 线程。UI 层与搜索层都按此截断。
+         */
+        const val MAX_KEYWORD_LENGTH = 64
+
+        /** 关键词归一化：去首尾空白 + 截断到 [MAX_KEYWORD_LENGTH]。 */
+        fun normalizeKeyword(raw: String): String = raw.trim().take(MAX_KEYWORD_LENGTH)
+    }
+
     /**
      * 执行搜索。
      *
-     * @param keyword  用户输入（已 trim）
+     * @param keyword  用户输入（内部会 trim 并截断到 [MAX_KEYWORD_LENGTH]）
      * @param category 可选分类过滤
      * @return 按「精确命中 → 热度」排序的标签列表
      */
     fun search(keyword: String, category: TagCategory? = null): List<Tag> {
-        if (keyword.isBlank()) return emptyList()
-        val trimmed = keyword.trim()
+        val trimmed = normalizeKeyword(keyword)
+        if (trimmed.isEmpty()) return emptyList()
         val index = memoryIndex
 
         val ordered = LinkedHashSet<String>()
@@ -111,18 +125,21 @@ class TagSearcher(private val dao: TagDao) {
             }
         }
 
-        // 4) SQLite 别名包含（低频标签兜底）
-        // 传"剩余额度"而不是全额，与其它分支口径一致（原先会多塞候选）；
-        // 关键词本身就是简体时 normalized == keyword，第二段自然不执行（不再把同一条全表 LIKE 查两遍）。
-        if (ordered.size < candidateLimit) {
+        // 4) SQLite 别名包含（仅在内存索引未就绪时兜底）
+        // 内存索引的 cjkAliasEntries 覆盖库内**全部**别名的 CJK 子串
+        // （loadAliasRows 没有 count 过滤），有索引时再跑一遍 `alias LIKE '%kw%'`
+        // 只是把同一次扫描从内存搬到磁盘上对 170.7 万行重新做一遍全表扫描。
+        // 实测该 LIKE 无可用索引（SCAN tags），这里跳过可省掉每次中文搜索的磁盘扫描。
+        if (index == null && ordered.size < candidateLimit) {
             ordered.addAll(
                 dao.searchByAliasContains(keyword, candidateLimit - ordered.size).map { it.name }
             )
-        }
-        if (normalized != keyword && ordered.size < candidateLimit) {
-            ordered.addAll(
-                dao.searchByAliasContains(normalized, candidateLimit - ordered.size).map { it.name }
-            )
+            // 关键词本身就是简体时 normalized == keyword，第二段自然不执行
+            if (normalized != keyword && ordered.size < candidateLimit) {
+                ordered.addAll(
+                    dao.searchByAliasContains(normalized, candidateLimit - ordered.size).map { it.name }
+                )
+            }
         }
     }
 
@@ -157,7 +174,7 @@ class TagSearcher(private val dao: TagDao) {
             )
         }
 
-        // 5) SQLite 子串兜底（低频标签；由 limit 保护，代价可控）
+        // 5) SQLite 子串兜底（低频标签；关键词已截断到 64 字符，且由 limit 提前收敛）
         if (ordered.size < candidateLimit) {
             ordered.addAll(
                 dao.searchByNameContains(keyword, candidateLimit - ordered.size).map { it.name }

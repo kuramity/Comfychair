@@ -1,7 +1,9 @@
 package sh.hnet.comfychair.ui.screens
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -210,11 +212,21 @@ fun AboutSettingsScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp)
                     .clickable {
+                        // P3-10：设备可能没有任何能处理网页的应用（精简 ROM / 无浏览器），
+                        // 不兜底会直接崩溃；这里提示用户而不是闪退。
                         val intent = Intent(
                             Intent.ACTION_VIEW,
                             Uri.parse("https://github.com/kuramity/Comfychair")
                         )
-                        context.startActivity(intent)
+                        try {
+                            context.startActivity(intent)
+                        } catch (e: ActivityNotFoundException) {
+                            Toast.makeText(
+                                context,
+                                R.string.error_open_link_failed,
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
                     }
             ) {
                 Row(

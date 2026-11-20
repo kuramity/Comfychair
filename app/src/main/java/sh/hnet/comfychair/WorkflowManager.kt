@@ -7,11 +7,12 @@ import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.NodeAttributeEdits
 import sh.hnet.comfychair.model.LoraSelection
 import sh.hnet.comfychair.model.WorkflowDefaults
+import sh.hnet.comfychair.storage.WorkflowFilePolicy
 import sh.hnet.comfychair.storage.WorkflowValuesStorage
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.BypassNodeResolver
-import sh.hnet.comfychair.util.LoraInjectionUtils
-import sh.hnet.comfychair.util.WorkflowJsonAnalyzer
+import sh.hnet.comfychair.lora.LoraInjectionUtils
+import sh.hnet.comfychair.workflow.validation.WorkflowJsonAnalyzer
 import sh.hnet.comfychair.util.Obfuscator
 import sh.hnet.comfychair.util.UuidUtils
 import sh.hnet.comfychair.util.ValidationUtils
@@ -106,6 +107,18 @@ object WorkflowManager {
     private const val USER_WORKFLOWS_KEY = "user_workflows_json"
     private const val USER_WORKFLOWS_DIR = "user_workflows"
 
+    /**
+     * 文件名里必须替换掉的字符：除「Unicode 字母 / 数字 / 下划线 / 连字符 / 点」之外的一切
+     * （含 `/` `\` `:` `*` `?` `"` `<` `>` `|` 与空白、控制字符）。点单独保留后由 trim 去掉首尾。
+     */
+    private val FILENAME_ILLEGAL_CHARS = Regex("[^\\p{L}\\p{N}_.-]")
+
+    /** 名字清洗后为空（纯标点/纯符号）时的兜底片段，避免出现 `tti_.json` 这种空名 */
+    private const val DEFAULT_FILENAME_SEGMENT = "workflow"
+
+    /** 文件名冲突时最多尝试多少个 `_N` 后缀，超出改用随机后缀 */
+    private const val MAX_FILENAME_DISAMBIGUATION = 999
+
     // Workflow data class
     data class Workflow(
         val id: String,
@@ -160,9 +173,22 @@ object WorkflowManager {
     val workflowsVersion: StateFlow<Long> = _workflowsVersion.asStateFlow()
 
     /**
+     * 上一次加载过程中是否出现过异常（内置或用户工作流任一读取失败）。
+     *
+     * 供启动清理等需要 fail-closed 的调用方使用：加载失败时列表里只有部分工作流，
+     * 拿它当「全部有效 ID」会把用户工作流的参数误判为孤儿数据删掉。
+     */
+    @Volatile
+    private var lastLoadHadErrors = false
+
+    /** 上一次加载是否出现过异常；每次加载开始时清零。 */
+    fun didLastLoadHaveErrors(): Boolean = lastLoadHadErrors
+
+    /**
      * Load all workflows (built-in and user-uploaded)
      */
     private fun loadAllWorkflows() {
+        lastLoadHadErrors = false
         workflows.clear()
         loadBuiltInWorkflows()
         loadUserWorkflows()
@@ -295,7 +321,9 @@ object WorkflowManager {
 
                 workflows.add(Workflow(id, name, description, jsonContent, type, isBuiltIn = true, defaults))
             } catch (e: Exception) {
-                // Failed to load workflow
+                // 内置工作流读取失败：标记本轮加载有异常，调用方不得把当前列表当成全集
+                lastLoadHadErrors = true
+                DebugLogger.w(TAG, "内置工作流加载失败：${e.message}")
             }
         }
     }
@@ -358,8 +386,22 @@ object WorkflowManager {
                     continue
                 }
 
-                val file = File(dir, filename)
-                if (!file.exists()) continue
+                // 文件名来自偏好里的 metadata（历史版本可能被构造过的备份写脏，
+                // 如 "../../../shared_prefs/AppSettings.xml"）：读取前必须按
+                // WorkflowFilePolicy 复核是「目录内的单层文件名」，否则会读到应用私有文件。
+                val file = WorkflowFilePolicy.resolveInDir(dir, filename)
+                if (file == null) {
+                    // 文件名非法同样是数据不完整，不能当作「该工作流不存在」去清参数
+                    lastLoadHadErrors = true
+                    DebugLogger.w(TAG, "用户工作流文件名非法，已跳过：$filename")
+                    continue
+                }
+                if (!file.exists()) {
+                    // 文件缺失说明数据不完整：不能把该工作流的参数当孤儿清掉
+                    lastLoadHadErrors = true
+                    DebugLogger.w(TAG, "用户工作流文件缺失：$filename")
+                    continue
+                }
 
                 val jsonContent = file.readText()
                 val jsonObject = try {
@@ -372,7 +414,9 @@ object WorkflowManager {
                 workflows.add(Workflow(id, name, description, jsonContent, type, isBuiltIn = false, defaults))
             }
         } catch (e: Exception) {
-            // Failed to load user workflows
+            // 用户工作流元数据损坏：标记本轮加载有异常，避免调用方按「部分列表」清理用户数据
+            lastLoadHadErrors = true
+            DebugLogger.w(TAG, "用户工作流加载失败：${e.message}")
         }
     }
 
@@ -463,8 +507,8 @@ object WorkflowManager {
             return Result.failure(Exception("A workflow with this name already exists"))
         }
 
-        // Generate filename for the new workflow
-        val filename = generateFilename(sourceWorkflow.type, newName)
+        // Generate filename for the new workflow（名字不同仍可能清洗成同一文件名，逐个试到空位）
+        val filename = generateUniqueFilename(sourceWorkflow.type, newName)
 
         // Parse and update the JSON with new name and description
         val json = try {
@@ -696,11 +740,48 @@ object WorkflowManager {
      */
     fun generateFilename(type: WorkflowType, name: String): String {
         val prefix = PREFIX_TO_TYPE.entries.find { it.value == type }?.key ?: "tti_"
-        val sanitizedName = name.lowercase()
-            .replace(Regex("[^a-z0-9]"), "_")
+        return "${prefix}${sanitizeFilenameSegment(name)}.json"
+    }
+
+    /**
+     * 把工作流名清洗成可安全落盘的文件名片段。
+     *
+     * 旧实现只保留 `[a-z0-9]`，中文名（如「写实流」）整体被替换成下划线后 trim 成空串，
+     * 于是所有纯中文名的工作流都折叠成同一个 `tti_.json`：第二个保存时不是被拒，
+     * 就是覆盖掉第一个的文件。这里改成保留 **Unicode 字母与数字**（中文/日文/emoji 之外的
+     * 文字都能留下来），只把路径分隔符、控制字符等真正非法的字符换成下划线。
+     */
+    internal fun sanitizeFilenameSegment(name: String): String {
+        val sanitized = name.lowercase()
+            .replace(FILENAME_ILLEGAL_CHARS, "_")
             .replace(Regex("_+"), "_")
-            .trim('_')
-        return "${prefix}${sanitizedName}.json"
+            .trim('_', '-', '.', ' ')
+        return sanitized.ifEmpty { DEFAULT_FILENAME_SEGMENT }
+    }
+
+    /**
+     * 生成一个**当前磁盘上确实不存在**的文件名。
+     *
+     * [generateFilename] 只保证「语法合法」，两个不同的名字仍可能清洗成同一个片段
+     * （例如 `a b` 与 `a-b`、或名字里只有标点）。写盘前必须再查一次存在性，
+     * 冲突时追加 `_2`、`_3`…，绝不允许静默覆盖已有工作流文件。
+     */
+    fun generateUniqueFilename(type: WorkflowType, name: String): String {
+        val first = generateFilename(type, name)
+        if (!isFilenameExists(first)) return first
+
+        val stem = first.removeSuffix(".json")
+        for (index in 2..MAX_FILENAME_DISAMBIGUATION) {
+            val candidate = "${stem}_$index.json"
+            if (!isFilenameExists(candidate)) {
+                DebugLogger.i(TAG, "generateUniqueFilename: '$first' 已存在，改用 '$candidate'")
+                return candidate
+            }
+        }
+        // 极端情况（同名后缀被占满）：再叠一个随机后缀，保证不会覆盖
+        val fallback = "${stem}_${UuidUtils.generateRandomId().take(8)}.json"
+        DebugLogger.w(TAG, "generateUniqueFilename: 后缀用尽，回退随机文件名 '$fallback'")
+        return fallback
     }
 
     /**
@@ -754,20 +835,49 @@ object WorkflowManager {
         }
     }
 
+    /** 提示词占位符在节点里实际落到的输入键（`CLIPTextEncode` 叫 text，部分节点叫 prompt）。 */
+    private val PROMPT_PLACEHOLDERS: Set<String> = setOf("positive_prompt", "negative_prompt")
+    private val PROMPT_INPUT_KEYS: Set<String> = setOf("text", "prompt")
+
+    /**
+     * 该输入键是否就是[placeholderName]自己应落的位置（= 这个节点确实在用这个字段）。
+     *
+     * 生成期是**全局字符串替换**，同一占位符合法出现在多个节点上（预置流 `prebuilt_30` 里
+     * `{{seed}}` 6 处、`{{width}}` 5 处、`{{positive_prompt}}` 5 处），所以「不是映射目标节点」
+     * 不能作为删除依据，必须再看输入键本身是不是该字段。
+     *
+     * 几类必须覆盖的别名/改名：
+     * - `seed` 在 `RandomNoise` 上叫 `noise_seed`（见 [TemplateKeyRegistry] 的 ALTERNATIVE_INPUT_KEYS）；
+     * - 提示词注册表的字段名是 `positive_text` / `negative_text`，而节点键实际是 `text` / `prompt`；
+     * - 未知占位符（注册表查不到）时 `getJsonKeyForPlaceholder` 回落到占位符名本身。
+     */
+    private fun inputKeyBelongsToPlaceholder(placeholderName: String, inputKey: String): Boolean {
+        if (inputKey == placeholderName) return true
+        if (inputKey == TemplateKeyRegistry.getJsonKeyForPlaceholder(placeholderName)) return true
+        if (TemplateKeyRegistry.doesInputKeyMatchField(placeholderName, inputKey)) return true
+        return placeholderName in PROMPT_PLACEHOLDERS && inputKey in PROMPT_INPUT_KEYS
+    }
+
     /**
      * 清掉「陈旧」与「未映射」的占位符。两个保存入口（新增 / 更新）共用。
      *
-     * - 陈旧（Case 1）：某节点还持有**已映射**字段的 `{{占位符}}`，但它已经不是该字段的目标节点
-     *   （用户重选过节点，或目标节点当初就没选对）。若留着，`replaceCommonPlaceholders()` 的全局
-     *   字符串替换会把值塞进不相干的节点（例如 `{{latent_upscale_model}}` 塞进
-     *   `UltralyticsDetectorProvider`）导致服务器 400。
+     * - 陈旧（Case 1）：某节点持有**已映射**字段的 `{{占位符}}`，但既不是该字段的目标节点，
+     *   输入键也不是这个字段自己（例如把 `{{latent_upscale_model}}` 塞进了
+     *   `UltralyticsDetectorProvider` 的 `text` 输入）。若留着，`replaceCommonPlaceholders()`
+     *   的全局字符串替换会把值塞进不相干节点导致服务器 400。
+     *   **反例（不得删除）**：同一占位符出现在另一个节点的**同名字段**上——那是多节点共用的
+     *   合法写法，生成期会一起替换；删了会让工作流永久损坏（之后提交报 `required_input_missing`）。
      * - 未映射（Case 2）：节点持有某个**没有任何映射**的可选字段的占位符。
+     *
+     * 判定粒度一律是 `(nodeId, inputKey)`：只删这一个输入键，绝不按占位符名字全局批量删。
      *
      * **处理方式一律是删掉该输入键，不是写成空串。** 空串能通过 ComfyUI 的 `/prompt` 校验
      * （`LoadImage.image` 只要是个字符串就算数），却会在**执行期**炸掉——实测 `image=""` 时
      * ComfyUI 把空串当目录去打开，抛 `[Errno 13] Permission denied: '<ComfyUI>/input'`，
      * App 只弹一句 "Generation failed"，用户看不出是哪个节点、什么原因。
      * 删掉输入键则立刻变成一次**缺必填输入的校验报错**，直接指向具体节点，才是「响亮的失败」。
+     *
+     * 取舍：拿不准时倾向**保留**——漏删最多换来一次服务器 400，误删会让工作流永久损坏。
      *
      * 只处理**字面量**占位符：连线（`["282",0]`）经 `optString` 取出后不匹配 `{{...}}` 正则，天然不受影响。
      */
@@ -787,14 +897,21 @@ object WorkflowManager {
                 val placeholderMatch = placeholderRegex.find(value) ?: continue
                 val placeholderName = placeholderMatch.groupValues[1]
 
-                // Case 1: placeholder belongs to a mapped field but this is not the target node
+                // Case 1：已映射字段的占位符
                 val targetNodeId = placeholderToTargetNodeId[placeholderName]
-                if (targetNodeId != null && nodeId != targetNodeId) {
+                if (targetNodeId != null) {
+                    // 目标节点，或本节点自己也在这个字段上用同一占位符（多节点共用）→ 保留
+                    if (nodeId == targetNodeId ||
+                        inputKeyBelongsToPlaceholder(placeholderName, inputKey)
+                    ) {
+                        continue
+                    }
+                    // 塞进了不相干输入 → 这才是真正该清的
                     inputs.remove(inputKey)
                     continue
                 }
 
-                // Case 2: placeholder belongs to an unmapped optional field
+                // Case 2：占位符属于某个未映射的可选字段，只清当前 (nodeId, inputKey) 这一项
                 val fieldKey = TemplateKeyRegistry.getJsonKeyForPlaceholder(placeholderName)
                 if (placeholderName in unmappedOptionalKeys || fieldKey in unmappedOptionalKeys) {
                     inputs.remove(inputKey)
@@ -919,12 +1036,14 @@ object WorkflowManager {
         }
 
         // Generate filename
-        val filename = generateFilename(type, name)
-
-        // Check for duplicate filename
-        if (isFilenameExists(filename)) {
+        //
+        // 名字重复仍旧按原来的语义直接拒绝（调用方已经先查过 isWorkflowNameTaken，
+        // 这里兜的是并发/竞态）。名字**不同但清洗后同名**的情况不再覆盖写盘，
+        // 由 generateUniqueFilename 追加后缀，见 P1-15。
+        if (isWorkflowNameTaken(name)) {
             return Result.failure(Exception("Workflow with this name already exists"))
         }
+        val filename = generateUniqueFilename(type, name)
 
         // Save file
         val dir = File(applicationContext.filesDir, USER_WORKFLOWS_DIR)
@@ -960,6 +1079,48 @@ object WorkflowManager {
         _workflowsVersion.value++
         return Result.success(workflow)
     }
+
+    /**
+     * 以 [base] 为基底合并默认值：**新抽到的值优先，抽不到的保留原值**。
+     *
+     * 只在「编辑已有工作流」这条路径上用。原因见 [updateUserWorkflowWithMapping] 里的说明：
+     * 已保存过的工作流节点里全是 `{{占位符}}`，重新保存时抽不到任何原始值，
+     * 若直接以抽取结果为准，`defaults` 会被整份清成 null（用户调好的参数全部丢失）。
+     */
+    internal fun mergeWorkflowDefaults(
+        override: WorkflowDefaults,
+        base: WorkflowDefaults
+    ): WorkflowDefaults = WorkflowDefaults(
+        width = override.width ?: base.width,
+        height = override.height ?: base.height,
+        steps = override.steps ?: base.steps,
+        cfg = override.cfg ?: base.cfg,
+        samplerName = override.samplerName ?: base.samplerName,
+        scheduler = override.scheduler ?: base.scheduler,
+        positivePrompt = override.positivePrompt ?: base.positivePrompt,
+        negativePrompt = override.negativePrompt ?: base.negativePrompt,
+        megapixels = override.megapixels ?: base.megapixels,
+        aspectRatio = override.aspectRatio ?: base.aspectRatio,
+        speedMode = override.speedMode ?: base.speedMode,
+        loraStrength = override.loraStrength ?: base.loraStrength,
+        length = override.length ?: base.length,
+        frameRate = override.frameRate ?: base.frameRate,
+        seed = override.seed ?: base.seed,
+        denoise = override.denoise ?: base.denoise,
+        batchSize = override.batchSize ?: base.batchSize,
+        upscaleMethod = override.upscaleMethod ?: base.upscaleMethod,
+        scaleBy = override.scaleBy ?: base.scaleBy,
+        stopAtClipLayer = override.stopAtClipLayer ?: base.stopAtClipLayer,
+        checkpointModel = override.checkpointModel ?: base.checkpointModel,
+        unetModel = override.unetModel ?: base.unetModel,
+        clipModel = override.clipModel ?: base.clipModel,
+        vaeModel = override.vaeModel ?: base.vaeModel,
+        clip1Model = override.clip1Model ?: base.clip1Model,
+        clip2Model = override.clip2Model ?: base.clip2Model,
+        clip3Model = override.clip3Model ?: base.clip3Model,
+        loraModel = override.loraModel ?: base.loraModel,
+        upscalerModel = override.upscalerModel ?: base.upscalerModel
+    )
 
     /**
      * Update an existing user workflow's JSON structure with new field mappings.
@@ -1032,7 +1193,12 @@ object WorkflowManager {
 
         // Create defaults object from extracted values
         // Field visibility is determined by placeholder detection, not by has* flags
-        val defaults = WorkflowDefaults(
+        //
+        // 关键：编辑已有工作流时，节点里存的已经是 {{占位符}}（上一轮保存时写进去的），
+        // extractedDefaults 一条都抽不到，直接用它会得到一个**全 null** 的 defaults，
+        // 把用户之前在生成页调好并随工作流保存的默认参数（尺寸/步数/CFG/提示词…）整份清空。
+        // 所以必须以原工作流的 defaults 为基底，只覆盖这次真正抽到的字段。
+        val extractedDefaultsObject = WorkflowDefaults(
             width = (extractedDefaults["width"] as? Number)?.toInt(),
             height = (extractedDefaults["height"] as? Number)?.toInt(),
             steps = (extractedDefaults["steps"] as? Number)?.toInt(),
@@ -1044,6 +1210,12 @@ object WorkflowManager {
             megapixels = (extractedDefaults["megapixels"] as? Number)?.toFloat(),
             length = (extractedDefaults["length"] as? Number)?.toInt(),
             frameRate = (extractedDefaults["frame_rate"] as? Number)?.toInt()
+        )
+        val defaults = mergeWorkflowDefaults(extractedDefaultsObject, existingWorkflow.defaults)
+        DebugLogger.d(
+            TAG,
+            "updateUserWorkflowWithMapping: 抽出 ${extractedDefaults.size} 个原始默认值，" +
+                "与原有 defaults 合并（未抽到的字段保留原值）"
         )
 
         // Create wrapped JSON with original metadata preserved
@@ -1099,8 +1271,11 @@ object WorkflowManager {
         }
 
         // Save file
+        // 文件名取自偏好里的 metadata，必须过安全策略：被旧版备份写脏的 metadata
+        // （含 "../" 或绝对路径）不能让我们把内容写到 user_workflows 目录之外。
         val dir = File(applicationContext.filesDir, USER_WORKFLOWS_DIR)
-        val file = File(dir, filename)
+        val file = WorkflowFilePolicy.resolveInDir(dir, filename)
+            ?: return Result.failure(Exception("Invalid workflow file name: $filename"))
         try {
             file.writeText(finalJson.toString(2))
         } catch (e: Exception) {
@@ -1260,9 +1435,16 @@ object WorkflowManager {
             }
 
             // Delete file
+            // 同样过安全策略：metadata 里的 filename 可能来自被构造过的备份，
+            // 直接拼 "user_workflows/$it" 会删到目录之外的文件（如备份/凭据）。
             filename?.let {
-                val file = File(applicationContext.filesDir, "$USER_WORKFLOWS_DIR/$it")
-                file.delete()
+                val dir = File(applicationContext.filesDir, USER_WORKFLOWS_DIR)
+                val file = WorkflowFilePolicy.resolveInDir(dir, it)
+                if (file != null) {
+                    file.delete()
+                } else {
+                    DebugLogger.w(TAG, "删除工作流时遇到非法文件名，已跳过：$it")
+                }
             }
 
             // Update preferences
@@ -1754,6 +1936,16 @@ object WorkflowManager {
                         val currentValue = inputs.opt(inputName)
                         // Don't overwrite connections (JSONArray format)
                         if (currentValue !is JSONArray) {
+                            // NaN / ±Infinity 写不进 JSON（org.json 会抛 Forbidden numeric value），
+                            // 也绝不可能是用户想要的参数：在落盘前最后一层直接丢弃这条编辑。
+                            if (value is Float && !value.isFinite()) {
+                                DebugLogger.w(TAG, "applyNodeAttributeEdits: 丢弃非有限浮点 node=$nodeId input=$inputName value=$value")
+                                continue
+                            }
+                            if (value is Double && !value.isFinite()) {
+                                DebugLogger.w(TAG, "applyNodeAttributeEdits: 丢弃非有限浮点 node=$nodeId input=$inputName value=$value")
+                                continue
+                            }
                             when (value) {
                                 is String -> inputs.put(inputName, value)
                                 is Int -> inputs.put(inputName, value)
@@ -2686,7 +2878,10 @@ object WorkflowManager {
         processedJson = injectImageSlots(processedJson, assignments)
 
         // Apply node attribute edits from the Workflow Editor
-        val preparedJson = applyNodeAttributeEdits(processedJson, workflow.id)
+        // 与其余四条生成路径（TTI / 图生图修复 / 文生视频 / 图生视频）保持一致：
+        // 编辑器里被用户 bypass（mode=4）的节点必须在这里真正摘掉并重连，
+        // 否则 API 格式的 prompt 不认识 mode 字段，被 bypass 的节点照样会被执行/校验。
+        val preparedJson = applyBypassedNodes(applyNodeAttributeEdits(processedJson, workflow.id))
         // 动态节点参数：统一替换「未识别」占位符。必须放在最后一步，避免与既有 replace* 逻辑打架
         // PE 门控物化：关掉提示词强化时把强化节点从图上摘掉（CRZSwitch 的惰性在
         // STRING 链路上实测不生效，不断结构就会白跑一次本地大模型）

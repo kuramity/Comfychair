@@ -10,7 +10,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -18,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
+import sh.hnet.comfychair.ui.components.shared.bottomSheetSafeDrawingInsets
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.BookmarkAdd
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -45,6 +45,8 @@ import sh.hnet.comfychair.R
 import sh.hnet.comfychair.model.PromptPreset
 import sh.hnet.comfychair.storage.PromptPresetStorage
 import sh.hnet.comfychair.util.GenerationMetadata
+import sh.hnet.comfychair.ui.theme.Dimensions
+import java.util.Locale
 
 /**
  * Bottom sheet displaying generation metadata from ComfyUI.
@@ -71,14 +73,17 @@ fun MetadataBottomSheet(
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        contentWindowInsets = { WindowInsets(0, 0, 0, 0) }
+        // 统一安全区：底部让开手势条 / 三键导航栏与输入法，左右让开横屏刘海。
+        // 本弹窗宿主在 edge-to-edge 的 MediaViewerActivity 里，原先写死
+        // WindowInsets(0,0,0,0) 会让三键导航（48dp）挡住滚动到底的最后一行。
+        contentWindowInsets = { bottomSheetSafeDrawingInsets() }
     ) {
         NoOverscrollContainer {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    .padding(bottom = 32.dp)
+                    .padding(horizontal = Dimensions.Spacing16)
+                    .padding(bottom = Dimensions.Spacing32)
                     .verticalScroll(rememberScrollState())
             ) {
                 // 标题 + 「加入提示词库」：正向与负面一并存入，按钮放在标题右侧
@@ -180,9 +185,17 @@ fun MetadataBottomSheet(
             storage = storage,
             onSaveWithScreenType = { name, prompt, negativePrompt, tags, screenType ->
                 val preset = PromptPreset.create(screenType, name, prompt, tags, negativePrompt)
-                storage.addPreset(preset)
-                showSavePromptDialog = false
-                Toast.makeText(context, R.string.msg_prompt_preset_saved, Toast.LENGTH_SHORT).show()
+                // 存储损坏时 addPreset 会拒绝写入并返回 false：不能弹「已保存」，也不关对话框
+                if (storage.addPreset(preset)) {
+                    showSavePromptDialog = false
+                    Toast.makeText(context, R.string.msg_prompt_preset_saved, Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(
+                        context,
+                        R.string.error_local_store_corrupted,
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         )
     }
@@ -297,7 +310,10 @@ private fun buildMetadataItems(metadata: GenerationMetadata, context: Context): 
     }
 
     metadata.loras.forEach { lora ->
-        val loraValue = "${lora.name} (${String.format("%.2f", lora.strength)})"
+        // 固定 Locale.US：ComfyUI 参数里的数值始终用半角数字与 "." 小数点。
+        // 跟随系统区域时，阿拉伯/波斯等区域会输出本地数字形态（如 ٠٫٨٠），
+        // 既和服务器/提示词里的写法不一致，也会让用户复制后无法回填。
+        val loraValue = "${lora.name} (${String.format(Locale.US, "%.2f", lora.strength)})"
         items.add(MetadataItem(context.getString(R.string.metadata_lora), loraValue))
     }
 
@@ -306,7 +322,8 @@ private fun buildMetadataItems(metadata: GenerationMetadata, context: Context): 
     }
 
     metadata.cfg?.let {
-        items.add(MetadataItem(context.getString(R.string.metadata_cfg), String.format("%.1f", it)))
+        // 同上：CFG 等采样参数固定 Locale.US，避免本地化数字形态
+        items.add(MetadataItem(context.getString(R.string.metadata_cfg), String.format(Locale.US, "%.1f", it)))
     }
 
     metadata.sampler?.let {

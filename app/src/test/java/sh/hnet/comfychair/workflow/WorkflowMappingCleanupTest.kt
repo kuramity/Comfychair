@@ -103,16 +103,27 @@ class WorkflowMappingCleanupTest {
 
     @Test
     fun `陈旧占位符被整键删除而不是写成空串`() {
-        val nodes = flf2vJson().getJSONObject("nodes")
-        // 假装 reference_image_1 的目标节点被改成了 282，于是 275 上那一份变成"陈旧"
+        // 用「不相干输入键」构造陈旧场景：同一占位符落在别的节点的同名字段上是合法的
+        // 多节点共用（见 PlaceholderCleanupTest），只有塞进不相干字段才该清。
+        val nodes = JSONObject(
+            """
+            {"nodes":{
+              "275":{"class_type":"ImageResizeKJv2","inputs":{
+                  "image":["282",0],"upscale_method":"{{reference_image_1}}"}},
+              "282":{"class_type":"LoadImage","inputs":{"image":"{{reference_image_1}}"}}
+            }}
+            """.trimIndent()
+        ).getJSONObject("nodes")
+
         WorkflowManager.clearStaleAndUnmappedPlaceholders(
             nodes,
             placeholderToTargetNodeId = mapOf("reference_image_1" to "282"),
             unmappedOptionalKeys = emptySet()
         )
 
-        val loadImage275 = nodes.getJSONObject("275").getJSONObject("inputs")
-        assertFalse("陈旧占位符所在的输入键应被删掉", loadImage275.has("image"))
+        val inputs = nodes.getJSONObject("275").getJSONObject("inputs")
+        assertFalse("陈旧占位符所在的输入键应被删掉", inputs.has("upscale_method"))
+        assertTrue("连线不能被顺手删掉", inputs.get("image") is org.json.JSONArray)
     }
 
     @Test

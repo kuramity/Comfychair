@@ -14,7 +14,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -24,8 +24,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.connection.CoreCategory
 import sh.hnet.comfychair.connection.ModelListUiState
 import sh.hnet.comfychair.connection.resolveModelListUiState
+import sh.hnet.comfychair.connection.stateOf
 import sh.hnet.comfychair.model.ModelIntro
 import sh.hnet.comfychair.model.ModelIntroTable
 
@@ -48,7 +50,12 @@ fun ModelDropdown(
     selectedValue: String,
     options: List<String>,
     onValueChange: (String) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /**
+     * G8 指令 1 的接线：UNET / VAE / CLIP 三类下拉传各自的类别，四态就按**这一类**的
+     * 终态判定；其余下拉传 null，沿用整体四态（行为与历史一致）。
+     */
+    category: CoreCategory? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
 
@@ -56,13 +63,22 @@ fun ModelDropdown(
     // 失败（可重试）。旧实现只区分"加载中"与"空"，/object_info 失败后下拉是
     // 一个沉默的空框，与"服务器没模型"无法区分。判定抽成纯函数
     // resolveModelListUiState（connection 包），JVM 单测逐条钉住
-    val cache by ConnectionManager.modelCache.collectAsState()
-    val listState = resolveModelListUiState(
-        isLoading = cache.isLoading,
-        isLoaded = cache.isLoaded,
-        lastError = cache.lastError,
-        optionCount = options.size
-    )
+    val cache by ConnectionManager.modelCache.collectAsStateWithLifecycle()
+    // G8：分类态优先。UNET 单独失败时不该把 VAE / CLIP 一起标成失败，
+    // UNET 也不该被整体的「还在加载」拖成永久「正在加载」（E7 的观感正是这么来的）
+    val listState = if (category != null) {
+        resolveModelListUiState(
+            state = cache.stateOf(category),
+            optionCount = options.size
+        )
+    } else {
+        resolveModelListUiState(
+            isLoading = cache.isLoading,
+            isLoaded = cache.isLoaded,
+            lastError = cache.lastError,
+            optionCount = options.size
+        )
+    }
 
     val tree = remember(options) { buildModelTree(options) }
     val hasFolders = remember(tree) { modelTreeHasFolders(tree) }
@@ -77,13 +93,22 @@ fun ModelDropdown(
         modifier = modifier
     ) {
         OutlinedTextField(
-            value = if (selectedValue.isBlank() && cache.isLoading) {
+            // 三个分支一律按 listState 判，不再直接读整体的 cache.isLoading（G8 指令 2）：
+            // 分类下拉只看自己那一类是否还在加载，别的类卡住不会把它拖成「正在加载…」
+            value = if (selectedValue.isBlank() && listState == ModelListUiState.LOADING) {
                 stringResource(R.string.model_list_loading)
             } else if (selectedValue.isBlank() && listState == ModelListUiState.FAILED) {
                 // 没有选中值时把失败写进字段本身：不打开下拉也能看到"出问题了"，
                 // 而不是一个看似正常的空框。已选中旧数据的字段不受影响（选项照常）
                 stringResource(R.string.model_list_load_failed)
+            } else if (selectedValue.isBlank() && listState == ModelListUiState.EMPTY && category != null) {
+                // G7 指令 2「禁止静默留空」：这一类真没模型时，收起状态下也要写明，
+                // 而不是留一个空白框让人以为加载坏了（E6「UNET 行空值」就是这么显示的）。
+                // 只对**分类下拉**生效：采样器 / 分辨率等非模型列表用「没有可用模型」
+                // 描述会是错的措辞，它们维持原样（展开时才提示）。
+                stringResource(R.string.model_list_empty)
             } else {
+
                 selectedValue
             },
             onValueChange = {},
@@ -100,7 +125,7 @@ fun ModelDropdown(
             expanded = expanded,
             onDismissRequest = { expanded = false }
         ) {
-            if (options.isEmpty() && cache.isLoading) {
+            if (options.isEmpty() && listState == ModelListUiState.LOADING) {
                 // 展开时数据还没到 —— 明确告诉用户在加载，而不是给一个空菜单
                 DropdownMenuItem(
                     text = { Text(stringResource(R.string.model_list_loading)) },
@@ -125,7 +150,8 @@ fun ModelDropdown(
                     text = { Text(stringResource(R.string.model_list_load_failed)) },
                     onClick = {
                         expanded = false
-                        ConnectionManager.refreshServerData()
+                        // G8 指令 1：分类下拉的重试入口就是「单独重试这一类」
+                        ConnectionManager.retryCoreCategory(category)
                     },
                     contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
                 )
@@ -163,7 +189,7 @@ fun ModelDropdown(
                     text = { Text(stringResource(R.string.model_list_load_failed)) },
                     onClick = {
                         expanded = false
-                        ConnectionManager.refreshServerData()
+                        ConnectionManager.retryCoreCategory(category)
                     },
                     contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
                 )

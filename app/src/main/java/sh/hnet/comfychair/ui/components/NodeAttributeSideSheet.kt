@@ -676,7 +676,9 @@ private fun FloatEditor(
         value = textValue,
         onValueChange = { newValue ->
             textValue = newValue
-            newValue.toFloatOrNull()?.let { onValueChange(it) }
+            // 只有有限值才回写编辑：NaN / ±Infinity 能被 toFloatOrNull 解析出来，
+            // 一旦进入 nodeAttributeEdits 就会污染工作流 JSON（org.json 拒绝写入 NaN）。
+            newValue.toFloatOrNull()?.takeIf { it.isFinite() }?.let { onValueChange(it) }
         },
         label = label,
         min = min ?: Float.MIN_VALUE,

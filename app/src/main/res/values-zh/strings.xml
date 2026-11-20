@@ -39,6 +39,7 @@
     <string name="button_browser_auth_done">完成</string>
     <string name="button_reauthenticate">重新登录</string>
     <string name="error_browser_auth_cancelled">登录未完成</string>
+    <string name="error_browser_auth_insecure_host">安全提示：%1$s 的证书不受信任，已阻止连接。</string>
 
     <!-- Connection alert dialog -->
     <string name="title_connection_lost">连接丢失</string>
@@ -143,7 +144,8 @@
     <string name="error_queue_clear">清空队列失败</string>
     <string name="msg_history_cleared_success">历史记录已清空</string>
     <string name="error_history_clear">清空历史记录失败</string>
-    <string name="msg_history_item_deleted_success">项目已删除</string>
+    <!-- G4：App 内删除 = 移入回收站（可恢复），文案跟随新语义 -->
+    <string name="msg_history_item_deleted_success">已移入回收站</string>
     <string name="error_history_item_delete">删除项目失败</string>
     <string name="msg_cache_cleared_success">缓存已清空</string>
     <string name="msg_defaults_restored_success">已恢复默认设置</string>
@@ -224,6 +226,12 @@
     <!-- Error and status messages -->
     <string name="error_not_comfyui_server">不是 ComfyUI 服务器</string>
     <string name="error_invalid_server_response">无效的服务器响应</string>
+    <string name="error_https_connection_failed">HTTPS 连接失败：如果服务器只支持 HTTP，请把地址改为 http:// 开头后重试</string>
+    <string name="action_retrust_certificate">重新信任服务器证书</string>
+    <string name="action_trust_certificate_first_time">信任该服务器证书并重试</string>
+    <string name="error_certificate_trust_failed">无法保存证书信任，请重试</string>
+    <string name="error_server_list_corrupted">服务器列表已损坏，本次更改未保存（原文件已备份）</string>
+    <string name="error_local_store_corrupted">本地数据已损坏，本次修改未保存（原数据已备份）</string>
     <string name="error_failed_load_workflow">加载工作流失败</string>
     <string name="error_generation_failed">生成失败</string>
     <string name="error_job_lost">任务已丢失：服务器上已找不到这个任务（可能重启过或队列被清空）。请重新生成。</string>
@@ -269,13 +277,14 @@
     <string name="button_select_all">全选</string>
     <string name="button_deselect_all">取消全选</string>
     <string name="dialog_delete_selected_title">删除所选项目？</string>
-    <string name="dialog_delete_selected_message">将从本机图库移除 %d 项，服务器上的文件不受影响；移除后无法恢复。</string>
+    <string name="dialog_delete_selected_message">将从本机图库移除 %d 项并放入回收站，可随时恢复；服务器上的文件不受影响。</string>
     <string name="label_item_selected">已选择</string>
     <string name="label_3d_badge">3D 模型</string>
     <string name="msg_items_saved_to_gallery">项目已保存到相册</string>
     <string name="msg_some_items_failed_to_save">部分项目保存失败</string>
     <string name="error_share_items">分享项目失败</string>
-    <string name="msg_items_deleted_success">项目已删除</string>
+    <!-- G4：批量删除 = 移入回收站 -->
+    <string name="msg_items_deleted_success">已移入回收站</string>
     <string name="msg_some_items_failed_to_delete">部分项目删除失败</string>
 
     <!-- Mask editor strings -->
@@ -486,6 +495,7 @@
     <string name="error_backup_create">创建备份失败</string>
     <string name="msg_backup_restore_success">设置恢复成功</string>
     <string name="msg_backup_restore_partial">设置部分恢复。部分工作流已跳过。</string>
+    <string name="msg_backup_restore_skipped_servers">设置部分恢复。%1$d 个服务器的地址或端口不合法，已跳过。</string>
     <string name="error_backup_restore">恢复备份失败</string>
     <string name="error_backup_invalid_json">无效的备份文件格式</string>
     <string name="error_backup_unsupported_version">不支持的备份版本</string>
@@ -510,7 +520,7 @@
     <string name="button_debug_logging_view">查看日志</string>
     <string name="title_debug_log">调试日志</string>
     <string name="msg_debug_log_empty">无日志条目</string>
-    <string name="debug_log_save">Save</string>
+    <string name="debug_log_save">保存</string>
     <string name="debug_log_follow">跟随</string>
     <string name="msg_debug_log_saved">日志保存成功</string>
     <string name="error_debug_log_save">保存日志失败</string>
@@ -861,6 +871,9 @@
     <string name="update_error_server">服务端错误（HTTP %1$d）。</string>
     <string name="update_error_http">服务端拒绝请求（HTTP %1$d）。</string>
     <string name="update_error_verify">安装包校验失败（SHA-256 不匹配）。</string>
+    <string name="update_error_verify_missing">更新清单缺少有效的 SHA-256 校验值，已拒绝该更新。</string>
+    <string name="update_error_redirect">下载被重定向到不可信的主机（%1$s），已中止。</string>
+    <string name="update_error_install_invalid">安装包的包名或签名与本应用不一致，已阻止安装。</string>
     <string name="update_error_disk">磁盘空间不足（剩余 %1$s，需要约 %2$s）。</string>
     <string name="update_error_retry_exhausted">已重试 %1$d 次仍失败，请检查网络后手动重试。</string>
     <string name="update_error_unknown">下载中断，可重试续传。</string>
@@ -887,4 +900,92 @@
     <string name="changelog_screen_title">更新日志</string>
     <string name="changelog_badge_current">当前版本</string>
     <string name="changelog_empty">暂无可显示的内容</string>
+
+    <!-- ==================== 翻译完整性补齐（v4.17，第 8 章 8.1） ==================== -->
+    <!-- 以下 key 此前只在默认 values/strings.xml 存在，中文界面会直接回落到默认值。
+         现按 TranslationCompletenessTest 的契约补齐：中文缺口必须为零。
+         注意：默认文件里标了 translatable="false" 的键（app_name、label_cfg 这类品牌名/
+         技术缩写、语言自称、纯格式串）**不在此处重复定义** —— 它们在默认资源里就有唯一
+         一份，各语种直接复用；重复写一份反而会让「不可翻译」标记失去意义、改品牌名时
+         要改两处。 -->
+
+    <!-- 标签库入口与收藏筛选 -->
+    <string name="nav_tag_library">标签库</string>
+    <string name="prompt_library_filter_favorites">仅显示收藏</string>
+
+    <!-- 标签库：分类 -->
+    <string name="tag_category_all">全部</string>
+    <string name="tag_category_general">通用</string>
+    <string name="tag_category_artist">画师</string>
+    <string name="tag_category_copyright">作品</string>
+    <string name="tag_category_character">角色</string>
+    <string name="tag_category_meta">元标签</string>
+
+    <!-- 标签库：搜索与加载状态 -->
+    <string name="tag_search_hint">搜索标签（中文 / 日文 / 英文）</string>
+    <string name="tag_search_clear">清空</string>
+    <string name="tag_searching">搜索中…</string>
+    <string name="tag_loading_db">正在加载标签库（首次约需数秒）…</string>
+    <string name="tag_empty_hint">输入关键词搜索标签</string>
+    <string name="tag_empty_no_result">未找到相关标签</string>
+    <string name="tag_retry">重试</string>
+    <string name="tag_error_init">标签库加载失败：%1$s</string>
+
+    <!-- 标签库：添加与详情 -->
+    <string name="tag_add_positive">+正</string>
+    <string name="tag_add_negative">-负</string>
+    <string name="tag_alias_zh">中文别名</string>
+    <string name="tag_alias_ja">日文别名</string>
+    <string name="tag_alias_en">英文别名</string>
+    <string name="tag_alias_group_title">%1$s（%2$d）</string>
+    <string name="tag_detail_back">返回</string>
+    <string name="tag_detail_count">热度 %1$s</string>
+    <string name="tag_detail_meaning">中文释义：%1$s</string>
+    <string name="tag_toast_added">已添加：%1$s</string>
+    <string name="tag_toast_no_target">当前没有可写入的生成页面</string>
+
+    <!-- 标签库：权重设置 -->
+    <string name="tag_weight_confirm">确定</string>
+    <string name="tag_weight_cancel">取消</string>
+    <string name="tag_weight_hint">权重范围 0.1 – 2.0；等于 1.0 时提示词中不写括号</string>
+
+    <!-- 标签库：提示词构建器 -->
+    <string name="tag_builder_title">构建器</string>
+    <string name="tag_builder_counts">正 %1$d · 负 %2$d</string>
+    <string name="tag_builder_positive">正向提示词</string>
+    <string name="tag_builder_negative">负向提示词</string>
+    <string name="tag_builder_empty">（空）</string>
+    <string name="tag_builder_expand">展开</string>
+    <string name="tag_builder_collapse">收起</string>
+    <string name="tag_builder_remove">移除</string>
+    <string name="tag_builder_no_target">当前没有可写入的生成页面，请先进入生成页并选择工作流</string>
+
+    <!-- 关于页：设备上没有能打开外部链接的应用（P3-10） -->
+    <string name="error_open_link_failed">没有可打开此链接的应用</string>
+
+    <!-- ============================================================ -->
+    <!-- G4（任务书 11.4）：图库回收站与服务器联动删除 -->
+    <!-- ============================================================ -->
+    <string name="action_gallery_trash">回收站</string>
+    <string name="gallery_trash_title">回收站（%1$d）</string>
+    <string name="gallery_trash_back">返回图库</string>
+    <string name="gallery_trash_empty">回收站是空的</string>
+    <string name="gallery_trash_clear_all">清空回收站</string>
+    <string name="gallery_trash_restore">恢复</string>
+    <string name="gallery_trash_delete_forever">彻底删除</string>
+    <string name="gallery_trash_pending_retry">服务器删除失败，待重试</string>
+    <string name="gallery_trash_other_server">属于未连接的服务器，连上那台后才能联动删除服务器文件</string>
+    <string name="gallery_trash_in_trash_since">删除于 %1$s</string>
+    <string name="dialog_trash_purge_title">联动删除服务器上的文件？</string>
+    <string name="dialog_trash_purge_message">首次启用服务器联动删除：下列文件（共 %1$d 个）将只通过服务器接口删除 ComfyUI 输出目录内的对应文件。确认后本服务器不再重复询问。</string>
+    <string name="dialog_trash_purge_note">若服务器未安装删除接口，只会清除本机记录、服务器文件保留；删除失败的条目留在回收站可重试。</string>
+    <string name="button_confirm_and_purge">确认启用并删除</string>
+    <string name="msg_trash_moved">已移入回收站</string>
+    <string name="msg_trash_restored">已恢复</string>
+    <string name="msg_trash_restore_failed">恢复失败（条目可能已不在回收站）</string>
+    <string name="msg_trash_purged_server">已联动服务器删除 %1$d 项</string>
+    <string name="msg_trash_purged_local_only">%1$d 项：服务器未安装删除接口，已清除本机记录（服务器文件保留）</string>
+    <string name="msg_trash_purge_pending">%1$d 项服务器删除失败，已留在回收站待重试</string>
+    <string name="msg_trash_kept_other_server">%1$d 项属于其它服务器，保留在回收站</string>
+    <string name="button_undo">撤销</string>
 </resources>

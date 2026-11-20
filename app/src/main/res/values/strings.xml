@@ -35,6 +35,7 @@
     <string name="button_browser_auth_done">Done</string>
     <string name="button_reauthenticate">Sign In Again</string>
     <string name="error_browser_auth_cancelled">Sign in was not completed</string>
+    <string name="error_browser_auth_insecure_host">Security warning: the certificate for %1$s is not trusted. Connection blocked.</string>
 
     <!-- Connection alert dialog -->
     <string name="title_connection_lost">Connection Lost</string>
@@ -116,7 +117,8 @@
     <string name="error_queue_clear">Failed to clear queue</string>
     <string name="msg_history_cleared_success">History cleared successfully</string>
     <string name="error_history_clear">Failed to clear history</string>
-    <string name="msg_history_item_deleted_success">Item deleted successfully</string>
+    <!-- G4: gallery delete now moves to trash (recoverable), wording follows the new semantics -->
+    <string name="msg_history_item_deleted_success">Moved to trash</string>
     <string name="error_history_item_delete">Failed to delete item</string>
     <string name="msg_cache_cleared_success">Cache cleared successfully</string>
     <string name="msg_defaults_restored_success">Defaults restored successfully</string>
@@ -183,6 +185,7 @@
     <string name="error_backup_create">Failed to create backup</string>
     <string name="msg_backup_restore_success">Settings restored successfully</string>
     <string name="msg_backup_restore_partial">Settings partially restored. Some workflows were skipped.</string>
+    <string name="msg_backup_restore_skipped_servers">Settings partially restored. %1$d server(s) with an invalid address or port were skipped.</string>
     <string name="error_backup_restore">Failed to restore backup</string>
     <string name="error_backup_invalid_json">Invalid backup file format</string>
     <string name="error_backup_unsupported_version">Unsupported backup version</string>
@@ -240,6 +243,12 @@
     <!-- Error and status messages -->
     <string name="error_not_comfyui_server">Not a ComfyUI server</string>
     <string name="error_invalid_server_response">Invalid server response</string>
+    <string name="error_https_connection_failed">HTTPS connection failed: if the server only supports HTTP, change the address to start with http:// and retry</string>
+    <string name="action_retrust_certificate">Re-trust server certificate</string>
+    <string name="action_trust_certificate_first_time">Trust this server certificate and retry</string>
+    <string name="error_certificate_trust_failed">Could not save the certificate trust, please try again</string>
+    <string name="error_server_list_corrupted">The server list is corrupted, so the change was not saved. The original file has been backed up.</string>
+    <string name="error_local_store_corrupted">Stored data is corrupted, so this change was not saved. The original data has been backed up.</string>
     <string name="error_failed_load_workflow">Failed to load workflow</string>
     <string name="error_generation_failed">Generation failed</string>
     <string name="error_job_lost">Task lost: the server no longer has this job (it may have restarted or the queue was cleared). Please generate again.</string>
@@ -283,13 +292,14 @@
     <string name="button_select_all">Select all</string>
     <string name="button_deselect_all">Deselect all</string>
     <string name="dialog_delete_selected_title">Delete selected items?</string>
-    <string name="dialog_delete_selected_message">%d items will be removed from this device\'s gallery only. Files on the server are not affected. This cannot be undone.</string>
+    <string name="dialog_delete_selected_message">%d items will be moved to the gallery trash on this device, where you can restore them anytime. Files on the server are not affected.</string>
     <string name="label_item_selected">Selected</string>
     <string name="label_3d_badge">3D model</string>
     <string name="msg_items_saved_to_gallery">Items saved to gallery</string>
     <string name="msg_some_items_failed_to_save">Some items failed to save</string>
     <string name="error_share_items">Failed to share items</string>
-    <string name="msg_items_deleted_success">Items deleted successfully</string>
+    <!-- G4: batch delete = move to trash -->
+    <string name="msg_items_deleted_success">Items moved to trash</string>
     <string name="msg_some_items_failed_to_delete">Some items failed to delete</string>
 
     <!-- Mask editor strings -->
@@ -946,6 +956,9 @@
     <string name="update_error_server">Server error (HTTP %1$d).</string>
     <string name="update_error_http">Server rejected the request (HTTP %1$d).</string>
     <string name="update_error_verify">Package verification failed (SHA-256 mismatch).</string>
+    <string name="update_error_verify_missing">The update manifest has no valid SHA-256 checksum. Update rejected.</string>
+    <string name="update_error_redirect">The download was redirected to an untrusted host (%1$s). Update aborted.</string>
+    <string name="update_error_install_invalid">The downloaded package name or signature does not match this app. Installation blocked.</string>
     <string name="update_error_disk">Not enough storage (free %1$s, need about %2$s).</string>
     <string name="update_error_retry_exhausted">Failed after %1$d retries. Check the network and retry manually.</string>
     <string name="update_error_unknown">Download interrupted. Resumable retry supported.</string>
@@ -972,4 +985,33 @@
     <string name="changelog_screen_title">Changelog</string>
     <string name="changelog_badge_current">Current</string>
     <string name="changelog_empty">No changelog available</string>
+
+    <!-- About screen: no app can handle the external link (P3-10) -->
+    <string name="error_open_link_failed">No app found that can open this link</string>
+
+    <!-- ============================================================ -->
+    <!-- G4 (spec 11.4): gallery trash + server-linked delete -->
+    <!-- ============================================================ -->
+    <string name="action_gallery_trash">Trash</string>
+    <string name="gallery_trash_title">Trash (%1$d)</string>
+    <string name="gallery_trash_back">Back to gallery</string>
+    <string name="gallery_trash_empty">Trash is empty</string>
+    <string name="gallery_trash_clear_all">Empty trash</string>
+    <string name="gallery_trash_restore">Restore</string>
+    <string name="gallery_trash_delete_forever">Delete forever</string>
+    <string name="gallery_trash_pending_retry">Server delete failed, pending retry</string>
+    <string name="gallery_trash_other_server">Belongs to another server; connect to it to delete server files</string>
+    <string name="gallery_trash_in_trash_since">Deleted at %1$s</string>
+    <string name="dialog_trash_purge_title">Also delete files on the server?</string>
+    <string name="dialog_trash_purge_message">First-time server-linked delete: the files below (%1$d) will be deleted from the ComfyUI output directory via the server interface only. This will not be asked again on this server.</string>
+    <string name="dialog_trash_purge_note">If the server has no delete interface installed, only local records are removed and server files are kept. Failed items stay in the trash for retry.</string>
+    <string name="button_confirm_and_purge">Confirm &amp; delete</string>
+    <string name="msg_trash_moved">Moved to trash</string>
+    <string name="msg_trash_restored">Restored</string>
+    <string name="msg_trash_restore_failed">Restore failed (entry no longer in trash)</string>
+    <string name="msg_trash_purged_server">%1$d deleted on server and device</string>
+    <string name="msg_trash_purged_local_only">%1$d: server has no delete interface, only local records removed (server files kept)</string>
+    <string name="msg_trash_purge_pending">%1$d failed to delete on server, kept in trash for retry</string>
+    <string name="msg_trash_kept_other_server">%1$d belong to other servers, kept in trash</string>
+    <string name="button_undo">Undo</string>
 </resources>
