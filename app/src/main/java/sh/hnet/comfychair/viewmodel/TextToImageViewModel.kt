@@ -20,6 +20,7 @@ import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.LoraSelection
 import sh.hnet.comfychair.model.PositivePromptPolicy
+import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.SeedMode
 import sh.hnet.comfychair.model.WorkflowCapabilities
 import sh.hnet.comfychair.model.nextSeed
@@ -218,6 +219,9 @@ sealed class TextToImageEvent {
 class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToImageEvent>() {
 
     override val initialState = TextToImageUiState()
+
+    /** 本页在 GenerationViewModel 里的注册键（基类 stopListening 用） */
+    override val generationOwnerId = OWNER_ID
 
     /**
      * 注册到标签库桥接：使标签库页面可以读写本页的正/负向提示词（需求 5.2）。
@@ -778,41 +782,20 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
 
     // Unified LoRA chain management
 
-    fun onAddLora() {
-        val state = _uiState.value
-        val newChain = LoraChainManager.addLora(state.loraChain, state.availableLoras)
-        if (newChain === state.loraChain) return // No change
+    override fun withLoraChain(state: TextToImageUiState, chain: List<LoraSelection>) =
+        state.copy(loraChain = chain)
 
-        _uiState.value = state.copy(loraChain = newChain)
-        saveConfiguration()
-    }
+    fun onAddLora() =
+        updateLoraChain(::saveConfiguration) { LoraChainManager.addLora(it.loraChain, it.availableLoras) }
 
-    fun onRemoveLora(index: Int) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.removeLora(state.loraChain, index)
-        if (newChain === state.loraChain) return // No change
+    fun onRemoveLora(index: Int) =
+        updateLoraChain(::saveConfiguration) { LoraChainManager.removeLora(it.loraChain, index) }
 
-        _uiState.value = state.copy(loraChain = newChain)
-        saveConfiguration()
-    }
+    fun onLoraNameChange(index: Int, name: String) =
+        updateLoraChain(::saveConfiguration) { LoraChainManager.updateLoraName(it.loraChain, index, name) }
 
-    fun onLoraNameChange(index: Int, name: String) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraName(state.loraChain, index, name)
-        if (newChain === state.loraChain) return // No change
-
-        _uiState.value = state.copy(loraChain = newChain)
-        saveConfiguration()
-    }
-
-    fun onLoraStrengthChange(index: Int, strength: Float) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraStrength(state.loraChain, index, strength)
-        if (newChain === state.loraChain) return // No change
-
-        _uiState.value = state.copy(loraChain = newChain)
-        saveConfiguration()
-    }
+    fun onLoraStrengthChange(index: Int, strength: Float) =
+        updateLoraChain(::saveConfiguration) { LoraChainManager.updateLoraStrength(it.loraChain, index, strength) }
 
     /**
      * Update the current bitmap (e.g., from preview or final image)
@@ -881,21 +864,6 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
         generationViewModel.registerSubmittedCallback(OWNER_ID) { advanceSeedIfNeeded() }
         generationViewModel.registerEventHandler(OWNER_ID) { event ->
             handleGenerationEvent(event)
-        }
-    }
-
-    /**
-     * Stop listening for generation events.
-     * Note: We keep the generationViewModelRef if generation is still running,
-     * as the handler may still be called for completion events.
-     */
-    fun stopListening(generationViewModel: GenerationViewModel) {
-        generationViewModel.unregisterSubmittedCallback(OWNER_ID)
-        generationViewModel.unregisterEventHandler(OWNER_ID)
-        if (!generationViewModel.generationState.value.isGenerating) {
-            if (generationViewModelRef == generationViewModel) {
-                generationViewModelRef = null
-            }
         }
     }
 
@@ -981,6 +949,17 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
 
         DebugLogger.i(TAG, "Preparing workflow: ${Obfuscator.workflowName(state.selectedWorkflow)}")
 
+        // 提交前兜底（1.3）：进占位符替换之前再清洗一次 sampler / scheduler。
+        // 读取阶段在「服务器清单未知」（冷启动）时是原样放行的，所以非法值可能还留在状态里，
+        // 而它会被 ComfyUI 的 validate_inputs() 判成 "Value not in list" 直接 400。
+        // 这里只改「取值」，替换逻辑本身不动；改了值就同步回界面（下拉框不该继续显示脏值）
+        val safeSampler = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers)
+        val safeScheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers)
+        if (safeSampler != state.sampler || safeScheduler != state.scheduler) {
+            DebugLogger.w(TAG, "采样参数非法，已纠正为 sampler=$safeSampler, scheduler=$safeScheduler")
+            _uiState.update { it.copy(sampler = safeSampler, scheduler = safeScheduler) }
+        }
+
         // Pass ALL model selections and parameters - only those with matching
         // placeholders in the workflow will be substituted
         val baseWorkflow = WorkflowManager.prepareWorkflowById(
@@ -1004,8 +983,8 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
             height = state.height.toIntOrNull() ?: 1024,
             steps = state.steps.toIntOrNull() ?: 20,
             cfg = state.cfg.toFloatOrNull() ?: 7.0f,
-            samplerName = state.sampler,
-            scheduler = state.scheduler,
+            samplerName = safeSampler,
+            scheduler = safeScheduler,
             seed = state.seed.toLongOrNull(),
             randomSeed = state.randomSeed,
             denoise = state.denoise.toFloatOrNull(),
@@ -1294,8 +1273,18 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
         val storage = workflowValuesStorage ?: return
         val serverId = ConnectionManager.currentServerId ?: return
 
+        // sampler / scheduler 的「服务器可用清单」：读持久化时就要用它清洗，所以缓存必须先拿到
+        // （持久化里可能残留非法值，用户实测 'dpm++' 一提交就 400）
+        val cache = ConnectionManager.modelCache.value
+
         // Load saved values and defaults by workflow ID (not name, to avoid duplicate name issues)
-        val savedValues = storage.loadValues(serverId, workflow.id)
+        // 读取即清洗：非法 sampler / scheduler 就地改写为默认值并写回磁盘（脏数据自愈）
+        val savedValues = storage.loadValuesSanitized(
+            serverId = serverId,
+            workflowId = workflow.id,
+            availableSamplers = cache.samplers,
+            availableSchedulers = cache.schedulers,
+        )
         val defaults = WorkflowManager.getWorkflowDefaultsById(workflow.id)
 
         // Get workflow placeholders - these determine field visibility via capabilities
@@ -1321,10 +1310,7 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
             savedValues?.dynamicParams ?: emptyMap()
         )
 
-        // Get current model cache to validate saved selections
-        val cache = ConnectionManager.modelCache.value
-
-        // Get saved model selections
+        // Get saved model selections（cache 已在函数开头取过，同一快照用于两处校验）
         val savedModel = savedValues?.model
         val savedVae = savedValues?.vaeModel
         val savedClip = savedValues?.clipModel
@@ -1372,10 +1358,17 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
                 ?: defaults?.steps?.toString() ?: "20",
             cfg = savedValues?.cfg?.toString()
                 ?: defaults?.cfg?.toString() ?: "7.0",
-            sampler = savedValues?.samplerName
-                ?: defaults?.samplerName ?: "euler",
-            scheduler = savedValues?.scheduler
-                ?: defaults?.scheduler ?: "normal",
+            // sampler / scheduler：已保存值 → 工作流默认值 → 缺省，最后再过一道清洗。
+            // 清洗走「读取口径」（见 sanitize*OnLoad）：服务器清单还没同步（空）时原样放行，
+            // 避免把服务器新增、内置清单还没收录的合法值误清成默认值
+            sampler = SamplerOptions.sanitizeSamplerOnLoad(
+                savedValues?.samplerName ?: defaults?.samplerName ?: SamplerOptions.DEFAULT_SAMPLER,
+                cache.samplers,
+            ),
+            scheduler = SamplerOptions.sanitizeSchedulerOnLoad(
+                savedValues?.scheduler ?: defaults?.scheduler ?: SamplerOptions.DEFAULT_SCHEDULER,
+                cache.schedulers,
+            ),
             // 正面提示词跟随工作流：没存过就回退该工作流的默认词（defaults.positive_prompt），
             // 存过空串则用空串（用户明确清空过）。锁定时保持界面上的词不动
             positivePrompt = PositivePromptPolicy.resolveOnLoad(

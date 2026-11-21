@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -34,6 +35,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.PagerSnapDistance
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudOff
@@ -98,6 +100,7 @@ import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.storage.AppSettings
+import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.ui.components.ImageViewer
 import sh.hnet.comfychair.ui.components.MetadataBottomSheet
 import sh.hnet.comfychair.ui.components.VideoPlayer
@@ -110,6 +113,7 @@ import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.components.ViewerSideBySide
 import sh.hnet.comfychair.ui.components.rememberLazyBitmap
 import sh.hnet.comfychair.ui.components.VideoScaleMode
+import sh.hnet.comfychair.util.viewerInitialPage
 import sh.hnet.comfychair.viewmodel.MediaViewerEvent
 import sh.hnet.comfychair.viewmodel.MediaViewerViewModel
 import sh.hnet.comfychair.viewmodel.ViewerFailureCategory
@@ -141,6 +145,16 @@ private fun copyUrlToClipboard(context: android.content.Context, url: String): B
 }
 
 /**
+ * 查看器内部条目稳定键：与图库网格 / 去重口径**完全一致**（NUL 分隔，见
+ * [GalleryMetadataCache.itemIdentityKey]）。P0-R3：之前查看器内部用下划线拼接
+ * `"${promptId}_${filename}"`，图库网格改成 NUL 口径后，撞键只是从网格挪到了 Pager
+ * （Compose Pager/LazyGrid 遇到重复 key 都抛 IllegalArgumentException）。
+ * 这里统一到同一个函数，避免两套口径再次分叉。
+ */
+private fun viewerItemKey(promptId: String, filename: String): String =
+    GalleryMetadataCache.itemIdentityKey(promptId, filename)
+
+/**
  * 由缓存侧标记推断失败档位（H6，与 MediaViewerViewModel.inferLoadFailure 同口径）。
  *
  * 为什么 UI 层要自己再查一遍：GALLERY 模式的图片加载走 rememberLazyBitmap（UI 侧链路），
@@ -150,8 +164,11 @@ private fun copyUrlToClipboard(context: android.content.Context, url: String): B
  */
 private fun inferFailureCategory(
     cacheKey: MediaCacheKey,
-    fromViewModel: ViewerFailureCategory?
+    fromViewModel: ViewerFailureCategory?,
+    sourceMissing: Boolean = false
 ): ViewerFailureCategory = when {
+    // 持久化的第三态优先：源已不存在时，即使本次没走到网络也必须是"文件不存在"
+    sourceMissing -> ViewerFailureCategory.FILE_MISSING
     MediaCache.isFileMissing(cacheKey) -> ViewerFailureCategory.FILE_MISSING
     ConnectionManager.isOffline || ConnectionManager.clientOrNull == null ->
         ViewerFailureCategory.NETWORK
@@ -211,7 +228,8 @@ fun MediaViewerScreen(
     //
     // remember 仍以条目列表指纹为 key：删图会让 pager 整段重建，档位与越界状态
     // 照旧回到中性值（与提升前的行为一致）。
-    val itemsKey = uiState.items.map { "${it.promptId}_${it.filename}" }.joinToString(",")
+    val itemsKey = uiState.items.map { viewerItemKey(it.promptId, it.filename) }
+        .joinToString("\u0001")
 
     // 并排预览三级手势的进度状态（语义见 ViewerSideBySide：0 = 全屏；1 = 并排；1.5 = 临时缩小档）
     var sideProgress by remember(itemsKey) { mutableFloatStateOf(0f) }
@@ -360,7 +378,7 @@ fun MediaViewerScreen(
                     // 把旧的透出截图挂到另一张图上。
                     val entryItemKey = remember {
                         uiState.items.getOrNull(uiState.currentIndex)?.let {
-                            "${it.promptId}_${it.filename}"
+                            viewerItemKey(it.promptId, it.filename)
                         }
                     }
 
@@ -371,8 +389,14 @@ fun MediaViewerScreen(
                         // 于是删完一张就跳回进入页，而不是停在删除位置旁边。
                         // 现在 currentIndex 由 ViewModel 在删除时已调整到合理位置，
                         // 重建后直接用它；普通翻页不改变 itemsKey，pager 不会被重建。
-                        val initialPage = uiState.currentIndex.coerceIn(
-                            0, (uiState.items.size - 1).coerceAtLeast(0)
+                        //
+                        // P0（v4.16.13 之后）：initialPage 的空列表边界统一走纯函数。
+                        // `coerceIn(0, size - 1)` 在 size = 0 时会变成 `coerceIn(0, -1)`，
+                        // 直接抛 IllegalArgumentException；外层虽然已用 isNotEmpty 拦住
+                        // 组合，但这里再保证一次"任何输入都产出合法页号"。
+                        val initialPage = viewerInitialPage(
+                            currentIndex = uiState.currentIndex,
+                            itemCount = uiState.items.size
                         )
                         val pagerState = rememberPagerState(
                             initialPage = initialPage,
@@ -388,7 +412,7 @@ fun MediaViewerScreen(
                         // 无分段遮罩链路，且初始页若是视频，透出会从播放器背后漏截图）
                         val revealItem = uiState.items.getOrNull(pagerState.currentPage)
                         // 用稳定键判断"是否还是进入时那一张"（P1-24：索引会因删除移位）
-                        val revealItemKey = revealItem?.let { "${it.promptId}_${it.filename}" }
+                        val revealItemKey = revealItem?.let { viewerItemKey(it.promptId, it.filename) }
                         val revealActive = dismissRevealEnabled &&
                             gallerySnapshot != null && galleryCellRect != null &&
                             revealItemKey != null && revealItemKey == entryItemKey &&
@@ -578,6 +602,10 @@ fun MediaViewerScreen(
                         // D4："点哪张图哪张全屏"。露边页要"先翻到它 + 同时放大回全屏"——
                         // 两件事并行，只做其中一件都会先跳正再缩放，观感断裂
                         fun expandPage(targetPage: Int) {
+                            // P0：列表可能在本页手势回调的生命周期内被删空（队列删空 →
+                            // 自动关闭前的一帧）。空列表直接不再翻页，绝不让
+                            // `coerceIn(0, size - 1)` 在 size = 0 时抛异常。
+                            if (uiState.items.isEmpty()) return
                             val safe = targetPage.coerceIn(0, uiState.items.size - 1)
                             if (safe == pagerState.currentPage) {
                                 animateProgressTo(0f)
@@ -814,8 +842,27 @@ fun MediaViewerScreen(
                         //   · 跨页上限 = ViewerPageMotion.flingPageCount(松手速度, 页距)
                         //   · 吸附目标 = ViewerPageMotion.snapTargetPage(衰减终点, ...)
                         // 慢速时跨页上限仍是 1 → 逐张手感与改动前完全一致。
+                        // 惯性档位（v4.16.14 / 复核 GATE-1）：跨页惯性只保留在**当前真的处于
+                        // 队列（并排三张）态**时 —— 判据是 sideBySideActive（sideProgress
+                        // 越过 0.5 的派生状态），不是"队列功能开关" threeLevelEnabled。
+                        //
+                        // 为什么不能用 threeLevelEnabled：它只是设置项（默认 true），
+                        // 而查看器初始态永远是全屏（sideProgress = 0）。绑设置项等于
+                        // "默认用户的全屏单图也保留多张惯性"，用户可见现象一条都没消除。
+                        // 这与既有队列态口径一致（见下方竖滑删除的
+                        // `threeLevelEnabled && sideBySideActive`）。
+                        //
+                        // allowInertia 用 lambda 注入且读的是 State（derivedStateOf）：
+                        // 每次 calculateTargetPage 调用都取当时的值，所以 remember 的
+                        // key 不需要带模式（带了反而会重建吸附对象，把在途 fling 的
+                        // 回调换成另一个实例）。
                         val pagerSnapDistance = remember(pagerState) {
-                            ViewerPagerSnapDistance { pagerState.pageCount }
+                            ViewerPagerSnapDistance(
+                                pageCountProvider = { pagerState.pageCount },
+                                allowInertia = {
+                                    pagerInertiaAllowed(threeLevelEnabled, sideBySideActive)
+                                }
+                            )
                         }
                         val pagerFlingBehavior = PagerDefaults.flingBehavior(
                             state = pagerState,
@@ -861,22 +908,41 @@ fun MediaViewerScreen(
                             // 并排露边必须让 pager 提前组合相邻页（API 名 beyondViewportPageCount，
                             // 即派工单里的 beyondBoundsPageCount），否则两侧露出来的是黑底
                             beyondViewportPageCount = if (threeLevelEnabled) 1 else 0,
-                            key = { index -> "${uiState.items[index].promptId}_${uiState.items[index].filename}" }
+                            // P0：key 与页内容一律用 getOrNull —— 删除/清空与 pager 测量之间
+                            // 可能差一帧，此时旧页索引会大于新列表长度。直接 `items[index]`
+                            // 就是一次 IndexOutOfBoundsException（线上表现为"进图库瞬间闪退"）。
+                            key = { index ->
+                                uiState.items.getOrNull(index)?.let {
+                                    viewerItemKey(it.promptId, it.filename)
+                                } ?: "missing-$index"
+                            }
                         ) { page ->
-                            val item = uiState.items[page]
+                            val item = uiState.items.getOrNull(page)
+                                ?: uiState.items.firstOrNull()
+                                ?: return@HorizontalPager
                             val isCurrentPage = page == pagerState.currentPage
                             val cacheKey = MediaCacheKey.of(item.promptId, item.filename, item.type)
                             // 本页的稳定键：与 entryItemKey 比对，判断"是不是进入时那一张"
                             //（P1-24：不能再用页索引，删除会让索引移位）
-                            val pageItemKey = "${item.promptId}_${item.filename}"
+                            val pageItemKey = viewerItemKey(item.promptId, item.filename)
                             val isEntryPage = pageItemKey == entryItemKey
 
                             // Lazy load bitmap from cache
+                            //
+                            // 第三态（源已不存在）：不再请求原图，直接拿本机 720 档缓存 ——
+                            // 画面是"清晰的低清副本"，不是加载中的模糊占位；右上角另有「已删除」角标。
+                            // 这里用**条目持久化字段**而不是上面含本次 404 的 sourceMissing：
+                            // 首次打开时还不知道已删除（也要允许那一次请求去确认 404），
+                            // 确认后 fetchViewerImage 会回落到本机缓存；若此时把 thumbnail 翻成 true，
+                            // remember 会重建状态、可能把刚显示出来的缓存图丢掉。
+                            val sourceMissing = item.sourceMissing || MediaCache.isFileMissing(cacheKey)
                             val (bitmap, isBitmapLoading) = rememberLazyBitmap(
                                 cacheKey = cacheKey,
                                 isVideo = item.isVideo,
                                 subfolder = item.subfolder,
-                                type = item.type
+                                type = item.type,
+                                thumbnail = item.sourceMissing,
+                                localOnly = item.sourceMissing
                             )
 
                             // Video URI only needed for current page (VideoPlayer)
@@ -911,7 +977,7 @@ fun MediaViewerScreen(
                                 ViewerShowState.LOADING
                             }
                             val failureCategory = if (showState == ViewerShowState.FAILED) {
-                                inferFailureCategory(cacheKey, uiState.loadFailure)
+                                inferFailureCategory(cacheKey, uiState.loadFailure, sourceMissing)
                             } else {
                                 null
                             }
@@ -1006,6 +1072,8 @@ fun MediaViewerScreen(
                                     onSingleTap = { viewModel.toggleUiVisibility() },
                                     cacheKey = cacheKey,
                                     failureCategory = failureCategory,
+                                    // 第三态且本机无缓存：失败占位必须说清「原图已被删除，且本机无缓存」
+                                    sourceMissingNoCache = sourceMissing,
                                     onRetry = { viewModel.retryCurrentItem() },
                                     // G6：下滑/双指收缩的退出都交给屏幕级唯一清理入口
                                     onViewerClose = currentExitViewer,
@@ -1036,8 +1104,12 @@ fun MediaViewerScreen(
                                     } else {
                                         { direction ->
                                             scope.launch {
+                                                // P0：回调触发时列表可能已被删空。空列表直接
+                                                // 放弃翻页（`coerceIn(0, -1)` 会抛异常）
+                                                val lastIndex = uiState.items.size - 1
+                                                if (lastIndex < 0) return@launch
                                                 val target = (pagerState.currentPage + direction)
-                                                    .coerceIn(0, uiState.items.size - 1)
+                                                    .coerceIn(0, lastIndex)
                                                 pagerState.animateScrollToPage(target)
                                             }
                                         }
@@ -1081,6 +1153,26 @@ fun MediaViewerScreen(
                                         null
                                     }
                                 )
+
+                                // 「已删除」角标（第三态）：源已不存在，画面是本机缓存的低清副本。
+                                // 与网格同一套视觉（error 底 + onError 文字 + CircleShape），
+                                // 不做模糊 —— 模糊在本项目里是「还在加载」的语义，必须与第三态区分。
+                                if (sourceMissing) {
+                                    Box(
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .statusBarsPadding()
+                                            .padding(top = 16.dp, end = 16.dp)
+                                            .background(MaterialTheme.colorScheme.error, CircleShape)
+                                            .padding(horizontal = 10.dp, vertical = 3.dp)
+                                    ) {
+                                        Text(
+                                            text = stringResource(R.string.label_source_missing),
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.onError
+                                        )
+                                    }
+                                }
 
                                 // 原图超过下载上限时的说明 + 取原图的途径。
                                 // 只出现在"当前页且确实是降级来的图"上：App 读不动那张图，
@@ -1136,6 +1228,13 @@ fun MediaViewerScreen(
                                 }
                             }
                         }
+                    }
+                } else {
+                    // P0：图库模式但条目已被删空（全删 / 会话失效 / 删除写入异常后的空列表）。
+                    // 空列表进入查看器本身就是非法状态 —— 这里不创建 pager，也不再让任何
+                    // `items[...]` / `coerceIn(0, size - 1)` 面对 size = 0，直接走统一退出入口关闭。
+                    LaunchedEffect(Unit) {
+                        currentExitViewer(ViewerExitReason.AUTO_CLOSE)
                     }
                 }
             }
@@ -1199,6 +1298,25 @@ fun MediaViewerScreen(
             }
         }
 
+        // 第三态且本机连缓存都没有：保存按钮必须禁用（点了也只会失败）。
+        // 此时画面区已显示「原图已被删除，且本机无缓存」，用户拿得到原因。
+        val currentItem = uiState.currentItem
+        val saveEnabled = remember(
+            currentItem?.promptId,
+            currentItem?.filename,
+            currentItem?.type,
+            currentItem?.sourceMissing,
+            uiState.isLoading
+        ) {
+            if (currentItem == null) {
+                true
+            } else {
+                val key = MediaCacheKey.of(currentItem.promptId, currentItem.filename, currentItem.type)
+                !((currentItem.sourceMissing || MediaCache.isFileMissing(key)) &&
+                    !MediaCache.hasLocalImage(key, currentItem.isVideo))
+            }
+        }
+
         // Floating Toolbar
         AnimatedVisibility(
             visible = uiState.isUiVisible,
@@ -1211,6 +1329,7 @@ fun MediaViewerScreen(
         ) {
             MediaViewerFloatingToolbar(
                 isGalleryMode = uiState.mode == ViewerMode.GALLERY,
+                saveEnabled = saveEnabled,
                 onDelete = { viewModel.deleteCurrentItem() },
                 onSave = { viewModel.saveCurrentItem() },
                 onShare = { viewModel.shareCurrentItem() },
@@ -1286,6 +1405,8 @@ private fun MediaViewerFloatingToolbar(
     onShare: () -> Unit,
     onInfo: () -> Unit,
     onCopyLink: () -> Unit,
+    /** false = 源已不存在且本机无缓存：保存必然失败，按钮直接禁用 */
+    saveEnabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val toolbarColors = FloatingToolbarColors(
@@ -1316,7 +1437,7 @@ private fun MediaViewerFloatingToolbar(
                 }
 
                 // Save button
-                IconButton(onClick = onSave) {
+                IconButton(onClick = onSave, enabled = saveEnabled) {
                     Icon(
                         Icons.Default.Save,
                         contentDescription = stringResource(R.string.media_viewer_save)
@@ -1367,6 +1488,11 @@ private fun MediaContent(
     cacheKey: MediaCacheKey? = null,
     // 失败占位（H1-a/H1-b）：调用方判定"内容缺失且不在加载"后传入；null = 不显示失败态
     failureCategory: ViewerFailureCategory? = null,
+    /**
+     * 第三态且本机无缓存：失败文案改用「原图已被删除，且本机无缓存」。
+     * 与普通 FILE_MISSING 分开，是因为用户还需要知道：连低清副本都没得存。
+     */
+    sourceMissingNoCache: Boolean = false,
     onRetry: (() -> Unit)? = null,
     // 关闭查看器的回调；null = 组件不启用关闭语义（缩略图槽位等场景）
     //
@@ -1467,6 +1593,7 @@ private fun MediaContent(
                     // 修复前视频页到这里永远转圈、图片页静默黑屏，用户无从分辨"在加载"还是"坏了"
                     MediaLoadFailurePlaceholder(
                         category = failureCategory,
+                        sourceMissingNoCache = sourceMissingNoCache,
                         onRetry = onRetry,
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1495,6 +1622,7 @@ private fun MediaContent(
 private fun MediaLoadFailurePlaceholder(
     category: ViewerFailureCategory,
     onRetry: (() -> Unit)?,
+    sourceMissingNoCache: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -1514,7 +1642,11 @@ private fun MediaLoadFailurePlaceholder(
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            text = stringResource(failureMessageRes(category)),
+            text = if (sourceMissingNoCache) {
+                stringResource(R.string.msg_image_source_missing_no_cache)
+            } else {
+                stringResource(failureMessageRes(category))
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = Color.White.copy(alpha = 0.8f)
         )
@@ -1575,9 +1707,21 @@ private fun MediaLoadFailureBar(
  *
  * 页数用 `() -> Int` 而不是直接持有 PagerState：这条接线本身要能在 JVM 单测里
  * 覆盖（ViewerPagerSnapDistanceTest），不把 Compose 状态机拖进测试。
+ *
+ * v4.16.14：新增 [allowInertia]（同样用 lambda 注入，保持可在 JVM 单测里开关）。
+ * 用户规格："横向甩动的跨多张惯性只保留在队列模式（并排三张）；单图全屏模式下
+ * 不管甩多大力都只滑一张。" 实现上**不改纯函数**：`allowInertia` 为 false 时把
+ * 速度按 0 传进 [ViewerPageMotion.snapTargetPage] —— 零速下 `flingPageCount`
+ * 返回 0、跨页上限退化为 `maxOf(1, 0) = 1`，正好就是"最多吸附相邻一张"，
+ * 而"拖过半仍能翻一张"的既有手感原样保留。（若改成 `atMost(0)` 会把慢速拖动
+ * 也钉死在原地：松手后永远弹回当前页。）
+ *
+ * 本类只负责"给什么速度就按什么口径吸附"，**判断当前该不该有惯性不在本类里**：
+ * 判据是 [pagerInertiaAllowed]（当前是否真的处于队列态），由屏幕的接线传进来。
  */
 internal class ViewerPagerSnapDistance(
-    private val pageCountProvider: () -> Int
+    private val pageCountProvider: () -> Int,
+    private val allowInertia: () -> Boolean = { true }
 ) : PagerSnapDistance {
 
     override fun calculateTargetPage(
@@ -1591,8 +1735,31 @@ internal class ViewerPagerSnapDistance(
         // 换成 currentPage 会在"速度方向令 firstVisiblePage 偏移"时错一页
         startPage = startPage,
         decayEndPage = suggestedTargetPage.toFloat(),
-        velocityPxPerSec = velocity,
+        // 全屏单图：速度视为 0，只允许相邻一张（见类注释）
+        velocityPxPerSec = if (allowInertia()) velocity else 0f,
         pagePitchPx = (pageSize + pageSpacing).toFloat(),
         pageCount = pageCountProvider()
     )
 }
+
+/**
+ * 横向惯性档位（v4.16.14 复核 GATE-1 的判据，纯函数便于单测）。
+ *
+ * 用户规格：**跨多张的横向惯性只保留在「队列模式（并排三张）」**；单图全屏模式下
+ * 不管甩多大力都只滑一张。所以判据必须是"**当前是否真的在队列态**"
+ * （[sideBySideActive]，即 sideProgress 越过 0.5 的派生状态），
+ * **不是"队列功能是否开启"**（threeLevelEnabled 只是设置项、默认 true，
+ * 而查看器初始态永远是全屏 —— 拿它当判据等于默认用户全屏仍然跨多页，
+ * 用户可见现象一条都不消除）。
+ *
+ * 两个条件同时成立才放开惯性，与屏幕里既有队列态口径
+ * （竖滑删除的 `threeLevelEnabled && sideBySideActive`）完全一致：
+ * - threeLevelEnabled = false：并排/队列链路整体停用，就没有"队列模式"可言；
+ * - sideBySideActive = false：此刻是全屏单图，只能逐张翻。
+ *
+ * 这个函数存在的唯一意义就是让"接线到底传了什么"可以被 JVM 单测钉住
+ * （见 ViewerPagerSnapDistanceTest 与 PagerInertiaWiringTest）：
+ * 只测 ViewerPagerSnapDistance 本身证明不了屏幕传的是哪个值。
+ */
+internal fun pagerInertiaAllowed(threeLevelEnabled: Boolean, sideBySideActive: Boolean): Boolean =
+    threeLevelEnabled && sideBySideActive

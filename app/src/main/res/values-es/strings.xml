@@ -234,6 +234,10 @@
 
     <!-- Save/share messages -->
     <string name="msg_image_saved_to_gallery">Imagen guardada en la galería</string>
+    <string name="msg_image_saved_lowres">Copia de baja resolución guardada (el original se ha eliminado)</string>
+    <string name="msg_video_saved_lowres">Copia local en caché guardada (el vídeo original se ha eliminado)</string>
+    <string name="msg_saved_local_copies">Copias locales en caché guardadas (los originales se han eliminado)</string>
+    <string name="msg_image_source_missing_no_cache">El original se ha eliminado y no hay caché local</string>
     <string name="msg_video_saved_to_gallery">Vídeo guardado en la galería</string>
     <string name="error_save_image">Error al guardar la imagen</string>
     <string name="error_save_video">Error al guardar el vídeo</string>
@@ -379,6 +383,7 @@
     <!-- Empty state messages -->
     <string name="msg_gallery_empty">Sin imágenes aún</string>
     <string name="gallery_file_missing_on_server">Archivo no disponible en el servidor (pudo ser eliminado). Toca para reintentar.</string>
+    <string name="label_source_missing">Eliminado</string>
 
     <!-- Section titles -->
     <string name="title_model_selection">Selección de modelo</string>
@@ -484,6 +489,9 @@
     <string name="desc_debug_logging_enable">Los registros se mantienen solo en memoria</string>
     <string name="button_debug_logging_view">Ver registros</string>
     <string name="title_debug_log">Registro de depuración</string>
+    <!-- Crash Log strings（崩溃日志与调试日志用途不同，设置页必须区分） -->
+    <string name="title_crash_log">Registro de fallos</string>
+    <string name="button_crash_log_view">Ver registros de fallos</string>
     <string name="msg_debug_log_empty">Sin entradas de registro</string>
     <string name="debug_log_save">Save</string>
     <string name="debug_log_follow">Seguir</string>
@@ -665,10 +673,11 @@
     <string name="update_action_install">Instalar</string>
     <string name="update_error_verify_missing">La lista de actualizacion no contiene una suma SHA-256 valida. Actualizacion rechazada.</string>
     <string name="update_error_redirect">La descarga se redirigio a un host no confiable (%1$s). Actualizacion cancelada.</string>
-    <string name="update_error_install_invalid">El nombre o la firma del paquete descargado no coincide con esta app. Instalacion bloqueada.</string>
+    <string name="update_error_install_invalid">El nombre del paquete descargado no coincide con esta app. Instalacion bloqueada.</string>
     <string name="update_action_retry">Reintentar</string>
     <string name="update_manual_check_failed">Fallo la comprobacion: %1$s</string>
     <string name="update_already_latest">Ya tienes la ultima version.</string>
+    <string name="update_missing_target_cancelled">Falta informacion de la actualizacion; descarga cancelada.</string>
     <!-- v4.6.1 Modulo A: aviso de propietario al cancelar -->
     <string name="generation_cancel_not_owner">La tarea en ejecucion no se inicio desde esta pantalla; cancelacion omitida</string>
     <string name="generation_cancel_no_active">No hay ninguna tarea activa que cancelar</string>

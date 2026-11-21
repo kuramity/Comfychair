@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -118,6 +119,7 @@ import sh.hnet.comfychair.MediaViewerActivity
 import sh.hnet.comfychair.MediaViewerSession
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.storage.AppSettings
+import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.storage.GalleryTrashEntry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.ViewerRect
@@ -130,6 +132,8 @@ import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.ui.components.shared.ThreeDViewerSheet
 import sh.hnet.comfychair.connection.rememberIsOffline
 import sh.hnet.comfychair.ui.components.rememberLazyBitmap
+import sh.hnet.comfychair.util.galleryInitialFirstVisibleItemIndex
+import sh.hnet.comfychair.util.galleryOpenIndex
 import sh.hnet.comfychair.viewmodel.ConnectionStatus
 import sh.hnet.comfychair.viewmodel.GalleryEvent
 import sh.hnet.comfychair.viewmodel.GalleryItem
@@ -198,7 +202,14 @@ fun GalleryScreen(
     LaunchedEffect(columns) {
         val anchor = settleAnchor ?: return@LaunchedEffect
         settleAnchor = null
-        gridState.scrollToItem(anchor)
+        // P0：锚点来自换列前的 firstVisibleItemIndex，期间列表可能被删除变短。
+        // 统一用纯函数夹到 [0, size-1]（空列表 → 0），不让旧的大索引流到任何下标运算里。
+        gridState.scrollToItem(
+            galleryInitialFirstVisibleItemIndex(
+                itemCount = uiState.items.size,
+                savedFirstVisibleIndex = anchor
+            )
+        )
     }
 
     // 开关关掉时强制回到 2 列：rememberSaveable 可能存着上次捏出来的 3/4 列，
@@ -283,12 +294,18 @@ fun GalleryScreen(
             }
 
             // 位置双向同步（C3）：查看器里翻到第 N 张后返回，列表自动滚到那一张。
-            // 回传的是稳定键（promptId_filename），在当前 items 里找索引——
-            // 该项可能已被删除：找不到就静默忽略，绝不滚动到错误位置
+            // 回传的是稳定键，在当前 items 里找索引——该项可能已被删除：
+            // 找不到就静默忽略，绝不滚动到错误位置。
+            //
+            // P0 复核 L3：查看器内部已统一到 NUL 口径（GalleryMetadataCache.itemIdentityKey），
+            // 但 MediaViewerActivity 的 EXTRA_CURRENT_ITEM_KEY 目前仍回传旧的下划线格式
+            // （该文件不在本次可改范围）。这里**同时接受两种格式**：等 Activity 侧也切到
+            // NUL 后无需再改本处，且切换前后都不会断位置同步。
             val currentKey = result.data?.getStringExtra(MediaViewerActivity.EXTRA_CURRENT_ITEM_KEY)
             if (currentKey != null) {
-                val index = uiState.items.indexOfFirst {
-                    "${it.promptId}_${it.filename}" == currentKey
+                val index = uiState.items.indexOfFirst { item ->
+                    GalleryMetadataCache.itemIdentityKey(item.promptId, item.filename) == currentKey ||
+                        "${item.promptId}_${item.filename}" == currentKey
                 }
                 val isAlreadyVisible = gridState.layoutInfo.visibleItemsInfo.any { it.index == index }
                 if (index >= 0 && !isAlreadyVisible) {
@@ -365,7 +382,9 @@ fun GalleryScreen(
                 subfolder = item.subfolder,
                 type = item.type,
                 isVideo = item.isVideo,
-                index = item.index
+                index = item.index,
+                // 第三态随队列带进查看器：否则查看器会再请求一次已删除的原图、白等超时
+                sourceMissing = item.sourceMissing
             )
         }
     }
@@ -381,12 +400,17 @@ fun GalleryScreen(
     fun launchMediaViewer(clickedIndex: Int) {
         if (isLaunchingViewer) return
 
+        // P0（空列表防御）：图库被删空 / 索引失效（点击后列表又变短）时**绝不启动查看器**。
+        // 空列表进入查看器本身就是非法状态；把 size = 0 的队列交给 Pager /
+        // `coerceIn(0, size - 1)` 只会换来一次闪退。这里直接不启动。
+        val safeIndex = galleryOpenIndex(clickedIndex, uiState.items.size) ?: return
+
         // Set active view to MediaViewer
         MediaCache.setActiveView(ActiveView.MEDIA_VIEWER)
 
         // Update priorities to protect items around clicked index
         val allKeys = uiState.items.map { it.toCacheKey() }
-        MediaCache.updateNavigationPriorities(clickedIndex, allKeys)
+        MediaCache.updateNavigationPriorities(safeIndex, allKeys)
 
         val viewerItems = galleryItemsToViewerItems(uiState.items)
         val intent = MediaViewerActivity.createGalleryIntent(
@@ -394,7 +418,7 @@ fun GalleryScreen(
             hostname = ConnectionManager.hostname,
             port = ConnectionManager.port,
             items = viewerItems,
-            initialIndex = clickedIndex
+            initialIndex = safeIndex
         )
         val activity = context as? Activity
         isLaunchingViewer = true
@@ -428,7 +452,7 @@ fun GalleryScreen(
         // 目标格子矩形（window 坐标）必须在主线程、且在截图发起前读：
         // visibleItemsInfo 只在组合线程有效，截图后布局可能已经变化
         val paddingPx = GALLERY_GRID_CONTENT_PADDING_DP * context.resources.displayMetrics.density
-        val itemInfo = gridState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == clickedIndex }
+        val itemInfo = gridState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == safeIndex }
         val revealCellRect: ViewerRect? = itemInfo?.let {
             galleryRevealCellRect(
                 gridOriginX = gridOriginInWindow.x,
@@ -523,7 +547,9 @@ fun GalleryScreen(
                 key = item.toCacheKey(),
                 isVideo = item.isVideo,
                 subfolder = item.subfolder,
-                type = item.type
+                type = item.type,
+                // 源已不存在：预取原图只会再拿一个 404
+                sourceMissing = item.sourceMissing
             )
         }
     }
@@ -568,7 +594,10 @@ fun GalleryScreen(
                     key = item.toCacheKey(),
                     isVideo = item.isVideo,
                     subfolder = item.subfolder,
-                    type = item.type
+                    type = item.type,
+                    // 首屏预取同样必须跳过已标记条目：冷启动时 missingKeys 为空，
+                    // 漏传会让已持久化的「已删除」条目再发一轮 /view 404 请求。
+                    sourceMissing = item.sourceMissing
                 )
             }
             MediaCache.initialPrefetch(initialItems)
@@ -657,7 +686,19 @@ fun GalleryScreen(
                                     color = MaterialTheme.colorScheme.onError,
                                     modifier = Modifier
                                         .align(Alignment.TopEnd)
-                                        .padding(top=(-4).dp, end=(-6).dp)
+                                        // 角标外推只能走 offset：padding() 不接受负值，运行时
+                                        // require 会抛 IllegalArgumentException: Padding must be
+                                        // non-negative（Padding.kt:483；v4.17.0 code138 真机崩溃点）。
+                                        // 换算依据：负 padding 的语义是「内容越过该边界外溢」——
+                                        // top = -4.dp = 向上溢出 4dp，end = -6.dp（LTR 下即 right）
+                                        // = 向右溢出 6dp；等价于绘制平移 offset(x = 6.dp, y = -4.dp)。
+                                        // 但 x 只能取 2dp：Material3 1.5.0-alpha11 的 IconButton 会把
+                                        // 内容 clip 到 40dp 正圆（SmallIconButtonTokens：24+8+8=40dp，
+                                        // ContainerShapeRound = CornerFull，已用 javap 核对字节码），
+                                        // x = 6dp 时角标右上角约在 (38, 4)，距圆心约 24dp > 半径 20dp，
+                                        // 会被切掉一角；x = 2dp 时最外点约 (34, 4)，只在顶边留下约 2dp
+                                        // 的圆弧内收，角标视觉完整，仍压在图标右上角外侧。
+                                        .offset(x = 2.dp, y = (-4).dp)
                                         .background(
                                             MaterialTheme.colorScheme.error,
                                             CircleShape
@@ -777,7 +818,10 @@ fun GalleryScreen(
                     }
                 } else {
                     // Gallery items
-                    itemsIndexed(uiState.items, key = { _, item -> "${item.promptId}_${item.filename}" }) { index, item ->
+                    // key 必须与去重口径（GalleryRepository 的 distinctBy）完全一致：
+                    // 用 "_" 拼会让 (a, b_c) 与 (a_b, c) 撞成同一个 key，
+                    // LazyGrid 撞 key 会抛 IllegalArgumentException = 闪退。
+                    itemsIndexed(uiState.items, key = { _, item -> GalleryMetadataCache.itemIdentityKey(item.promptId, item.filename) }) { index, item ->
                         GalleryItemCard(
                             item = item,
                             isSelected = galleryViewModel.isItemSelected(item),
@@ -1168,16 +1212,24 @@ private fun GalleryItemCard(
     var retryTick by remember(cacheKey) { mutableStateOf(0) }
     // 列表格用服务端压缩版缩略图：放大类工作流的原图可达 200 MB，
     // 为了一格 180dp 的预览去传原图，是整个图库里最贵的一笔开销（见 MediaCache.fetchThumbnail）
+    //
+    // 第三态：条目 sourceMissing（/view 404 已持久化）时**不发任何请求**，
+    // 只读本机 720 档缓存 —— 第二次进图库不再白等一次超时。
+    // 用户点格子手动重试（retryTick > 0）则临时放行网络一次，文件被放回时能恢复。
+    val sourceMissing = item.sourceMissing || MediaCache.isFileMissing(cacheKey)
     val (bitmap, isLoading) = rememberLazyBitmap(
         cacheKey = cacheKey,
         isVideo = item.isVideo,
         subfolder = item.subfolder,
         type = item.type,
         thumbnail = true,
-        retryTick = retryTick
+        retryTick = retryTick,
+        // 已确认源不存在（持久标记或本次会话刚 404）：不发网络请求，直接用本机 720 档；
+        // 用户点格子重试过一次后（retryTick > 0）允许再探一次，文件被放回时可恢复。
+        localOnly = sourceMissing && retryTick == 0
     )
     // 服务器上已确认没有这个文件（404，例如电脑端清理了 output）
-    val isMissing = !isLoading && bitmap == null && MediaCache.isFileMissing(cacheKey)
+    val isMissing = !isLoading && bitmap == null && sourceMissing
     // 失败占位（转圈结束但没拿到图）：点击重试的分流条件
     val failedPlaceholder = bitmap == null && !isLoading
 
@@ -1200,10 +1252,12 @@ private fun GalleryItemCard(
             // 分流必须在卡片内部（bitmap/isLoading/retryTick 都是这个卡片的状态，
             // 外层的 itemsIndexed lambda 看不见）；选择模式下照常走 onTap（选中逻辑）。
             // key 用 failedPlaceholder：状态翻转时重启手势检测，避免闭包读到旧值。
-            .pointerInput(failedPlaceholder) {
+            // 第三态（sourceMissing）且本机无缓存时不在这里重试：点开查看器，
+            // 由查看器明确显示「原图已被删除，且本机无缓存」（重试入口也在那）。
+            .pointerInput(failedPlaceholder, item.sourceMissing) {
                 detectTapGestures(
                     onTap = {
-                        if (failedPlaceholder && !selectionMode) {
+                        if (failedPlaceholder && !item.sourceMissing && !selectionMode) {
                             retryTick++
                         } else {
                             onTap()
@@ -1266,6 +1320,8 @@ private fun GalleryItemCard(
                                 else -> Icons.Default.Image
                             },
                             contentDescription = when {
+                                isMissing && item.sourceMissing ->
+                                    stringResource(R.string.msg_image_source_missing_no_cache)
                                 isMissing -> stringResource(R.string.gallery_file_missing_on_server)
                                 isOffline -> stringResource(R.string.content_description_not_cached)
                                 else -> null
@@ -1331,6 +1387,27 @@ private fun GalleryItemCard(
                         contentDescription = stringResource(R.string.label_3d_badge),
                         tint = MaterialTheme.colorScheme.onPrimary,
                         modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+
+            // 「已删除」角标（第三态）：源已不存在、画面是本机缓存的低清副本。
+            // 视觉复用回收站角标：error 底 + onError 文字 + CircleShape。
+            // 纵向错位只用 offset（padding 不接受负值，v4.17.0 真机崩溃点见 NoNegativePaddingTest），
+            // 与 3D 角标同占 TopEnd 时下移一行，两者都不被遮挡。
+            if (sourceMissing && !isSelected) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .offset(y = if (item.threeD != null) 30.dp else 0.dp)
+                        .padding(8.dp)
+                        .background(MaterialTheme.colorScheme.error, CircleShape)
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = stringResource(R.string.label_source_missing),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onError
                     )
                 }
             }

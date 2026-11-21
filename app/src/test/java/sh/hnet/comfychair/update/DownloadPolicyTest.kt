@@ -112,12 +112,26 @@ class DownloadPolicyTest {
     // ---------- 3. 重试上限 ----------
 
     @Test
-    fun `attempt 4 can retry attempt 5 cannot`() {
+    fun `attempt 0 and 1 can retry attempt 2 cannot`() {
+        // v4.18.0（R5）：上限由 5 降到 2 —— 用户实测「重试 5 次仍失败」烧掉大量流量。
+        // 反证：把 MAX_AUTO_RETRIES 改回 5（或任何 >2 的值），这个断言必须变红。
         assertTrue(DownloadPolicy.shouldRetryAutomatically(0))
         assertTrue(DownloadPolicy.shouldRetryAutomatically(1))
-        assertTrue(DownloadPolicy.shouldRetryAutomatically(4))
-        assertFalse(DownloadPolicy.shouldRetryAutomatically(5))
-        assertFalse(DownloadPolicy.shouldRetryAutomatically(6))
+        assertFalse(DownloadPolicy.shouldRetryAutomatically(2))
+        assertFalse(DownloadPolicy.shouldRetryAutomatically(3))
+    }
+
+    @Test
+    fun `legacy switch also has a hard retry cap`() {
+        // R5 第 3 条：回退开关不允许存在「无次数上限」的分支（那是流量黑洞）。
+        // 反证：把 LEGACY_MAX_AUTO_RETRIES 改成 99，这两条断言必须变红。
+        assertTrue(DownloadPolicy.shouldRetryLegacy(0))
+        assertTrue(DownloadPolicy.shouldRetryLegacy(2))
+        assertFalse(DownloadPolicy.shouldRetryLegacy(3))
+        assertFalse(DownloadPolicy.shouldRetryLegacy(99))
+        // 统一入口按模式分派，两条路径都必然是有限值
+        assertFalse(DownloadPolicy.shouldRetry(2, legacyMode = false))
+        assertFalse(DownloadPolicy.shouldRetry(3, legacyMode = true))
     }
 
     // ---------- 4. 停滞看门狗 ----------

@@ -1,7 +1,9 @@
 package sh.hnet.comfychair.storage
 
 import android.content.Context
+import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.WorkflowValues
+import sh.hnet.comfychair.util.DebugLogger
 
 /**
  * Storage for per-workflow user values.
@@ -30,6 +32,48 @@ class WorkflowValuesStorage(context: Context) {
         } catch (e: Exception) {
             null
         }
+    }
+
+    /**
+     * 读取该工作流的保存值，并**在读取时清洗 sampler / scheduler**（非法值自愈）。
+     *
+     * 为什么要在读的时候做：下拉框的 `selectedValue` 是原样回显的（见
+     * BottomSheetConfigHelpers），持久化里存了 `dpm++` 这种非法值时 UI 没有任何提示，
+     * 用户一按生成就被 ComfyUI 的 `validate_inputs()` 判成 `Value not in list` 返回 400
+     * （真机日志：`scheduler: 'dpm++' not in ['simple', 'sgm_uniform', ...]`）。
+     *
+     * 处理方式：**在服务器清单已知（非空）时**把非法值就地改写为默认值，并**立即写回**磁盘 ——
+     * 脏数据只生效一次，之后读到的就是干净值（写回才是"自愈"）。
+     * 只改写确实非法的字段：字段本来为 null（= 跟随工作流默认）时保持 null，不无谓地固化。
+     *
+     * **清单未知（`available*` 为空）时不做判断**：冷启动时 `/object_info` 常还没回来，
+     * 内置清单可能落后于服务端（日志里的 `shifted_tangent` 就不在内置清单里），
+     * 此时判废 + 写回会把用户合法的选择永久改掉。这个窗口交给提交前的严格清洗兜底
+     * （见各 ViewModel 的 prepare*：清单为空才退回内置清单，且不会写坏磁盘）。
+     *
+     * @param availableSamplers 服务器 `/object_info` 报的可用 sampler；空表 = 还没同步，本次不判废
+     * @param availableSchedulers 同上，scheduler 版
+     * @return 清洗后的保存值；该工作流从未保存过时返回 null
+     */
+    fun loadValuesSanitized(
+        serverId: String,
+        workflowId: String,
+        availableSamplers: List<String>,
+        availableSchedulers: List<String>
+    ): WorkflowValues? {
+        val saved = loadValues(serverId, workflowId) ?: return null
+        // 读阶段只在服务器清单已知时判废（见 SamplerOptions.sanitizeSamplerOnLoad 的时序说明）
+        val sampler = saved.samplerName?.let { SamplerOptions.sanitizeSamplerOnLoad(it, availableSamplers) }
+        val scheduler = saved.scheduler?.let { SamplerOptions.sanitizeSchedulerOnLoad(it, availableSchedulers) }
+        if (sampler == saved.samplerName && scheduler == saved.scheduler) return saved
+        val healed = saved.copy(samplerName = sampler, scheduler = scheduler)
+        saveValues(serverId, workflowId, healed)
+        DebugLogger.w(
+            TAG,
+            "已修正持久化里的非法采样参数：sampler ${saved.samplerName} -> $sampler，" +
+                "scheduler ${saved.scheduler} -> $scheduler"
+        )
+        return healed
     }
 
     /**
@@ -127,5 +171,6 @@ class WorkflowValuesStorage(context: Context) {
 
     companion object {
         private const val PREFS_NAME = "WorkflowValuesPrefs"
+        private const val TAG = "WorkflowValuesStorage"
     }
 }

@@ -45,6 +45,25 @@ object UpdateChecker {
     var lastCheckError: String? = null
         private set
 
+    /**
+     * 检查结论（v4.18.0，R3）。
+     *
+     * 原先只有「有更新 → UpdateInfo / 否则 null」两种返回，调用方**分不清**
+     * 「已经是最新」和「检查失败（断网 / 隧道断开 / 清单损坏）」——
+     * 而 R3 要求「已经是最新时取消残留 Worker + 清通知」，这个动作必须只在
+     * 真的确认「远端不比本地新」时执行，不能在网络失败时误伤正在进行的下载。
+     */
+    sealed class CheckResult {
+        /** 远端有更新的版本 */
+        data class Available(val info: UpdateInfo) : CheckResult()
+
+        /** 清单拉取并校验成功，但远端版本不比本地新 */
+        data class UpToDate(val remoteVersionCode: Int) : CheckResult()
+
+        /** 检查失败（未配置 / 网络 / 解析 / 安全校验），[message] 为人类可读原因 */
+        data class Failed(val message: String) : CheckResult()
+    }
+
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -76,69 +95,74 @@ object UpdateChecker {
     }
 
     /**
-     * 拉取并解析更新清单。
+     * 拉取并解析更新清单（旧接口，保留给只关心「有没有更新」的调用方）。
      *
      * @param manualCheck true 表示用户手动触发（失败原因会写入 [lastCheckError] 供 UI 展示）；
      *                    false 表示启动时的静默检查（失败不留痕、不弹窗）
-     * @return 有更新时返回 [UpdateInfo]；无更新（已是最新版）返回 null 且不写错误；
-     *         检查失败返回 null（手动检查时 [lastCheckError] 有原因）
+     * @return 有更新时返回 [UpdateInfo]；无更新（已是最新版）或检查失败返回 null
      */
-    fun checkForUpdate(currentVersionCode: Int, manualCheck: Boolean): UpdateInfo? {
+    fun checkForUpdate(currentVersionCode: Int, manualCheck: Boolean): UpdateInfo? =
+        when (val result = checkDetailed(currentVersionCode, manualCheck)) {
+            is CheckResult.Available -> result.info
+            else -> null
+        }
+
+    /**
+     * 拉取并解析更新清单，返回可区分「有更新 / 已是最新 / 检查失败」的结论（R3）。
+     *
+     * 「已是最新」必须能被调用方认出来：那是取消残留下载 Worker、清更新通知的触发条件。
+     * 检查失败（断网 / 隧道断开 / 清单损坏）绝不能触发清理 —— 否则会把用户正在进行的
+     * 下载误杀。
+     *
+     * 安全校验顺序保持 fail-closed：地址白名单 → sha256 必须存在且合法 → 才比较版本号。
+     */
+    fun checkDetailed(currentVersionCode: Int, manualCheck: Boolean): CheckResult {
         lastCheckError = null
+
+        fun fail(message: String): CheckResult {
+            DebugLogger.w(TAG, "Check failed: $message")
+            if (manualCheck) lastCheckError = message
+            return CheckResult.Failed(message)
+        }
+
         // 未配置更新源（开源默认）：不发任何网络请求，静默按「无更新」处理
         if (!isConfigured) {
-            if (manualCheck) {
-                lastCheckError = "未配置更新源（构建时未注入 UPDATE_MANIFEST_URL）"
-            }
-            return null
+            return fail("未配置更新源（构建时未注入 UPDATE_MANIFEST_URL）")
         }
         val info = try {
             val request = Request.Builder().url(MANIFEST_URL).get().build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    onError("服务器返回 HTTP ${response.code}", manualCheck)
-                    return null
+                    return fail("服务器返回 HTTP ${response.code}")
                 }
                 val body = response.body?.string()
                 if (body.isNullOrEmpty()) {
-                    onError("清单为空", manualCheck)
-                    return null
+                    return fail("清单为空")
                 }
                 UpdateInfo.fromJson(body)
             }
         } catch (e: IOException) {
-            onError("无法连接更新服务器（${e.javaClass.simpleName}）", manualCheck)
-            return null
+            return fail("无法连接更新服务器（${e.javaClass.simpleName}）")
         } catch (e: Exception) {
-            onError("清单解析失败（${e.message}）", manualCheck)
-            return null
+            return fail("清单解析失败（${e.message}）")
         }
 
         if (!isApkUrlAllowed(info.apkUrl)) {
-            onError("清单里的下载地址不在允许的域名内", manualCheck)
-            return null
+            return fail("清单里的下载地址不在允许的域名内")
         }
 
         // P0-7：清单必须带有效 SHA-256 校验值，否则下载完成也无法确认载荷完整性。
         // 在这里就拒绝，避免白下 150MB 再失败；Worker 侧另有硬闸门兜底。
         if (DownloadPolicy.normalizeSha256(info.sha256) == null) {
-            onError("清单缺少有效的 sha256 校验值，已拒绝该更新", manualCheck)
-            return null
+            return fail("清单缺少有效的 sha256 校验值，已拒绝该更新")
         }
 
         return if (shouldUpdate(currentVersionCode, info.versionCode)) {
             DebugLogger.i(TAG, "Update available: code ${info.versionCode} > $currentVersionCode")
-            info
+            CheckResult.Available(info)
         } else {
             DebugLogger.i(TAG, "Already up to date (local=$currentVersionCode remote=${info.versionCode})")
-            null
-        }
-    }
-
-    private fun onError(message: String, manualCheck: Boolean) {
-        DebugLogger.w(TAG, "Check failed: $message")
-        if (manualCheck) {
-            lastCheckError = message
+            CheckResult.UpToDate(info.versionCode)
         }
     }
 }

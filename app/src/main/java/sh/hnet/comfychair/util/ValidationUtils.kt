@@ -116,6 +116,30 @@ object ValidationUtils {
     }
 
     /**
+     * Validate video length with the "steps of 4" requirement (1, 5, 9, 13...).
+     * This is specific to video generation workflows: the length must be 1..129 and
+     * `(n - 1) % 4 == 0`. Unlike [validateLength], an empty string is an error.
+     *
+     * @param value The length value as string
+     * @param context Optional context for localized error message
+     * @return Error message if invalid, null if valid
+     */
+    fun validateVideoLength(value: String, context: Context? = null): String? {
+        val num = value.toIntOrNull()
+        return when {
+            value.isEmpty() -> context?.getString(R.string.error_required)
+                ?: "Required"
+            num == null -> context?.getString(R.string.error_invalid_number)
+                ?: "Invalid number"
+            num !in 1..129 -> context?.getString(R.string.error_length_range)
+                ?: "Must be 1-129"
+            (num - 1) % 4 != 0 -> context?.getString(R.string.error_length_step)
+                ?: "Must be 1, 5, 9, 13... (steps of 4)"
+            else -> null
+        }
+    }
+
+    /**
      * Validate frame rate value.
      * @param value The frame rate value as string
      * @param context Optional context for localized error message

@@ -294,6 +294,26 @@ object MediaCache {
     private val missingKeys: MutableSet<String> =
         java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
+    /**
+     * 「源已不存在」的观察者（图库仓储用它把 404 落进索引）。
+     *
+     * MediaCache 只知道缓存键、不知道 GalleryItem 与本地索引；仓储在构造时注册监听，
+     * 收到 [MediaCacheKey] 后找到对应条目、置 `sourceMissing = true` 并持久化。
+     * 用 CopyOnWriteArrayList：注册发生在初始化，通知发生在 OkHttp 回调线程，读多写零。
+     */
+    private val sourceMissingListeners =
+        java.util.concurrent.CopyOnWriteArrayList<(MediaCacheKey) -> Unit>()
+
+    /** 注册「/view 404」观察者（幂等：重复注册同一实例不会通知两次）。 */
+    fun addSourceMissingListener(listener: (MediaCacheKey) -> Unit) {
+        sourceMissingListeners.addIfAbsent(listener)
+    }
+
+    /** 注销观察者（目前只有单例仓储注册，保留给测试/生命周期清理）。 */
+    fun removeSourceMissingListener(listener: (MediaCacheKey) -> Unit) {
+        sourceMissingListeners.remove(listener)
+    }
+
     /** 这个条目是否已确认服务器上没有（404） */
     fun isFileMissing(key: MediaCacheKey): Boolean = key.keyString in missingKeys
 
@@ -307,11 +327,21 @@ object MediaCache {
      *
      * 只有 fetchImage 链路能把 404 单独分型出来（fetchVideo 不分），所以写入点都在图片链路上。
      * 记下之后：① fetchThumbnail / fetchViewerImage 在 [isFileMissing] 上短路，不再白打这趟请求；
-     * ② 图库格子与查看器的"文件不存在"占位有了数据源。
-     * 清除途径：手动重试（[clearFileMissing]）与下拉刷新（[clearForRefresh]）。
+     * ② 图库格子与查看器的"文件不存在"占位有了数据源；③ 通知仓储把标记持久化进索引，
+     * 重开 App / 刷新图库后仍然是第三态（不会重新白等超时）。
+     *
+     * 同一键只在**首次**判定时通知：重复 404 不反复写索引。
      */
     private fun markFileMissing(key: MediaCacheKey) {
-        missingKeys.add(key.keyString)
+        if (!missingKeys.add(key.keyString)) return
+        for (listener in sourceMissingListeners) {
+            try {
+                listener(key)
+            } catch (e: Exception) {
+                // 观察者（仓储/索引写盘）出错不能反过来打断加载链路
+                DebugLogger.w(TAG, "sourceMissing listener failed: ${e.message}")
+            }
+        }
     }
 
     // Disk cache directory name
@@ -607,6 +637,59 @@ object MediaCache {
         }
     }
 
+    /**
+     * 取本机已有的图片副本（纯本地：内存 → 持久化 720 档 → 旧磁盘缓存 → 旧缩略图）。
+     *
+     * 专门给「源已不存在」条目用：服务器文件没了，保存/兜底展示只能用本机缓存。
+     * 顺序按清晰度优先（原图缓存 > 720 统一档 > 512 缩略图），全部不命中返回 null
+     * —— 调用方据此提示「原图已被删除，且本机无缓存」并禁用保存。
+     */
+    fun getLocalImage(key: MediaCacheKey): Bitmap? {
+        val keyStr = key.keyString
+        bitmapCache.get(keyStr)?.let { return it }
+        val context = applicationContext ?: return thumbnailCache.get(keyStr)
+        thumbnailCache.get(keyStr)?.let { return it }
+        // filesDir 持久化统一档（720 长边 JPEG，v4.16.1）
+        readPersistBitmap(context, resolvePersistFile(context, key, false))?.let { return it }
+        // 旧 cacheDir 原图 / 旧缩略图（升级兼容）
+        readBitmapFromDisk(context, key)?.let { return it }
+        return readThumbFromDisk(context, key)
+    }
+
+    /**
+     * 本机是否还有这个图片条目的任何副本（不触发网络、不触发解码）。
+     *
+     * 只做文件存在性判断，供 UI 决定「源已不存在 + 本机无缓存」时是否禁用保存。
+     */
+    fun hasLocalImage(key: MediaCacheKey, isVideo: Boolean = false): Boolean {
+        val keyStr = key.keyString
+        if (isVideo) {
+            return videoCache.get(keyStr) != null || readCachedBytes(key, isVideo = true) != null
+        }
+        if (bitmapCache.get(keyStr) != null || thumbnailCache.get(keyStr) != null) return true
+        val context = applicationContext ?: return false
+        return resolvePersistFile(context, key, false) != null ||
+            resolveDiskCacheFile(context, key, false) != null ||
+            resolveThumbFile(context, key) != null
+    }
+
+    /**
+     * 取本机已有的视频首帧（纯本地：内存 → filesDir/gallery_thumbs → 旧 cacheDir 视频字节抽帧）。
+     *
+     * 「源已不存在」的视频条目展示第三态用：原文件已删，只能显示本机缓存的首帧。
+     */
+    fun getLocalVideoFrame(key: MediaCacheKey): Bitmap? {
+        val keyStr = key.keyString
+        bitmapCache.get(keyStr)?.let { return it }
+        thumbnailCache.get(keyStr)?.let { return it }
+        val context = applicationContext ?: return null
+        readPersistBitmap(context, resolvePersistFile(context, key, true))?.let { return it }
+        return readBitmapOnlyFromDisk(context, key, true)?.also { bits ->
+            // 抽帧结果进内存缓存，避免同一格反复解码
+            bitmapCache.put(keyStr, bits)
+        }
+    }
+
     // Cache of video URIs (lightweight - just stores Uri references)
     private val videoUriCache = ConcurrentHashMap<String, Uri>()
 
@@ -705,6 +788,13 @@ object MediaCache {
      * 缩略图提取往往已经把同一段视频取过一次——重复下载就是几十 MB。
      */
     fun getCachedVideoBytes(key: MediaCacheKey): ByteArray? = videoCache.get(key.keyString)
+
+    /**
+     * 取本机已有的视频字节（内存 → 旧磁盘缓存），不联网。
+     * 「源已不存在」条目的保存/分享走这条；没有缓存返回 null。
+     */
+    fun getLocalVideoBytes(key: MediaCacheKey): ByteArray? =
+        videoCache.get(key.keyString) ?: readCachedBytes(key, isVideo = true)
 
     /**
      * 全尺寸位图入内存缓存的统一闸门：超大图直接跳过。
@@ -820,6 +910,8 @@ object MediaCache {
 
         for (i in startIndex until endIndex) {
             val item = allItems[i]
+            // 源已不存在：不预取原图（重试也是 404）
+            if (item.sourceMissing) continue
             val keyStr = item.key.keyString
 
             // Skip if already cached
@@ -871,6 +963,8 @@ object MediaCache {
      */
     fun initialPrefetch(items: List<PrefetchItem>) {
         for (item in items) {
+            // 源已不存在：不预取原图（重试也是 404）
+            if (item.sourceMissing) continue
             val keyStr = item.key.keyString
             if (!isCached(item.key, item.isVideo) && !inProgressKeys.contains(keyStr)) {
                 prefetchQueue.offer(PrefetchRequest(
@@ -895,7 +989,9 @@ object MediaCache {
         isVideo: Boolean,
         subfolder: String,
         type: String,
-        priority: Int = PriorityLruCache.PRIORITY_DEFAULT
+        priority: Int = PriorityLruCache.PRIORITY_DEFAULT,
+        /** true = 只读本机缓存，绝不发网络请求（「源已不存在」条目走这条） */
+        localOnly: Boolean = false
     ): Bitmap? {
         val keyStr = key.keyString
         val context = applicationContext ?: return null
@@ -916,9 +1012,42 @@ object MediaCache {
             // 与「内存优先」的内存缓存策略无关（见 CacheModePolicy）。
             if (offlineReadOnly) {
                 return withContext(Dispatchers.IO) {
-                    val bitmap = readBitmapOnlyFromDisk(context, key, isVideo)
+                    val bitmap = if (isVideo) {
+                        getLocalVideoFrame(key)
+                    } else {
+                        readBitmapOnlyFromDisk(context, key, false)
+                    }
                     bitmap?.let { cacheFullBitmap(keyStr, it) }
                     DebugLogger.d(TAG, "fetchBitmap: $keyStr offline -> disk cache ${if (bitmap != null) "HIT" else "MISS"}")
+                    bitmap
+                }
+            }
+
+            // 本会话已确认 404（源已不存在）：不再打网络，只用本机缓存。
+            // 手动重试与下拉刷新会清掉 missingKeys，届时允许再探一次。
+            if (isFileMissing(key)) {
+                return withContext(Dispatchers.IO) {
+                    val local = if (isVideo) {
+                        getLocalVideoFrame(key)
+                    } else {
+                        getLocalImage(key)
+                    }
+                    local?.let { cacheFullBitmap(keyStr, it) }
+                    DebugLogger.d(TAG, "fetchBitmap: $keyStr known missing -> local ${if (local != null) "HIT" else "MISS"}")
+                    local
+                }
+            }
+
+            // 「源已不存在」：只用本机缓存（原图/720 档/缩略图任一命中即可），不发请求
+            if (localOnly) {
+                return withContext(Dispatchers.IO) {
+                    val bitmap = if (isVideo) {
+                        getLocalVideoFrame(key)
+                    } else {
+                        getLocalImage(key)
+                    }
+                    bitmap?.let { cacheFullBitmap(keyStr, it) }
+                    DebugLogger.d(TAG, "fetchBitmap: $keyStr local-only -> ${if (bitmap != null) "HIT" else "MISS"}")
                     bitmap
                 }
             }
@@ -955,6 +1084,22 @@ object MediaCache {
                 if (offlineReadOnly) {
                     DebugLogger.d(TAG, "fetchBitmap: $keyStr -> offline, disk cache MISS")
                     return@withContext null
+                }
+
+                // 本会话已确认 404（源已不存在）：磁盘优先也只用本机缓存
+                if (isFileMissing(key)) {
+                    return@withContext if (isVideo) {
+                        getLocalVideoFrame(key)
+                    } else {
+                        getLocalImage(key)
+                    }
+                }
+
+                // 「源已不存在」：磁盘优先模式也先把 720 档/缩略图算进本地缓存，再决定是否联网
+                if (localOnly) {
+                    val local = if (isVideo) getLocalVideoFrame(key) else getLocalImage(key)
+                    DebugLogger.d(TAG, "fetchBitmap: $keyStr local-only -> ${if (local != null) "HIT" else "MISS"}")
+                    return@withContext local
                 }
 
                 // Fetch from server
@@ -997,27 +1142,26 @@ object MediaCache {
         key: MediaCacheKey,
         isVideo: Boolean,
         subfolder: String,
-        type: String
+        type: String,
+        /** true = 只读本机缓存，绝不发网络请求（「源已不存在」条目走这条） */
+        localOnly: Boolean = false
     ): Bitmap? {
         // v4.16.1 分流：持久化开关开启 → 走 filesDir 统一档链路（720 档 + 落盘 + 重开立即清晰）；
         // 关闭 → 走下方原逻辑（cacheDir + 512 档），两套互不读写对方目录。
         // 开关每次调用读一次（SharedPreferences 有内存缓存，读取极快）：设置变化即时生效。
         val appContext = applicationContext
         if (appContext != null && AppSettings.isGalleryPersistentCacheEnabled(appContext)) {
-            return fetchThumbnailPersistent(key, isVideo, subfolder, type, appContext)
+            return fetchThumbnailPersistent(key, isVideo, subfolder, type, appContext, localOnly)
         }
 
         val keyStr = key.keyString
+        // 第三态只读本机：内存里已有原图就直接用（省掉一次落盘读 + 解码）
+        if (localOnly) bitmapCache.get(keyStr)?.let { return it }
         thumbnailCache.get(keyStr)?.let { return it }
 
-        // 已确认服务器上没有的条目不再打网络（重试也是 404）
-        if (isFileMissing(key)) {
-            DebugLogger.d(TAG, "fetchThumbnail: $keyStr known missing -> skip")
-            return null
-        }
-
         if (isVideo) {
-            return fetchBitmap(key, true, subfolder, type)?.also { thumbnailCache.put(keyStr, it) }
+            return fetchBitmap(key, true, subfolder, type, localOnly = localOnly)
+                ?.also { thumbnailCache.put(keyStr, it) }
         }
 
         val context = applicationContext
@@ -1030,6 +1174,18 @@ object MediaCache {
                 DebugLogger.d(TAG, "fetchThumbnail: $keyStr disk -> HIT")
                 return it
             }
+        }
+        // 已确认服务器上没有（404）或「源已不存在」：不再打网络。
+        // 但**必须放在磁盘读之后**，且旧 thumb 未命中时再查一遍完整本机副本
+        // （旧 gallery_cache 原图 / 持久化目录），避免 UI 判"无缓存"而保存却成功。
+        if (isFileMissing(key) || localOnly) {
+            val legacy = withContext(Dispatchers.IO) { getLocalImage(key) }
+            if (legacy != null) {
+                thumbnailCache.put(keyStr, legacy)
+                return legacy
+            }
+            DebugLogger.d(TAG, "fetchThumbnail: $keyStr local-only -> MISS (skip network)")
+            return null
         }
         if (context == null || offlineReadOnly || client == null) {
             DebugLogger.d(TAG, "fetchThumbnail: $keyStr -> offline/unavailable, MISS")
@@ -1086,16 +1242,12 @@ object MediaCache {
         isVideo: Boolean,
         subfolder: String,
         type: String,
-        context: Context
+        context: Context,
+        localOnly: Boolean = false
     ): Bitmap? {
         val keyStr = key.keyString
+        if (localOnly) bitmapCache.get(keyStr)?.let { return it }
         thumbnailCache.get(keyStr)?.let { return it }
-
-        // 已确认服务器上没有的条目不再打网络（重试也是 404，与旧链路同一份 missingKeys）
-        if (isFileMissing(key)) {
-            DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr known missing -> skip")
-            return null
-        }
 
         // 磁盘层（filesDir 新目录）：图片读统一档，视频读首帧。
         // F1：新键名未命中时回退旧版本 `{promptId}_{filename}.jpg`，避免升级后旧缓存全部失效。
@@ -1108,6 +1260,22 @@ object MediaCache {
             return cached
         }
 
+        // 已确认 404 / 第三态：持久化目录没有就回退旧 cacheDir 副本。
+        // 老用户升级后可能只剩 gallery_cache / gallery_thumb 里的图；不能因为新目录没有
+        // 就显示"本机无缓存"——保存路径 getLocalImage 明明还能取到，UI 与保存能力必须一致。
+        if (isFileMissing(key) || localOnly) {
+            val legacy = withContext(Dispatchers.IO) {
+                if (isVideo) getLocalVideoFrame(key) else getLocalImage(key)
+            }
+            if (legacy != null) {
+                thumbnailCache.put(keyStr, legacy)
+                DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr local fallback -> HIT")
+                return legacy
+            }
+            DebugLogger.d(TAG, "fetchThumbnail(persist): $keyStr local-only -> MISS (skip network)")
+            return null
+        }
+
         // 离线（强制 / 自动）：持久化目录就是离线缩略图的数据源，不联网
         val client = comfyUIClient
         if (client == null || ConnectionManager.isOffline) {
@@ -1118,7 +1286,7 @@ object MediaCache {
         if (isVideo) {
             // 视频没有"服务端压缩预览"概念：复用 fetchBitmap 的视频链路（拉字节 → 提取首帧），
             // 首帧等比缩到统一档长边后落盘 gallery_thumbs
-            val frame = fetchBitmap(key, true, subfolder, type) ?: return null
+            val frame = fetchBitmap(key, true, subfolder, type, localOnly = localOnly) ?: return null
             val scaled = withContext(Dispatchers.IO) {
                 scaleBitmapToLongest(frame, GALLERY_DECODE_DIMENSION)
             }
@@ -1204,7 +1372,9 @@ object MediaCache {
     suspend fun fetchViewerImage(
         key: MediaCacheKey,
         subfolder: String,
-        type: String
+        type: String,
+        /** true = 只读本机缓存，绝不发网络请求（「源已不存在」条目走这条） */
+        localOnly: Boolean = false
     ): ViewerImage {
         val keyStr = key.keyString
         bitmapCache.get(keyStr)?.let { return ViewerImage(it, false) }
@@ -1220,6 +1390,23 @@ object MediaCache {
                 readBitmapOnlyFromDisk(context, key, false)
             }
             return ViewerImage(fromDisk, false)
+        }
+
+        // 「源已不存在」：原图已被确认删除（404 已持久化进索引），不再请求 ——
+        // 直接用本机缓存（720 档/旧磁盘原图），避免每次进查看器都白等一次超时。
+        if (localOnly) {
+            val local = withContext(Dispatchers.IO) { getLocalImage(key) }
+            local?.let { cacheFullBitmap(keyStr, it) }
+            DebugLogger.d(TAG, "fetchViewerImage: $keyStr local-only -> ${if (local != null) "HIT" else "MISS"}")
+            return ViewerImage(local, false)
+        }
+
+        // 本会话已确认 404：不再请求原图，直接用本机缓存（手动重试/下拉刷新会清标记）
+        if (isFileMissing(key)) {
+            val local = withContext(Dispatchers.IO) { getLocalImage(key) }
+            local?.let { cacheFullBitmap(keyStr, it) }
+            DebugLogger.d(TAG, "fetchViewerImage: $keyStr known missing -> local ${if (local != null) "HIT" else "MISS"}")
+            return ViewerImage(local, false)
         }
 
         // 已知超大：不再试原图（试也是白试一趟），直接用压缩版
@@ -1246,8 +1433,13 @@ object MediaCache {
             return ViewerImage(bitmap, false)
         }
         if (failure == ConnectionFailure.FILE_MISSING) {
-            // 404 记档：之后缩略图/查看器不再白打这趟请求，UI 也能显示"文件不存在"
+            // 404 记档：之后缩略图/查看器不再白打这趟请求，仓储据此把标记持久化进索引
             markFileMissing(key)
+            // 源已不存在：回落到本机缓存（720 档/旧磁盘原图），让界面直接进入第三态
+            // ——清晰的低清副本 + 「已删除」角标，而不是一次失败占位后让用户反复重试。
+            val local = withContext(Dispatchers.IO) { getLocalImage(key) }
+            local?.let { cacheFullBitmap(keyStr, it) }
+            return ViewerImage(local, false)
         }
         if (failure != ConnectionFailure.FILE_TOO_LARGE) {
             return ViewerImage(null, false)
@@ -1501,11 +1693,20 @@ object MediaCache {
             }
         }
 
-        bitmap?.let {
-            cacheFullBitmap(key.keyString, it, priority)
+        if (bitmap != null) {
+            cacheFullBitmap(key.keyString, bitmap, priority)
+            return bitmap
         }
 
-        return bitmap
+        // 404 = 源已不存在：不回 null，回落到本机缓存（720 档/旧磁盘），
+        // 让界面进入第三态（清晰的低清副本 + 「已删除」角标），而不是黑屏/失败图标。
+        if (isFileMissing(key)) {
+            return withContext(Dispatchers.IO) { getLocalImage(key) }?.also {
+                cacheFullBitmap(key.keyString, it, priority)
+            }
+        }
+
+        return null
     }
 
     private suspend fun fetchVideoBitmap(
@@ -1552,7 +1753,11 @@ object MediaCache {
         if (videoBytes == null) {
             // Fetch video bytes
             videoBytes = suspendCancellableCoroutine { continuation ->
-                client.fetchVideo(key.filename, subfolder, type) { bytes, _ ->
+                client.fetchVideo(key.filename, subfolder, type) { bytes, failureType ->
+                    // 404 = 视频源已不存在：与图片链路同一份 missingKeys / 第三态标记
+                    if (bytes == null && failureType == ConnectionFailure.FILE_MISSING) {
+                        markFileMissing(key)
+                    }
                     continuation.resume(bytes)
                 }
             }
@@ -1561,7 +1766,10 @@ object MediaCache {
             videoBytes?.let { videoCache.put(keyStr, it, PriorityLruCache.PRIORITY_DEFAULT) }
         }
 
-        if (videoBytes == null) return null
+        if (videoBytes == null) {
+            // 源已不存在：回落到本机缓存的首帧，让格子/查看器进入第三态
+            return if (isFileMissing(key)) getLocalVideoFrame(key) else null
+        }
 
         // Double-check bitmap cache (another thread might have extracted while we fetched)
         bitmapCache.get(keyStr)?.let { return it }
@@ -1593,9 +1801,17 @@ object MediaCache {
         }
 
         // Write to disk cache (don't keep in memory)
-        bitmap?.let { writeBitmapToDisk(context, key, it) }
+        if (bitmap != null) {
+            writeBitmapToDisk(context, key, bitmap)
+            return bitmap
+        }
 
-        return bitmap
+        // 404 = 源已不存在：回落到本机缓存（720 档/旧磁盘），让界面进入第三态
+        if (isFileMissing(key)) {
+            return getLocalImage(key)
+        }
+
+        return null
     }
 
     private suspend fun fetchVideoBitmapDiskFirst(
@@ -1623,10 +1839,13 @@ object MediaCache {
 
         // 回退：远程抽帧失败（认证 / 自签证书 / 协议不支持）时按原链路整段下载并落盘
         val videoBytes = suspendCancellableCoroutine<ByteArray?> { continuation ->
-            client.fetchVideo(key.filename, subfolder, type) { bytes, _ ->
+            client.fetchVideo(key.filename, subfolder, type) { bytes, failureType ->
+                if (bytes == null && failureType == ConnectionFailure.FILE_MISSING) {
+                    markFileMissing(key)
+                }
                 continuation.resume(bytes)
             }
-        } ?: return null
+        } ?: return if (isFileMissing(key)) getLocalVideoFrame(key) else null
 
         // Write video to disk cache
         writeVideoToDisk(context, key, videoBytes)
@@ -1673,6 +1892,13 @@ object MediaCache {
                 }
             }
 
+            // 本会话已确认 404：保存/分享直接用本机缓存，不再白打一次请求
+            if (isFileMissing(key)) {
+                return withContext(Dispatchers.IO) {
+                    getLocalImage(key)?.also { cacheFullBitmap(key.keyString, it, priority) }
+                }
+            }
+
             return withContext(Dispatchers.IO) {
                 val bitmap = suspendCancellableCoroutine { continuation ->
                     client!!.fetchImage(key.filename, subfolder, type) { bmp, failureType ->
@@ -1683,8 +1909,18 @@ object MediaCache {
                     }
                 }
 
-                bitmap?.let { cacheFullBitmap(key.keyString, it, priority) }
-                bitmap
+                if (bitmap != null) {
+                    cacheFullBitmap(key.keyString, bitmap, priority)
+                    return@withContext bitmap
+                }
+                // 404 = 源已不存在：保存/分享等调用方拿到的是本机低清副本，而不是 null
+                // （界面据此走"已保存低清版"，而不是一句没有原因的保存失败）。
+                if (isFileMissing(key)) {
+                    return@withContext getLocalImage(key)?.also {
+                        cacheFullBitmap(key.keyString, it, priority)
+                    }
+                }
+                null
             }
         } else {
             // Disk-first: check disk cache first, fetch and save to disk if not found
@@ -1692,6 +1928,11 @@ object MediaCache {
                 readBitmapFromDisk(context, key)?.let {
                     DebugLogger.d(TAG, "fetchImage: ${key.keyString} from disk cache -> HIT")
                     return@withContext it
+                }
+
+                // 本会话已确认 404：保存/分享直接用本机缓存
+                if (isFileMissing(key)) {
+                    return@withContext getLocalImage(key)
                 }
 
                 // 离线态：磁盘缓存就是全部内容，不得再去请求服务器
@@ -1710,8 +1951,14 @@ object MediaCache {
                     }
                 }
 
-                bitmap?.let { writeBitmapToDisk(context, key, it) }
-                bitmap
+                if (bitmap != null) {
+                    writeBitmapToDisk(context, key, bitmap)
+                    return@withContext bitmap
+                }
+                if (isFileMissing(key)) {
+                    return@withContext getLocalImage(key)
+                }
+                null
             }
         }
     }
@@ -1733,7 +1980,9 @@ object MediaCache {
     suspend fun fetchVideoBytes(
         key: MediaCacheKey,
         subfolder: String,
-        type: String
+        type: String,
+        /** true = 只读本机缓存，绝不发网络请求（「源已不存在」的视频条目走这条） */
+        localOnly: Boolean = false
     ): ByteArray? {
         val context = applicationContext ?: return null
         val client = comfyUIClient  // May be null in offline mode
@@ -1747,25 +1996,29 @@ object MediaCache {
                 return it
             }
 
-            // 离线：回落到磁盘缓存（只读）
-            if (offlineReadOnly) {
+            // 离线 / 已确认 404 / 第三态：只读磁盘缓存，不发请求
+            if (offlineReadOnly || localOnly || isFileMissing(key)) {
                 return withContext(Dispatchers.IO) {
                     val bytes = readVideoBytesFromDisk(context, key)
                     bytes?.let { videoCache.put(key.keyString, it, PriorityLruCache.PRIORITY_DEFAULT) }
-                    DebugLogger.d(TAG, "fetchVideoBytes: ${key.keyString} offline -> disk cache ${if (bytes != null) "HIT" else "MISS"}")
+                    DebugLogger.d(TAG, "fetchVideoBytes: ${key.keyString} local-only -> disk cache ${if (bytes != null) "HIT" else "MISS"}")
                     bytes
                 }
             }
 
             return withContext(Dispatchers.IO) {
                 val bytes = suspendCancellableCoroutine { continuation ->
-                    client!!.fetchVideo(key.filename, subfolder, type) { videoBytes, _ ->
+                    client!!.fetchVideo(key.filename, subfolder, type) { videoBytes, failureType ->
+                        if (videoBytes == null && failureType == ConnectionFailure.FILE_MISSING) {
+                            markFileMissing(key)
+                        }
                         continuation.resume(videoBytes)
                     }
                 }
 
                 bytes?.let { videoCache.put(key.keyString, it, PriorityLruCache.PRIORITY_DEFAULT) }
-                bytes
+                // 404：回落到本机磁盘字节（源已不存在，但本机可能还留着）
+                bytes ?: if (isFileMissing(key)) readVideoBytesFromDisk(context, key) else null
             }
         } else {
             // Disk-first: check disk cache first, fetch and save to disk if not found
@@ -1775,21 +2028,24 @@ object MediaCache {
                     return@withContext it
                 }
 
-                // 离线态：磁盘缓存就是全部内容，不得再去请求服务器
-                if (offlineReadOnly) {
-                    DebugLogger.d(TAG, "fetchVideoBytes: ${key.keyString} -> offline, disk cache MISS")
+                // 离线态 / 已确认 404 / 第三态：磁盘缓存就是全部内容，不得再去请求服务器
+                if (offlineReadOnly || localOnly || isFileMissing(key)) {
+                    DebugLogger.d(TAG, "fetchVideoBytes: ${key.keyString} -> local-only, disk cache MISS")
                     return@withContext null
                 }
 
                 DebugLogger.d(TAG, "fetchVideoBytes: ${key.keyString} -> fetching from server")
                 val bytes = suspendCancellableCoroutine { continuation ->
-                    client!!.fetchVideo(key.filename, subfolder, type) { videoBytes, _ ->
+                    client!!.fetchVideo(key.filename, subfolder, type) { videoBytes, failureType ->
+                        if (videoBytes == null && failureType == ConnectionFailure.FILE_MISSING) {
+                            markFileMissing(key)
+                        }
                         continuation.resume(videoBytes)
                     }
                 }
 
                 bytes?.let { writeVideoToDisk(context, key, it) }
-                bytes
+                bytes ?: if (isFileMissing(key)) readVideoBytesFromDisk(context, key) else null
             }
         }
     }
@@ -1897,12 +2153,14 @@ object MediaCache {
         key: MediaCacheKey,
         subfolder: String,
         type: String,
-        context: Context
+        context: Context,
+        /** true = 只读本机缓存，绝不发网络请求（「源已不存在」的视频条目走这条） */
+        localOnly: Boolean = false
     ): Uri? {
         val keyStr = key.keyString
 
         // Ensure bytes are cached
-        val bytes = fetchVideoBytes(key, subfolder, type) ?: return null
+        val bytes = fetchVideoBytes(key, subfolder, type, localOnly) ?: return null
 
         // Extract and cache dimensions/thumbnail if not already cached
         if (!videoDimensionsCache.containsKey(keyStr)) {
@@ -1945,6 +2203,8 @@ object MediaCache {
         for ((index, priority) in indicesToPrefetch) {
             if (index in allItems.indices) {
                 val item = allItems[index]
+                // 源已不存在：预取原图没有意义（只会再拿一个 404）
+                if (item.sourceMissing) continue
                 val keyStr = item.key.keyString
                 // Skip if already cached
                 if (!isCached(item.key, item.isVideo)) {
@@ -2026,7 +2286,14 @@ object MediaCache {
         val key: MediaCacheKey,
         val isVideo: Boolean,
         val subfolder: String,
-        val type: String
+        val type: String,
+        /**
+         * 源已不存在（/view 404 已持久化）→ 预取直接跳过。
+         *
+         * 预取拉的是**原图**；对已删除的条目再拉只会换回一次 404，
+         * 既浪费请求也让"每次进图库都要重新等一次"的观感继续存在。
+         */
+        val sourceMissing: Boolean = false
     )
 
     private fun isCached(key: MediaCacheKey, isVideo: Boolean): Boolean {

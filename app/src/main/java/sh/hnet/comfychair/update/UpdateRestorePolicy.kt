@@ -70,4 +70,63 @@ object UpdateRestorePolicy {
     } catch (_: Exception) {
         null
     }
+
+    // ---------------- R4：已下载包的复用 ----------------
+
+    /** 本地已下载包的处理结论 */
+    enum class LocalPackageVerdict {
+        /** 可直接复用 → 状态置 READY_TO_INSTALL，不重新下载 */
+        REUSE,
+
+        /** 不可复用（校验不过 / 版本不比已安装的新 / 包名不符）→ 丢弃 */
+        DISCARD
+    }
+
+    /**
+     * 冷启动 / 重进 App 时，磁盘上的 `update.apk` 能不能直接当「待安装」用（R4）。
+     *
+     * 四个条件缺一不可：
+     * 1. [shaVerdict] 为 [Verdict.VERIFIED]（与清单 sha256 一致）；
+     * 2. 有落盘的 versionCode 元数据（老版本下载的包没有，无法证明「更新」，按不可信处理）；
+     * 3. 该 versionCode **大于**当前已安装版本 —— 否则就是「已经装好了还在提示安装」，
+     *    正是用户看到的「安装进程一直挂起」的一部分；
+     * 4. 包名校验通过（[AppInstaller.isApkTrusted]，签名由系统安装时校验）。
+     *
+     * 纯函数：不碰文件、不碰 Android，单测直接覆盖每种组合。
+     */
+    fun decideLocalPackage(
+        shaVerdict: Verdict,
+        packageVersionCode: Int?,
+        installedVersionCode: Int,
+        packageTrusted: Boolean
+    ): LocalPackageVerdict =
+        if (shaVerdict == Verdict.VERIFIED &&
+            packageVersionCode != null &&
+            packageVersionCode > installedVersionCode &&
+            packageTrusted
+        ) {
+            LocalPackageVerdict.REUSE
+        } else {
+            LocalPackageVerdict.DISCARD
+        }
+
+    /**
+     * 冷启动后应该呈现的阶段（R2：进程重启后**不得**是「下载中」）。
+     *
+     * - 本地有可复用包 → [UpdatePhase.READY_TO_INSTALL]（只差一步安装）；
+     * - 本进程内确实有正在跑的下载会话（Activity 重建，不是进程重启）→ 保留 DOWNLOADING；
+     * - 其余（含「.part 存在」）→ [UpdatePhase.IDLE]。
+     *
+     * `partExists` 只作为语义说明参数：**残留的 .part 永远不能把状态恢复成下载中**，
+     * 它只是下次用户手动点「下载更新」时断点续传的素材。
+     */
+    fun coldStartPhase(
+        localPackageReusable: Boolean,
+        downloadSessionActive: Boolean,
+        @Suppress("UNUSED_PARAMETER") partExists: Boolean
+    ): UpdatePhase = when {
+        localPackageReusable -> UpdatePhase.READY_TO_INSTALL
+        downloadSessionActive -> UpdatePhase.DOWNLOADING
+        else -> UpdatePhase.IDLE
+    }
 }

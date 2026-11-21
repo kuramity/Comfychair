@@ -41,10 +41,16 @@ import java.util.concurrent.TimeUnit
  * v4.12.0 稳定性修订（A-R1 取证，逐项编号见类内各处注释）：
  * - 状态机收敛：每次进入都把仓库状态拉回 DOWNLOADING，修复自动重试后进度永久停摆；
  * - 416 自愈：`.part` 达到总长时直接进 SHA 校验；收到 416 删 .part 只全量重下一次；
- * - 异常分型 + 重试上限（5 次）：可恢复走 retry，HTTP 4xx / 磁盘不足直接最终失败；
+ * - 异常分型 + 重试上限（v4.18.0 由 5 降到 2）：可恢复走 retry，HTTP 4xx / 磁盘不足直接最终失败；
  * - 停滞看门狗：连续 120 秒无字节增长主动 cancel 连接续传重试（readTimeout 的补充）；
  * - 失败横幅按阶段区分文案；重试退避期间通知切"等待重试（第 N 次）"。
  * 以上新行为统一受 [AppSettings.isUpdateDownloadLegacyMode] 回退开关约束（安全阀）。
+ *
+ * v4.18.0（R3 / R5）：
+ * - **版本闸门**：每次启动先比「目标 versionCode」与「当前已安装 versionCode」，
+ *   已装好就直接结束并清通知，不再白下 160MB；
+ * - **失败即停**：达到上限返回 failure（不再 retry），并发一条「点检查更新可重试」的通知；
+ * - **回退开关也有上限**（3 次），不存在无上限的重试分支。
  */
 class UpdateDownloadWorker(
     context: Context,
@@ -57,6 +63,17 @@ class UpdateDownloadWorker(
         const val KEY_EXPECTED_SIZE = "expectedSize"
         const val KEY_VERSION_NAME = "versionName"
 
+        /**
+         * 本次任务要下载的 versionCode（R3）。
+         *
+         * Worker 每次启动（含 WorkManager 的自动重试、跨进程恢复）都拿它和
+         * **当前已安装版本**再比一次：装好了新版本还在下旧包，正是用户流量被烧掉的根源。
+         */
+        const val KEY_VERSION_CODE = "versionCode"
+
+        /** 下载会话代次（R2：迟到的旧会话回调不污染新会话状态） */
+        const val KEY_SESSION_GENERATION = "sessionGeneration"
+
         /** 文件名约定（硬性约束 15） */
         const val PART_FILE_NAME = "update.apk.part"
         const val FINAL_FILE_NAME = "update.apk"
@@ -68,6 +85,14 @@ class UpdateDownloadWorker(
          * 写完安装包就写它，删包时一起删。
          */
         const val SHA_FILE_NAME = "update.apk.sha256"
+
+        /**
+         * 安装包 versionCode 旁车（R4）。
+         *
+         * 只有 sha256 说明「文件没被换过」，说明不了「它比已安装的版本新」——
+         * 没有这份元数据，冷启动就会把一个已经装好的版本重新提示为「待安装」。
+         */
+        const val VERSION_FILE_NAME = "update.apk.version"
 
         /** 单次读写的 buffer 大小（硬性约束 14：8KB–64KB 区间内取 64KB） */
         private const val BUFFER_SIZE = 64 * 1024
@@ -149,6 +174,18 @@ class UpdateDownloadWorker(
         fun partFile(context: Context): File = File(updateDir(context), PART_FILE_NAME)
         fun finalFile(context: Context): File = File(updateDir(context), FINAL_FILE_NAME)
         fun shaFile(context: Context): File = File(updateDir(context), SHA_FILE_NAME)
+        fun versionFile(context: Context): File = File(updateDir(context), VERSION_FILE_NAME)
+
+        /**
+         * 读取当前**已安装**的 versionCode（Int 口径的便捷入口）。
+         *
+         * 实现统一委托给 [UpdateCleanupPolicy.installedVersionCode]：PackageManager 为主，
+         * 异常时回退 BuildConfig 并记 warning。F2 复核指出旧实现有两份口径不同的回退
+         * （Worker 读失败返回 0 = 闸门 fail-open；共享版回退 BuildConfig），后续必然漂移，
+         * 因此这里只保留一层委托，不再自己 catch。
+         */
+        internal fun installedVersionCode(context: Context): Int =
+            UpdateCleanupPolicy.installedVersionCode(context).toInt()
 
         /**
          * 从 Content-Range 头解析总长度：`bytes 123-456789/456790` → 456790。
@@ -178,11 +215,46 @@ class UpdateDownloadWorker(
         val expectedSha256 = inputData.getString(KEY_SHA256).orEmpty()
         val expectedSize = inputData.getLong(KEY_EXPECTED_SIZE, -1L)
         val versionName = inputData.getString(KEY_VERSION_NAME).orEmpty()
+        val targetVersionCode = inputData.getInt(KEY_VERSION_CODE, 0)
+        val generation = inputData.getLong(KEY_SESSION_GENERATION, -1L)
         // 回退开关（v4.12.0 安全阀）：true = 保持 v4.11.0 前的旧行为
         val legacy = AppSettings.isUpdateDownloadLegacyMode(applicationContext)
 
         if (url.isNullOrEmpty()) {
-            repository.publishFailed("下载地址缺失")
+            repository.publishFailed("下载地址缺失", generation)
+            return@withContext Result.failure()
+        }
+
+        // P2 fail-closed（复核 low）：升级前入队的旧任务没有 KEY_VERSION_CODE 入参，
+        // getInt(默认 0) 读成 0；而 isObsolete 要求 target > 0 才可能返回 true，
+        // 于是闸门对这类任务完全失效 —— WorkManager 在应用更新后重排它们，旧包会被
+        // 继续下完（继续烧流量）。拿不到目标版本就无法证明该任务还需要跑，直接中止。
+        // 正常路径（入队时必带 versionCode）行为不变。
+        if (UpdateCleanupPolicy.shouldAbortMissingTarget(targetVersionCode)) {
+            DebugLogger.w(
+                TAG,
+                "更新任务缺少目标 versionCode（读到 $targetVersionCode），无法判断是否过时 → 中止下载"
+            )
+            // 用户可见文案走资源（6 个语言目录同步补齐），不再硬编码中文（F1 复核）。
+            val message = applicationContext.getString(R.string.update_missing_target_cancelled)
+            repository.publishFailed(message, generation)
+            UpdateNotifier.notifyFailed(applicationContext, message)
+            UpdateNotifier.cancelProgress(applicationContext)
+            return@withContext Result.failure()
+        }
+
+        // R3：每次启动都再比一次版本号。
+        // WorkManager 会把未完成的 OneTimeWork 跨进程、跨重启恢复，于是「已经装好新版本
+        // 之后旧任务还在下」——这是流量被烧掉、通知栏进度条永远撤不掉的直接原因。
+        // 这里在**发任何网络请求之前**拦下，不再白下一字节。
+        val installedCode = installedVersionCode(applicationContext)
+        if (UpdateCleanupPolicy.isObsolete(targetVersionCode, installedCode)) {
+            DebugLogger.i(
+                TAG,
+                "任务已过时（目标 $targetVersionCode <= 已安装 $installedCode），跳过下载并清理"
+            )
+            repository.publishObsolete()
+            UpdateNotifier.cancel(applicationContext)
             return@withContext Result.failure()
         }
 
@@ -243,7 +315,7 @@ class UpdateDownloadWorker(
                     DownloadPolicy.Sha256Verdict.MISSING -> {
                         DebugLogger.w(TAG, "清单缺少有效 SHA-256（raw=$expectedSha256）→ 拒绝安装")
                         val message = applicationContext.getString(R.string.update_error_verify_missing)
-                        repository.publishFailed(message)
+                        repository.publishFailed(message, generation)
                         UpdateNotifier.notifyFailed(applicationContext, message)
                         UpdateNotifier.cancelProgress(applicationContext)
                         return@withContext Result.failure()
@@ -266,7 +338,7 @@ class UpdateDownloadWorker(
                 // 真下载后校验仍失败：不可恢复（A-R1 Important-1 的分型口径）
                 DebugLogger.w(TAG, "SHA-256 mismatch: expected=$expectedSha256 actual=$actualSha")
                 val message = applicationContext.getString(R.string.update_error_verify)
-                repository.publishFailed(message)
+                repository.publishFailed(message, generation)
                 UpdateNotifier.notifyFailed(applicationContext, message)
                 UpdateNotifier.cancelProgress(applicationContext)
                 return@withContext Result.failure()
@@ -295,33 +367,59 @@ class UpdateDownloadWorker(
                 DebugLogger.w(TAG, "写入 sha256 旁车失败：${e.javaClass.simpleName} ${e.message}")
             }
 
-            repository.publishReady(final.length())
+            // R4：把本次包的 versionCode 一起落盘。冷启动只有 sha256 还不够 ——
+            // 「文件没被换」不等于「它比已安装的版本新」，缺了版本号就会把
+            // 已经装好的版本重新提示成「待安装」。
+            if (targetVersionCode > 0) {
+                try {
+                    versionFile(applicationContext).writeText(targetVersionCode.toString())
+                } catch (e: Exception) {
+                    DebugLogger.w(TAG, "写入 versionCode 旁车失败：${e.javaClass.simpleName} ${e.message}")
+                }
+            }
+
+            repository.publishReady(final.length(), generation)
             UpdateNotifier.notifyUpdateReady(applicationContext, versionName)
             UpdateNotifier.cancelProgress(applicationContext)
             Result.success(workDataOf("finalSize" to final.length()))
         } catch (e: kotlinx.coroutines.CancellationException) {
-            // 任务被 WorkManager 取消（用户撤单/系统清理）：不是失败，不要发"下载失败"横幅
+            // 任务被 WorkManager 取消（手动重试 REPLACE / R3 清理 / 系统清理）：
+            // 不是失败，不要发"下载失败"横幅；只把会话标记收掉（代次不符的迟到回调会被忽略）
+            repository.publishSessionEnded(generation)
             throw e
         } catch (e: IOException) {
             if (legacy) {
-                // 回退开关：保持旧行为——任何 IO 异常都 Result.retry()（无次数上限）
-                DebugLogger.w(TAG, "Download failed (legacy): ${e.message}")
-                repository.publishFailed(
-                    applicationContext.getString(R.string.update_error_legacy_interrupted, e.javaClass.simpleName)
+                // 回退开关（v4.12.0 安全阀）：R5 第 3 条要求它**也有上限** ——
+                // 旧行为「任何 IO 异常都 Result.retry()、无次数上限」是流量黑洞，
+                // 已删除。这里最多 LEGACY_MAX_AUTO_RETRIES 次，之后失败即停。
+                DebugLogger.w(
+                    TAG,
+                    "Download failed (legacy): attempt=$runAttemptCount ${e.message}"
                 )
-                UpdateNotifier.notifyFailed(
-                    applicationContext,
-                    repository.state.value.error ?: "下载中断，可重试续传"
-                )
-                Result.retry()
+                if (DownloadPolicy.shouldRetryLegacy(runAttemptCount)) {
+                    UpdateNotifier.notifyWaitingRetry(applicationContext, versionName, runAttemptCount + 1)
+                    Result.retry()
+                } else {
+                    val message = applicationContext.getString(
+                        R.string.update_error_retry_exhausted,
+                        runAttemptCount
+                    )
+                    repository.publishFailed(message, generation)
+                    UpdateNotifier.notifyFailed(
+                        applicationContext,
+                        applicationContext.getString(R.string.update_failed_retry_hint)
+                    )
+                    UpdateNotifier.cancelProgress(applicationContext)
+                    Result.failure()
+                }
             } else {
-                handleDownloadFailure(e, versionName)
+                handleDownloadFailure(e, versionName, generation)
             }
         } catch (e: Exception) {
             // 非 IO 异常维持旧行为：直接最终失败
             DebugLogger.w(TAG, "Download error: ${e.message}")
             val message = applicationContext.getString(R.string.update_error_unexpected, e.message ?: "")
-            repository.publishFailed(message)
+            repository.publishFailed(message, generation)
             UpdateNotifier.notifyFailed(
                 applicationContext,
                 repository.state.value.error ?: message
@@ -339,9 +437,10 @@ class UpdateDownloadWorker(
      * 重试路径刻意不 publishFailed：FAILED 只留给"最终失败"，
      * 否则会出现"横幅说失败、后台还在重试"的矛盾状态（A-R1 第 1 条）。
      */
-    private fun handleDownloadFailure(e: IOException, versionName: String): Result {
+    private fun handleDownloadFailure(e: IOException, versionName: String, generation: Long): Result {
         val kind = DownloadPolicy.classifyFailure(e)
         val attempt = runAttemptCount
+        // R5：可重试异常也只在 MAX_AUTO_RETRIES（2）以内重试，之后失败即停
         val canRetry = DownloadPolicy.isRetryable(e) &&
             DownloadPolicy.shouldRetryAutomatically(attempt)
         DebugLogger.w(TAG, "download failed: kind=$kind attempt=$attempt retry=$canRetry msg=${e.message}")
@@ -350,8 +449,15 @@ class UpdateDownloadWorker(
             return Result.retry()
         }
         val message = failureMessage(e, kind, attempt)
-        repository.publishFailed(message)
-        UpdateNotifier.notifyFailed(applicationContext, message)
+        repository.publishFailed(message, generation)
+        // 已到上限：通知里给出明确的下一步（用户手动点「检查更新」即可续传重试），
+        // 并撤掉那条 setOngoing 的进度条 —— 否则它会一直挂在通知栏，看起来像「安装进程挂起」。
+        val notificationText = if (DownloadPolicy.isRetryable(e)) {
+            applicationContext.getString(R.string.update_failed_retry_hint)
+        } else {
+            message
+        }
+        UpdateNotifier.notifyFailed(applicationContext, notificationText)
         UpdateNotifier.cancelProgress(applicationContext)
         return Result.failure()
     }

@@ -26,7 +26,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.FilterQuality
@@ -173,7 +172,7 @@ fun ImageViewer(
     var isDismissSettling by remember { mutableStateOf(false) }
     var settleJob by remember { mutableStateOf<Job?>(null) }
 
-    // 容器尺寸（onSizeChanged 写入）。声明提到这里：下方 E5 的 snapshotFlow 监听
+    // 容器尺寸（onSizeChanged 写入）。声明提到这里：下方 E5 的透出收回
     // 与飞回收尾都要读它，Kotlin 局部变量不允许前向引用
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
 
@@ -188,15 +187,31 @@ fun ImageViewer(
         )
     }
 
-    // E5：回弹动画中监听进度跌回 10% 以下 → 遮罩恢复纯黑。用 snapshotFlow 订阅
-    // Animatable 的每帧值（与拖动中的跨阈值检测同口径），不占用 animateTo 的 block
+    // E5（v4.16.14 修）：**手指一松就把透出作废**，由 120ms tween 从当前值平滑回到纯黑。
+    //
+    // 修复前的写法是：回弹期间用 snapshotFlow 订阅 dismissDragAnimatable 的位移，
+    // 直到位移跌回 10% 阈值才把 maskRevealed 翻 false（见 ViewerDismissGesture.
+    // dismissMaskTargetAlpha）。问题出在"回弹比淡出慢"这条时序：
+    //   ① 手指还在拖时 maskRevealed = true，遮罩目标变成 0.2，开始 120ms 淡出；
+    //   ② 用户在淡出还没走完时松手 → 回弹弹簧把位移从松手值送回 0，需要 200~400ms；
+    //   ③ 这段时间里 maskRevealed **仍然是 true**，于是那条 tween 在手指抬起之后
+    //      继续朝 0.2 补完 —— 图库截图（含各格缩略图）在松手后反而变得更清楚；
+    //   ④ 位移掉到 10% 以下才翻 false，再花 120ms 淡回纯黑。
+    // 观感就是"松手回弹的瞬间，屏幕边缘/底部露出的图库缩略图闪一下"：透出不是被
+    // 收回，而是先补完再收回。画面里那一块"图片"就是图库截图里的缩略图 ——
+    // 竖版/方图在 20:9 屏上 Fit 后上下各有黑边，底部那条黑边正对着图库最下面一排格子。
+    //
+    // 透出的语义是"继续下拉就能关闭"的提示，手指一松就没有意义：立刻作废才是对的。
+    // 只改"何时开始收回"，tween 时长（120ms）和图片的回弹弹簧一点没动，
+    // 所以不会出现"背景瞬变黑"的抽帧感 —— 遮罩永远从当前值连续过渡。
     LaunchedEffect(isDismissSettling) {
         if (isDismissSettling && currentFlyBackCellRect != null) {
-            snapshotFlow { dismissDragAnimatable.value }.collect { value ->
-                maskRevealed = ViewerDismissGesture.dismissMaskTargetAlpha(
-                    value, containerSize.height.toFloat()
-                ) < 1f
-            }
+            maskRevealed = ViewerDismissGesture.shouldRevealMask(
+                displacement = dismissDragAnimatable.value,
+                screenHeightPx = containerSize.height.toFloat(),
+                // 已松手：不管此刻位移多深，透出一律收回
+                gestureActive = false
+            )
         }
     }
 
@@ -379,8 +394,10 @@ fun ImageViewer(
             isDismissSettling = true
             dismissDragY = 0f
             dismissDragX = 0f
-            // E5：回弹过程中遮罩恢复纯黑——由上方监听 isDismissSettling 的
-            // snapshotFlow 按 Animatable 每帧值驱动 maskRevealed 翻转
+            // E5（v4.16.14 修）：透出在松手这一刻就作废——由监听 isDismissSettling 的
+            // effect 立刻把 maskRevealed 翻 false，120ms tween 从当前值收回纯黑。
+            // 修复前这里靠"位移跌回 10% 以下"才收回，导致淡出在手指抬起后还继续补完
+            // （图库缩略图在回弹途中反而更清楚），就是松手瞬间闪一下的根因。
             val settleY = launch {
                 dismissDragAnimatable.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 300f))
             }
@@ -471,7 +488,18 @@ fun ImageViewer(
                 // cause 非空 = 协程被取消（动画期间组件离开组合 / 统一清理自己取消它）：
                 // 与捏合收尾同款处理，不重复发起退出（清理已经在做同一份复位）
                 if (cause == null) {
-                    isFlyBackAnimating = false
+                    // E4 二次修复（v4.19.2）：**不要**在这里关 isFlyBackAnimating。
+                    //
+                    // 飞回动画结束时 flyBackAnimatable.value 已到 1f，graphicsLayer 的飞回分支
+                    // 经 flyBackTargetFactors 插值出的正是「图片停在目标格子里」——那是正确的
+                    // 最后一帧，与宿主页的窗口转场天然衔接。
+                    //
+                    // 一旦把它置 false，graphicsLayer 立刻落到 else 分支：scale = 1（全屏）、
+                    // translation = 0、alpha = 1，在 requestViewerExit 真正销毁组件之前闪出一帧
+                    // 「全屏极清晰的图」。这正是上一次修复（只清零 dismissDrag 而不改开关时机）
+                    // 换成的新残影形态 —— 关这个开关的动作本身就是残影来源，与位移清不清零无关。
+                    //
+                    // 组件马上会被 requestViewerExit 销毁，标志位无需手工复位。
                     currentOnFlyBackCompleted?.invoke()
                     requestViewerExit(ViewerExitReason.DISMISS_DRAG)
                 }
@@ -589,6 +617,15 @@ fun ImageViewer(
                     }
                     val currentScale = if (isAnimating) scaleAnimatable.value else scale
                     val currentOffset = if (isAnimating) offsetAnimatable.value else offset
+                    // E4 残影排查（临时日志，保留供用户验证时序）：只在 DEBUG 包生效，
+                    // release 包 BuildConfig.DEBUG 为 false，编译器会整段裁掉，零开销。
+                    if (BuildConfig.DEBUG) {
+                        Log.d(
+                            "FlyBackProbe",
+                            "flyBack=$isFlyBackAnimating settling=$isDismissSettling " +
+                                "dy=$dismissY dx=$dismissX scale=$currentScale alpha=${visuals.alpha}"
+                        )
+                    }
                     // G6（任务书 12.2）：这里**不再有**捏合关闭的内容层淡出因子。
                     // 旧实现把双指收缩退出做成两段动画：内容层先缩小淡出 160ms
                     // （pinchCloseScale/AlphaAnimatable），播完再把 isPinchClosing 翻回
@@ -633,18 +670,29 @@ fun ImageViewer(
                             rotationZ = 0f
                         }
                     } else {
-                        val effScaleFactor = deleteVisuals?.scale ?: visuals.scale
-                        scaleX = currentScale * effScaleFactor * sideScale
-                        scaleY = currentScale * effScaleFactor * sideScale
-                        // N8：横向自由拖动位移叠加在平移上（透出程度仍只看 dismissY）。
-                        // G4：删除模式下 dismissX 恒 0（updateDismissDrag 锁死横轴），
-                        // 这里不需要分支——位移源头就是轴间仲裁本身
-                        translationX = currentOffset.x + dismissX
-                        translationY = currentOffset.y + dismissY
-                        alpha = deleteVisuals?.alpha ?: visuals.alpha
-                        // rotationZ 必须**每帧显式赋值**：graphicsLayer 的属性块跨帧复用，
-                        // 不写会残留上一次删除手势的倾角（删除结束、日常拖动带歪图）
-                        rotationZ = deleteVisuals?.rotationDeg ?: 0f
+                        // E4 二次修复兜底：已经提交退出（exitCommitted = true 由 requestViewerExit /
+                        // resetViewerLayers 设置，且全仓没有任何地方把它设回 false）时，内容层一律不画。
+                        // 这样即便某条路径又把 isFlyBackAnimating 翻回了 false（例如宿主页的退出清理
+                        // resetViewerLayers），也绝不会再画出 scale=1 的全屏回落帧。
+                        if (exitCommitted) {
+                            alpha = 0f
+                            // rotationZ 同样显式归零：graphicsLayer 属性块跨帧复用，
+                            // 兜底分支也必须保持"每帧写全"的复位纪律
+                            rotationZ = 0f
+                        } else {
+                            val effScaleFactor = deleteVisuals?.scale ?: visuals.scale
+                            scaleX = currentScale * effScaleFactor * sideScale
+                            scaleY = currentScale * effScaleFactor * sideScale
+                            // N8：横向自由拖动位移叠加在平移上（透出程度仍只看 dismissY）。
+                            // G4：删除模式下 dismissX 恒 0（updateDismissDrag 锁死横轴），
+                            // 这里不需要分支——位移源头就是轴间仲裁本身
+                            translationX = currentOffset.x + dismissX
+                            translationY = currentOffset.y + dismissY
+                            alpha = deleteVisuals?.alpha ?: visuals.alpha
+                            // rotationZ 必须**每帧显式赋值**：graphicsLayer 的属性块跨帧复用，
+                            // 不写会残留上一次删除手势的倾角（删除结束、日常拖动带歪图）
+                            rotationZ = deleteVisuals?.rotationDeg ?: 0f
+                        }
                     }
                 }
                 .pointerInput(Unit) {
@@ -747,11 +795,16 @@ fun ImageViewer(
                                 ViewerDismissGesture.FREE_DRAG_THRESHOLD_RATIO
                             )
                             // E2：拖动进度跨过 10% 时翻转遮罩目标（翻转由 LaunchedEffect
-                            // 启动 120ms tween 过渡）；未启用透出时布尔恒 false 不产生过渡
+                            // 启动 120ms tween 过渡）；未启用透出时布尔恒 false 不产生过渡。
+                            // 判据统一走纯函数 shouldRevealMask：除了 10% 位移阈值，
+                            // 还要"手指仍按在屏上"——松手后的收回在下方 isDismissSettling
+                            // 的 effect 里做（同一个判据，gestureActive = false）
                             if (currentFlyBackCellRect != null) {
-                                maskRevealed = ViewerDismissGesture.dismissMaskTargetAlpha(
-                                    dismissDragY, containerSize.height.toFloat()
-                                ) < 1f
+                                maskRevealed = ViewerDismissGesture.shouldRevealMask(
+                                    displacement = dismissDragY,
+                                    screenHeightPx = containerSize.height.toFloat(),
+                                    gestureActive = true
+                                )
                             }
                         }
 

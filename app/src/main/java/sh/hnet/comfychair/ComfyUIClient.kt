@@ -144,15 +144,27 @@ class ComfyUIClient(
         }
 
         /**
+         * **唯一**的「源已不存在」判定：只有 HTTP 404。
+         *
+         * 为什么不能把"加载失败"都算进来：超时、断网（-1 / IOException）、5xx、403
+         * 都可能是暂时的 —— 地铁里打开图库不能满屏「已删除」。只有服务端明确回答
+         * "这个文件没有"，才允许进入第三态并持久化标记。
+         *
+         * 抽成纯函数便于 JVM 单测覆盖（404 → true；200/403/500/网络异常 → false）。
+         */
+        internal fun isSourceMissingStatus(code: Int): Boolean = code == 404
+
+        /**
          * 把 /view 的 HTTP 状态码映射成失败类型（v4.6.0）。
          *
          * 404 单独分类（[ConnectionFailure.FILE_MISSING]）：电脑端清理 output 后，
          * /history 索引里残留的条目会一直打到这个码 —— 重试永远不会成功，
          * 图库对它们应该显示"文件不存在"并停止请求。抽成纯函数便于单测覆盖。
          */
-        internal fun connectionFailureForHttpCode(code: Int): ConnectionFailure = when (code) {
-            404 -> ConnectionFailure.FILE_MISSING
-            401, 403 -> ConnectionFailure.AUTHENTICATION
+        internal fun connectionFailureForHttpCode(code: Int): ConnectionFailure = when {
+            // 判定口径唯一来源：[isSourceMissingStatus]，不允许在这里另写一份 `== 404`
+            isSourceMissingStatus(code) -> ConnectionFailure.FILE_MISSING
+            code == 401 || code == 403 -> ConnectionFailure.AUTHENTICATION
             else -> ConnectionFailure.NETWORK
         }
 
@@ -799,8 +811,14 @@ class ComfyUIClient(
      * @param callback (httpCode, networkFailed) —— httpCode 仅在拿到响应时非 null
      */
     fun probeBrowserDeleteSupport(callback: (httpCode: Int?, networkFailed: Boolean) -> Unit) {
+        // L1：与 fetchAllHistory 同款"只投递一次"守卫 —— 能力探测是删除阶段二的入口，
+        // 回调二次投递会让仓储层的延续二次 resume（Already resumed）炸在 OkHttp 线程。
+        val delivery = SingleDeliveryGuard { DebugLogger.w(TAG, "probeBrowserDeleteSupport 忽略重复的回调投递") }
+        fun deliver(httpCode: Int?, networkFailed: Boolean) =
+            delivery.deliver { callback(httpCode, networkFailed) }
+
         val baseUrl = getBaseUrl() ?: run {
-            callback(null, true)
+            deliver(null, true)
             return
         }
 
@@ -811,11 +829,11 @@ class ComfyUIClient(
 
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: IOException) {
-                callback(null, true)
+                deliver(null, true)
             }
 
             override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use { callback(it.code, false) }
+                response.use { deliver(it.code, false) }
             }
         })
     }
@@ -835,8 +853,14 @@ class ComfyUIClient(
         folderType: String,
         callback: (httpCode: Int?, networkFailed: Boolean) -> Unit
     ) {
+        // L1：只投递一次（同 fetchAllHistory）。删除文件是破坏性操作，回调两次会让
+        // 上层延续二次 resume 直接崩进程，也会让计数/状态机重复前进。
+        val delivery = SingleDeliveryGuard { DebugLogger.w(TAG, "deleteBrowserFile 忽略重复的回调投递") }
+        fun deliver(httpCode: Int?, networkFailed: Boolean) =
+            delivery.deliver { callback(httpCode, networkFailed) }
+
         val baseUrl = getBaseUrl() ?: run {
-            callback(null, true)
+            deliver(null, true)
             return
         }
 
@@ -856,11 +880,11 @@ class ComfyUIClient(
 
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: IOException) {
-                callback(null, true)
+                deliver(null, true)
             }
 
             override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use { callback(it.code, false) }
+                response.use { deliver(it.code, false) }
             }
         })
     }
@@ -1015,8 +1039,18 @@ class ComfyUIClient(
      *                 - historyJson: The full history JSON object with all prompts, or null on error
      */
     fun fetchAllHistory(callback: (historyJson: JSONObject?) -> Unit) {
+        // P0：回调只投递一次。
+        //
+        // OkHttp 正常只会回调一次，但旧实现的 onResponse 里 `callback(historyJson)`
+        // 包在 try 里、catch 里又兜了一次 `callback(null)` —— 一旦首次投递本身抛异常
+        // （例如上层的延续二次 resume 抛 Already resumed），catch 会再投递一次，
+        // 于是"异常 → 再投递 → 再抛"在 OkHttp 回调线程上炸穿进程。
+        // 所以这里的 delivery 就是这道闸：第二次投递直接丢弃（只记日志）。
+        val delivery = SingleDeliveryGuard { DebugLogger.w(TAG, "fetchAllHistory 忽略重复的回调投递") }
+        fun deliver(historyJson: JSONObject?) = delivery.deliver { callback(historyJson) }
+
         val baseUrl = getBaseUrl() ?: run {
-            callback(null)
+            deliver(null)
             return
         }
 
@@ -1029,21 +1063,23 @@ class ComfyUIClient(
 
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: IOException) {
-                callback(null)
+                deliver(null)
             }
 
             override fun onResponse(call: okhttp3.Call, response: Response) {
                 response.use {
                     if (response.isSuccessful) {
-                        try {
+                        // 解析失败只在本地收敛成 null，不再在 catch 里二次投递
+                        val historyJson = try {
                             val body = response.body?.string() ?: "{}"
-                            val historyJson = JSONObject(body)
-                            callback(historyJson)
+                            JSONObject(body)
                         } catch (e: Exception) {
-                            callback(null)
+                            DebugLogger.w(TAG, "fetchAllHistory 解析失败: ${e.message}")
+                            null
                         }
+                        deliver(historyJson)
                     } else {
-                        callback(null)
+                        deliver(null)
                     }
                 }
             }
@@ -1701,7 +1737,13 @@ class ComfyUIClient(
                         val result = downloadWithStallDetection(call, response.body!!, "Video", MAX_VIDEO_DOWNLOAD_BYTES)
                         callback(result.bytes, result.failureType)
                     } else {
-                        callback(null, ConnectionFailure.NETWORK)
+                        // 与图片链路同一口径：404 单独分型为 FILE_MISSING（源已不存在），
+                        // 其余 HTTP 错误才归 NETWORK —— 视频/GIF 也能进入第三态并停止重试。
+                        val failureType = connectionFailureForHttpCode(response.code)
+                        if (failureType == ConnectionFailure.FILE_MISSING) {
+                            DebugLogger.w(TAG, "Video missing on server (404): ${Obfuscator.filename(filename)}")
+                        }
+                        callback(null, failureType)
                     }
                 }
             }
@@ -2024,5 +2066,34 @@ class ComfyUIClient(
         // Note: We don't shutdown the httpClient here as it might be reused
         // In a real app, you might want to manage the client lifecycle differently
     }
+}
+
+/**
+ * "回调只投递一次"守卫（P0：二次 resume 崩溃的 client 层防线）。
+ *
+ * 用法：`val guard = SingleDeliveryGuard { 记日志 }; guard.deliver { callback(x) }`。
+ * 第二次及以后的 [deliver] 一律丢弃：[onDuplicate] 只用于记日志，**不会**再触发回调。
+ *
+ * 为什么必须"投递前就置位"：如果先执行 block 再置位，block 里抛异常时状态不会变，
+ * 下一次投递会重复执行 —— 而 P0 场景正是"首次投递抛异常 → catch 再投递一次"。
+ *
+ * 抽成独立类（而不是内联局部变量）是为了 JVM 单测能直接钉住"二次投递不抛异常"。
+ */
+internal class SingleDeliveryGuard(
+    private val onDuplicate: (() -> Unit)? = null
+) {
+    private var delivered = false
+
+    fun deliver(block: () -> Unit) {
+        if (delivered) {
+            onDuplicate?.invoke()
+            return
+        }
+        delivered = true
+        block()
+    }
+
+    /** 是否已经投递过（排障/单测用）。 */
+    fun hasDelivered(): Boolean = delivered
 }
 

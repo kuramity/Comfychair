@@ -16,8 +16,24 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  */
 object DownloadPolicy {
 
-    /** 自动重试上限（WorkManager runAttemptCount 达到该值后判最终失败，不再 Result.retry()） */
-    const val MAX_AUTO_RETRIES = 5
+    /**
+     * 自动重试上限（WorkManager runAttemptCount 达到该值后判最终失败，不再 Result.retry()）。
+     *
+     * v4.18.0（R5）由 5 降到 2：用户实测「重试 5 次烧掉大量流量」。断网/弱网下每轮
+     * 重试都会重新发一次 Range 请求，源站不支持 Range 时还要从 0 重下 —— 每多一轮都是
+     * 几十到上百 MB 的量。两次足够覆盖一次瞬时抖动，剩下交给用户手动点「检查更新」。
+     */
+    const val MAX_AUTO_RETRIES = 2
+
+    /**
+     * 回退开关（[sh.hnet.comfychair.storage.AppSettings.isUpdateDownloadLegacyMode]）
+     * 打开时的重试上限。
+     *
+     * v4.18.0（R5 第 3 条）：旧行为是「任何 IO 异常都 Result.retry()，无次数上限」，
+     * 那是一个流量黑洞（WorkManager 会一直退避重试到天荒地老）。回退开关只用于排障，
+     * 但同样必须有天花板 —— 3 次。
+     */
+    const val LEGACY_MAX_AUTO_RETRIES = 3
 
     /** 进度级停滞阈值：连续这么久没有任何字节增长，看门狗就主动断开连接续传重试 */
     const val STALL_THRESHOLD_MS = 120_000L
@@ -97,9 +113,29 @@ object DownloadPolicy {
         FailureKind.UNKNOWN -> e is IOException
     }
 
-    /** 自动重试次数是否还在上限内（runAttemptCount：0 = 首次运行，4 可重试、5 不可） */
+    /** 自动重试次数是否还在上限内（runAttemptCount：0 = 首次运行，1 可重试、2 不可） */
     fun shouldRetryAutomatically(runAttemptCount: Int): Boolean =
         runAttemptCount in 0 until MAX_AUTO_RETRIES
+
+    /**
+     * 回退开关下的重试判定（R5 第 3 条：回退模式也必须有上限）。
+     *
+     * 反证口径：把 [LEGACY_MAX_AUTO_RETRIES] 改成 99，`shouldRetryLegacy(3)` 的断言必须变红。
+     */
+    fun shouldRetryLegacy(runAttemptCount: Int): Boolean =
+        runAttemptCount in 0 until LEGACY_MAX_AUTO_RETRIES
+
+    /**
+     * 统一重试判定：正常逻辑上限 2，回退开关上限 3。
+     *
+     * **不存在「无次数上限」的分支** —— 这是 R5 的硬约束，任何调用方都必须走这里。
+     */
+    fun shouldRetry(runAttemptCount: Int, legacyMode: Boolean): Boolean =
+        if (legacyMode) {
+            shouldRetryLegacy(runAttemptCount)
+        } else {
+            shouldRetryAutomatically(runAttemptCount)
+        }
 
     /**
      * ".part 已等于总长" = 上次已下完但没来得及 rename。此时再发 `bytes=N-`
