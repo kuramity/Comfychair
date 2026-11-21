@@ -267,6 +267,10 @@
 
     <!-- Save/share messages -->
     <string name="msg_image_saved_to_gallery">Image saved to gallery</string>
+    <string name="msg_image_saved_lowres">Saved low-resolution copy (original was deleted)</string>
+    <string name="msg_video_saved_lowres">Saved local cached copy (original video was deleted)</string>
+    <string name="msg_saved_local_copies">Saved local cached copies (originals were deleted)</string>
+    <string name="msg_image_source_missing_no_cache">Original was deleted and no local cache exists</string>
     <string name="msg_video_saved_to_gallery">Video saved to gallery</string>
     <string name="error_save_image">Failed to save image</string>
     <string name="error_save_video">Failed to save video</string>
@@ -522,6 +526,7 @@
     <!-- Empty state messages -->
     <string name="msg_gallery_empty">No images yet</string>
     <string name="gallery_file_missing_on_server">File not on server (may have been cleaned up). Tap to retry.</string>
+    <string name="label_source_missing">Deleted</string>
 
     <!-- Section titles -->
     <string name="title_model_selection">Model selection</string>
@@ -646,6 +651,9 @@
     <string name="desc_debug_logging_enable">Logs are kept in memory only</string>
     <string name="button_debug_logging_view">View logs</string>
     <string name="title_debug_log">Debug log</string>
+    <!-- Crash Log strings（崩溃日志与调试日志用途不同，设置页必须区分） -->
+    <string name="title_crash_log">Crash log</string>
+    <string name="button_crash_log_view">View crash logs</string>
     <string name="msg_debug_log_empty">No log entries</string>
     <string name="debug_log_save">Save</string>
     <string name="debug_log_follow">Follow</string>
@@ -856,31 +864,8 @@
     <string name="error_save_audio">Failed to upload audio</string>
     <string name="action_delete_selected">Delete selected</string>
 
-    <!-- Timeline director deck (MiniMaxH3TimelineDirector) clip editor -->
-    <string name="timeline_section_title">Timeline clips</string>
-    <string name="timeline_clip_count">%1$d / %2$d</string>
-    <string name="timeline_clip_label">Clip %1$d</string>
-    <string name="timeline_clip_remove">Remove this clip</string>
-    <string name="timeline_add_clip">Add video clip</string>
-    <string name="timeline_loaded_hint">Loaded the timeline arranged in the workflow</string>
-    <string name="timeline_field_start">Timeline start</string>
-    <string name="timeline_field_duration">Length</string>
-    <string name="timeline_field_trim">Source in</string>
-    <string name="timeline_selection_title">Generation range</string>
-    <string name="timeline_field_selection_start">Start</string>
-    <string name="timeline_field_selection_length">Duration</string>
-    <string name="timeline_summary">%1$s s pinned by clips · %2$s s to generate</string>
-    <string name="timeline_gaps_title">Gaps you can generate</string>
-    <string name="timeline_gap_item">%1$s – %2$s s (%3$s s)</string>
-    <string name="timeline_gap_use">Generate</string>
-    <string name="timeline_gap_none">The generation range sits entirely on clips — there is no gap to fill</string>
-    <string name="timeline_reference_mode_label">How this clip is used</string>
-    <string name="timeline_reference_mode_guide">Keep original frames</string>
-    <string name="timeline_reference_mode_edit">Editable reference</string>
-    <string name="timeline_reference_mode_boundary">Pin edges only</string>
-    <string name="msg_timeline_needs_clip">Add at least one video clip first</string>
-    <string name="msg_timeline_video_unreadable">Couldn\'t read this video\'s duration — try another file</string>
-    <string name="error_upload_video">Failed to upload video</string>
+    <!-- Friendly interception for a removed feature (legacy Timeline Director workflow) -->
+    <string name="msg_timeline_director_removed">This workflow uses the removed Timeline Director. Please use another video workflow.</string>
 
     <!-- 超大图（原图超过下载上限时的降级提示） -->
     <string name="viewer_large_image_notice">Original too large — showing compressed preview</string>
@@ -958,15 +943,26 @@
     <string name="update_error_verify">Package verification failed (SHA-256 mismatch).</string>
     <string name="update_error_verify_missing">The update manifest has no valid SHA-256 checksum. Update rejected.</string>
     <string name="update_error_redirect">The download was redirected to an untrusted host (%1$s). Update aborted.</string>
-    <string name="update_error_install_invalid">The downloaded package name or signature does not match this app. Installation blocked.</string>
+    <string name="update_error_install_invalid">The downloaded package name does not match this app. Installation blocked.</string>
+    <string name="update_error_install_missing">The update package is missing or unreadable. Check for updates to download it again.</string>
+    <string name="update_error_install_unavailable">No system installer is available on this device. Installation cannot start.</string>
     <string name="update_error_disk">Not enough storage (free %1$s, need about %2$s).</string>
     <string name="update_error_retry_exhausted">Failed after %1$d retries. Check the network and retry manually.</string>
     <string name="update_error_unknown">Download interrupted. Resumable retry supported.</string>
     <string name="update_error_unexpected">Download error: %1$s</string>
     <string name="update_error_legacy_interrupted">Download interrupted (%1$s), resumable retry supported.</string>
+    <!-- v4.18.0 复核补充：历史任务缺少目标 versionCode 时 fail-closed 的取消通知 -->
+    <string name="update_missing_target_cancelled">Update task info missing; download cancelled.</string>
     <!-- v4.12.0: backoff notice on the progress notification + unknown-total fallback line -->
     <string name="update_progress_retrying">Waiting to retry (attempt %1$d)</string>
     <string name="update_progress_unknown_total">Downloaded %1$s</string>
+    <!-- v4.18.0 R5/R6：重试上限耗尽后的下一步提示 + 非 WiFi 下载前确认 -->
+    <string name="update_failed_retry_hint">Download failed. Tap \"Check for updates\" to retry.</string>
+    <string name="update_cellular_confirm_title">Mobile network download</string>
+    <string name="update_cellular_confirm_message">You are on a mobile network. This update is about %1$s. Continue downloading?</string>
+    <string name="update_cellular_confirm_message_unknown">You are on a mobile network and this update is large. Continue downloading?</string>
+    <string name="update_action_continue">Continue</string>
+    <string name="update_action_cancel">Cancel</string>
     <!-- v4.8.2 取消失败不再假装成功 -->
     <string name="generation_cancel_failed">Cancel failed: the server did not acknowledge. The task is still running.</string>
     <!-- v4.6.1 模块 A：取消归属校验提示 -->

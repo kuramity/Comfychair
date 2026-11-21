@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.util.DebugLogger
+import sh.hnet.comfychair.util.Obfuscator
 import sh.hnet.comfychair.viewmodel.GalleryItem
 import java.io.File
 import java.util.UUID
@@ -62,27 +63,84 @@ object GalleryTrashStorage {
     private const val TRASH_FILE_NAME = "gallery_trash.json"
 
     /** 全量读入；文件缺失或整份损坏 → 空表（宁可显示空回收站，也不猜内容）。 */
-    fun loadAll(context: Context): List<GalleryTrashEntry> {
-        val file = File(context.filesDir, TRASH_FILE_NAME)
+    fun loadAll(context: Context): List<GalleryTrashEntry> =
+        loadAllFromFile(File(context.filesDir, TRASH_FILE_NAME))
+
+    /**
+     * 文件级读取（JVM 单测用临时文件走完整 save → load 往返）。
+     *
+     * 整份解析失败**不崩**：记 error 日志 + 把坏文件备份成 `.corrupt-*`（不删原文件），
+     * 返回空表。单条损坏由 [parse] 自己跳过并记日志。
+     */
+    internal fun loadAllFromFile(file: File): List<GalleryTrashEntry> {
         if (!file.exists()) return emptyList()
         return try {
-            parse(file.readText())
+            val raw = file.readText()
+            val parsed = parse(raw)
+            if (parsed.size < countTopLevelItems(raw)) {
+                // 坏记录被跳过：这次读取可能少几条（可恢复的仍会显示）。
+                // 下次任何一次 saveAll 都会按内存里的干净条目整份重写，坏记录不会永远留着。
+                DebugLogger.w(
+                    TAG,
+                    "回收站有 ${countTopLevelItems(raw) - parsed.size} 条记录解析失败被跳过（文件: ${file.name}）"
+                )
+            }
+            parsed
         } catch (e: Exception) {
-            DebugLogger.e(TAG, "回收站读取失败: ${e.message}")
+            DebugLogger.e(TAG, "回收站读取失败（整份损坏，已保留原文件）: ${e.message}")
+            GalleryMetadataCache.backupCorruptFile(file)
             emptyList()
         }
     }
 
-    /** 全量落盘（原子写）。条目数量是个位数~几十级，全量重写最简单也最不容易漏状态。 */
-    fun saveAll(context: Context, entries: List<GalleryTrashEntry>) {
-        try {
-            GalleryMetadataCache.writeTextAtomically(
-                File(context.filesDir, TRASH_FILE_NAME),
-                toJson(entries)
-            )
-        } catch (e: Exception) {
-            DebugLogger.e(TAG, "回收站保存失败: ${e.message}")
+    /**
+     * 全量落盘（原子写 + 写后读回校验）。
+     *
+     * @return 是否真的落盘并校验通过。false 时调用方必须当作"本次删除未持久化"
+     *         处理（内存状态不能领先于磁盘），不能记成功日志。
+     */
+    fun saveAll(context: Context, entries: List<GalleryTrashEntry>): Boolean =
+        saveAllToFile(File(context.filesDir, TRASH_FILE_NAME), entries)
+
+    /**
+     * 文件级落盘（JVM 单测直接钉住"写后读回校验 + 失败回滚"）。
+     *
+     * 回收站记录是"恢复的唯一依据"：写成功但读不回来的文件 = 所有条目永久失联。
+     * 因此写完立刻用 [parse] 读回，条数/身份集合不一致（或解析抛异常）就回滚写前内容。
+     *
+     * @return true = 写入且校验通过
+     */
+    internal fun saveAllToFile(file: File, entries: List<GalleryTrashEntry>): Boolean {
+        val payload = toJson(entries)
+        val expectedIdentities = entries.map { it.identityKey }
+        val ok = GalleryMetadataCache.writeTextAtomicallyVerified(
+            file = file,
+            content = payload,
+            label = "回收站",
+            verify = { text ->
+                val parsed = try {
+                    parse(text)
+                } catch (e: Exception) {
+                    null
+                }
+                parsed != null &&
+                    parsed.size == entries.size &&
+                    parsed.map { it.identityKey } == expectedIdentities
+            }
+        )
+        if (!ok) {
+            // 失败详情（含读回内容前 200 字符）由 writeTextAtomicallyVerified 记 error 日志；
+            // 这里只补一条条数口径，避免把文件名原样重复写进日志。
+            DebugLogger.e(TAG, "回收站保存失败已回滚（期望 ${entries.size} 条）")
         }
+        return ok
+    }
+
+    /** 数一下 JSON 数组的顶层条目数（只用于"跳过几条"的日志口径，解析失败返回 0）。 */
+    private fun countTopLevelItems(json: String): Int = try {
+        JSONArray(json).length()
+    } catch (e: Exception) {
+        0
     }
 
     // ============================================================
@@ -104,7 +162,9 @@ object GalleryTrashStorage {
                 put("type", entry.item.type)
                 put("isVideo", entry.item.isVideo)
                 put("index", entry.item.index)
-                entry.item.threeD?.let {
+                // 只有 filename 非空的 3D 三元组才写出：解析侧（optString + isNotBlank）
+                // 会把空 filename 视为"没有 3D"，两侧口径必须一致，否则往返会悄悄变 null。
+                entry.item.threeD?.takeIf { it.filename.isNotBlank() }?.let {
                     put("threeDFilename", it.filename)
                     put("threeDSubfolder", it.subfolder)
                     put("threeDType", it.type)
@@ -126,7 +186,19 @@ object GalleryTrashStorage {
                 val o = array.optJSONObject(i) ?: continue
                 val filename = o.optString("filename")
                 val promptId = o.optString("promptId")
-                if (filename.isBlank() || promptId.isBlank()) continue
+                // 只有 filename 是硬性必需（没有它任何一条都无法定位/恢复）。
+                // promptId 为空时**保留**而不是丢：直接丢 = 这条图从回收站里蒸发、
+                // 用户再也没机会恢复；保留下来至少还能显示、还能手动处理。
+                if (filename.isBlank()) {
+                    DebugLogger.w(TAG, "跳过缺 filename 的回收站记录（第 $i 条）")
+                    continue
+                }
+                if (promptId.isBlank()) {
+                    DebugLogger.w(
+                        TAG,
+                        "回收站记录 promptId 为空（第 $i 条，filename=${Obfuscator.filename(filename)}）：保留"
+                    )
+                }
                 val threeD = o.optString("threeDFilename", "")
                     .takeIf { it.isNotBlank() }
                     ?.let {

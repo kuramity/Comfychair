@@ -250,6 +250,10 @@
 
     <!-- Save/share messages -->
     <string name="msg_image_saved_to_gallery">图片已保存到相册</string>
+    <string name="msg_image_saved_lowres">已保存低清版（原图已被删除）</string>
+    <string name="msg_video_saved_lowres">已保存本机缓存版（原视频已被删除）</string>
+    <string name="msg_saved_local_copies">已保存本机缓存版（原文件已被删除）</string>
+    <string name="msg_image_source_missing_no_cache">原图已被删除，且本机无缓存</string>
     <string name="msg_video_saved_to_gallery">视频已保存到相册</string>
     <string name="error_save_image">保存图片失败</string>
     <string name="error_save_video">保存视频失败</string>
@@ -409,6 +413,7 @@
     <!-- Empty state messages -->
     <string name="msg_gallery_empty">暂无图片</string>
     <string name="gallery_file_missing_on_server">服务器上已没有这个文件（可能已被清理）。点击重试。</string>
+    <string name="label_source_missing">已删除</string>
 
     <!-- Section titles -->
     <string name="title_model_selection">模型选择</string>
@@ -519,6 +524,9 @@
     <string name="desc_debug_logging_enable">日志仅保存在内存中</string>
     <string name="button_debug_logging_view">查看日志</string>
     <string name="title_debug_log">调试日志</string>
+    <!-- Crash Log strings（崩溃日志与调试日志用途不同，设置页必须区分） -->
+    <string name="title_crash_log">崩溃日志</string>
+    <string name="button_crash_log_view">查看崩溃日志</string>
     <string name="msg_debug_log_empty">无日志条目</string>
     <string name="debug_log_save">保存</string>
     <string name="debug_log_follow">跟随</string>
@@ -716,31 +724,8 @@
     <string name="error_save_audio">音频上传失败</string>
     <string name="action_delete_selected">删除所选</string>
 
-    <!-- 时间线导演台（MiniMaxH3TimelineDirector）片段编辑器 -->
-    <string name="timeline_section_title">时间线片段</string>
-    <string name="timeline_clip_count">%1$d / %2$d</string>
-    <string name="timeline_clip_label">片段 %1$d</string>
-    <string name="timeline_clip_remove">移除此片段</string>
-    <string name="timeline_add_clip">添加视频片段</string>
-    <string name="timeline_loaded_hint">已载入工作流里摆好的时间线</string>
-    <string name="timeline_field_start">时间轴起点</string>
-    <string name="timeline_field_duration">占用长度</string>
-    <string name="timeline_field_trim">源入点</string>
-    <string name="timeline_selection_title">生成范围</string>
-    <string name="timeline_field_selection_start">起点</string>
-    <string name="timeline_field_selection_length">时长</string>
-    <string name="timeline_summary">原画面固定 %1$s 秒 · 模型生成 %2$s 秒</string>
-    <string name="timeline_gaps_title">可生成的空隙</string>
-    <string name="timeline_gap_item">%1$s – %2$s 秒（共 %3$s 秒）</string>
-    <string name="timeline_gap_use">生成本段</string>
-    <string name="timeline_gap_none">生成范围完全落在片段上，没有空隙要生成</string>
-    <string name="timeline_reference_mode_label">这段原画面怎么用</string>
-    <string name="timeline_reference_mode_guide">固定原画面</string>
-    <string name="timeline_reference_mode_edit">可编辑参考</string>
-    <string name="timeline_reference_mode_boundary">仅固定边界</string>
-    <string name="msg_timeline_needs_clip">请先添加至少一段视频</string>
-    <string name="msg_timeline_video_unreadable">读不出这个视频的时长，换一个文件试试</string>
-    <string name="error_upload_video">视频上传失败</string>
+    <!-- 已移除功能的拦截提示（旧版「时间线导演台」工作流） -->
+    <string name="msg_timeline_director_removed">这条工作流用到了已移除的「时间线导演台」，请改用其他视频工作流</string>
 
     <!-- 超大图（原图超过下载上限时的降级提示） -->
     <string name="viewer_large_image_notice">原图过大，已显示压缩版</string>
@@ -873,15 +858,26 @@
     <string name="update_error_verify">安装包校验失败（SHA-256 不匹配）。</string>
     <string name="update_error_verify_missing">更新清单缺少有效的 SHA-256 校验值，已拒绝该更新。</string>
     <string name="update_error_redirect">下载被重定向到不可信的主机（%1$s），已中止。</string>
-    <string name="update_error_install_invalid">安装包的包名或签名与本应用不一致，已阻止安装。</string>
+    <string name="update_error_install_invalid">安装包的包名与本应用不一致，已阻止安装。</string>
+    <string name="update_error_install_missing">安装包不存在或无法读取，请点「检查更新」重新下载。</string>
+    <string name="update_error_install_unavailable">本机没有可用的系统安装器，无法启动安装。</string>
     <string name="update_error_disk">磁盘空间不足（剩余 %1$s，需要约 %2$s）。</string>
     <string name="update_error_retry_exhausted">已重试 %1$d 次仍失败，请检查网络后手动重试。</string>
     <string name="update_error_unknown">下载中断，可重试续传。</string>
     <string name="update_error_unexpected">下载出错：%1$s</string>
     <string name="update_error_legacy_interrupted">下载中断（%1$s），可重试续传。</string>
+    <!-- v4.18.0 复核补充：历史任务缺少目标 versionCode 时 fail-closed 的取消通知 -->
+    <string name="update_missing_target_cancelled">更新任务信息缺失，已取消下载。</string>
     <!-- v4.12.0 重试退避通知文案 + 总长未知时的进度降级行 -->
     <string name="update_progress_retrying">等待重试（第 %1$d 次）</string>
     <string name="update_progress_unknown_total">已下载 %1$s</string>
+    <!-- v4.18.0 R5/R6：重试上限耗尽后的下一步提示 + 非 WiFi 下载前确认 -->
+    <string name="update_failed_retry_hint">下载失败，点「检查更新」可重试。</string>
+    <string name="update_cellular_confirm_title">移动网络下载</string>
+    <string name="update_cellular_confirm_message">当前是移动网络，本次更新约 %1$s。是否继续下载？</string>
+    <string name="update_cellular_confirm_message_unknown">当前是移动网络，本次更新体积较大。是否继续下载？</string>
+    <string name="update_action_continue">继续</string>
+    <string name="update_action_cancel">取消</string>
     <!-- v4.8.2 取消失败不再假装成功 -->
     <string name="generation_cancel_failed">取消失败：服务器未确认，任务仍在运行</string>
     <!-- v4.6.1 模块 A：取消归属校验提示 -->

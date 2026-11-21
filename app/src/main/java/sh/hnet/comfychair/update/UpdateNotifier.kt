@@ -23,7 +23,7 @@ import sh.hnet.comfychair.util.DebugLogger
  *
  * **点击即安装**：完成通知的 PendingIntent 指向 [UpdateInstallActivity]（无界面中转），
  * 由它在**点击的那一刻**调用 [AppInstaller.install] —— 内部先过
- * [AppInstaller.isApkTrusted]（包名 + 签名）才拉起系统安装器；没有「安装未知应用」
+ * [AppInstaller.isApkTrusted]（校验包名；签名由系统安装时校验）才拉起系统安装器；没有「安装未知应用」
  * 权限则跳该权限的系统设置页（引导，不静默绕过）。
  * 校验放在点击时而不是发通知时，是因为 PendingIntent 里的 URI 一旦固定，
  * 到安装器读取正文之间的窗口内文件仍可能被替换（P0-7 复核 R2-L1 的 TOCTOU）。
@@ -154,6 +154,10 @@ object UpdateNotifier {
      * 把进度通知切成"等待重试（第 N 次）"的明确文案，不留旧的百分比 ——
      * 否则退避期间用户看到的是一条永远不动的旧进度条，误以为还在下载。
      * 仓库状态此时保持 DOWNLOADING（FAILED 只留给最终失败）。
+     *
+     * v4.18.0（R5）：这条通知在退避期间**没有前台服务托管**，因此不能再是
+     * `setOngoing(true)` —— 旧实现把它钉死在通知栏，用户滑不掉，正是用户描述的
+     * 「安装进程一直挂起，不手动取消安装进程」。改为可滑动消除 + 点击进入 App。
      */
     fun notifyWaitingRetry(context: Context, versionName: String, attempt: Int) {
         if (!canPost(context)) return
@@ -162,7 +166,8 @@ object UpdateNotifier {
             .setSmallIcon(R.drawable.ic_comfychair_foreground)
             .setContentTitle(context.getString(R.string.update_progress_title, versionName))
             .setContentText(context.getString(R.string.update_progress_retrying, attempt))
-            .setOngoing(true)
+            .setOngoing(false)
+            .setAutoCancel(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -247,7 +252,7 @@ object UpdateNotifier {
 
     /**
      * 安装用的 PendingIntent：点击后落到 [UpdateInstallActivity]，由它在**点击那一刻**
-     * 重新做包名/签名校验再拉起安装器（没权限则跳设置页）。
+     * 重新做包名校验再拉起安装器（签名由系统安装时校验；没权限则跳设置页）。
      * APK 不见了等前置条件不满足时退化为「打开 App」。
      */
     private fun installPendingIntent(context: Context): PendingIntent {
@@ -272,7 +277,7 @@ object UpdateNotifier {
         // 通知一旦发出，URI 就固定下来了，而文件内容要等用户点击、系统安装器打开时
         // 才被读取 —— 中间这段窗口里替换 update.apk 就能让安装器读到未校验的文件（TOCTOU）。
         // 改为指向中转 Activity：它在点击时调 AppInstaller.install（内部先过
-        // isApkTrusted 包名+签名校验），校验与拉起安装器之间只剩一次函数调用，
+        // isApkTrusted 校验包名；签名由系统安装时校验），校验与拉起安装器之间只剩一次函数调用，
         // 与弹窗按钮完全同构。
         return Intent(context, UpdateInstallActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

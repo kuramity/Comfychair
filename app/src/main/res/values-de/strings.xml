@@ -251,6 +251,10 @@
 
     <!-- Save/share messages -->
     <string name="msg_image_saved_to_gallery">Bild in Galerie gespeichert</string>
+    <string name="msg_image_saved_lowres">Niedrig aufgelöste Kopie gespeichert (Original wurde gelöscht)</string>
+    <string name="msg_video_saved_lowres">Lokal zwischengespeicherte Kopie gespeichert (Originalvideo wurde gelöscht)</string>
+    <string name="msg_saved_local_copies">Lokal zwischengespeicherte Kopien gespeichert (Originale wurden gelöscht)</string>
+    <string name="msg_image_source_missing_no_cache">Original wurde gelöscht und es gibt keinen lokalen Cache</string>
     <string name="msg_video_saved_to_gallery">Video in Galerie gespeichert</string>
     <string name="error_save_image">Bild konnte nicht gespeichert werden</string>
     <string name="error_save_video">Video konnte nicht gespeichert werden</string>
@@ -394,6 +398,7 @@
     <!-- Empty state messages -->
     <string name="msg_gallery_empty">Noch keine Bilder</string>
     <string name="gallery_file_missing_on_server">Datei nicht auf dem Server (moeglicherweise bereinigt). Zum Wiederholen tippen.</string>
+    <string name="label_source_missing">Gelöscht</string>
 
     <!-- Section titles -->
     <string name="title_model_selection">Modellauswahl</string>
@@ -482,6 +487,9 @@
     <string name="desc_debug_logging_enable">Protokolle werden nur im Speicher gehalten</string>
     <string name="button_debug_logging_view">Protokolle anzeigen</string>
     <string name="title_debug_log">Debug-Protokoll</string>
+    <!-- Crash Log strings（崩溃日志与调试日志用途不同，设置页必须区分） -->
+    <string name="title_crash_log">Crash-Protokoll</string>
+    <string name="button_crash_log_view">Crash-Protokolle anzeigen</string>
     <string name="msg_debug_log_empty">Keine Protokolleinträge</string>
     <string name="debug_log_save">Save</string>
     <string name="debug_log_follow">Folgen</string>
@@ -663,10 +671,11 @@
     <string name="update_action_install">Installieren</string>
     <string name="update_error_verify_missing">Die Aktualisierungsliste enthaelt keine gueltige SHA-256-Pruefsumme. Update abgelehnt.</string>
     <string name="update_error_redirect">Der Download wurde auf einen nicht vertrauenswuerdigen Host umgeleitet (%1$s). Update abgebrochen.</string>
-    <string name="update_error_install_invalid">Paketname oder Signatur des Downloads passt nicht zu dieser App. Installation blockiert.</string>
+    <string name="update_error_install_invalid">Der Paketname des Downloads passt nicht zu dieser App. Installation blockiert.</string>
     <string name="update_action_retry">Wiederholen</string>
     <string name="update_manual_check_failed">Pruefung fehlgeschlagen: %1$s</string>
     <string name="update_already_latest">Bereits die neueste Version.</string>
+    <string name="update_missing_target_cancelled">Informationen zur Aktualisierung fehlen; Download abgebrochen.</string>
     <!-- v4.6.1 Modul A: Hinweis zur Abbruch-Zuordnung -->
     <string name="generation_cancel_not_owner">Die laufende Aufgabe wurde nicht von diesem Bildschirm gestartet; Abbrechen uebersprungen</string>
     <string name="generation_cancel_no_active">Keine aktive Aufgabe zum Abbrechen</string>

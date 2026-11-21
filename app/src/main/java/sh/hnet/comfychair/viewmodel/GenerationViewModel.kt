@@ -295,6 +295,17 @@ class GenerationViewModel : ViewModel() {
     private val _isSubmitting = MutableStateFlow(false)
     val isSubmitting: StateFlow<Boolean> = _isSubmitting.asStateFlow()
 
+    /**
+     * 当前持有提交闸门的页面 ownerId（v4.16.14 复核 BUSY-03）：null = 无提交在途。
+     *
+     * 为什么需要：`isSubmitting` 是四个生成页**共享**的 Activity 级状态，只表达"有提交在途"，
+     * 不表达"是谁在提交"。界面的忙碌皮肤必须只出现在提交方那页 —— 否则 A 页提交期间切到
+     * B 页，B 页哪怕提示词为空/未选图（isEnabled=false），按钮也会显示忙碌皮肤而不是真禁用
+     * 灰底。页面侧据此过滤：`isSubmitting && submitOwnerId == 本页 OWNER_ID`。
+     */
+    private val _submitOwnerId = MutableStateFlow<String?>(null)
+    val submitOwnerId: StateFlow<String?> = _submitOwnerId.asStateFlow()
+
     /** 提交闸门的超时看门狗（P1-4）：网络层回调丢失时兜底释放，避免按钮永久卡死 */
     private var submitGateWatchdog: Job? = null
 
@@ -1047,6 +1058,9 @@ class GenerationViewModel : ViewModel() {
             DebugLogger.d(TAG, "提交被拒：上一次提交仍在途，静默丢弃（owner=$ownerId）")
             return
         }
+        // 先登记提交方 ownerId，再置 isSubmitting：两态都由页面收集，先 owner 后
+        // isSubmitting 可避免"已提交但 owner 还没到"的一帧里忙碌皮肤闪回灰底。
+        _submitOwnerId.value = ownerId
         _isSubmitting.value = true
         armSubmitGateWatchdog(ticket)
 
@@ -1139,7 +1153,13 @@ class GenerationViewModel : ViewModel() {
         submitGateWatchdog?.cancel()
         submitGateWatchdog = null
         // 用闸门真实状态回写，而不是硬编码 false：极端时序下这里可能刚好又有人在途
-        _isSubmitting.value = submitGate.isInFlight
+        val stillInFlight = submitGate.isInFlight
+        _isSubmitting.value = stillInFlight
+        // v4.16.14（复核 BUSY-03）：闸门已空 → 清 owner；仍在途说明新提交已抢到闸门，
+        // 保留现值（新提交紧接着会写入自己的 owner），避免把 B 页的忙碌皮肤清掉。
+        if (!stillInFlight) {
+            _submitOwnerId.value = null
+        }
     }
 
     /**

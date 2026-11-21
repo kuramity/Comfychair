@@ -29,6 +29,7 @@ import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.LoraSelection
 import sh.hnet.comfychair.model.PositivePromptPolicy
+import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.SeedMode
 import sh.hnet.comfychair.model.WorkflowCapabilities
 import sh.hnet.comfychair.model.nextSeed
@@ -343,6 +344,9 @@ sealed class ImageToImageEvent {
 class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, ImageToImageEvent>() {
 
     override val initialState = ImageToImageUiState()
+
+    /** 本页在 GenerationViewModel 里的注册键（基类 stopListening 用） */
+    override val generationOwnerId = OWNER_ID
 
     /**
      * 注册到标签库桥接（需求 5.2）。
@@ -878,8 +882,18 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         val storage = workflowValuesStorage ?: return
         val serverId = ConnectionManager.currentServerId ?: return
 
+        // sampler / scheduler 的「服务器可用清单」：读持久化时就要用它清洗，所以缓存必须先拿到
+        // （持久化里可能残留非法值，用户实测 'dpm++' 一提交就 400）
+        val cache = ConnectionManager.modelCache.value
+
         // Load saved values and defaults by workflow ID (not name, to avoid duplicate name issues)
-        val savedValues = storage.loadValues(serverId, workflow.id)
+        // 读取即清洗：非法 sampler / scheduler 就地改写为默认值并写回磁盘（脏数据自愈）
+        val savedValues = storage.loadValuesSanitized(
+            serverId = serverId,
+            workflowId = workflow.id,
+            availableSamplers = cache.samplers,
+            availableSchedulers = cache.schedulers,
+        )
         val defaults = WorkflowManager.getWorkflowDefaultsById(workflow.id)
 
         // Get workflow placeholders - these determine field visibility via capabilities
@@ -905,10 +919,7 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
 
         val state = _uiState.value
 
-        // Get current model cache to validate saved selections
-        val cache = ConnectionManager.modelCache.value
-
-        // Get saved model selections
+        // Get saved model selections（cache 已在函数开头取过，同一快照用于两处校验）
         val savedModel = savedValues?.model
         val savedVae = savedValues?.vaeModel
         val savedClip = savedValues?.clipModel
@@ -950,10 +961,16 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
                 ?: defaults?.steps?.toString() ?: "20",
             cfg = savedValues?.cfg?.toString()
                 ?: defaults?.cfg?.toString() ?: "7.0",
-            sampler = savedValues?.samplerName
-                ?: defaults?.samplerName ?: "euler",
-            scheduler = savedValues?.scheduler
-                ?: defaults?.scheduler ?: "normal",
+            // sampler / scheduler：已保存值 → 工作流默认值 → 缺省，最后再过一道清洗。
+            // 清洗走「读取口径」（见 sanitize*OnLoad）：服务器清单还没同步（空）时原样放行
+            sampler = SamplerOptions.sanitizeSamplerOnLoad(
+                savedValues?.samplerName ?: defaults?.samplerName ?: SamplerOptions.DEFAULT_SAMPLER,
+                cache.samplers,
+            ),
+            scheduler = SamplerOptions.sanitizeSchedulerOnLoad(
+                savedValues?.scheduler ?: defaults?.scheduler ?: SamplerOptions.DEFAULT_SCHEDULER,
+                cache.schedulers,
+            ),
             // 正面提示词跟随工作流（修复流自己的那份）；没存过回退该工作流的默认词。
             // 两条载入路径都正常赋值：模式切换本身就会切换激活工作流，正面词跟着走才符合
             // "跟随工作流"语义（互不污染由保存侧的模式隔离保证，见 saveWorkflowValues）
@@ -1044,8 +1061,18 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         val storage = workflowValuesStorage ?: return
         val serverId = ConnectionManager.currentServerId ?: return
 
+        // sampler / scheduler 的「服务器可用清单」：读持久化时就要用它清洗，所以缓存必须先拿到
+        // （编辑流与修复流各存一套值，两条载入路径都要过清洗）
+        val cache = ConnectionManager.modelCache.value
+
         // Load saved values and defaults by workflow ID (not name, to avoid duplicate name issues)
-        val savedValues = storage.loadValues(serverId, workflow.id)
+        // 读取即清洗：非法 sampler / scheduler 就地改写为默认值并写回磁盘（脏数据自愈）
+        val savedValues = storage.loadValuesSanitized(
+            serverId = serverId,
+            workflowId = workflow.id,
+            availableSamplers = cache.samplers,
+            availableSchedulers = cache.schedulers,
+        )
         val defaults = WorkflowManager.getWorkflowDefaultsById(workflow.id)
 
         // Get workflow placeholders - these determine field visibility
@@ -1056,9 +1083,6 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
             workflow.id,
             savedValues?.dynamicParams ?: emptyMap()
         )
-
-        // Get current model cache to validate saved selections
-        val cache = ConnectionManager.modelCache.value
 
         // Apply saved model selections - use deferred mechanism to handle race condition
         val savedEditingUnet = savedValues?.model  // unified field for editing UNET
@@ -1100,10 +1124,17 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
             editingDynamicParams = dynamicParamsSnapshot.params,
             editingDynamicParamValues = dynamicParamsSnapshot.values,
             editingDynamicParamsRegistryReady = ConnectionManager.nodeTypeRegistry.isPopulated(),
-            editingSampler = savedValues?.samplerName
-                ?: defaults?.samplerName ?: "euler",
-            editingScheduler = savedValues?.scheduler
-                ?: defaults?.scheduler ?: "simple",
+            // 编辑面板的 sampler / scheduler：同样"已保存值 → 默认值 → 缺省"再清洗。
+            // 注意缺省 scheduler 这里是 simple（与修复面板的 normal 不同，是本页既有行为，保持不动）；
+            // 清洗只在值非法时把它换成 normal，合法值原样保留。清单走读取口径（见 sanitize*OnLoad）
+            editingSampler = SamplerOptions.sanitizeSamplerOnLoad(
+                savedValues?.samplerName ?: defaults?.samplerName ?: "euler",
+                cache.samplers,
+            ),
+            editingScheduler = SamplerOptions.sanitizeSchedulerOnLoad(
+                savedValues?.scheduler ?: defaults?.scheduler ?: "simple",
+                cache.schedulers,
+            ),
             // 正面提示词跟随工作流（编辑流自己的那份）—— 与修复流互不干扰
             positivePrompt = PositivePromptPolicy.resolveOnLoad(
                 locked = state.positivePromptLocked,
@@ -1930,37 +1961,20 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
 
     // Unified LoRA chain callbacks
 
-    fun onAddLora() {
-        val state = _uiState.value
-        val newChain = LoraChainManager.addLora(state.loraChain, state.availableLoras)
-        if (newChain === state.loraChain) return // No change
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    override fun withLoraChain(state: ImageToImageUiState, chain: List<LoraSelection>) =
+        state.copy(loraChain = chain)
 
-    fun onRemoveLora(index: Int) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.removeLora(state.loraChain, index)
-        if (newChain === state.loraChain) return // No change
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onAddLora() =
+        updateLoraChain(::savePreferences) { LoraChainManager.addLora(it.loraChain, it.availableLoras) }
 
-    fun onLoraNameChange(index: Int, name: String) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraName(state.loraChain, index, name)
-        if (newChain === state.loraChain) return // No change
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onRemoveLora(index: Int) =
+        updateLoraChain(::savePreferences) { LoraChainManager.removeLora(it.loraChain, index) }
 
-    fun onLoraStrengthChange(index: Int, strength: Float) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraStrength(state.loraChain, index, strength)
-        if (newChain === state.loraChain) return // No change
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onLoraNameChange(index: Int, name: String) =
+        updateLoraChain(::savePreferences) { LoraChainManager.updateLoraName(it.loraChain, index, name) }
+
+    fun onLoraStrengthChange(index: Int, strength: Float) =
+        updateLoraChain(::savePreferences) { LoraChainManager.updateLoraStrength(it.loraChain, index, strength) }
 
     // Editing mode callbacks
 
@@ -2471,6 +2485,21 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         }
 
         // Prepare editing workflow JSON
+        // 提交前兜底（1.3）：替换占位符之前再清洗一次。读取阶段在「服务器清单未知」（冷启动）
+        // 时是原样放行的，所以这里是脏数据第一次被纠正的地方；顺手同步回界面状态，
+        // 免得下拉框继续显示一个提交不出去的值（下一次保存会把它落盘）
+        val safeEditingSampler = SamplerOptions.sanitizeSampler(state.editingSampler, state.availableSamplers)
+        val safeEditingScheduler = SamplerOptions.sanitizeScheduler(state.editingScheduler, state.availableSchedulers)
+        if (safeEditingSampler != state.editingSampler || safeEditingScheduler != state.editingScheduler) {
+            DebugLogger.w(
+                TAG,
+                "编辑流采样参数非法，已纠正为 sampler=$safeEditingSampler, scheduler=$safeEditingScheduler"
+            )
+            _uiState.update {
+                it.copy(editingSampler = safeEditingSampler, editingScheduler = safeEditingScheduler)
+            }
+        }
+
         val baseWorkflow = WorkflowManager.prepareImageEditingWorkflowById(
             workflowId = state.selectedEditingWorkflowId,
             positivePrompt = state.positivePrompt,
@@ -2494,8 +2523,9 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
             megapixels = state.editingMegapixels.toFloatOrNull() ?: 2.0f,
             steps = state.editingSteps.toIntOrNull() ?: 4,
             cfg = state.editingCfg.toFloatOrNull() ?: 1.0f,
-            samplerName = state.editingSampler,
-            scheduler = state.editingScheduler,
+            // 提交前兜底（1.3）：用上面清洗后的取值，替换逻辑本身不动
+            samplerName = safeEditingSampler,
+            scheduler = safeEditingScheduler,
             denoise = state.editingDenoise.toFloatOrNull() ?: 1.0f,
             sourceImageFilename = uploadedSource,
             referenceImage1Filename = uploadedRef1,
@@ -2579,6 +2609,17 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         val uploadedFilename = uploadResult.filename
 
         // Prepare workflow JSON using unified fields
+        // 提交前兜底（1.3）：替换占位符之前再清洗一次（理由同编辑流：读取时清单未知不判废）
+        val safeInpaintSampler = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers)
+        val safeInpaintScheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers)
+        if (safeInpaintSampler != state.sampler || safeInpaintScheduler != state.scheduler) {
+            DebugLogger.w(
+                TAG,
+                "修复流采样参数非法，已纠正为 sampler=$safeInpaintSampler, scheduler=$safeInpaintScheduler"
+            )
+            _uiState.update { it.copy(sampler = safeInpaintSampler, scheduler = safeInpaintScheduler) }
+        }
+
         val baseWorkflow = WorkflowManager.prepareImageToImageWorkflowById(
             workflowId = state.selectedWorkflowId,
             positivePrompt = state.positivePrompt,
@@ -2598,8 +2639,9 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
             megapixels = state.megapixels.toFloatOrNull() ?: 1.0f,
             steps = state.steps.toIntOrNull() ?: 20,
             cfg = state.cfg.toFloatOrNull() ?: 7.0f,
-            samplerName = state.sampler,
-            scheduler = state.scheduler,
+            // 提交前兜底（1.3）：用上面清洗后的取值，替换逻辑本身不动
+            samplerName = safeInpaintSampler,
+            scheduler = safeInpaintScheduler,
             denoise = state.denoise.toFloatOrNull() ?: 1.0f,
             imageFilename = uploadedFilename,
             seed = state.seed.toLongOrNull(),
@@ -2778,23 +2820,6 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
 
         generationViewModel.registerEventHandler(OWNER_ID) { event ->
             handleGenerationEvent(event)
-        }
-    }
-
-    /**
-     * Stop listening for generation events.
-     * Note: We keep the generationViewModelRef if generation is still running,
-     * as the handler may still be called for completion events.
-     */
-    fun stopListening(generationViewModel: GenerationViewModel) {
-        generationViewModel.unregisterSubmittedCallback(OWNER_ID)
-        generationViewModel.unregisterEventHandler(OWNER_ID)
-        // Only clear ref if no generation is active (handler was actually unregistered)
-        // If generation is running, the handler is kept and needs the ref
-        if (!generationViewModel.generationState.value.isGenerating) {
-            if (generationViewModelRef == generationViewModel) {
-                generationViewModelRef = null
-            }
         }
     }
 

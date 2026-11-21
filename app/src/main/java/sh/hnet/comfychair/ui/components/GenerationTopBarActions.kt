@@ -79,7 +79,7 @@ internal fun saveShareEnabled(hasResult: Boolean, isEditing: Boolean): Boolean =
  *
  * | 参数 | 传 null 的条件 |
  * |---|---|
- * | [onUploadImage] | 文生视频（没有输入图概念）；图生视频的时间线流 |
+ * | [onUploadImage] | 文生视频（没有输入图概念）；图生视频恒定传入（无源图时点它直接选图） |
  * | [onEditMask] / [onClearMask] | 非图生图修复模式，或还没有源图 |
  *
  * @param hasResult 当前模式是否有可导出结果（图片=预览位非空 / 视频=产物 URI 非空）

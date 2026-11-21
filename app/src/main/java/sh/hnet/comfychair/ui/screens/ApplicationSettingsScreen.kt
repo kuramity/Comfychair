@@ -1,6 +1,8 @@
 package sh.hnet.comfychair.ui.screens
 
 import android.app.LocaleManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.net.Uri
 import android.os.LocaleList
 import android.widget.Toast
@@ -8,13 +10,18 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.ChevronRight
@@ -25,11 +32,14 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ToggleButton
 import androidx.compose.runtime.Composable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -43,11 +53,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.ui.components.LanguageDropdown
 import sh.hnet.comfychair.ui.components.LanguageOption
 import sh.hnet.comfychair.ui.components.LogViewerDialog
 import sh.hnet.comfychair.ui.components.SettingsScreenScaffold
+import sh.hnet.comfychair.util.CrashLogger
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.viewmodel.SettingsEvent
 import sh.hnet.comfychair.viewmodel.SettingsViewModel
@@ -86,6 +99,8 @@ fun ApplicationSettingsScreen(
 
     // Debug logging state
     var showLogViewer by remember { mutableStateOf(false) }
+    // 崩溃日志查看（独立于"调试日志"开关：崩溃日志始终写入，release 也要能看）
+    var showCrashLogViewer by remember { mutableStateOf(false) }
 
     // File picker for creating backup
     val backupSaveLauncher = rememberLauncherForActivityResult(
@@ -833,6 +848,41 @@ fun ApplicationSettingsScreen(
             }
         }
 
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // 崩溃日志 Card（P0 可观测性）
+        // 与"调试日志"分开：崩溃日志**始终写入**，不受调试开关影响，release 版也要能看。
+        // 只做"能看 + 能复制"，不引入文件选择器、不上传网络。
+        Card(
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+            ) {
+                Text(
+                    // P0-R6：文案一律走已翻译的资源，不硬编码中文（本项目默认 values 是英文，
+                    // 另有 de/es/fr/pl/zh 五套资源；硬编码会让非中文用户在设置页看到中文）。
+                    // 崩溃日志改用独立文案（title_crash_log / button_crash_log_view），
+                    // 与上方「调试日志」卡片区分——两者用途不同，不能同名同按钮。
+                    text = stringResource(R.string.title_crash_log),
+                    style = MaterialTheme.typography.titleMedium
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Button(
+                    onClick = { showCrashLogViewer = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.BugReport, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(stringResource(R.string.button_crash_log_view))
+                }
+            }
+        }
+
         // Bottom padding
         Spacer(modifier = Modifier.height(16.dp))
     }
@@ -847,4 +897,138 @@ fun ApplicationSettingsScreen(
             }
         )
     }
+
+    // 崩溃日志查看对话框（列文件名/大小/时间，顶部可一键复制全部内容）
+    if (showCrashLogViewer) {
+        CrashLogViewerDialog(onDismiss = { showCrashLogViewer = false })
+    }
 }
+
+/**
+ * 崩溃日志查看对话框。
+ *
+ * 只读当前 `filesDir/crash/` 下的日志文件（[CrashLogger.listCrashFiles]），
+ * 顶部「复制」把 [CrashLogger.exportAll] 的结果放进剪贴板。
+ * 不做文件选择器、不做网络上传 —— 用户自己决定把内容发给谁。
+ */
+@Composable
+private fun CrashLogViewerDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    // 打开对话框时快照一次即可：崩溃日志只会在进程崩溃时新增，当前进程还活着就不会变
+    val files = remember { CrashLogger.listCrashFiles(context) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true
+        )
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.95f)
+                .fillMaxHeight(0.8f),
+            shape = MaterialTheme.shapes.large
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                // 标题栏：复制 / 关闭
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = stringResource(R.string.title_crash_log),
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(ClipboardManager::class.java)
+                            if (clipboard != null) {
+                                clipboard.setPrimaryClip(
+                                    ClipData.newPlainText(
+                                        // 剪贴板预览标题也用应用名（已翻译的常量），不硬编码中文
+                                        context.getString(R.string.app_name),
+                                        CrashLogger.exportAll(context)
+                                    )
+                                )
+                                Toast.makeText(
+                                    context,
+                                    R.string.msg_copied_to_clipboard,
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    R.string.tag_copy_failed,
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    ) {
+                        Text(stringResource(R.string.button_copy_to_clipboard))
+                    }
+                    TextButton(onClick = onDismiss) {
+                        Text(stringResource(R.string.content_description_close))
+                    }
+                }
+
+                HorizontalDivider()
+
+                if (files.isEmpty()) {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = stringResource(R.string.msg_debug_log_empty),
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 16.dp)
+                    ) {
+                        items(files, key = { it.absolutePath }) { file ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 10.dp)
+                            ) {
+                                Text(
+                                    text = file.name,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "${formatCrashFileSize(file.length())} · " +
+                                        formatCrashFileTime(file.lastModified()),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 崩溃日志文件大小：B / KB / MB，保留一位小数 */
+private fun formatCrashFileSize(bytes: Long): String = when {
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024 * 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+    else -> String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+}
+
+/** 崩溃日志修改时间（本地时区） */
+private fun formatCrashFileTime(millis: Long): String =
+    SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(millis))

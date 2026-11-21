@@ -40,6 +40,7 @@ import androidx.navigation.NavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.currentBackStackEntryAsState
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.navigation.MainRoute
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.storage.AppSettings
@@ -70,6 +71,11 @@ fun MainNavigationBar(
     // Observe gallery items to show latest thumbnail in FAB
     val galleryItems by GalleryRepository.getInstance().galleryItems.collectAsStateWithLifecycle()
     val latestItem = galleryItems.firstOrNull()
+    // 「源已不存在」：持久标记在索引里，本次会话的 404 在 missingKeys 里，两者任一成立
+    // 都只读本机缓存 —— 冷启动时 missingKeys 为空，只看它会让已标记条目再发一次 /view。
+    val latestSourceMissing = latestItem?.let { item ->
+        item.sourceMissing || MediaCache.isFileMissing(item.toCacheKey())
+    } ?: false
 
     // Lazy load thumbnail for FAB - keep previous thumbnail until new one is ready
     val displayedThumbnail = rememberRetainedBitmap(
@@ -78,7 +84,9 @@ fun MainNavigationBar(
         subfolder = latestItem?.subfolder ?: "",
         type = latestItem?.type ?: "",
         // 底栏上是个几十 dp 的小图标，没有理由为它去拉原图
-        thumbnail = true
+        thumbnail = true,
+        // 源已不存在：只读本机缩略图，绝不发网络请求
+        localOnly = latestSourceMissing
     )
 
     // 各 tab 的导航动作（起始页是**动态**的，见任一 tab 的 popUpTo 注释）

@@ -20,7 +20,6 @@ import sh.hnet.comfychair.workflow.PlaceholderLiterals
 import sh.hnet.comfychair.workflow.SaveFormatMaterializer
 import sh.hnet.comfychair.workflow.TemplateKeyRegistry
 import sh.hnet.comfychair.workflow.TemplatePatterns
-import sh.hnet.comfychair.workflow.TimelineSlotDetector
 import sh.hnet.comfychair.workflow.dynamic.ClipGateMaterializer
 import sh.hnet.comfychair.workflow.dynamic.DynamicParam
 import sh.hnet.comfychair.workflow.dynamic.DynamicParamRange
@@ -626,6 +625,15 @@ object WorkflowManager {
                     }
                 }
             }
+        }
+
+        // P3-9：API 格式的执行引擎不识别 mode 字段（mode 只存在于 UI 工作流格式），
+        // muted 节点（mode=2）若原样导出，接收端会把它当普通节点执行，与用户的
+        // 「静音」意图相反。按 ComfyUI 的 mute 语义剔除该节点并断开其下游连线；
+        // bypass（mode=4）不在本路径处理，非 mute 节点的导出结果保持原样。
+        val mutedCount = BypassNodeResolver.stripMutedNodes(nodesJson)
+        if (mutedCount > 0) {
+            DebugLogger.i(TAG, "Exported workflow 剔除 $mutedCount 个 muted 节点: ${workflow.name}")
         }
 
         DebugLogger.i(TAG, "Exported workflow to ComfyUI format: ${workflow.name}")
@@ -1750,73 +1758,6 @@ object WorkflowManager {
      * （动态节点参数引擎的替换也用同一份）。
      */
     private fun escapeForJson(input: String): String = escapeJsonString(input)
-
-    /**
-     * 时间线导演台的两个占位符（[TimelineSlotDetector.TIMELINE_PLACEHOLDER] /
-     * [TimelineSlotDetector.GENERATION_SECONDS_PLACEHOLDER]）的替换。
-     *
-     * 抽成独立函数是为了能在 JVM 单测里钉住转义：整份时间线是一段 JSON 文本，要塞进
-     * JSON 字符串里当值，转义错一个字符（时间线里有引号、中文、换行）整个提交就会变成
-     * 非法 JSON —— 而那种错误在手机上只表现为"生成失败"，看不出是转义问题。
-     *
-     * @param timelineData 时间线 JSON 文本；空串按"一个片段都没有"处理，注入 `{}`
-     * @param generationSeconds 生成时长；null 表示不替换（保留占位符，由提交校验暴露出来）
-     */
-    internal fun applyTimelinePlaceholders(
-        json: String,
-        timelineData: String,
-        generationSeconds: Double?
-    ): String {
-        var out = json
-        // 整份时间线是**字符串**输入：替换结果要带上引号（模板里那两个引号可能被
-        // 带引号形态一起吃掉，也可能原样留着，见 replacePlaceholderWithJsonLiteral）
-        if (out.contains(TimelineSlotDetector.TIMELINE_PLACEHOLDER)) {
-            val timelineJson = timelineData.takeIf { it.isNotBlank() } ?: "{}"
-            out = replacePlaceholderWithJsonLiteral(
-                json = out,
-                placeholder = TimelineSlotDetector.TIMELINE_PLACEHOLDER,
-                literal = "\"${escapeForJson(timelineJson)}\""
-            )
-        }
-        // 生成时长是 **JSON 数字**（不带引号）。这里必须把模板里那对引号一起吃掉：
-        // 留下引号会得到一个字符串 "5.000"，而节点定义里它是 Float 输入 ——
-        // 那是个只在提交时才暴露、且看不出根因的类型错误（单元测试抓到过一次）。
-        //
-        // 用 Double.toString()（Kotlin 给最短往返表示）而不是 "%.3f"：后者会引入
-        // 0.0005 秒以内的舍入，让这个值与 timeline_data 里的 selection.duration
-        // 不再完全同源。亚帧级的差异（1 帧 = 0.0417 秒）不至于让 guide 落错帧，
-        // 但"两个必须同源的值其实不同"是个没必要留的隐患。
-        // 它也顺带避开了 Locale 问题：某些语言环境的小数点是逗号，那会写出非法 JSON
-        if (generationSeconds != null) {
-            out = replacePlaceholderWithJsonLiteral(
-                json = out,
-                placeholder = TimelineSlotDetector.GENERATION_SECONDS_PLACEHOLDER,
-                literal = generationSeconds.toString()
-            )
-        }
-        return out
-    }
-
-    /**
-     * 用一个 JSON 字面量替换占位符。
-     *
-     * 两种写法都要认：`"{{name}}"`（值整体是占位符，模板自带引号）与裸 `{{name}}`
-     * （嵌在更长的字符串里）。带引号形态会**连引号一起**被替换掉，这样调用方就能
-     * 通过 [literal] 决定结果是字符串还是数字 —— 这是它与普通字符串替换的唯一区别，
-     * 也是 `{{generation_seconds}}` 不会变成字符串的原因。
-     */
-    private fun replacePlaceholderWithJsonLiteral(
-        json: String,
-        placeholder: String,
-        literal: String
-    ): String {
-        val quoted = "\"$placeholder\""
-        return if (json.contains(quoted)) {
-            json.replace(quoted, literal)
-        } else {
-            json.replace(placeholder, literal)
-        }
-    }
 
     /**
      * Replace all common parameter placeholders in a workflow JSON.
@@ -3080,19 +3021,6 @@ object WorkflowManager {
         speedMode: String? = null,
         // 主 LoRA 权重（LoraLoaderModelOnly.strength_model）
         loraStrength: Float? = null,
-        /**
-         * 时间线导演台的整份时间线（`timeline_data` 的 JSON 文本，见 [sh.hnet.comfychair.model.TimelineDocument]）。
-         *
-         * 空串按「一个片段都没有」处理并注入 `{}`：插件对空串也会自己兜成 `{}`，
-         * 但显式写出来能让服务器侧日志一眼看出这是 App 给的，而不是用户漏填。
-         */
-        timelineData: String = "",
-        /**
-         * 生成时长（秒）。与 `timeline_data.selection.duration` **必须同源**：
-         * 节点用 `generation_seconds` 算生成帧数、用 `selection` 算原画面固定到第几帧，
-         * 两者不一致会让 guide 落到错误的帧上（画面错位，且不报错）。
-         */
-        generationSeconds: Double? = null,
         // 动态节点参数：占位符名 -> 值（见 getDynamicParams）
         dynamicParams: Map<String, String> = emptyMap(),
         /**
@@ -3163,11 +3091,6 @@ object WorkflowManager {
         // 参考音频：用户没填的音频槽要连同 LoadAudio 节点一起删掉，
         // 否则节点会带着 {{...}} 占位符提交，ComfyUI 去找一个名为 "{{audio_filename}}" 的文件而失败
         processedJson = injectAudioSlots(processedJson, audioSlotFiles)
-
-        // 时间线导演台：整份时间线是**一个字符串输入**，与 positive_prompt 同构
-        // （模板里 `"timeline_data": "{{timeline_data}}"` 已带外层引号，这里只给转义后的内容）。
-        // 不替换的后果不只是参数没生效：占位符会被当字面量发给插件，它 json.loads 会直接抛错。
-        processedJson = applyTimelinePlaceholders(processedJson, timelineData, generationSeconds)
 
         // Common parameter placeholders (unified handling)
         processedJson = replaceCommonPlaceholders(

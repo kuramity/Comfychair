@@ -57,6 +57,10 @@ data class FlyBackStartFactors(
     val alpha: Float
 )
 
+// E4 二次修复（v4.19.2）：原 FlyBackEndState / flyBackEndStateAfterCompletion
+// 已随收尾时机修复一并删除 —— 新契约是"飞回正常播完不关飞回分支"，
+// "终态清零 + 关分支"这套换算不再有调用方，留着装死代码只会诱使后人把它接回去。
+
 object ViewerDismissGesture {
 
     /** 松手关闭阈值一：位移超过屏高的 22% */
@@ -160,6 +164,38 @@ object ViewerDismissGesture {
         if (!dy.isFinite() || !screenHeightPx.isFinite() || screenHeightPx <= 0f) return 1f
         if (dy <= 0f) return 1f
         return if (dy / screenHeightPx >= REVEAL_PROGRESS_RATIO) REVEAL_MASK_ALPHA else 1f
+    }
+
+    /**
+     * E5（v4.16.14 修）：此刻是否该保持"透出图库"（遮罩目标 0.2）。
+     *
+     * 判据两条同时成立才透出：
+     * 1. **手指仍按在屏上**（[gestureActive]）——透出是"继续下拉就能关闭"的提示，
+     *    手指一松就没有意义，必须立刻收回；
+     * 2. 位移达到 [REVEAL_PROGRESS_RATIO]（10% 屏高）。
+     *
+     * ## 为什么必须加第 1 条（本次修复的根因）
+     *
+     * 旧实现只有第 2 条：回弹期间用 snapshotFlow 盯 `dismissDragAnimatable` 的位移，
+     * 直到它跌回 10% 以下才把透出目标翻回纯黑。于是"松手那一刻还没淡完的透出"
+     * 会在手指抬起之后**继续补完**（120ms tween 的目标仍是 0.2）—— 图库截图里
+     * 那些缩略图在回弹途中反而变得更清楚，之后才淡回纯黑。观感就是
+     * "松手回弹的瞬间，屏幕边缘/底部露出的图库缩略图闪一下"。
+     *
+     * 加一条 `gestureActive = false → 一律 false` 之后，收回与松手发生在同一帧，
+     * 遮罩只会从当前值单调过渡回纯黑，不会再"先补完再收回"。
+     *
+     * @param displacement 脱离拖动位移（px，y 向下为正；回弹期间取 Animatable 的值）
+     * @param screenHeightPx 屏高（px，未测得时按纯黑兜底）
+     * @param gestureActive 手指是否仍按在屏上（true = 拖动中，false = 已松手/回弹中）
+     */
+    fun shouldRevealMask(
+        displacement: Float,
+        screenHeightPx: Float,
+        gestureActive: Boolean
+    ): Boolean {
+        if (!gestureActive) return false
+        return dismissMaskTargetAlpha(displacement, screenHeightPx) < 1f
     }
 
     /**

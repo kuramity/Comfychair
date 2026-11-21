@@ -39,6 +39,8 @@ data class LazyBitmapState(
  * @param retryTick 重试计数器：加载失败后 UI 让用户点击占位图标重试，
  *   每点一次 +1，这里靠 key 变化重新触发 LaunchedEffect（v4.6.0 ——
  *   以前失败即定格，唯一的恢复手段是把这个格子滑出屏幕再滑回来）。
+ * @param localOnly true = 只读本机缓存、绝不发网络请求。「源已不存在」条目用它：
+ *   原图已被确认删除（/view 404），再请求只会白等一次超时；显示与保存一律用本机缓存。
  * @return LazyBitmapState with the bitmap and loading state
  */
 @Composable
@@ -48,7 +50,8 @@ fun rememberLazyBitmap(
     subfolder: String,
     type: String,
     thumbnail: Boolean = false,
-    retryTick: Int = 0
+    retryTick: Int = 0,
+    localOnly: Boolean = false
 ): LazyBitmapState {
     val keyString = cacheKey.keyString
 
@@ -64,7 +67,7 @@ fun rememberLazyBitmap(
     }
 
     // Load bitmap if not in cache（retryTick 进 key：点击重试时重新执行整段）
-    LaunchedEffect(keyString, thumbnail, retryTick) {
+    LaunchedEffect(keyString, thumbnail, retryTick, localOnly) {
         if (state.value.bitmap == null) {
             if (retryTick > 0) {
                 // 手动重试：用户可能已经把服务器上的文件放了回去，清掉 404 标记再试
@@ -82,9 +85,9 @@ fun rememberLazyBitmap(
 
             // Fetch directly
             val bitmap = if (thumbnail) {
-                MediaCache.fetchThumbnail(cacheKey, isVideo, subfolder, type)
+                MediaCache.fetchThumbnail(cacheKey, isVideo, subfolder, type, localOnly)
             } else {
-                MediaCache.fetchBitmap(cacheKey, isVideo, subfolder, type)
+                MediaCache.fetchBitmap(cacheKey, isVideo, subfolder, type, localOnly = localOnly)
             }
             state.value = LazyBitmapState(bitmap, false)
         }
@@ -107,6 +110,9 @@ fun rememberLazyBitmap(
  * @param isVideo Whether this is a video
  * @param subfolder The subfolder for fetching
  * @param type The type for fetching
+ * @param localOnly true = 只读本机缓存、绝不发网络请求。「源已不存在」条目用它；
+ *   底栏 FAB 这类"顺手取一张缩略图"的入口同样必须遵守，否则冷启动时
+ *   missingKeys 为空，已标记的条目仍会白打一次 /view。
  * @return The most recent successfully loaded bitmap, or null if none
  */
 @Composable
@@ -115,11 +121,12 @@ fun rememberRetainedBitmap(
     isVideo: Boolean,
     subfolder: String,
     type: String,
-    thumbnail: Boolean = false
+    thumbnail: Boolean = false,
+    localOnly: Boolean = false
 ): Bitmap? {
     var displayedBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-    LaunchedEffect(cacheKey?.keyString, thumbnail) {
+    LaunchedEffect(cacheKey?.keyString, thumbnail, localOnly) {
         if (cacheKey == null) {
             // 没有条目可显示了：回归默认图标（调用方在 null 时会渲染占位图标）
             displayedBitmap = null
@@ -142,9 +149,9 @@ fun rememberRetainedBitmap(
         // If still null, fetch directly
         if (newBitmap == null) {
             newBitmap = if (thumbnail) {
-                MediaCache.fetchThumbnail(cacheKey, isVideo, subfolder, type)
+                MediaCache.fetchThumbnail(cacheKey, isVideo, subfolder, type, localOnly)
             } else {
-                MediaCache.fetchBitmap(cacheKey, isVideo, subfolder, type)
+                MediaCache.fetchBitmap(cacheKey, isVideo, subfolder, type, localOnly = localOnly)
             }
         }
 

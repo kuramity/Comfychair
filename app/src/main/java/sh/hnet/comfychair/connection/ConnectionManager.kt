@@ -418,6 +418,24 @@ object ConnectionManager {
     }
 
     /**
+     * 只置「抑制连接页自动重连」这一个标志，别的什么都不做（**不改连接、不清缓存、不清队列**）。
+     *
+     * 使用场景：主界面在起始 tab 按返回键回连接页（[sh.hnet.comfychair.MainContainerActivity]
+     * 的返回键回调）。此时用户并没有登出 —— 生成任务可能还在跑，队列、生成状态、连接都要保留，
+     * 所以不能调 [logout]（它会 `reconnectBlocked = true` + `disconnect()` + 清 lastSession）。
+     *
+     * 复用 [isUserInitiatedLogout] 是刻意的：连接页只认这一个标志
+     * （`LoginScreen.kt:448` 的 `shouldAutoConnect`），且它紧接着第 449 行就会
+     * [clearLogoutFlag]，所以本标志只生效一次 —— 既保证「回连接页后停在连接页」，
+     * 又不会让用户以后再也自动连不上。`private set` 的封装也靠这个入口保住：
+     * 外部只能「请求抑制一次」，不能把标志长期置真。
+     */
+    fun suppressAutoConnectOnce() {
+        isUserInitiatedLogout = true
+        DebugLogger.d(TAG, "suppressAutoConnectOnce: 回连接页，抑制一次性自动重连（不登出）")
+    }
+
+    /**
      * Acknowledge that the session-expiry event has been handled.
      * Call this after presenting the re-authentication UI to the user.
      * Also re-arms the AuthInterceptor so it can detect the next expiry.
@@ -2353,11 +2371,39 @@ object ConnectionManager {
                 "UpscaleModelLoader",
                 TemplateKeyRegistry.getJsonKeyForPlaceholder("upscale_model")
             ),
-            samplers = nodeTypeRegistry.getOptionsForField(
-                TemplateKeyRegistry.getJsonKeyForPlaceholder("sampler_name")
+            // "sampler_name" / "scheduler" 同样是**通用字段名**（同 aspectRatios / speedModes 的先例），
+            // 必须按节点类型取：GITS / OSS FLUX / ays 等自定义采样节点也声明了这两个名字，
+            // 按字段名取并集会把 "dpm++"、"GITS[coeff=1.2]"、"OSS FLUX"、"AYS SD1" 混进下拉。
+            // 用户在下拉里选一个（列表里"合法"），提交给原生 KSampler 就 400：
+            //   Value not in list: sampler_name: 'dpm++' not in (list of length ...)
+            // 所以：KSampler 优先 → KSamplerAdvanced 兜底 → 并集兜底（没有 KSampler 的工作流）。
+            // 注意这层只管**候选从哪来**；持久化脏数据的清洗仍由 SamplerOptions.sanitize*
+            // 在提交前把关（两层互补，缺一不可）。
+            samplers = selectNodeTypedOptions(
+                primary = nodeTypeRegistry.getOptionsForNodeInput(
+                    "KSampler",
+                    TemplateKeyRegistry.getJsonKeyForPlaceholder("sampler_name")
+                ),
+                secondary = nodeTypeRegistry.getOptionsForNodeInput(
+                    "KSamplerAdvanced",
+                    TemplateKeyRegistry.getJsonKeyForPlaceholder("sampler_name")
+                ),
+                fallback = nodeTypeRegistry.getOptionsForField(
+                    TemplateKeyRegistry.getJsonKeyForPlaceholder("sampler_name")
+                )
             ),
-            schedulers = nodeTypeRegistry.getOptionsForField(
-                TemplateKeyRegistry.getJsonKeyForPlaceholder("scheduler")
+            schedulers = selectNodeTypedOptions(
+                primary = nodeTypeRegistry.getOptionsForNodeInput(
+                    "KSampler",
+                    TemplateKeyRegistry.getJsonKeyForPlaceholder("scheduler")
+                ),
+                secondary = nodeTypeRegistry.getOptionsForNodeInput(
+                    "KSamplerAdvanced",
+                    TemplateKeyRegistry.getJsonKeyForPlaceholder("scheduler")
+                ),
+                fallback = nodeTypeRegistry.getOptionsForField(
+                    TemplateKeyRegistry.getJsonKeyForPlaceholder("scheduler")
+                )
             ),
             // "aspect_ratio" 与 "mode" 都是通用字段名（多个节点都有 mode），必须按节点类型取，
             // 否则会把无关节点的选项并进来（同 upscaleModels 的先例）
@@ -2422,5 +2468,35 @@ object ConnectionManager {
             clipFailure = CategoryFailureReason.REQUEST_FAILED
         )
     }
+}
+
+/**
+ * 按「节点类型优先、并集兜底」挑选下拉候选（纯函数，可 JVM 单测）。
+ *
+ * 为什么需要：`getOptionsForField` 是按**字段名**跨所有节点收集并集，只适合
+ * 「这个字段名只有一类节点声明」的模型加载器（ckpt_name 之类）。而 `sampler_name` /
+ * `scheduler` 是通用字段名 —— GITS / OSS FLUX / ays 等自定义采样节点也声明了它们，
+ * 并集里就会出现原生 KSampler 不认识的取值（`dpm++`、`GITS[coeff=1.2]`、`OSS FLUX`、
+ * `AYS SD1` …）。用户在这些"看起来合法"的选项里挑一个提交 → ComfyUI 的
+ * `validate_inputs()` 判 `Value not in list` → 400。
+ *
+ * 选择策略（与同文件 aspectRatios / speedModes 的「按节点类型取」同一思路）：
+ * 1. [primary] 非空（服务器上有 KSampler）→ **只用它**：原生节点的候选就是原生节点能接受的值；
+ * 2. [primary] 空、[secondary] 非空（只有 KSamplerAdvanced）→ 用它；
+ * 3. 两者都空（工作流里没有原生采样节点，例如某些第三方采样器工作流）→ 退回并集 [fallback]，
+ *    宁可多给候选也不要下拉全空（下拉全空用户连选都选不了）。
+ *
+ * @param primary 首选节点（KSampler）该输入声明的候选
+ * @param secondary 次选节点（KSamplerAdvanced）该输入声明的候选
+ * @param fallback 跨所有节点的并集（最后兜底）
+ */
+internal fun selectNodeTypedOptions(
+    primary: List<String>,
+    secondary: List<String>,
+    fallback: List<String>
+): List<String> = when {
+    primary.isNotEmpty() -> primary
+    secondary.isNotEmpty() -> secondary
+    else -> fallback
 }
 

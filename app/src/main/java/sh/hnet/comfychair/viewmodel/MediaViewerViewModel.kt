@@ -115,6 +115,53 @@ internal object ViewerLoadPolicy {
 }
 
 /**
+ * 「移入回收站」结果档位。
+ *
+ * 两个布尔位就是界面必须遵守的两条纪律：
+ * - [removeFromUi]：只有真正进站才允许把条目从当前界面移除（查看器队列 / 图库选中项）；
+ * - [showSuccess]：只有全部进站才允许提示成功。
+ *
+ * FAILED 两者皆 false —— 落盘失败时移除条目会让界面之间数据分叉
+ * （查看器没了、回收站没有、图库还在）。
+ */
+internal enum class TrashDeleteResult(
+    val removeFromUi: Boolean,
+    val showSuccess: Boolean
+) {
+    /** 全部进站：移除 + 提示成功 */
+    SUCCESS(true, true),
+
+    /** 部分进站：只移除已进站的（仓储已处理），提示部分失败 */
+    PARTIAL(true, false),
+
+    /** 一条都没进站：界面保持原样，提示失败 */
+    FAILED(false, false)
+}
+
+/**
+ * 「移入回收站」返回值 → 界面动作的纯判定。
+ *
+ * [GalleryRepository.moveToTrash] 的契约：返回进站的回收站身份键列表，
+ * **空列表 = 未进站**（回收站落盘失败 / 异常兜底）。调用方必须先过这里再动界面，
+ * 否则会出现"用户以为删了，其实还在"的数据分叉。
+ *
+ * 抽成 object 以便 JVM 单测直接覆盖（与 [ViewerLoadPolicy] 同一模式）。
+ */
+internal object TrashDeleteOutcome {
+
+    /** 单条删除（查看器）：返回身份键非空才算进站。 */
+    fun single(trashIdentities: List<String>): TrashDeleteResult =
+        if (trashIdentities.isEmpty()) TrashDeleteResult.FAILED else TrashDeleteResult.SUCCESS
+
+    /** 批量删除（图库多选）：按实际进站条数与请求条数分档；0 条 = 全败，绝不报成功。 */
+    fun batch(successCount: Int, requestedCount: Int): TrashDeleteResult = when {
+        successCount <= 0 -> TrashDeleteResult.FAILED
+        successCount < requestedCount -> TrashDeleteResult.PARTIAL
+        else -> TrashDeleteResult.SUCCESS
+    }
+}
+
+/**
  * Represents an item in the media viewer
  */
 @Immutable
@@ -124,7 +171,15 @@ data class MediaViewerItem(
     val subfolder: String,
     val type: String,
     val isVideo: Boolean,
-    val index: Int = 0
+    val index: Int = 0,
+    /**
+     * 源已不存在（/view 404，标记随图库索引持久化）。
+     *
+     * 查看器队列是进入时拍下的快照，不随图库仓储实时刷新，所以该字段必须一起带过来：
+     * 否则从图库点开一张已删除的图，查看器又会去请求原图、白等一次超时。
+     * 旧版本保存的查看器会话没有这个键 → fromJson 缺省 false，兼容。
+     */
+    val sourceMissing: Boolean = false
 ) {
     fun toJson(): JSONObject {
         return JSONObject().apply {
@@ -134,6 +189,7 @@ data class MediaViewerItem(
             put("type", type)
             put("isVideo", isVideo)
             put("index", index)
+            put("sourceMissing", sourceMissing)
         }
     }
 
@@ -145,7 +201,8 @@ data class MediaViewerItem(
                 subfolder = json.optString("subfolder", ""),
                 type = json.optString("type", "output"),
                 isVideo = json.optBoolean("isVideo", false),
-                index = json.optInt("index", 0)
+                index = json.optInt("index", 0),
+                sourceMissing = json.optBoolean("sourceMissing", false)
             )
         }
 
@@ -370,7 +427,7 @@ class MediaViewerViewModel : ViewModel() {
             _uiState.value = _uiState.value.copy(
                 currentVideoUri = uri,
                 isLoading = false,
-                loadFailure = if (uri == null) inferLoadFailure(key) else null
+                loadFailure = if (uri == null) inferLoadFailure(key, item) else null
             )
         } else {
             val bitmap = MediaCache.getBitmap(key)
@@ -406,7 +463,9 @@ class MediaViewerViewModel : ViewModel() {
                 key = item.toCacheKey(),
                 isVideo = item.isVideo,
                 subfolder = item.subfolder,
-                type = item.type
+                type = item.type,
+                // 源已不存在：预取原图只会再拿一个 404
+                sourceMissing = item.sourceMissing
             )
         }
 
@@ -465,24 +524,37 @@ class MediaViewerViewModel : ViewModel() {
         viewModelScope.launch {
             if (item.isVideo) {
                 // Fetch video and create URI in one step
-                val uri = MediaCache.fetchVideoUri(key, item.subfolder, item.type, context)
+                val uri = MediaCache.fetchVideoUri(
+                    key = key,
+                    subfolder = item.subfolder,
+                    type = item.type,
+                    context = context,
+                    // 源已不存在：只读本机缓存的视频字节，不再请求已删除的原文件
+                    localOnly = !shouldRequestOriginal(item)
+                )
                 _uiState.value = _uiState.value.copy(
                     currentVideoUri = uri,
                     isLoading = false,
                     // 失败必须留档（H1-a）：修复前这里只置 null，UI 拿"videoUri == null"
                     // 当"还在加载"的信号，结果失败后永远转圈
-                    loadFailure = if (uri == null) inferLoadFailure(key) else null
+                    loadFailure = if (uri == null) inferLoadFailure(key, item) else null
                 )
             } else {
                 // 原图优先，超限时自动降级到服务端压缩版（见 MediaCache.fetchViewerImage）：
-                // 200 MB 的放大图手机读不动，但"长什么样"还得让人看到
-                val viewerImage = MediaCache.fetchViewerImage(key, item.subfolder, item.type)
+                // 200 MB 的放大图手机读不动，但"长什么样"还得让人看到。
+                // 源已不存在：只读本机缓存（720 档/旧磁盘），不发请求 —— 这是第三态的核心。
+                val viewerImage = MediaCache.fetchViewerImage(
+                    key = key,
+                    subfolder = item.subfolder,
+                    type = item.type,
+                    localOnly = !shouldRequestOriginal(item)
+                )
                 _uiState.value = _uiState.value.copy(
                     currentBitmap = viewerImage.bitmap,
                     compressedFallback = viewerImage.compressedFallback,
                     isLoading = false,
                     // 失败必须留档（H1-b）：修复前图片失败只走黑屏分支，无提示无重试
-                    loadFailure = if (viewerImage.bitmap == null) inferLoadFailure(key) else null
+                    loadFailure = if (viewerImage.bitmap == null) inferLoadFailure(key, item) else null
                 )
             }
         }
@@ -494,7 +566,13 @@ class MediaViewerViewModel : ViewModel() {
      * 404 记在 MediaCache（[MediaCache.isFileMissing]），离线状态记在 ConnectionManager；
      * 两处都查不到时给 GENERIC —— 宁可文案保守，也不能把可重试的失败说成"文件不存在"。
      */
-    private fun inferLoadFailure(key: MediaCacheKey): ViewerFailureCategory = when {
+    private fun inferLoadFailure(
+        key: MediaCacheKey,
+        item: MediaViewerItem? = null
+    ): ViewerFailureCategory = when {
+        // 已持久化的第三态（源已不存在）优先：即使本次没走到网络、missingKeys 为空，
+        // 文案也必须是"文件不存在"，不能退回可重试的 NETWORK/GENERIC。
+        item?.sourceMissing == true -> ViewerFailureCategory.FILE_MISSING
         MediaCache.isFileMissing(key) -> ViewerFailureCategory.FILE_MISSING
         ConnectionManager.isOffline || ConnectionManager.clientOrNull == null ->
             ViewerFailureCategory.NETWORK
@@ -509,8 +587,25 @@ class MediaViewerViewModel : ViewModel() {
      * 本身没有短路标记，直接重拉即可。
      */
     fun retryCurrentItem() {
-        val item = _uiState.value.currentItem ?: return
+        val state = _uiState.value
+        val item = state.currentItem ?: return
         MediaCache.clearFileMissing(item.toCacheKey())
+        if (item.sourceMissing) {
+            // 用户显式重试 = 允许再探一次：必须一并清掉持久化标记，
+            // 否则 shouldRequestOriginal 会一直短路，重试变成"原地再失败一次"。
+            // 文件确实被放回服务器 → 恢复正常；仍然 404 → 重新标记，第三态不丢。
+            GalleryRepository.getInstance().clearSourceMissing(item.promptId, item.filename)
+            _uiState.value = state.copy(
+                items = state.items.map {
+                    if (it.promptId == item.promptId && it.filename == item.filename) {
+                        it.copy(sourceMissing = false)
+                    } else {
+                        it
+                    }
+                },
+                loadFailure = null
+            )
+        }
         loadCurrentItem()
     }
 
@@ -587,6 +682,7 @@ class MediaViewerViewModel : ViewModel() {
         val context = applicationContext ?: return null
 
         return withContext(Dispatchers.IO) {
+            val cacheKey = item.toCacheKey()
             val fromLocalOrServer: ByteArray? = when {
                 // For SINGLE mode videos, try to read from local file first
                 state.mode == ViewerMode.SINGLE && item.isVideo && state.currentVideoUri != null -> {
@@ -601,8 +697,11 @@ class MediaViewerViewModel : ViewModel() {
                 }
                 // For items with server file info and a client, fetch from server
                 // （离线态不请求服务器：此时客户端仍在，但离线语义就是"不发请求"）
+                // 源已不存在（/view 404 已确认）：参数也只能从本机缓存字节里取，
+                // 不再为一条注定 404 的记录白打两次请求（头段 + 全量回退）。
                 item.filename.isNotEmpty() && ConnectionManager.clientOrNull != null &&
-                    !ConnectionManager.isOffline -> {
+                    !ConnectionManager.isOffline &&
+                    !item.sourceMissing && !MediaCache.isFileMissing(cacheKey) -> {
                     val client = ConnectionManager.clientOrNull!!
                     if (item.isVideo) {
                         // 视频的参数在文件尾部（moov box），取头部没有意义，必须拿到完整字节。
@@ -737,6 +836,14 @@ class MediaViewerViewModel : ViewModel() {
                     )
                 )
             )
+
+            // 返回空列表 = 没进站（回收站落盘失败或异常兜底）。此时条目仍在
+            // 图库里，查看器队列不能移除 —— 不移除、不填撤销槽、不提示成功，
+            // 只报失败；否则"查看器没了、回收站没有、图库还在"，界面之间数据分叉。
+            if (TrashDeleteOutcome.single(identities) == TrashDeleteResult.FAILED) {
+                _events.emit(MediaViewerEvent.ShowToast(R.string.error_history_item_delete))
+                return@launch
+            }
 
             // Mark that items were removed from the list (for result reporting)
             _hasDeletedItems.value = true
@@ -929,19 +1036,38 @@ class MediaViewerViewModel : ViewModel() {
         val key = item.toCacheKey()
 
         withContext(Dispatchers.IO) {
-            // Try cache first, then fetch if needed
-            val bitmap = MediaCache.getBitmap(key)
-                ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            // 源已不存在：允许保存，但只能保存本机缓存的低清版（原图在服务器上已删除）。
+            // 判定同时看持久化字段与本次会话的 404 标记：查看器队列是进入时的快照，
+            // item.sourceMissing 可能还没跟上刚刚发生的 404。
+            val sourceMissing = item.sourceMissing || MediaCache.isFileMissing(key)
+            val bitmap = if (sourceMissing) {
+                MediaCache.getLocalImage(key)
+            } else {
+                MediaCache.getBitmap(key)
+                    ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            }
 
             if (bitmap == null) {
-                _events.emit(MediaViewerEvent.ShowToast(R.string.error_save_image))
+                _events.emit(
+                    MediaViewerEvent.ShowToast(
+                        if (sourceMissing) {
+                            R.string.msg_image_source_missing_no_cache
+                        } else {
+                            R.string.error_save_image
+                        }
+                    )
+                )
                 return@withContext
             }
 
             val saved = PhotoManager.saveBitmap(context, bitmap)
             _events.emit(
                 MediaViewerEvent.ShowToast(
-                    if (saved) R.string.msg_image_saved_to_gallery else R.string.error_save_image
+                    when {
+                        !saved -> R.string.error_save_image
+                        sourceMissing -> R.string.msg_image_saved_lowres
+                        else -> R.string.msg_image_saved_to_gallery
+                    }
                 )
             )
         }
@@ -952,18 +1078,36 @@ class MediaViewerViewModel : ViewModel() {
 
         withContext(Dispatchers.IO) {
             // Try cache first, then fetch if needed
-            val videoBytes = MediaCache.getVideoBytes(key)
-                ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            val sourceMissing = item.sourceMissing || MediaCache.isFileMissing(key)
+            val videoBytes = if (sourceMissing) {
+                MediaCache.getLocalVideoBytes(key)
+            } else {
+                MediaCache.getVideoBytes(key)
+                    ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            }
 
             if (videoBytes == null) {
-                _events.emit(MediaViewerEvent.ShowToast(R.string.error_save_video))
+                _events.emit(
+                    MediaViewerEvent.ShowToast(
+                        if (sourceMissing) {
+                            R.string.msg_image_source_missing_no_cache
+                        } else {
+                            R.string.error_save_video
+                        }
+                    )
+                )
                 return@withContext
             }
 
             val saved = PhotoManager.saveVideoBytes(context, videoBytes)
             _events.emit(
                 MediaViewerEvent.ShowToast(
-                    if (saved) R.string.msg_video_saved_to_gallery else R.string.error_save_video
+                    when {
+                        !saved -> R.string.error_save_video
+                        // 视频缓存不是"低分辨率"：用视频专用文案，不能套图片的"低清版"
+                        sourceMissing -> R.string.msg_video_saved_lowres
+                        else -> R.string.msg_video_saved_to_gallery
+                    }
                 )
             )
         }
@@ -1064,9 +1208,13 @@ class MediaViewerViewModel : ViewModel() {
     private suspend fun shareImageFromServer(context: Context, item: MediaViewerItem) {
         val key = item.toCacheKey()
 
-        // Try cache first, then fetch if needed
-        val bitmap = MediaCache.getBitmap(key)
-            ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+        // 源已不存在：分享载荷只能用本机缓存，不发原图请求
+        val bitmap = if (item.sourceMissing) {
+            MediaCache.getLocalImage(key)
+        } else {
+            MediaCache.getBitmap(key)
+                ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+        }
 
         if (bitmap == null) {
             _events.emit(MediaViewerEvent.ShowToast(R.string.error_share_image))
@@ -1079,9 +1227,13 @@ class MediaViewerViewModel : ViewModel() {
     private suspend fun shareVideoFromServer(context: Context, item: MediaViewerItem) {
         val key = item.toCacheKey()
 
-        // Try cache first, then fetch if needed
-        val videoBytes = MediaCache.getVideoBytes(key)
-            ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+        // Try cache first, then fetch if needed（源已不存在时只用本机字节）
+        val videoBytes = if (item.sourceMissing) {
+            MediaCache.getLocalVideoBytes(key)
+        } else {
+            MediaCache.getVideoBytes(key)
+                ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+        }
 
         if (videoBytes == null) {
             _events.emit(MediaViewerEvent.ShowToast(R.string.error_share_video))

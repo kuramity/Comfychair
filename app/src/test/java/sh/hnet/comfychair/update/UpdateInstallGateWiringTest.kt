@@ -8,10 +8,14 @@ import java.io.File
 /**
  * 安装闸门接线契约（P0-7 及其复核 F1 / R2-L1）。
  *
- * 历史：装前包名/签名校验原先只在 [AppInstaller.install] 里做，而通知栏
+ * 历史：装前包名校验原先只在 [AppInstaller.install] 里做，而通知栏
  * 「更新已就绪」的 PendingIntent 自己 `buildInstallIntent`（FileProvider + ACTION_VIEW）
  * 直接拉起系统安装器 —— 同一份 APK 换个入口就绕过校验（F1）。
  * 补上通知侧校验后仍有 TOCTOU：URI 在发通知时就固定，文件到点击时才被读取（R2-L1）。
+ *
+ * 2026-11-20：装前校验从「包名 + 签名证书比对」瘦身为「仅包名」——读待装 APK 签名
+ * 是国产引擎的高分误报特征，且系统安装时会自己校验签名。这里同时钉住「签名读取
+ * 不得加回来」，防止回归。
  *
  * 现在两道入口共用一条链，这里用源码文本断言把它钉住：
  * 1. UpdateNotifier 不自己构造 FileProvider 安装 URI，安装意图指向 UpdateInstallActivity；
@@ -27,6 +31,16 @@ class UpdateInstallGateWiringTest {
             ?: error("找不到源文件 $relative，尝试过：${candidates.map { it.absolutePath }}")
         return file.readText()
     }
+
+    /**
+     * 去掉 Kotlin 注释后再断言。
+     *
+     * AppInstaller.kt 的 KDoc 里**正面提到** GET_SIGNING_CERTIFICATES / signingInfo
+     * 是为了记录"为什么删"，不能因此判定代码里还在用；所以只检查去注释后的代码。
+     */
+    private fun codeOnly(source: String): String =
+        source.replace(Regex("/\\*[\\s\\S]*?\\*/"), "")
+            .replace(Regex("//[^\\n]*"), "")
 
     private val notifierPath = "src/main/java/sh/hnet/comfychair/update/UpdateNotifier.kt"
     private val installerPath = "src/main/java/sh/hnet/comfychair/update/AppInstaller.kt"
@@ -73,6 +87,25 @@ class UpdateInstallGateWiringTest {
         assertTrue(
             "isApkTrusted 必须保持 internal（退回 private 会让通知侧无法复用同一实现）",
             body.contains("internal fun isApkTrusted(")
+        )
+    }
+
+    @Test
+    fun `装前校验只读包名，不读 APK 签名（国产引擎误报特征，勿加回）`() {
+        val code = codeOnly(readSource(installerPath))
+
+        assertFalse(
+            "AppInstaller 不得再请求签名证书：getPackageArchiveInfo + GET_SIGNING_CERTIFICATES " +
+                "是国产引擎的高分误报特征，且系统安装时会自己校验签名一致性",
+            code.contains("GET_SIGNING_CERTIFICATES") || code.contains("GET_SIGNATURES")
+        )
+        assertFalse(
+            "AppInstaller 不得再读取 signingInfo / 计算签名摘要（签名一致性由系统安装器保证）",
+            code.contains("signingInfo") || code.contains("MessageDigest")
+        )
+        assertTrue(
+            "包名比对必须保留（系统不拦包名不同的 APK）：getPackageArchiveInfo 仍要以仅取包名的 flags 调用",
+            code.contains("getPackageArchiveInfo(apk.absolutePath, 0)")
         )
     }
 

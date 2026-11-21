@@ -165,6 +165,17 @@ internal const val BORDER_ALPHA_LIGHT_DISABLED = 0.08f
 internal const val BORDER_ALPHA_DARK_DISABLED = 0.25f
 
 /**
+ * 忙碌态整体压暗系数（v4.16.14）：**忙碌 ≠ 禁用**。
+ *
+ * 忙碌（提交闸门在途 / 上传 / 取回 / 连接）时不换灰底、不拆皮肤，只把渐变与白边的
+ * alpha 乘本系数 —— 保留"正在和服务器传输"的降档观感，同时让已扩散的水波继续可见。
+ * 白边走启用档再乘系数（而不是直接掉到禁用档 0.10/0.08，否则点下生成瞬间白边会
+ * 忽然变淡一半）。点阵不乘：白点压在压暗的渐变上反而更清晰。
+ * internal 供单测钉住规格。
+ */
+internal const val BUSY_SKIN_DIM_ALPHA = 0.88f
+
+/**
  * 外辉光（基准 box-shadow 的 16px color-a 辉光项）：不用 BlurMaskFilter（硬件层会忽略），
  * 改用 3 层外扩描边模拟柔光 —— 外扩 2/4/6dp、alpha 逐层递减，深色主题更亮、浅色主题偏冷更淡。
  * 描边线宽 2dp：比白边粗一档，叠加后看起来是"晕"而不是"圈"。
@@ -243,8 +254,10 @@ internal fun shouldDrawTouchGlow(showDots: Boolean, showTouchGlow: Boolean): Boo
  * ## v5.x 皮肤（双色渐变 + 白边 + 外辉光）
  *
  * - [gradientColors] 非 null 时在本层**最底**画 shape 区域内的 135° 双色渐变。
- *   可见性靠调用方配合：enabled 时把 M3 按钮的 containerColor 设为 [Color.Transparent]，
- *   渐变从透明容器下露出来；disabled 时调用方传 null 且恢复默认容器色，特效整体归零。
+ *   可见性靠调用方配合：可点时把 M3 按钮的 containerColor 设为 [Color.Transparent]，
+ *   渐变从透明容器下露出来；**真禁用**时调用方传 null 且恢复默认容器色，特效整体归零。
+ *   v4.16.14：忙碌态是例外 —— 调用方把 disabledContainerColor 也设成透明，渐变照画
+ *   但整体乘 [BUSY_SKIN_DIM_ALPHA] 压暗（见 [busy]）。
  * - 白边/外辉光跟随主题自适应（surface 亮度判断深浅，每次重组重算、不缓存颜色），
  *   调色盘换 accent 后下一帧渐变与辉光立即跟随 —— 颜色一律不进 remember。
  * - 外辉光是画在控件边界之外的溢出绘制，依赖父链无 clip；若某容器把溢出裁掉了，
@@ -254,14 +267,22 @@ internal fun shouldDrawTouchGlow(showDots: Boolean, showTouchGlow: Boolean): Boo
  * @param shape 裁剪形状：波纹/点阵被裁进该形状，防止溢出圆角
  * @param enabled false 时皮肤**降级**而非整条关闭（v4.16.6 Q2）：渐变/辉光投影/点阵/
  *   按压回弹全部关闭，但保留一圈**降档白边**（约启用档一半 alpha）勾出禁用灰块的
- *   轮廓——深色底上半透明灰块没白边勾勒时边缘糊化，用户感知为"按钮形状变了"
+ *   轮廓——深色底上半透明灰块没白边勾勒时边缘糊化，用户感知为"按钮形状变了"。
+ *   这里描述的是**真禁用**（`enabled=false && busy=false`）；忙碌态见 [busy]
+ * @param busy 忙碌态（v4.16.14）：按钮暂时不可点，但仍处于"正在和服务器传输"的过程
+ *   （提交闸门在途 / 上传 / 取回 / 连接），**不是**"输入不合法"的真禁用。true 时渐变、
+ *   点阵、白边、投影/辉光**全部**继续绘制，整体只乘 [BUSY_SKIN_DIM_ALPHA] 压暗 ——
+ *   点「生成」瞬间已经扩散的水波与按钮轮廓都不会凭空消失。调用方必须传**本页自己的**
+ *   忙碌态（已剔除离线与别页提交），本层不做来源判断。
+ *   注意：忙碌只放宽**绘制**，**新波纹登记仍要求 enabled**（disabled 按钮按下去不能有
+ *   "点击被接收"的动画）。默认 false：所有既有调用点行为与改动前一致
  * @param skinEnabled 皮肤总开关（v4.16.10 N1-2.2）：false 时**整条不挂**（无渐变/白边/
  *   投影/辉光/点阵/按压缩放，回 v4.16.6 之前的 `return this` 零绘制行为）——与 [enabled]
  *   拆成两个独立信号：[enabled] 表达"按钮可不可点"（false = 画禁用降档白边），
  *   [skinEnabled] 表达"用户要不要皮肤"（false = 什么都不画）。原先两信号混用
  *   （`enabled = xxxEnabled && dotFeedbackEnabled`），用户关掉波纹点阵后可用按钮会
  *   误画禁用档白边（0.10 而非 0.22）。默认 true：不传的调用点（齿轮/顶栏图标）行为不变
- * @param gradientColors 双色渐变（null = 不画；disabled 态必须传 null）
+ * @param gradientColors 双色渐变（null = 不画；**真禁用**态必须传 null，忙碌态照传）
  * @param glowColor 外辉光/投影颜色（accent，跟随调色盘）
  * @param rippleColor 触点辉光颜色（触点处一小团实心柔光，随寿命淡出）
  * @param dotColor 点阵点颜色
@@ -285,6 +306,7 @@ fun Modifier.rippleFeedback(
     interactionSource: MutableInteractionSource? = null,
     shape: Shape = MaterialTheme.shapes.large,
     enabled: Boolean = true,
+    busy: Boolean = false,
     skinEnabled: Boolean = true,
     gradientColors: List<Color>? = null,
     glowColor: Color = MaterialTheme.colorScheme.primary,
@@ -308,10 +330,11 @@ fun Modifier.rippleFeedback(
     // `return this` 行为。这是"用户关掉波纹点阵"的语义：连禁用降档白边也不画 ——
     // 禁用降档（下一行注释）只服务"皮肤开着但按钮禁用"的组合。
     if (!skinEnabled) return this
-    // v4.16.6（Q2）：禁用不再整条 return —— 皮肤降级：白边保留但降档（禁用灰块轮廓可辨），
-    // 渐变/辉光投影/点阵/按压回弹仍然关闭。禁用按钮收不到 PressInteraction（clickable
-    // enabled=false），下面的 pressed 已按 enabled 门控 → scale 与白边增压恒为静置值，
-    // 即使调用方在禁用瞬间残留按压态也不会闪出回弹。
+    // v4.16.6（Q2）：真禁用（enabled=false 且 busy=false）不再整条 return —— 皮肤降级：
+    // 白边保留但降档（禁用灰块轮廓可辨），渐变/辉光投影/点阵/按压回弹仍然关闭。
+    // v4.16.14：忙碌态（enabled=false 但 busy=true）是另一条分支 —— 皮肤照画、整体压暗。
+    // 禁用按钮收不到 PressInteraction（clickable enabled=false），下面的 pressed 已按
+    // enabled 门控 → scale 与白边增压恒为静置值，即使调用方在禁用瞬间残留按压态也不会闪出回弹。
     val source = interactionSource ?: remember { MutableInteractionSource() }
     val sourcePressed by source.collectIsPressedAsState()
     val pressed = sourcePressed && enabled
@@ -339,6 +362,10 @@ fun Modifier.rippleFeedback(
         label = "rippleFeedbackBorderBoost",
     )
 
+    // v4.16.14：忙碌态整体压暗（只乘 alpha、不换色）：渐变 → 0.88、白边 → 0.88。
+    // 真禁用不乘（那时渐变/点阵本就不画，白边走禁用降档）。
+    val busyDim = if (busy) BUSY_SKIN_DIM_ALPHA else 1f
+
     // 深浅主题判断：按当前实际生效配色的**页面底色**（Scaffold 的 containerColor 取
     // background 槽位）亮度判定 —— 不用 isSystemInDarkTheme()（那只反映系统设置，
     // App 有独立主题模式，会不一致）。不 remember：换主题或换 accent 后重组时立即
@@ -353,7 +380,9 @@ fun Modifier.rippleFeedback(
     // Q2 禁用降档：白边是禁用态唯一保留的皮肤要素，alpha 换禁用档；忽略 override
     //（override 的三个场景——下拉打开提亮 32% / 回退 18% / 齿轮 18%——都只在启用态有意义，
     // 禁用按钮打不开菜单、齿轮恒启用，不存在"禁用还要 override"的调用点）
-    val borderAlpha = if (!enabled) {
+    // v4.16.14：忙碌态**不是**真禁用 —— 白边走启用档（override 照常生效），只由 busyDim
+    // 整体压暗。否则点下生成的瞬间白边会从 22% 突然掉到 10%，观感是"按钮闪了一下"。
+    val borderAlpha = if (!enabled && !busy) {
         if (isDarkScheme) {
             if (skinV2) BORDER_ALPHA_DARK_V2_DISABLED else BORDER_ALPHA_DARK_DISABLED
         } else {
@@ -371,9 +400,16 @@ fun Modifier.rippleFeedback(
     // 投影 alpha 同样深浅两套（U3：深色首层 0.22 发脏 → 0.16；浅色更轻）
     val shadowAlphas = if (isDarkScheme) SHADOW_ALPHAS_DARK else SHADOW_ALPHAS_LIGHT
 
-    // Q2：点阵禁用即关（禁用不该有点阵，与按压回弹同批关闭）——帧循环/绘制/波纹登记
-    // 三处以本开关为准，禁用时整条点阵链（协程 + 指针监听）都不挂
-    val dotsActive = showDots && enabled
+    // Q2：真禁用时点阵不画、不登记（禁用不该有点阵，与按压回弹同批关闭）。
+    // v4.16.14：把「继续绘制」与「登记新波纹」拆成两个门控 ——
+    // - dotsActive（帧循环/绘制）：enabled || busy，忙碌态继续推进已扩散的水波；
+    // - dotsRegister（pointerInput）：只认 enabled，disabled 按钮按下去不得再登记新波纹。
+    // 真禁用（!enabled && !busy）两者都关。判定收敛到纯函数，由 JVM 单测钉住。
+    val dotsActive = RippleSkinState.dotsVisible(showDots, enabled, busy)
+    // v4.16.14（复核 BUSY-01）：忙碌态只推进已扩散的波纹，disabled 按钮按下去不再登记
+    // 新波纹（否则整圈水波＋触点辉光会给出"点击被接收"的假反馈；submitGate 只防重复
+    // 提交，不是交互反馈）。登记仍严格要求 enabled。
+    val dotsRegister = RippleSkinState.dotsRegister(showDots, enabled)
 
     // 低端机只在组合时判定一次，决定点阵间距是否加倍
     val isLowRamDevice = remember(context) {
@@ -441,7 +477,9 @@ fun Modifier.rippleFeedback(
     }
 
     // 帧驱动：没有活跃波纹时挂在 snapshotFlow 上休眠，不空转烧帧；
-    // showDots=false（U1 收敛态）或禁用态（Q2）连这个协程都不挂 —— 无波纹来源，整条帧链没有存在意义
+    // showDots=false（U1 收敛态）或真禁用态（Q2）连这个协程都不挂 —— 无波纹来源，整条帧链没有存在意义。
+    // v4.16.14：忙碌态保留（dotsActive 由 RippleSkinState.dotsVisible 判定），
+    // 提交往返期间已扩散的波纹必须继续推进，否则点下生成后水波会"卡死在半路"。
     if (dotsActive) {
         LaunchedEffect(Unit) {
             while (true) {
@@ -483,13 +521,19 @@ fun Modifier.rippleFeedback(
             //    画在**最底层** —— 渐变与按钮本体盖住上层重叠区，只有按钮下缘露出的
             //    条带可见，叠出向下渐弱的投影感。画在控件边界之外的溢出绘制，依赖父链无 clip
             //    （与旧外辉光同机制；旧辉光 6dp 全向溢出已长期在线上正常绘制）。
-            // Q2：禁用态投影不画（皮肤降级只保留白边；渐变调用方传 null 时本就不画，
-            // 这里再按 enabled 门控一道，防御"禁用还传渐变"的调用点）
-            if (showHalo && haloDownward && enabled) {
+            // Q2：真禁用态投影不画（皮肤降级只保留白边；渐变调用方传 null 时本就不画，
+            // 这里再按 enabled 门控一道，防御"禁用还传渐变"的调用点）。
+            // v4.16.14（复核 BUSY-02）：忙碌态投影照画并乘 busyDim —— 否则点下生成的
+            // 瞬间渐变/白边/点阵都在、唯独按钮下方两层投影整个消失，仍是一次可见跳变。
+            if (showHalo && haloDownward && (enabled || busy)) {
                 shadowOutline?.let { outline ->
                     SHADOW_OFFSETS_DP.forEachIndexed { idx, offDp ->
                         translate(0f, offDp.dp.toPx()) {
-                            drawOutline(outline = outline, color = glowColor, alpha = shadowAlphas[idx])
+                            drawOutline(
+                                outline = outline,
+                                color = glowColor,
+                                alpha = shadowAlphas[idx] * busyDim,
+                            )
                         }
                     }
                 }
@@ -498,10 +542,18 @@ fun Modifier.rippleFeedback(
             // 0.5) 双色渐变底（v5.x）：画在 drawContent 之前、裁进 shape。
             //    可见性机制：enabled 时调用方把 M3 容器色设为透明，渐变从下层露出；
             //    不缓存 Brush —— 每帧从参数现取，accent 切换后下一帧立即换色。
+            //    v4.16.14：忙碌态（enabled=false 但 busy=true）同样要画 —— 调用方此时把
+            //    disabledContainerColor 也设成透明，渐变就是按钮唯一的底色；只是每个
+            //    色标的 alpha 乘 busyDim 做整体压暗（不换色，仍能一眼看出是同一套皮肤）。
             val colors = gradientColors
-            if (colors != null && colors.size >= 2 && enabled) {
+            if (colors != null && colors.size >= 2 && (enabled || busy)) {
+                val gradientColorsDimmed = if (busyDim == 1f) {
+                    colors
+                } else {
+                    colors.map { it.copy(alpha = it.alpha * busyDim) }
+                }
                 val gradient = Brush.linearGradient(
-                    colors = colors,
+                    colors = gradientColorsDimmed,
                     start = Offset.Zero,
                     end = Offset(size.width, size.height),
                 )
@@ -515,8 +567,9 @@ fun Modifier.rippleFeedback(
 
             // 2) 外辉光：3 层外扩描边模拟柔光，画在控件边界之外（父链无 clip 时可见）。
             //    静置常显（基准 box-shadow 本来就是静置属性，不是按压特效）。
-            //    v2 的向下投影已在第 0 层画过，这里只走旧环形辉光。Q2：禁用态不画。
-            if (showHalo && !haloDownward && enabled) {
+            //    v2 的向下投影已在第 0 层画过，这里只走旧环形辉光。Q2：真禁用态不画。
+            //    v4.16.14（复核 BUSY-02）：忙碌态照画并乘 busyDim（与投影同口径）。
+            if (showHalo && !haloDownward && (enabled || busy)) {
                 haloOutlines?.let { outlines ->
                     outlines.forEachIndexed { idx, outline ->
                         val expandPx = HALO_EXPAND_DP[idx].dp.toPx()
@@ -524,7 +577,7 @@ fun Modifier.rippleFeedback(
                             drawOutline(
                                 outline = outline,
                                 color = glowColor,
-                                alpha = haloAlphas[idx],
+                                alpha = haloAlphas[idx] * busyDim,
                                 style = Stroke(width = HALO_STROKE_DP.dp.toPx()),
                             )
                         }
@@ -533,15 +586,16 @@ fun Modifier.rippleFeedback(
             }
 
             // 3) 白边：贴内缘的细描边（旧版 1.5dp / v2 皮肤 1dp），**必须画在 drawContent 之后**
-            //    （渐变态下按钮容器透明，白边压在渐变上沿内缘一圈）。Q2：禁用态也画
+            //    （渐变态下按钮容器透明，白边压在渐变上沿内缘一圈）。Q2：**真禁用**态也画
             //    （alpha 走禁用降档档位）——这是禁用灰块唯一的轮廓来源。
+            //    v4.16.14：忙碌态走启用档再乘 busyDim（白边只轻微压暗，不会突然变淡）。
             if (showBorder && borderOutline != null) {
                 val insetPx = BORDER_INSET_DP.dp.toPx()
                 translate(insetPx, insetPx) {
                     drawOutline(
                         outline = borderOutline,
                         color = borderColor,
-                        alpha = (borderAlpha * borderBoost).coerceAtMost(1f),
+                        alpha = (borderAlpha * borderBoost * busyDim).coerceAtMost(1f),
                         style = Stroke(width = borderStrokeWidth.dp.toPx()),
                     )
                 }
@@ -549,7 +603,8 @@ fun Modifier.rippleFeedback(
 
             // 4) 触点辉光 + 点阵，全部裁进按钮形状，防止溢出圆角。
             //    涟漪完全由点阵的点亮 + 上凸体现；触点处保留一小团实心柔光（点，不是环）。
-            //    showDots=false 或禁用态（Q2）整层不画（U1 收敛：点阵只留在生成主按钮，其余按钮零残留）。
+            //    showDots=false 或真禁用态（Q2）整层不画（U1 收敛：点阵只留在生成主按钮，其余按钮零残留）。
+            //    v4.16.14：忙碌态继续画 —— 这是"点生成后水波消失"的直接修复点。
             if (dotsActive) {
                 clipPath(clipPath) {
                     val now = System.nanoTime() / NANOS_PER_SEC
@@ -597,9 +652,11 @@ fun Modifier.rippleFeedback(
             }
         }
         .then(
-            // 波纹登记只在点阵开着且启用时挂：showDots=false 或禁用态的按钮连 Press 观察都不做，
-            // 保证零波纹（不登记 → ripples 恒空 → 帧循环休眠、无残影可画）。
-            if (dotsActive) {
+            // 波纹登记只在点阵开着**且按钮可点**时挂（v4.16.14 复核 BUSY-01：忙碌态不登记新波纹）：
+            // showDots=false 或 disabled 的按钮连 Press 观察都不做，保证零新波纹
+            //（不登记 → ripples 恒空 → 帧循环休眠、无残影可画）。忙碌态已在寿命中的波纹
+            // 继续由帧循环与绘制层的 dotsActive 推进 —— 两件事，两个门控。
+            if (dotsRegister) {
                 Modifier.pointerInput(grid) {
                     // Initial pass 只观察不消费：Press 时以触点为圆心登记一道波纹
                     awaitPointerEventScope {

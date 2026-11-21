@@ -22,6 +22,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -30,6 +33,8 @@ import androidx.core.content.ContextCompat
 import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.update.AppInstaller
+import sh.hnet.comfychair.update.UpdateInfo
+import sh.hnet.comfychair.update.UpdateNetworkPolicy
 import sh.hnet.comfychair.update.UpdatePhase
 import sh.hnet.comfychair.update.UpdateRepository
 import sh.hnet.comfychair.update.UpdateState
@@ -72,6 +77,62 @@ fun UpdateDialog(
         }
     }
 
+    // R6：非 WiFi 下载前的确认目标。非空 = 正在等用户确认「就用移动网络下」。
+    var cellularConfirmFor by remember { mutableStateOf<UpdateInfo?>(null) }
+
+    // 真正开始一次下载（唯一入队入口，R2：只有用户点按钮才会走到这里）
+    fun startDownloadNow(info: UpdateInfo) {
+        requestNotificationPermissionIfNeeded()
+        UpdateRepository.startDownload(context, info)
+    }
+
+    /**
+     * R6：点「下载更新」后的网络闸门。
+     * WiFi / 非计费网络 → 直接开始；移动网络 → 先弹一次确认（正文带体积），
+     * 用户点「继续」才下载，取消则什么都不做。
+     */
+    fun requestDownload(info: UpdateInfo) {
+        val type = UpdateNetworkPolicy.currentType(context)
+        if (UpdateNetworkPolicy.canStartDownload(type, userConfirmed = false)) {
+            startDownloadNow(info)
+        } else {
+            cellularConfirmFor = info
+        }
+    }
+
+    // 非 WiFi 确认框（R6）：只有用户明确点「继续」才真正开始下载
+    cellularConfirmFor?.let { confirmInfo ->
+        AlertDialog(
+            onDismissRequest = { cellularConfirmFor = null },
+            title = { Text(stringResource(R.string.update_cellular_confirm_title)) },
+            text = {
+                Text(
+                    if (confirmInfo.apkSize > 0) {
+                        stringResource(
+                            R.string.update_cellular_confirm_message,
+                            formatBytes(confirmInfo.apkSize)
+                        )
+                    } else {
+                        stringResource(R.string.update_cellular_confirm_message_unknown)
+                    }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        cellularConfirmFor = null
+                        startDownloadNow(confirmInfo)
+                    }
+                ) { Text(stringResource(R.string.update_action_continue)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { cellularConfirmFor = null }) {
+                    Text(stringResource(R.string.update_action_cancel))
+                }
+            }
+        )
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss, // 硬性约束 11：只隐藏，不取消任何东西
         title = { Text(stringResource(R.string.update_dialog_title)) },
@@ -79,10 +140,7 @@ fun UpdateDialog(
         confirmButton = {
             when (state.phase) {
                 UpdatePhase.AVAILABLE -> TextButton(
-                    onClick = {
-                        requestNotificationPermissionIfNeeded()
-                        pending?.let { UpdateRepository.startDownload(context, it) }
-                    }
+                    onClick = { pending?.let { requestDownload(it) } }
                 ) { Text(stringResource(R.string.update_action_now)) }
 
                 UpdatePhase.READY_TO_INSTALL -> TextButton(
@@ -96,10 +154,7 @@ fun UpdateDialog(
                 ) { Text(stringResource(R.string.update_action_install)) }
 
                 UpdatePhase.FAILED -> TextButton(
-                    onClick = {
-                        requestNotificationPermissionIfNeeded()
-                        pending?.let { UpdateRepository.startDownload(context, it) }
-                    }
+                    onClick = { pending?.let { requestDownload(it) } }
                 ) { Text(stringResource(R.string.update_action_retry)) }
 
                 else -> Unit

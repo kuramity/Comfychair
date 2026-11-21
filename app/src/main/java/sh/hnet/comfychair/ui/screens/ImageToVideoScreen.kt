@@ -10,8 +10,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +25,7 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
@@ -83,7 +82,6 @@ import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.ui.components.GenerationButton
 import sh.hnet.comfychair.ui.components.GenerationProgressBar
 import sh.hnet.comfychair.ui.components.ImageSlotArea
-import sh.hnet.comfychair.ui.components.TimelineClipArea
 import sh.hnet.comfychair.ui.components.PromptLibraryDialog
 import sh.hnet.comfychair.ui.components.PromptPresetDialog
 import sh.hnet.comfychair.ui.components.shared.previewSurfaceBackground
@@ -128,6 +126,8 @@ fun ImageToVideoScreen(
     // P1-4：提交在途（闸门持有中）。并入按钮 enabled 条件，连点时按钮本身即禁用，
     // 不再依赖 ViewModel 层静默丢弃来兜底。
     val isSubmitting by generationViewModel.isSubmitting.collectAsStateWithLifecycle()
+    // v4.16.14（复核 BUSY-03）：提交闸门是四页共享的，忙碌皮肤只属于提交方本页
+    val submitOwner by generationViewModel.submitOwnerId.collectAsStateWithLifecycle()
 
     // Check if THIS screen owns the currently executing job (for progress bar)
     val isThisScreenExecuting = queueState.executingOwnerId == ImageToVideoViewModel.OWNER_ID
@@ -287,10 +287,10 @@ fun ImageToVideoScreen(
                     threeDResult = null,
                     hasResult = videoUri != null,
                     isEditing = uiState.viewMode != ImageToVideoViewMode.PREVIEW,
-                    // 导演台流不显示加图：那条流没有任何图片输入口，
-                    // 选了图会被上传到服务器却无处注入 —— 用户以为照片是参考素材，实际零效果
-                    onUploadImage = if (!uiState.isTimelineWorkflow) {
-                        ({ imagePickerLauncher.launch("image/*") })
+                    // 旧版时间线导演台流（legacyTimelineUnsupported）没有图位可注入，隐藏加图入口
+                    // （UX-UPLOAD-01：警告条已显示、生成已禁用，加图按钮再留着只会让用户传一张无处注入的图）
+                    onUploadImage = if (!uiState.legacyTimelineUnsupported) {
+                        { imagePickerLauncher.launch("image/*") }
                     } else null,
                     // 产物 URI 非空才执行（按钮仅在 hasResult 且非编辑态时可点，恒定传回调不改变原行为）
                     onSave = {
@@ -385,32 +385,7 @@ fun ImageToVideoScreen(
                 ) {
                     when (uiState.viewMode) {
                         ImageToVideoViewMode.SOURCE -> {
-                            if (uiState.isTimelineWorkflow) {
-                                // 时间线导演台：这一整块换成片段编辑器。
-                                // 导演台流的素材全在 timeline_data 里，没有图位也没有音频槽，
-                                // 所以下面那两个分支在它身上永远不会命中。
-                                TimelineClipArea(
-                                    clips = uiState.timelineClips,
-                                    selectionStart = uiState.timelineSelectionStart,
-                                    selectionDuration = uiState.timelineSelectionDuration,
-                                    gaps = uiState.timelineGaps,
-                                    coveredSeconds = uiState.timelineCoveredSeconds,
-                                    canAdd = uiState.canAddTimelineClip,
-                                    loadedFromWorkflow = uiState.timelineLoadedFromWorkflow,
-                                    onAddClip = imageToVideoViewModel::addTimelineClip,
-                                    onClipStartChange = imageToVideoViewModel::setTimelineClipStart,
-                                    onClipDurationChange = imageToVideoViewModel::setTimelineClipDuration,
-                                    onClipTrimStartChange = imageToVideoViewModel::setTimelineClipTrimStart,
-                                    onClipReferenceModeChange = imageToVideoViewModel::setTimelineClipReferenceMode,
-                                    onRemoveClip = imageToVideoViewModel::removeTimelineClip,
-                                    onSelectionChange = imageToVideoViewModel::setTimelineSelection,
-                                    onUseGap = imageToVideoViewModel::selectTimelineGap,
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .verticalScroll(rememberScrollState())
-                                        .padding(8.dp)
-                                )
-                            } else if (usesImageSlots) {
+                            if (usesImageSlots) {
                                 Column(modifier = Modifier.fillMaxSize()) {
                                     // 图位区：单图位按整块渲染，多图位分格，多于 4 张可纵向滚动。
                                     // slots 用实时列表（可能被删到空），删空时图位区只剩「+ 添加」入口。
@@ -535,6 +510,30 @@ fun ImageToVideoScreen(
             }
         }
 
+        // 旧版「时间线导演台」工作流：功能已移除，明确告知，别让用户等一次必然失败的提交。
+        // 样式与配置面板的 IssueRow（警告图标 + 错误色 bodySmall）保持一致，不另造组件。
+        if (uiState.legacyTimelineUnsupported) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .padding(top = 8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = stringResource(R.string.msg_timeline_director_removed),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+
         // Prompt Input — expands to fill screen above keyboard when focused
         OutlinedTextField(
             value = uiState.positivePrompt,
@@ -602,6 +601,8 @@ fun ImageToVideoScreen(
                 uploadProgress = uiState.uploadProgress,
                 isFetching = uiState.isFetching,
                 isConnecting = isConnecting,
+                // v4.16.14：本页自己的提交才算忙碌态（别页提交时本页仍按真禁用灰底）
+                isSubmitting = isSubmitting && submitOwner == ImageToVideoViewModel.OWNER_ID,
                 onGenerate = {
                     scope.launch {
                         val workflowJson = imageToVideoViewModel.prepareWorkflow()

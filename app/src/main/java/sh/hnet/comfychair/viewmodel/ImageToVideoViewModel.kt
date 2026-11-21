@@ -25,36 +25,20 @@ import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.AudioSlot
 import sh.hnet.comfychair.model.ImageSlot
 import sh.hnet.comfychair.model.LoraSelection
+import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.SeedMode
-import sh.hnet.comfychair.model.nextSeed
 import sh.hnet.comfychair.model.NUMBERED_SLOT_PLACEHOLDER_PREFIX
 import sh.hnet.comfychair.model.NumberedSlotContainer
-import sh.hnet.comfychair.model.MAX_TIMELINE_CLIPS
-import sh.hnet.comfychair.model.TimelineClip
-import sh.hnet.comfychair.model.TimelineClipDraft
-import sh.hnet.comfychair.model.TimelineDocument
-import sh.hnet.comfychair.model.TimelineReferenceMode
-import sh.hnet.comfychair.model.UncoveredInterval
 import sh.hnet.comfychair.model.VideoOptions
 import sh.hnet.comfychair.model.WorkflowCapabilities
 import sh.hnet.comfychair.model.audioContainerOf
-import sh.hnet.comfychair.model.coveredSeconds
 import sh.hnet.comfychair.model.hasRoomForAudioSlot
 import sh.hnet.comfychair.model.hasRoomForNumberedSlot
 import sh.hnet.comfychair.model.nextAudioSlot
-import sh.hnet.comfychair.model.nextClipStart
 import sh.hnet.comfychair.model.nextNumberedSlot
 import sh.hnet.comfychair.model.numberedContainerOf
-import sh.hnet.comfychair.model.toDraft
-import sh.hnet.comfychair.model.uncoveredIntervals
 import sh.hnet.comfychair.model.withAudioSlotAdded
-import sh.hnet.comfychair.model.withClipRemoved
-import sh.hnet.comfychair.model.withClipUpdated
 import sh.hnet.comfychair.model.withSlotAdded
-import sh.hnet.comfychair.workflow.TimelineSlotDetector
-import sh.hnet.comfychair.workflow.WorkflowConstraintsProvider
-import sh.hnet.comfychair.model.contract.CommonGenerationState
-import sh.hnet.comfychair.model.WorkflowValues
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.taglibrary.state.PromptBridge
 import sh.hnet.comfychair.taglibrary.state.PromptTargetFactory
@@ -72,6 +56,9 @@ import sh.hnet.comfychair.workflow.AudioSlotDetector
 import sh.hnet.comfychair.workflow.ImageSlotDetector
 import sh.hnet.comfychair.workflow.dynamic.DynamicParam
 import sh.hnet.comfychair.viewmodel.base.BaseGenerationViewModel
+import sh.hnet.comfychair.viewmodel.base.PlayingVideoRegistry
+import sh.hnet.comfychair.viewmodel.base.VideoGenerationState
+import sh.hnet.comfychair.viewmodel.base.VideoGenerationSupport
 
 /**
  * UI state for the view mode toggle
@@ -128,27 +115,19 @@ data class ImageToVideoUiState(
     val numberedAudioContainer: NumberedSlotContainer? = null,
 
     /**
-     * 时间线导演台的探测结果；非 null 表示当前工作流是导演台流。
+     * 当前工作流是旧版「时间线导演台」流（带 `MiniMaxH3TimelineDirector` 节点）。
      *
-     * 与图位/音频槽一样是**检测阶段的持久事实**，不随用户增删片段改变 ——
-     * 片段被删光时界面仍要显示编辑区（否则再也加不回来）。
+     * 该功能已整体移除：这类工作流的 `timeline_data` 输入不再有人维护，若按普通图生视频
+     * 路径提交，服务器只会回一个看不懂的 400。加载时记下这个事实，界面给出明确提示并禁用生成。
      */
-    val timelineSlot: TimelineSlotDetector.TimelineSlot? = null,
-    /** 用户正在编辑的片段列表（含还没上传的本地文件） */
-    val timelineClips: List<TimelineClipDraft> = emptyList(),
-    /** 生成选区起点（秒） */
-    val timelineSelectionStart: Double = 0.0,
-    /** 生成选区长度（秒）—— 与节点的 `generation_seconds` 同源 */
-    val timelineSelectionDuration: Double = 5.0,
-    /** 电脑端已有时间线带过来的片段（只在加载的那一次为 true，用来给一句提示） */
-    val timelineLoadedFromWorkflow: Boolean = false,
+    val legacyTimelineUnsupported: Boolean = false,
 
     val previewBitmap: Bitmap? = null,
     val currentVideoUri: android.net.Uri? = null,
 
     // Workflow selection
-    val selectedWorkflow: String = "",
-    val selectedWorkflowId: String = "",  // Workflow ID for storage
+    override val selectedWorkflow: String = "",
+    override val selectedWorkflowId: String = "",  // Workflow ID for storage
     val availableWorkflows: List<ItvWorkflowItem> = emptyList(),
 
     // Workflow placeholders - detected from {{placeholder}} patterns in workflow JSON
@@ -156,22 +135,22 @@ data class ImageToVideoUiState(
 
     // 动态节点参数（通用节点参数引擎）：工作流里「未识别」的 {{占位符}}。
     // dynamicParams 是控件清单（UI 依 control 渲染），dynamicParamValues 是用户当前值（按占位符名索引）。
-    val dynamicParams: List<DynamicParam> = emptyList(),
-    val dynamicParamValues: Map<String, String> = emptyMap(),
+    override val dynamicParams: List<DynamicParam> = emptyList(),
+    override val dynamicParamValues: Map<String, String> = emptyMap(),
     // 推导 dynamicParams 时 /object_info 注册表是否已就绪（与 dynamicParams 同一次快照，UI 提示条用）
-    val dynamicParamsRegistryReady: Boolean = false,
+    override val dynamicParamsRegistryReady: Boolean = false,
 
     // Model selections - single-model patterns (e.g., LTX 2.0)
     override val selectedCheckpoint: String = "",
     override val selectedUnet: String = "",
     override val selectedLoraName: String = "",  // Mandatory LoRA dropdown
     /** 主 LoRA 权重（{{lora_strength}}）：只有工作流带该占位符时配置面板才显示滑块 */
-    val loraStrength: Float = 1.0f,
+    override val loraStrength: Float = 1.0f,
     // Model selections - dual-model patterns (e.g., Wan 2.2)
-    val selectedHighnoiseUnet: String = "",
-    val selectedLownoiseUnet: String = "",
-    val selectedHighnoiseLora: String = "",
-    val selectedLownoiseLora: String = "",
+    override val selectedHighnoiseUnet: String = "",
+    override val selectedLownoiseUnet: String = "",
+    override val selectedHighnoiseLora: String = "",
+    override val selectedLownoiseLora: String = "",
     // Model selections - common
     override val selectedVae: String = "",
     override val selectedClip: String = "",
@@ -211,11 +190,11 @@ data class ImageToVideoUiState(
     override val filteredLatentUpscaleModels: List<String>? = null,
 
     // Generation parameters
-    val width: String = "848",
-    val height: String = "480",
+    override val width: String = "848",
+    override val height: String = "480",
     override val megapixels: String = "1.0",
-    val length: String = "33",
-    val fps: String = "16",
+    override val length: String = "33",
+    override val fps: String = "16",
     override val steps: String = "20",
     override val cfg: String = "7.0",
     override val sampler: String = "euler",
@@ -249,7 +228,7 @@ data class ImageToVideoUiState(
     val positivePrompt: String = "",
 
     // Negative prompt (per-workflow)
-    val negativePrompt: String = "",
+    override val negativePrompt: String = "",
 
     // Deferred model selections (for restoring after models load)
     // Single-model patterns
@@ -272,8 +251,8 @@ data class ImageToVideoUiState(
     val deferredLatentUpscaleModel: String? = null,
 
     // Additional LoRA chains (optional, 0-5 LoRAs on top of mandatory LightX2V LoRAs)
-    val highnoiseLoraChain: List<LoraSelection> = emptyList(),
-    val lownoiseLoraChain: List<LoraSelection> = emptyList(),
+    override val highnoiseLoraChain: List<LoraSelection> = emptyList(),
+    override val lownoiseLoraChain: List<LoraSelection> = emptyList(),
 
     // Primary LoRA chain (for CommonGenerationState interface - video screens use dual chains)
     override val loraChain: List<LoraSelection> = emptyList(),
@@ -286,7 +265,7 @@ data class ImageToVideoUiState(
     /** 上传进度 0–100（-1 = 当前没有上传）；v4.6.1 模块 D */
     val uploadProgress: Int = -1,
     val isFetching: Boolean = false
-) : CommonGenerationState {
+) : VideoGenerationState {
 
     /**
      * 界面是否显示「+ 添加」。判据只看"工作流有没有乙类容器"这个持久事实，
@@ -325,55 +304,6 @@ data class ImageToVideoUiState(
      */
     val usesAudioSlots: Boolean
         get() = audioSlots.isNotEmpty() || numberedAudioContainer != null
-
-    /** 当前工作流是不是时间线导演台流（决定界面显示片段编辑器、以及放开「必须有一张图」） */
-    val isTimelineWorkflow: Boolean
-        get() = timelineSlot != null
-
-    /** 还能不能再加一个片段 */
-    val canAddTimelineClip: Boolean
-        get() = timelineClips.size < MAX_TIMELINE_CLIPS
-
-    /**
-     * 选区的结束时刻（秒）。片段默认落点与空隙提示都以它为参照。
-     */
-    val timelineSelectionEnd: Double
-        get() = timelineSelectionStart + timelineSelectionDuration
-
-    /**
-     * 片段列表的「要发给插件的形态」。
-     *
-     * 间隙读数与提交都走这一个入口（文件名此时还没上传，用空串占位——时长计算不依赖它），
-     * 避免"界面按一种口径算、提交按另一种口径算"这种对不上账的缺陷。
-     */
-    val timelineClipsAsTimeline: List<TimelineClip>
-        get() = timelineClips.map { it.toClip(it.uploadedFile.orEmpty()) }
-
-    /**
-     * 选区内**被原画面固定**的秒数。
-     *
-     * 这是导演台最该让用户看见的读数：只有没被固定的那部分才是模型真正要"想"出来的内容，
-     * 自由生成长度太短意味着模型几乎没有发挥空间（画面会贴着原片段走）。
-     */
-    val timelineCoveredSeconds: Double
-        get() = coveredSeconds(
-            selectionStart = timelineSelectionStart,
-            selectionDuration = timelineSelectionDuration,
-            clips = timelineClipsAsTimeline
-        )
-
-    /**
-     * 选区内没有被任何片段覆盖的空隙，升序（界面据此列出"可生成的空隙"）。
-     *
-     * 比一帧还窄的空隙被滤掉：插件按 1/24 秒的容差判定"是不是空隙"，而生成时长的下界是
-     * 5 帧 —— 列出来也点不出可用结果（点了会被夹到 5 帧，反而伸进两边的片段里）。
-     */
-    val timelineGaps: List<UncoveredInterval>
-        get() = uncoveredIntervals(
-            selectionStart = timelineSelectionStart,
-            selectionDuration = timelineSelectionDuration,
-            clips = timelineClipsAsTimeline
-        ).filter { it.duration >= TimelineDocument.MIN_SELECTION_SECONDS }
 }
 
 /**
@@ -405,6 +335,28 @@ internal fun imageSlotFilesForInjection(
     state: ImageToVideoUiState,
     uploadedByPlaceholder: Map<String, String>
 ): Map<String, String> = if (state.usesImageSlots) uploadedByPlaceholder else emptyMap()
+
+/**
+ * 旧版「时间线导演台」工作流判定：功能已移除，加载时给出明确提示，避免提交后看不懂的 400。
+ *
+ * 判据是工作流里有没有 `MiniMaxH3TimelineDirector` 节点 —— 那是那条插件链唯一的入口节点。
+ * 独立实现而不复用已删除的检测器：这里只需要一个"是不是这类流"的布尔判断，不读任何内容。
+ *
+ * 格式兼容 `WorkflowParser` 的两种结构：app 自定义格式（`{"nodes": {...}}` 包一层）与
+ * 标准 ComfyUI API 格式（节点直接挂在根对象上）。裸 API 格式漏判会让旧时间线副本
+ * 绕过友好提示、提交后撞看不懂的 400（LEGACY-FORMAT-01）。
+ * 节点表判据取 `class_type`：根对象上的 LiteGraph 元数据（`last_node_id` 等标量）不是
+ * JSONObject 自然跳过；LiteGraph 格式的 `nodes` 是数组（节点用 `type` 而非 `class_type`），
+ * 也不会命中，保持返回 false。
+ */
+internal fun isLegacyTimelineWorkflow(workflowJson: JSONObject): Boolean {
+    val nodes = workflowJson.optJSONObject("nodes") ?: workflowJson
+    for (nodeId in nodes.keys()) {
+        val node = nodes.optJSONObject(nodeId) ?: continue
+        if (node.optString("class_type") == "MiniMaxH3TimelineDirector") return true
+    }
+    return false
+}
 
 /**
  * 顶部上传入口该写进哪个图位：**第一个空图位** → 否则第一个图位 → 都没有时新建一个（乙类最小编号）。
@@ -443,32 +395,18 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
 
     override val initialState = ImageToVideoUiState()
 
+    /** 本页在 GenerationViewModel 里的注册键（基类 stopListening 用） */
+    override val generationOwnerId = OWNER_ID
+
     /**
-     * 当前正在播放的视频键（5.2）：拿到 URI 时登记、切走 / 清空时注销。
-     *
-     * 磁盘优先模式下 [MediaStateHolder.getVideoUri] 返回的就是 filesDir 里那个文件，
-     * 只靠「每类最近一次 prompt」保护不住它 —— 用户再生成一个视频，旧 promptId 立刻被顶掉，
-     * 正在播放的文件就可能被磁盘裁剪删掉。登记后裁剪会整组跳过（见 trimVideoFiles）。
+     * 当前正在播放的视频键（5.2）登记器：拿到 URI 时登记、切走 / 清空时注销。
+     * 语义见 [PlayingVideoRegistry]（与原先本类的字段 + 两个私有方法完全一致）。
      */
-    private var playingVideoKey: MediaStateHolder.MediaKey? = null
-
-    /** 登记「这个视频正在播放」；同一键重复调用不会重复登记。 */
-    private fun markPlayingVideo(key: MediaStateHolder.MediaKey) {
-        if (playingVideoKey == key) return
-        playingVideoKey?.let { MediaStateHolder.unregisterPlayingVideo(it) }
-        playingVideoKey = key
-        MediaStateHolder.registerPlayingVideo(key)
-    }
-
-    /** 注销当前播放登记（播放已切走 / 清空）。 */
-    private fun clearPlayingVideo() {
-        playingVideoKey?.let { MediaStateHolder.unregisterPlayingVideo(it) }
-        playingVideoKey = null
-    }
+    private val playingVideo = PlayingVideoRegistry()
 
     override fun onCleared() {
         super.onCleared()
-        clearPlayingVideo()
+        playingVideo.clear()
         // P2-20：注销标签库桥接，静态 map 不再钉住已销毁的 ViewModel
         PromptBridge.unregister(OWNER_ID)
     }
@@ -507,18 +445,6 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
 
         /** 编号图位占位符前缀，编号紧跟其后（如 reference_image_1） */
         private const val PLACEHOLDER_REFERENCE_PREFIX = NUMBERED_SLOT_PLACEHOLDER_PREFIX
-
-        /**
-         * 时间线导演台的默认生成长度（秒）。
-         *
-         * 取 5 与桌面插件的默认一致（`emptyState()` 里的 `duration: 5`）：手机上不动这一项，
-         * 生成出来的时长就与在电脑上打开这条流时一样。
-         */
-        const val DEFAULT_TIMELINE_SELECTION_SECONDS = 5.0
-
-        /** 片段 id：只要求本机内唯一，插件不解释它的内容 */
-        fun newTimelineClipId(): String =
-            "clip_" + java.util.UUID.randomUUID().toString().replace("-", "").take(12)
     }
 
     init {
@@ -672,7 +598,7 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
             if (uri != null) {
                 _uiState.value = _uiState.value.copy(currentVideoUri = uri)
                 // 播放方登记（5.2）：裁剪不要删掉这个文件（磁盘优先模式下 URI 就指向它）
-                markPlayingVideo(key)
+                playingVideo.mark(key)
             }
         }
     }
@@ -695,7 +621,6 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
 
         val sortedWorkflows = unifiedWorkflows.sortedBy { it.displayName }
         val currentSelection = _uiState.value.selectedWorkflow
-        val previousWorkflowId = _uiState.value.selectedWorkflowId
         val selectedWorkflowItem = if (currentSelection.isEmpty())
             sortedWorkflows.firstOrNull()
         else
@@ -710,26 +635,14 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         // Reload workflow values to refresh capability flags from WorkflowDefaults
         // This is important after backup restore when workflowsVersion triggers this function
         if (selectedWorkflowItem != null) {
-            // 还是同一条工作流时保留时间线片段：workflowsVersion 会因为"去工作流管理里改个
-            // 名字/导入导出"而触发一次这里，那种情况下用户摆好的时间线不该被重置。
-            // 真换了工作流则不保留 —— 片段属于那条流的 timeline_data。
-            loadWorkflowValues(
-                selectedWorkflowItem,
-                preserveTimelineEdits = selectedWorkflowItem.id == previousWorkflowId
-            )
+            loadWorkflowValues(selectedWorkflowItem)
         }
     }
 
     /**
      * Load workflow values without triggering save (used during initialization and workflow changes)
-     *
-     * @param preserveTimelineEdits 还是同一条工作流（列表刷新、元数据编辑触发的重载）时置 true：
-     *   保留用户已经摆好的时间线片段与生成范围。false 表示真的换了工作流，时间线按新工作流重算。
      */
-    private fun loadWorkflowValues(
-        workflowItem: ItvWorkflowItem,
-        preserveTimelineEdits: Boolean = false
-    ) {
+    private fun loadWorkflowValues(workflowItem: ItvWorkflowItem) {
         val storage = workflowValuesStorage ?: return
         val serverId = ConnectionManager.currentServerId ?: return
 
@@ -760,11 +673,10 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
             AudioSlotDetector.detect(root = it, objectInfo = null)
         }.orEmpty()
 
-        // 时间线导演台：识别到就说明这是导演台流，界面换成片段编辑器。
-        // 节点里已有的 timeline_data 一并读出来当初值 —— 用户在电脑上摆好的时间线
-        // 在手机上打开就能看见，不用重摆一遍
-        val timelineSlot = slotsRoot?.let { TimelineSlotDetector.detect(it) }
-        val keepTimeline = preserveTimelineEdits && timelineSlot != null
+        // 旧版「时间线导演台」工作流：该功能已整体移除，这里把"这条流不能用"的事实
+        // 记进状态，界面据此提示并禁用生成 —— 否则它会走普通图生视频路径，
+        // 提交时因为 timeline_data 没人维护只拿到一句看不懂的 400
+        val legacyTimelineUnsupported = slotsRoot?.let { isLegacyTimelineWorkflow(it) } == true
 
         // 动态节点参数（通用节点参数引擎）：扫描 + 类型推导，并按
         // 「已有保存值 → defaults.<占位符名> → 节点定义的 default → 空」取值
@@ -899,20 +811,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
             // ViewModel 还活着；只有进程结束才需要重新选一次。
             slotAudioFiles = emptyMap(),
             numberedAudioContainer = audioContainerOf(audioSlots),
-            // 时间线导演台：同样随新工作流重算，不沿用上一个工作流的片段
-            // （沿用会让新工作流的 timeline_data 里塞进另一条流的视频）。
-            // 例外是"同一条工作流被重新加载"（preserveTimelineEdits），那时保留用户已摆好的内容。
-            // 必须同时确认新工作流也是导演台流，否则会留下一个永远显示不出来的片段列表
-            timelineSlot = timelineSlot,
-            timelineClips = if (keepTimeline) state.timelineClips
-                else timelineSlot?.document?.clips?.map { it.toDraft() }.orEmpty(),
-            timelineSelectionStart = if (keepTimeline) state.timelineSelectionStart
-                else timelineSlot?.document?.selectionStart ?: 0.0,
-            timelineSelectionDuration = if (keepTimeline) state.timelineSelectionDuration
-                else timelineSlot?.document?.selectionDuration
-                    ?: DEFAULT_TIMELINE_SELECTION_SECONDS,
-            timelineLoadedFromWorkflow = if (keepTimeline) state.timelineLoadedFromWorkflow
-                else timelineSlot?.hasInitialClips == true,
+            // 旧版「时间线导演台」判定同样随新工作流重算：不沿用上一个工作流的结论
+            legacyTimelineUnsupported = legacyTimelineUnsupported,
             // Workflow capabilities from placeholders
             capabilities = WorkflowCapabilities.fromPlaceholders(
                 placeholders = placeholders,
@@ -961,50 +861,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
 
         // Load existing values to preserve nodeAttributeEdits from Workflow Editor
         val existingValues = storage.loadValues(serverId, workflowId)
-
         // Use workflow ID as storage key (UUID-based)
-        val values = WorkflowValues(
-            width = state.width.toIntOrNull(),
-            height = state.height.toIntOrNull(),
-            length = state.length.toIntOrNull(),
-            frameRate = state.fps.toIntOrNull(),
-            // 步数 / 主 LoRA 权重按工作流持久化（否则切工作流就丢回缺省）
-            steps = state.steps.toIntOrNull(),
-            loraStrength = state.loraStrength,
-            // 百万像素 / 宽高比 / 加速模式按工作流持久化
-            megapixels = state.megapixels.toFloatOrNull(),
-            aspectRatio = state.aspectRatio.takeIf { it.isNotEmpty() },
-            speedMode = state.speedMode.takeIf { it.isNotEmpty() },
-            // 种子手动控制：与文生图一样按工作流持久化
-            seed = state.seed.toLongOrNull(),
-            randomSeed = state.randomSeed,
-            // 新键（四态取值方式）；老版本读上面那个布尔
-            seedMode = state.seedMode.name,
-            negativePrompt = state.negativePrompt.takeIf { it.isNotEmpty() },
-            // Single-model patterns
-            model = state.selectedCheckpoint.takeIf { it.isNotEmpty() },
-            unetModel = state.selectedUnet.takeIf { it.isNotEmpty() },
-            loraModel = state.selectedLoraName.takeIf { it.isNotEmpty() },
-            // Dual-model patterns
-            highnoiseUnetModel = state.selectedHighnoiseUnet.takeIf { it.isNotEmpty() },
-            lownoiseUnetModel = state.selectedLownoiseUnet.takeIf { it.isNotEmpty() },
-            highnoiseLoraModel = state.selectedHighnoiseLora.takeIf { it.isNotEmpty() },
-            lownoiseLoraModel = state.selectedLownoiseLora.takeIf { it.isNotEmpty() },
-            // Common models
-            vaeModel = state.selectedVae.takeIf { it.isNotEmpty() },
-            clipModel = state.selectedClip.takeIf { it.isNotEmpty() },
-            clip1Model = state.selectedClip1.takeIf { it.isNotEmpty() },
-            clip2Model = state.selectedClip2.takeIf { it.isNotEmpty() },
-            clip3Model = state.selectedClip3.takeIf { it.isNotEmpty() },
-            clip4Model = state.selectedClip4.takeIf { it.isNotEmpty() },
-            textEncoderModel = state.selectedTextEncoder.takeIf { it.isNotEmpty() },
-            latentUpscaleModel = state.selectedLatentUpscaleModel.takeIf { it.isNotEmpty() },
-            highnoiseLoraChain = LoraSelection.toJsonString(state.highnoiseLoraChain).takeIf { state.highnoiseLoraChain.isNotEmpty() },
-            lownoiseLoraChain = LoraSelection.toJsonString(state.lownoiseLoraChain).takeIf { state.lownoiseLoraChain.isNotEmpty() },
-            nodeAttributeEdits = existingValues?.nodeAttributeEdits,
-            // 动态节点参数（通用节点参数引擎）
-            dynamicParams = state.dynamicParamValues
-        )
+        val values = VideoGenerationSupport.buildWorkflowValues(state, existingValues)
 
         storage.saveValues(serverId, workflowId, values)
     }
@@ -1195,168 +1053,6 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         }.getOrNull()?.takeIf { it.isNotBlank() } ?: fallback
     }
 
-    // ---------- 时间线导演台 ----------
-
-    /**
-     * 给时间线添一段视频（手机本地文件）。
-     *
-     * 选完文件**立刻**读时长与音轨：这两个值决定片段能摆多长、会不会带原声参考，
-     * 界面上的三个数字框都依赖它们。读不出来就直接拒绝 —— 一个时长未知的片段
-     * 摆到时间线上会让选区与空隙的读数全是错的，那比"加不进去"更糟。
-     *
-     * 文件本身不读字节（几十 MB 的视频读进来只会占内存），真正上传发生在提交时，
-     * 与图片/音频同一条路径。
-     */
-    fun addTimelineClip(uri: Uri) {
-        val context = applicationContext ?: return
-        val state = _uiState.value
-        if (!state.canAddTimelineClip) return
-
-        val meta = probeVideoMeta(context, uri)
-        if (meta == null) {
-            viewModelScope.launch { _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_timeline_video_unreadable)) }
-            return
-        }
-
-        val draft = TimelineClipDraft(
-            id = newTimelineClipId(),
-            uri = uri,
-            displayName = queryAudioDisplayName(context, uri),
-            // 默认接在已有片段之后（见 nextClipStart 的说明）
-            start = nextClipStart(state.timelineClips),
-            duration = meta.durationSeconds.coerceAtLeast(TimelineDocument.MIN_CLIP_SECONDS),
-            trimStart = 0.0,
-            sourceDuration = meta.durationSeconds,
-            hasAudio = meta.hasAudio,
-            // 默认 guide：与桌面插件的默认一致，手机上不动这一项就等于桌面上的行为
-            referenceMode = TimelineReferenceMode.GUIDE,
-            uploadedFile = null
-        )
-        _uiState.value = state.copy(timelineClips = state.timelineClips + draft)
-    }
-
-    /** 改片段在时间轴上的落点 */
-    fun setTimelineClipStart(id: String, seconds: Double) {
-        _uiState.value = _uiState.value.copy(
-            timelineClips = withClipUpdated(_uiState.value.timelineClips, id) {
-                it.copy(start = TimelineDocument.clampStart(seconds))
-            }
-        )
-    }
-
-    /**
-     * 改片段在时间轴上占的长度。
-     *
-     * 上界取"源里还剩多少"而不是一个固定值：超出源长度的部分插件根本取不到画面，
-     * 界面上却会显示那么长，用户会以为生成区里有原画面在托底。
-     */
-    fun setTimelineClipDuration(id: String, seconds: Double) {
-        _uiState.value = _uiState.value.copy(
-            timelineClips = withClipUpdated(_uiState.value.timelineClips, id) { draft ->
-                val maxSeconds = draft.availableSourceSeconds
-                    .coerceAtLeast(TimelineDocument.MIN_CLIP_SECONDS)
-                draft.copy(duration = seconds.coerceIn(TimelineDocument.MIN_CLIP_SECONDS, maxSeconds))
-            }
-        )
-    }
-
-    /**
-     * 改片段从源视频的第几秒开始取。
-     *
-     * 与桌面插件同一套联动：入点往后推之后，长度要跟着缩到源的剩余长度以内，
-     * 否则"入点 8 秒 + 长度 5 秒"会去读一个只有 10 秒的源的第 8→13 秒。
-     *
-     * 源长度一律走 [TimelineClipDraft.sourceLengthSeconds]（带缺失兜底），不读裸
-     * `sourceDuration`：那份字段在电脑端旧数据里可能是 0，会让"点一下入点框"
-     * 就把片段压到 5 帧。
-     */
-    fun setTimelineClipTrimStart(id: String, seconds: Double) {
-        _uiState.value = _uiState.value.copy(
-            timelineClips = withClipUpdated(_uiState.value.timelineClips, id) { draft ->
-                val sourceLength = draft.sourceLengthSeconds
-                val maxTrim = (sourceLength - TimelineDocument.MIN_CLIP_SECONDS).coerceAtLeast(0.0)
-                val trim = seconds.coerceIn(0.0, maxTrim)
-                val maxDuration = (sourceLength - trim)
-                    .coerceAtLeast(TimelineDocument.MIN_CLIP_SECONDS)
-                draft.copy(trimStart = trim, duration = draft.duration.coerceAtMost(maxDuration))
-            }
-        )
-    }
-
-    /** 改片段与生成选区的关系（固定得多死，见 [TimelineReferenceMode]） */
-    fun setTimelineClipReferenceMode(id: String, mode: TimelineReferenceMode) {
-        _uiState.value = _uiState.value.copy(
-            timelineClips = withClipUpdated(_uiState.value.timelineClips, id) {
-                it.copy(referenceMode = mode)
-            }
-        )
-    }
-
-    /** 从时间线上移走一段 */
-    fun removeTimelineClip(id: String) {
-        val remaining = withClipRemoved(_uiState.value.timelineClips, id)
-        _uiState.value = _uiState.value.copy(
-            timelineClips = remaining,
-            // 片段被删光后"已载入工作流里摆好的时间线"这句提示就不再成立了：
-            // 它说的是节点里带过来的内容，而用户已经把它们全删了
-            timelineLoadedFromWorkflow = _uiState.value.timelineLoadedFromWorkflow && remaining.isNotEmpty()
-        )
-    }
-
-    /** 改生成选区的起点与长度（长度会夹到节点承认的 0.21–150 秒） */
-    fun setTimelineSelection(start: Double, duration: Double) {
-        _uiState.value = _uiState.value.copy(
-            timelineSelectionStart = TimelineDocument.clampStart(start),
-            timelineSelectionDuration = TimelineDocument.clampSelectionDuration(duration)
-        )
-    }
-
-    /**
-     * 把生成选区对准一段空隙（界面上的「生成本段」按钮）。
-     *
-     * 长度超过上限时从空隙起点截取前 150 秒，而不是把整段空隙缩到 150 秒 ——
-     * 截取得到的选区一定是空隙的**子区间**，不会跑到片段上去；
-     * 缩放则会让选区两端伸进两边的片段里，变成"固定原画面 + 生成"的另一种结果。
-     */
-    fun selectTimelineGap(gap: UncoveredInterval) {
-        setTimelineSelection(
-            start = gap.start,
-            duration = gap.duration.coerceAtMost(TimelineDocument.MAX_DURATION_SECONDS)
-        )
-    }
-
-    /** 视频时长与有没有音轨 */
-    private data class VideoMeta(val durationSeconds: Double, val hasAudio: Boolean)
-
-    /**
-     * 读视频的时长与音轨信息。
-     *
-     * 只读元数据不解码画面：`METADATA_KEY_DURATION` 对绝大多数容器都是头部信息，
-     * 读一个几百 MB 的文件也是毫秒级。读不出来（文件损坏、容器不支持）返回 null，
-     * 由调用方拒绝这次选择。
-     */
-    private fun probeVideoMeta(context: android.content.Context, uri: Uri): VideoMeta? =
-        runCatching {
-            val retriever = android.media.MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(context, uri)
-                val durationMs = retriever
-                    .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    ?.toLongOrNull()
-                    ?: return null
-                if (durationMs <= 0L) return null
-                VideoMeta(
-                    durationSeconds = durationMs / 1000.0,
-                    // 这个键"存在"就表示有音轨（没有音轨时 extractMetadata 返回 null）
-                    hasAudio = retriever.extractMetadata(
-                        android.media.MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO
-                    ) != null
-                )
-            } finally {
-                runCatching { retriever.release() }
-            }
-        }.getOrNull()
-
     // View mode
     fun onViewModeChange(mode: ImageToVideoViewMode) {
         _uiState.value = _uiState.value.copy(viewMode = mode)
@@ -1388,8 +1084,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         val workflowItem = state.availableWorkflows.find { it.name == workflow } ?: return
 
         // 重选当前这条流：直接返回，不能往下走。下拉里当前项是可以点的，而
-        // loadWorkflowValues 会把界面上调过的值全部重置回工作流默认（时间线片段、
-        // 生成范围也一样）——"手滑点一下自己"会让刚摆好的时间线无声消失。
+        // loadWorkflowValues 会把界面上调过的值全部重置回工作流默认（参数与
+        // 生成范围也一样）——"手滑点一下自己"会让刚调好的值无声消失。
         // 工作流管理里改元数据也会触发一次重载，这里一并挡掉。
         if (workflowItem.id == state.selectedWorkflowId) return
 
@@ -1510,7 +1206,7 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
     }
 
     fun onLengthChange(length: String) {
-        val error = validateVideoLength(length)
+        val error = ValidationUtils.validateVideoLength(length, applicationContext)
         _uiState.value = _uiState.value.copy(length = length, lengthError = error)
         if (error == null) savePreferences()
     }
@@ -1572,20 +1268,12 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
      */
     private fun refreshDynamicParamsIfNeeded() {
         val state = _uiState.value
-        if (state.selectedWorkflowId.isEmpty()) return
-        val snapshot = WorkflowManager.loadDynamicParams(state.selectedWorkflowId, state.dynamicParamValues)
-        val ready = ConnectionManager.nodeTypeRegistry.isPopulated()
-        if (snapshot.params == state.dynamicParams &&
-            snapshot.values == state.dynamicParamValues &&
-            ready == state.dynamicParamsRegistryReady
-        ) {
-            return
-        }
-        DebugLogger.d(TAG, "注册表就绪，重算动态参数：${snapshot.params.size} 个控件")
+        val update = VideoGenerationSupport.refreshDynamicParams(state) ?: return
+        DebugLogger.d(TAG, "注册表就绪，重算动态参数：${update.params.size} 个控件")
         _uiState.value = state.copy(
-            dynamicParams = snapshot.params,
-            dynamicParamValues = snapshot.values,
-            dynamicParamsRegistryReady = ready
+            dynamicParams = update.params,
+            dynamicParamValues = update.values,
+            dynamicParamsRegistryReady = update.registryReady
         )
     }
 
@@ -1600,15 +1288,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
      */
     fun advanceSeedIfNeeded() {
         val state = _uiState.value
-        if (!state.seedMode.advances) return
-        val constraints = WorkflowConstraintsProvider.getConstraints("seed", state.selectedWorkflow)
-        val next = nextSeed(
-            current = state.seed.toLongOrNull() ?: 0L,
-            step = state.seedMode.step,
-            min = constraints.min.toLong(),
-            max = constraints.max.toLong()
-        )
-        _uiState.value = state.copy(seed = next.toString(), seedError = null)
+        val next = VideoGenerationSupport.advanceSeed(state) ?: return
+        _uiState.value = state.copy(seed = next, seedError = null)
         savePreferences()
     }
 
@@ -1690,41 +1371,20 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
     }
 
     // Primary LoRA chain operations (for single-model workflows like LTX 2.0)
-    fun onAddLora() {
-        val state = _uiState.value
-        val newChain = LoraChainManager.addLora(state.loraChain, state.availableLoras)
-        if (newChain === state.loraChain) return // No change
+    override fun withLoraChain(state: ImageToVideoUiState, chain: List<LoraSelection>) =
+        state.copy(loraChain = chain)
 
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onAddLora() =
+        updateLoraChain(::savePreferences) { LoraChainManager.addLora(it.loraChain, it.availableLoras) }
 
-    fun onRemoveLora(index: Int) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.removeLora(state.loraChain, index)
-        if (newChain === state.loraChain) return // No change
+    fun onRemoveLora(index: Int) =
+        updateLoraChain(::savePreferences) { LoraChainManager.removeLora(it.loraChain, index) }
 
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onLoraNameChange(index: Int, name: String) =
+        updateLoraChain(::savePreferences) { LoraChainManager.updateLoraName(it.loraChain, index, name) }
 
-    fun onLoraNameChange(index: Int, name: String) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraName(state.loraChain, index, name)
-        if (newChain === state.loraChain) return // No change
-
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
-
-    fun onLoraStrengthChange(index: Int, strength: Float) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraStrength(state.loraChain, index, strength)
-        if (newChain === state.loraChain) return // No change
-
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onLoraStrengthChange(index: Int, strength: Float) =
+        updateLoraChain(::savePreferences) { LoraChainManager.updateLoraStrength(it.loraChain, index, strength) }
 
     // High noise LoRA chain operations
     fun onAddHighnoiseLora() {
@@ -1801,25 +1461,6 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
     }
 
     /**
-     * Video length validation with special requirement for "steps of 4" (1, 5, 9, 13...).
-     * This is specific to video generation workflows.
-     */
-    private fun validateVideoLength(value: String): String? {
-        val num = value.toIntOrNull()
-        return when {
-            value.isEmpty() -> applicationContext?.getString(R.string.error_required)
-                ?: "Required"
-            num == null -> applicationContext?.getString(R.string.error_invalid_number)
-                ?: "Invalid number"
-            num !in 1..129 -> applicationContext?.getString(R.string.error_length_range)
-                ?: "Must be 1-129"
-            (num - 1) % 4 != 0 -> applicationContext?.getString(R.string.error_length_step)
-                ?: "Must be 1, 5, 9, 13... (steps of 4)"
-            else -> null
-        }
-    }
-
-    /**
      * 上传各图位图片并准备工作流。
      *
      * 图位是图片的唯一来源：用户删掉/留空某个图位，这里就不会给它落键，
@@ -1839,6 +1480,13 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
 
         val state = _uiState.value
 
+        // 旧版「时间线导演台」工作流：功能已移除，直接明确告知，
+        // 不让用户白等一次因为 timeline_data 没人维护而必然失败的提交
+        if (state.legacyTimelineUnsupported) {
+            _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_timeline_director_removed))
+            return null
+        }
+
         // Validate all fields
         if (state.widthError != null || state.heightError != null ||
             state.lengthError != null || state.fpsError != null) {
@@ -1854,25 +1502,12 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         return try {
             // 逐张上传已填图位。一张都没填时直接放弃：注入器会把整条图片链路删光，
             // 出片必然失败，不如在这里给一句能读懂的提示。
-            //
-            // 导演台流整段跳过：那条流没有图片输入口，上传了也无处注入（白占流量与内存）。
-            // 正常路径下它的图位表本来就是空的（切流时重置），这里是兜底。
             val uploadedByPlaceholder = mutableMapOf<String, String>()
-            if (!state.isTimelineWorkflow) {
-                for ((placeholder, bitmap) in state.slotImages) {
-                    val filename = uploadBitmap(client, bitmap, "itv_$placeholder") ?: return null
-                    uploadedByPlaceholder[placeholder] = filename
-                }
+            for ((placeholder, bitmap) in state.slotImages) {
+                val filename = uploadBitmap(client, bitmap, "itv_$placeholder") ?: return null
+                uploadedByPlaceholder[placeholder] = filename
             }
-            // 素材要求两类流各一条：非导演台流要至少一张图（一张都没有时注入器会把整条图片
-            // 链路删光，出片必然失败）；导演台流要至少一段视频（没有片段时节点会抛
-            // "导演台没有可用参考"，那是个服务器侧异常，不如在这里给一句能读懂的提示）。
-            if (state.isTimelineWorkflow) {
-                if (state.timelineClips.isEmpty()) {
-                    _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_timeline_needs_clip))
-                    return null
-                }
-            } else if (uploadedByPlaceholder.isEmpty()) {
+            if (uploadedByPlaceholder.isEmpty()) {
                 _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_no_source_image))
                 return null
             }
@@ -1884,47 +1519,6 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
             for ((placeholder, choice) in state.slotAudioFiles) {
                 val filename = uploadAudio(client, choice) ?: return null
                 uploadedAudio[placeholder] = filename
-            }
-
-            // 时间线导演台：逐段上传本地视频，再把整份时间线序列化成一个字符串。
-            // 已经在服务器上的片段（从电脑端时间线读回来的）直接用原名，不重传 ——
-            // 否则"电脑上摆好、手机上生成"会被迫把每个文件重传一遍。
-            val timelineData: String
-            val timelineSeconds: Double?
-            if (state.isTimelineWorkflow) {
-                val clips = mutableListOf<TimelineClip>()
-                for (draft in state.timelineClips) {
-                    val file = if (draft.needsUpload) {
-                        uploadVideo(client, draft) ?: return null
-                    } else {
-                        val existing = draft.uploadedFile
-                        if (existing.isNullOrBlank()) {
-                            _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_timeline_video_unreadable))
-                            return null
-                        }
-                        existing
-                    }
-                    clips += draft.toClip(file)
-                }
-                val document = TimelineDocument(
-                    selectionStart = state.timelineSelectionStart,
-                    selectionDuration = state.timelineSelectionDuration,
-                    clips = clips,
-                    // 素材箱与「视频原声」开关 App 不编辑，但必须原样带给节点：
-                    // 用户在电脑上摆好的图片/音频参考、与提示词里写的 <Picture N>/<Audio N>
-                    // 是一一对应的，丢掉它们会让提示词引用一个不存在的参考 ——
-                    // 节点不报错，只是生成结果与用户在电脑上看到的安排不一致。
-                    videoAudioEnabled = state.timelineSlot?.document?.videoAudioEnabled ?: true,
-                    rawImages = state.timelineSlot?.document?.rawImages,
-                    rawAudios = state.timelineSlot?.document?.rawAudios
-                )
-                timelineData = document.toJson()
-                // 与 selection.duration 同源：节点用 generation_seconds 算帧数、
-                // 用 selection 算原画面固定到第几帧，两者不一致会让 guide 落到错误的帧上
-                timelineSeconds = document.selectionDuration
-            } else {
-                timelineData = ""
-                timelineSeconds = null
             }
 
             val baseWorkflow = WorkflowManager.prepareImageToVideoWorkflowById(
@@ -1967,8 +1561,9 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
                 // Generation parameters
                 steps = state.steps.toIntOrNull(),
                 cfg = state.cfg.toFloatOrNull(),
-                samplerName = state.sampler,
-                scheduler = state.scheduler,
+                // 提交前兜底（1.3）：与文生视频同理，取值来自缺省常量，仍在进占位符替换前统一清洗
+                samplerName = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers),
+                scheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers),
                 denoise = state.denoise.toFloatOrNull(),
                 seed = state.seed.toLongOrNull(),
                 randomSeed = state.randomSeed,
@@ -1978,9 +1573,6 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
                 speedMode = state.speedMode.takeIf { it.isNotEmpty() },
                 // 主 LoRA 权重（工作流没有 {{lora_strength}} 时不会被替换）
                 loraStrength = state.loraStrength,
-                // 时间线导演台：整份时间线 + 与它同源的生成时长（非导演台流下注入器是空操作）
-                timelineData = timelineData,
-                generationSeconds = timelineSeconds,
                 // 动态节点参数（通用节点参数引擎）
                 dynamicParams = state.dynamicParamValues
             ) ?: return null
@@ -2085,26 +1677,7 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         )
 
     /**
-     * 上传一段时间线视频，成功时返回服务器上的文件名。
-     *
-     * 与音频同一条路径（`/upload/image` 不校验内容，只按文件名落盘到 input 目录），
-     * 差别只有 MIME 类型与扩展名。
-     */
-    private suspend fun uploadVideo(client: ComfyUIClient, draft: TimelineClipDraft): String? {
-        val uri = draft.uri ?: return null
-        return uploadLocalFile(
-            client = client,
-            uri = uri,
-            displayName = draft.displayName,
-            fallbackMimeType = "video/mp4",
-            fallbackExtension = "mp4",
-            namePrefix = "itv_clip",
-            errorRes = R.string.error_upload_video
-        )
-    }
-
-    /**
-     * 读本地文件字节并上传到服务器的 input 目录（图片/音频/视频共用这一条路径）。
+     * 读本地文件字节并上传到服务器的 input 目录（图片/音频共用这一条路径）。
      *
      * @param fallbackMimeType 内容提供者没给出合法 MIME 时的兜底
      * @param fallbackExtension 文件名没有扩展名时的兜底
@@ -2164,12 +1737,15 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
     override fun hasValidConfiguration(): Boolean {
         val state = _uiState.value
 
+        // 旧版「时间线导演台」工作流：功能已移除，这条路永远不可提交
+        // （界面同时有一条可见提示说明原因，见 ImageToVideoScreen）
+        if (state.legacyTimelineUnsupported) {
+            return false
+        }
+
         // 至少要有一张图。判断落在图位本身：有图位定义时看"有没有哪个图位填了图"
         // （首尾帧各自独立可选，只填首帧也算配置完整），没有图位定义的历史工作流退回原来的主图判断。
-        // 导演台流不看图：它的素材是时间线上的视频片段，图位在那个流里根本不存在。
-        val hasImage = if (state.isTimelineWorkflow) {
-            state.timelineClips.isNotEmpty()
-        } else if (state.imageSlots.isEmpty()) {
+        val hasImage = if (state.imageSlots.isEmpty()) {
             state.slotImages[PLACEHOLDER_MAIN_IMAGE] != null
         } else {
             state.imageSlots.any { state.slotImages[it.placeholder] != null }
@@ -2206,7 +1782,7 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         MediaStateHolder.evict(MediaStateHolder.MediaKey.ItvPreview)
         _uiState.value = _uiState.value.copy(previewBitmap = null, currentVideoUri = null)
         // 播放已清空：注销裁剪保护（5.2）
-        clearPlayingVideo()
+        playingVideo.clear()
         // Clear prompt ID tracking to prevent restoration on subsequent screen navigations
         MediaStateHolder.clearCurrentItvPromptId()
     }
@@ -2215,7 +1791,7 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         lastClearedForPromptId = null // Reset tracking when manually clearing
         _uiState.value = _uiState.value.copy(previewBitmap = null, currentVideoUri = null)
         // 播放已清空：注销裁剪保护（5.2）
-        clearPlayingVideo()
+        playingVideo.clear()
         // Clear prompt ID tracking to prevent restoration on subsequent screen navigations
         MediaStateHolder.clearCurrentItvPromptId()
     }
@@ -2247,23 +1823,6 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
 
         generationViewModel.registerEventHandler(OWNER_ID) { event ->
             handleGenerationEvent(event)
-        }
-    }
-
-    /**
-     * Stop listening for generation events.
-     * Note: We keep the refs if generation is still running,
-     * as the handler may still be called for completion events.
-     */
-    fun stopListening(generationViewModel: GenerationViewModel) {
-        generationViewModel.unregisterSubmittedCallback(OWNER_ID)
-        generationViewModel.unregisterEventHandler(OWNER_ID)
-        // Only clear refs if no generation is active (handler was actually unregistered)
-        // If generation is running, the handler is kept and needs the refs
-        if (!generationViewModel.generationState.value.isGenerating) {
-            if (generationViewModelRef == generationViewModel) {
-                generationViewModelRef = null
-            }
         }
     }
 
@@ -2331,7 +1890,7 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
                 // Clear preview bitmap so video player takes display precedence
                 _uiState.value = _uiState.value.copy(currentVideoUri = uri, previewBitmap = null)
                 // 播放方登记（5.2）：新视频开始播放，旧的那份同时注销
-                markPlayingVideo(MediaStateHolder.MediaKey.ItvVideo(promptId))
+                playingVideo.mark(MediaStateHolder.MediaKey.ItvVideo(promptId))
                 deleteLastPreviewImage()
                 generationViewModelRef?.completeGeneration(promptId)
             }

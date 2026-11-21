@@ -3,8 +3,6 @@ package sh.hnet.comfychair.update
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.content.pm.SigningInfo
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -14,7 +12,6 @@ import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.util.DebugLogger
 import java.io.File
-import java.security.MessageDigest
 
 /**
  * 安装触发器（v4.6.0）—— ACTION_VIEW + FileProvider 拉起系统安装器。
@@ -28,10 +25,13 @@ import java.security.MessageDigest
  * - 文件通过 [FileProvider]（authorities 与项目既有的 image 分享共用，
  *   file_paths.xml 里补 external-files-path 的 update 子目录）。
  *
- * v4.16.11（P0-7）：**装前校验包名与签名**。SHA-256 只保证"下载的文件没被中间人换掉"，
+ * v4.16.11（P0-7）：**装前校验包名**。SHA-256 只保证"下载的文件没被中间人换掉"，
  * 挡不住"有人直接把任意 APK 放进 update/update.apk 再触发安装"这条旁路
- * （update/ 位于外部私有目录，root 或被篡改的环境可达）。系统安装器不校验包名/签名
- * 是否与当前 App 一致，所以必须在拉起安装器之前自查。
+ * （update/ 位于外部私有目录，root 或被篡改的环境可达）。系统安装器不拦包名不同的
+ * APK（会装成另一个 App），所以必须在拉起安装器之前自查包名。
+ *
+ * 签名比对已移除（国产引擎误报治理，2026-11-20）：不再读取待安装 APK 的签名证书，
+ * 具体原因与"将来要恢复该怎么办"见 [isApkTrusted] 的注释。
  */
 object AppInstaller {
 
@@ -55,12 +55,16 @@ object AppInstaller {
         val apk = UpdateDownloadWorker.finalFile(context)
         if (!apk.isFile || apk.length() == 0L) {
             DebugLogger.w(TAG, "install called but apk missing")
+            // v4.18.0（派工单 §4.6）：安装失败必须给出明确原因。
+            // 原先这里只写日志 —— 用户从通知栏点「安装」时界面一闪而过、什么都不发生，
+            // 看起来就是「安装进程挂起」。
+            Toast.makeText(context, R.string.update_error_install_missing, Toast.LENGTH_LONG).show()
             return InstallResult.FAILED
         }
 
-        // P0-7：装前自查包名与签名，不符直接拒绝并提示（不拉起安装器）
+        // P0-7：装前只自查包名（签名由系统安装时校验），不符直接拒绝并提示（不拉起安装器）
         if (!isApkTrusted(context, apk)) {
-            DebugLogger.w(TAG, "APK 包名或签名与当前应用不一致，已拒绝安装")
+            DebugLogger.w(TAG, "APK 包名与当前应用不一致，已拒绝安装")
             Toast.makeText(
                 context,
                 R.string.update_error_install_invalid,
@@ -90,95 +94,93 @@ object AppInstaller {
             InstallResult.INSTALL_STARTED
         } catch (e: ActivityNotFoundException) {
             DebugLogger.w(TAG, "No installer activity: ${e.message}")
+            // v4.18.0（§4.6）：设备没有系统安装器时也要说清原因，不能静默失败
+            Toast.makeText(
+                context,
+                R.string.update_error_install_unavailable,
+                Toast.LENGTH_LONG
+            ).show()
             InstallResult.FAILED
         }
     }
 
     /**
-     * 校验待安装 APK 的包名与签名（P0-7）。
+     * 校验待安装 APK 的包名（P0-7）。
      *
-     * **这是安装链路的唯一闸门**：弹窗按钮（[install]）与通知栏「点击安装」
-     * （[UpdateNotifier] 的 buildInstallIntent）都必须先调用本方法，
+     * **这是安装链路的唯一闸门**：弹窗按钮（[install]）、通知栏「点击安装」
+     * （[UpdateNotifier] 的 buildInstallIntent）以及冷启动恢复
+     * （[UpdateRepository.restoreFromDisk]）都必须先调用本方法，
      * 否则后者就是绕过校验的旁路。
      *
-     * 规则：
-     * 1. 包名必须等于本 App 的 applicationId（[BuildConfig.APPLICATION_ID]，
-     *    即 `sh.hnet.comfychair.plus`）—— 防同名替换之外的任何换包；
-     * 2. 待安装包的每个签名证书 SHA-256 必须出现在「当前已安装自身」的
-     *    当前签名或历史签名里 —— 只有同一签名身份才能覆盖升级，仿冒包会被拒绝。
+     * 规则：包名必须等于本 App 的 applicationId（[BuildConfig.APPLICATION_ID]，
+     * 即 `sh.hnet.comfychair.plus`）—— 防同名替换之外的任何换包。
+     * 任何一步解析失败（APK 结构损坏、读不到包名）都按不通过处理（fail-closed）。
      *
-     * 任何一步解析失败（APK 结构损坏、取不到签名信息）都按不通过处理（fail-closed）。
+     * ## 为什么不再比对签名证书（2026-11-20 移除）
+     *
+     * 这里原先用 `getPackageArchiveInfo(..., GET_SIGNING_CERTIFICATES)` 取出待装包的
+     * 签名证书，再与「当前已安装自身」的当前/历史签名做 SHA-256 比对。删除原因：
+     * 1. **系统本来就会校验**：Android 在安装 APK 时自己比对签名身份，不一致会直接
+     *    以 `INSTALL_FAILED_UPDATE_INCOMPATIBLE` 拒绝升级。手动比对不带来任何额外防护，
+     *    只是把同一条错误提示提前到拉起安装器之前。
+     * 2. **它是国产安全引擎的高分静态特征**：`getPackageArchiveInfo` +
+     *    `GET_SIGNING_CERTIFICATES` / `signingInfo` 的组合是 dropper、假安装器、
+     *    包名劫持类样本的常见套路，实测会触发小米「包含病毒」启发式误报。
+     *    移除后 App 不再具备「读他人 APK 签名」的特征。
+     *
+     * **包名比对必须保留**：系统不会拦包名不同的 APK（会静默装成另一个 App），
+     * 这部分有实际防护价值。
+     *
+     * 若将来需要「装完确认到底装成功没有」，应改用
+     * [android.content.pm.PackageInstaller.Session] 的提交回调结果判断，
+     * **不要**回到「提前读待装包签名」这条老路。
      */
     internal fun isApkTrusted(context: Context, apk: File): Boolean {
-        val pm = context.packageManager
         return try {
-            val archive = pm.getPackageArchiveInfo(
-                apk.absolutePath,
-                PackageManager.GET_SIGNING_CERTIFICATES
-            ) ?: return false
-
-            if (archive.packageName != BuildConfig.APPLICATION_ID) {
-                DebugLogger.w(
-                    TAG,
-                    "包名不匹配：archive=${archive.packageName} expected=${BuildConfig.APPLICATION_ID}"
-                )
-                return false
+            // 第二个参数传 0：只要 packageName，不请求任何签名信息
+            val archive = context.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
+            val archivePackage = archive?.packageName
+            when (checkApkPackageName(archivePackage, BuildConfig.APPLICATION_ID)) {
+                ApkPackageCheck.OK -> true
+                ApkPackageCheck.ARCHIVE_UNREADABLE -> {
+                    DebugLogger.w(TAG, "读不出待安装 APK 的包名（结构损坏或非 APK），按不通过处理")
+                    false
+                }
+                ApkPackageCheck.MISMATCH -> {
+                    DebugLogger.w(
+                        TAG,
+                        "包名不匹配：archive=$archivePackage expected=${BuildConfig.APPLICATION_ID}"
+                    )
+                    false
+                }
             }
-
-            val apkDigests = signerDigests(archive.signingInfo)
-            if (apkDigests.isEmpty()) {
-                DebugLogger.w(TAG, "待安装 APK 取不到签名信息")
-                return false
-            }
-
-            val installed = pm.getPackageInfo(
-                context.packageName,
-                PackageManager.GET_SIGNING_CERTIFICATES
-            )
-            val installedInfo = installed?.signingInfo
-            // 当前签名 + 历史签名：兼容密钥轮换（rotation）后的旧签名 APK
-            val allowed = signerDigests(installedInfo) + historyDigests(installedInfo)
-            if (allowed.isEmpty()) {
-                DebugLogger.w(TAG, "取不到本机已安装包的签名信息")
-                return false
-            }
-
-            val trusted = apkDigests.all { it in allowed }
-            if (!trusted) {
-                DebugLogger.w(TAG, "签名不匹配：apk=${apkDigests.size} 个证书均不在本机签名链内")
-            }
-            trusted
         } catch (e: Exception) {
-            // 解析失败（损坏/非 APK/签名块异常）一律不通过
+            // 解析失败（损坏/非 APK）一律不通过
             DebugLogger.w(TAG, "APK 校验异常：${e.javaClass.simpleName} ${e.message}")
             false
         }
     }
 
-    /** 当前签名者证书的 SHA-256（小写十六进制） */
-    private fun signerDigests(info: SigningInfo?): Set<String> {
-        if (info == null) return emptySet()
-        return info.apkContentsSigners
-            ?.mapNotNull { sha256Of(it.toByteArray()) }
-            ?.toSet()
-            .orEmpty()
-    }
+    /** 装前包名校验结论；区分「读不出」与「不一致」只为日志说清原因 */
+    internal enum class ApkPackageCheck { OK, ARCHIVE_UNREADABLE, MISMATCH }
 
-    /** 历史签名（密钥轮换前的旧证书）；APK 本身没有历史签名，只有已安装包才有 */
-    private fun historyDigests(info: SigningInfo?): Set<String> {
-        if (info == null) return emptySet()
-        return info.signingCertificateHistory
-            ?.mapNotNull { sha256Of(it.toByteArray()) }
-            ?.toSet()
-            .orEmpty()
-    }
-
-    private fun sha256Of(bytes: ByteArray): String? = try {
-        MessageDigest.getInstance("SHA-256").digest(bytes)
-            .joinToString("") { "%02x".format(it) }
-    } catch (e: Exception) {
-        DebugLogger.w(TAG, "证书摘要计算失败：${e.message}")
-        null
+    /**
+     * 纯函数：装前包名校验（不依赖 Android 接口，可直接单元测试）。
+     *
+     * @param archivePackageName `getPackageArchiveInfo` 读出的包名；
+     *   null 或空白表示读不出，按不通过处理（fail-closed）
+     * @param expectedAppId 本 App 的 applicationId
+     */
+    internal fun checkApkPackageName(
+        archivePackageName: String?,
+        expectedAppId: String
+    ): ApkPackageCheck {
+        if (archivePackageName.isNullOrBlank()) return ApkPackageCheck.ARCHIVE_UNREADABLE
+        return if (archivePackageName == expectedAppId) {
+            ApkPackageCheck.OK
+        } else {
+            ApkPackageCheck.MISMATCH
+        }
     }
 
     /** 跳转到"允许安装未知应用"的系统设置页（引导，非自动授权） */

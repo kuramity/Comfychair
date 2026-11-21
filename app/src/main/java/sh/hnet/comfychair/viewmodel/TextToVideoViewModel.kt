@@ -17,12 +17,10 @@ import sh.hnet.comfychair.WorkflowType
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.LoraSelection
+import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.SeedMode
 import sh.hnet.comfychair.model.VideoOptions
 import sh.hnet.comfychair.model.WorkflowCapabilities
-import sh.hnet.comfychair.model.nextSeed
-import sh.hnet.comfychair.model.contract.CommonGenerationState
-import sh.hnet.comfychair.model.WorkflowValues
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.taglibrary.state.PromptBridge
 import sh.hnet.comfychair.taglibrary.state.PromptTargetFactory
@@ -34,9 +32,11 @@ import sh.hnet.comfychair.util.SeasonalPrompts
 import sh.hnet.comfychair.util.ValidationUtils
 import sh.hnet.comfychair.util.VideoUtils
 import sh.hnet.comfychair.workflow.ImageSlotDetector
-import sh.hnet.comfychair.workflow.WorkflowConstraintsProvider
 import sh.hnet.comfychair.workflow.dynamic.DynamicParam
 import sh.hnet.comfychair.viewmodel.base.BaseGenerationViewModel
+import sh.hnet.comfychair.viewmodel.base.PlayingVideoRegistry
+import sh.hnet.comfychair.viewmodel.base.VideoGenerationState
+import sh.hnet.comfychair.viewmodel.base.VideoGenerationSupport
 
 /**
  * Represents a workflow item with display name
@@ -57,8 +57,8 @@ data class TextToVideoUiState(
     val currentVideoUri: android.net.Uri? = null,
 
     // Workflow selection
-    val selectedWorkflow: String = "",
-    val selectedWorkflowId: String = "",  // Workflow ID for storage
+    override val selectedWorkflow: String = "",
+    override val selectedWorkflowId: String = "",  // Workflow ID for storage
     val availableWorkflows: List<TtvWorkflowItem> = emptyList(),
 
     // Workflow placeholders - detected from {{placeholder}} patterns in workflow JSON
@@ -66,22 +66,22 @@ data class TextToVideoUiState(
 
     // 动态节点参数（通用节点参数引擎）：工作流里「未识别」的 {{占位符}}。
     // dynamicParams 是控件清单（UI 依 control 渲染），dynamicParamValues 是用户当前值（按占位符名索引）。
-    val dynamicParams: List<DynamicParam> = emptyList(),
-    val dynamicParamValues: Map<String, String> = emptyMap(),
+    override val dynamicParams: List<DynamicParam> = emptyList(),
+    override val dynamicParamValues: Map<String, String> = emptyMap(),
     // 推导 dynamicParams 时 /object_info 注册表是否已就绪（与 dynamicParams 同一次快照，UI 提示条用）
-    val dynamicParamsRegistryReady: Boolean = false,
+    override val dynamicParamsRegistryReady: Boolean = false,
 
     // Model selections - single-model patterns (e.g., LTX 2.0)
     override val selectedCheckpoint: String = "",
     override val selectedUnet: String = "",
     override val selectedLoraName: String = "",  // Mandatory LoRA dropdown
     /** 主 LoRA 权重（{{lora_strength}}）：只有工作流带该占位符时配置面板才显示滑块 */
-    val loraStrength: Float = 1.0f,
+    override val loraStrength: Float = 1.0f,
     // Model selections - dual-model patterns (e.g., Wan 2.2)
-    val selectedHighnoiseUnet: String = "",
-    val selectedLownoiseUnet: String = "",
-    val selectedHighnoiseLora: String = "",
-    val selectedLownoiseLora: String = "",
+    override val selectedHighnoiseUnet: String = "",
+    override val selectedLownoiseUnet: String = "",
+    override val selectedHighnoiseLora: String = "",
+    override val selectedLownoiseLora: String = "",
     // Model selections - common
     override val selectedVae: String = "",
     override val selectedClip: String = "",
@@ -121,11 +121,11 @@ data class TextToVideoUiState(
     override val filteredLatentUpscaleModels: List<String>? = null,
 
     // Generation parameters
-    val width: String = "848",
-    val height: String = "480",
+    override val width: String = "848",
+    override val height: String = "480",
     override val megapixels: String = "1.0",
-    val length: String = "33",
-    val fps: String = "16",
+    override val length: String = "33",
+    override val fps: String = "16",
     override val steps: String = "20",
     override val cfg: String = "7.0",
     override val sampler: String = "euler",
@@ -159,7 +159,7 @@ data class TextToVideoUiState(
     val positivePrompt: String = "",
 
     // Negative prompt (per-workflow)
-    val negativePrompt: String = "",
+    override val negativePrompt: String = "",
 
     // Deferred model selections (for restoring after models load)
     // Single-model patterns
@@ -182,8 +182,8 @@ data class TextToVideoUiState(
     val deferredLatentUpscaleModel: String? = null,
 
     // Additional LoRA chains (optional, 0-5 LoRAs on top of mandatory LightX2V LoRAs)
-    val highnoiseLoraChain: List<LoraSelection> = emptyList(),
-    val lownoiseLoraChain: List<LoraSelection> = emptyList(),
+    override val highnoiseLoraChain: List<LoraSelection> = emptyList(),
+    override val lownoiseLoraChain: List<LoraSelection> = emptyList(),
 
     // Primary LoRA chain (for CommonGenerationState interface - video screens use dual chains)
     override val loraChain: List<LoraSelection> = emptyList(),
@@ -193,7 +193,7 @@ data class TextToVideoUiState(
 
     // Fetch state
     val isFetching: Boolean = false
-) : CommonGenerationState
+) : VideoGenerationState
 
 /**
  * One-time events for Text-to-Video screen
@@ -210,32 +210,18 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
 
     override val initialState = TextToVideoUiState()
 
+    /** 本页在 GenerationViewModel 里的注册键（基类 stopListening 用） */
+    override val generationOwnerId = OWNER_ID
+
     /**
-     * 当前正在播放的视频键（5.2）：拿到 URI 时登记、切走 / 清空时注销。
-     *
-     * 磁盘优先模式下 [MediaStateHolder.getVideoUri] 返回的就是 filesDir 里那个文件，
-     * 只靠「每类最近一次 prompt」保护不住它 —— 用户再生成一个视频，旧 promptId 立刻被顶掉，
-     * 正在播放的文件就可能被磁盘裁剪删掉。登记后裁剪会整组跳过（见 trimVideoFiles）。
+     * 当前正在播放的视频键（5.2）登记器：拿到 URI 时登记、切走 / 清空时注销。
+     * 语义见 [PlayingVideoRegistry]（与原先本类的字段 + 两个私有方法完全一致）。
      */
-    private var playingVideoKey: MediaStateHolder.MediaKey? = null
-
-    /** 登记「这个视频正在播放」；同一键重复调用不会重复登记。 */
-    private fun markPlayingVideo(key: MediaStateHolder.MediaKey) {
-        if (playingVideoKey == key) return
-        playingVideoKey?.let { MediaStateHolder.unregisterPlayingVideo(it) }
-        playingVideoKey = key
-        MediaStateHolder.registerPlayingVideo(key)
-    }
-
-    /** 注销当前播放登记（播放已切走 / 清空）。 */
-    private fun clearPlayingVideo() {
-        playingVideoKey?.let { MediaStateHolder.unregisterPlayingVideo(it) }
-        playingVideoKey = null
-    }
+    private val playingVideo = PlayingVideoRegistry()
 
     override fun onCleared() {
         super.onCleared()
-        clearPlayingVideo()
+        playingVideo.clear()
         // P2-20：注销标签库桥接，静态 map 不再钉住已销毁的 ViewModel
         PromptBridge.unregister(OWNER_ID)
     }
@@ -421,7 +407,7 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
             if (uri != null) {
                 _uiState.value = _uiState.value.copy(currentVideoUri = uri)
                 // 播放方登记（5.2）：裁剪不要删掉这个文件（磁盘优先模式下 URI 就指向它）
-                markPlayingVideo(key)
+                playingVideo.mark(key)
             }
         }
     }
@@ -652,50 +638,8 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
 
         // Load existing values to preserve nodeAttributeEdits from Workflow Editor
         val existingValues = storage.loadValues(serverId, workflowId)
-
         // Use workflow ID as storage key (UUID-based)
-        val values = WorkflowValues(
-            width = state.width.toIntOrNull(),
-            height = state.height.toIntOrNull(),
-            length = state.length.toIntOrNull(),
-            frameRate = state.fps.toIntOrNull(),
-            // 步数 / 主 LoRA 权重按工作流持久化（否则切工作流就丢回缺省）
-            steps = state.steps.toIntOrNull(),
-            loraStrength = state.loraStrength,
-            // 百万像素 / 宽高比 / 加速模式按工作流持久化
-            megapixels = state.megapixels.toFloatOrNull(),
-            aspectRatio = state.aspectRatio.takeIf { it.isNotEmpty() },
-            speedMode = state.speedMode.takeIf { it.isNotEmpty() },
-            // 种子手动控制：与文生图一样按工作流持久化
-            seed = state.seed.toLongOrNull(),
-            randomSeed = state.randomSeed,
-            // 新键（四态取值方式）；老版本读上面那个布尔
-            seedMode = state.seedMode.name,
-            negativePrompt = state.negativePrompt.takeIf { it.isNotEmpty() },
-            // Single-model patterns
-            model = state.selectedCheckpoint.takeIf { it.isNotEmpty() },
-            unetModel = state.selectedUnet.takeIf { it.isNotEmpty() },
-            loraModel = state.selectedLoraName.takeIf { it.isNotEmpty() },
-            // Dual-model patterns
-            highnoiseUnetModel = state.selectedHighnoiseUnet.takeIf { it.isNotEmpty() },
-            lownoiseUnetModel = state.selectedLownoiseUnet.takeIf { it.isNotEmpty() },
-            highnoiseLoraModel = state.selectedHighnoiseLora.takeIf { it.isNotEmpty() },
-            lownoiseLoraModel = state.selectedLownoiseLora.takeIf { it.isNotEmpty() },
-            // Common models
-            vaeModel = state.selectedVae.takeIf { it.isNotEmpty() },
-            clipModel = state.selectedClip.takeIf { it.isNotEmpty() },
-            clip1Model = state.selectedClip1.takeIf { it.isNotEmpty() },
-            clip2Model = state.selectedClip2.takeIf { it.isNotEmpty() },
-            clip3Model = state.selectedClip3.takeIf { it.isNotEmpty() },
-            clip4Model = state.selectedClip4.takeIf { it.isNotEmpty() },
-            textEncoderModel = state.selectedTextEncoder.takeIf { it.isNotEmpty() },
-            latentUpscaleModel = state.selectedLatentUpscaleModel.takeIf { it.isNotEmpty() },
-            highnoiseLoraChain = LoraSelection.toJsonString(state.highnoiseLoraChain).takeIf { state.highnoiseLoraChain.isNotEmpty() },
-            lownoiseLoraChain = LoraSelection.toJsonString(state.lownoiseLoraChain).takeIf { state.lownoiseLoraChain.isNotEmpty() },
-            nodeAttributeEdits = existingValues?.nodeAttributeEdits,
-            // 动态节点参数（通用节点参数引擎）
-            dynamicParams = state.dynamicParamValues
-        )
+        val values = VideoGenerationSupport.buildWorkflowValues(state, existingValues)
 
         storage.saveValues(serverId, workflowId, values)
     }
@@ -842,7 +786,7 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
     }
 
     fun onLengthChange(length: String) {
-        val error = validateVideoLength(length)
+        val error = ValidationUtils.validateVideoLength(length, applicationContext)
         _uiState.value = _uiState.value.copy(length = length, lengthError = error)
         if (error == null) savePreferences()
     }
@@ -904,20 +848,12 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
      */
     private fun refreshDynamicParamsIfNeeded() {
         val state = _uiState.value
-        if (state.selectedWorkflowId.isEmpty()) return
-        val snapshot = WorkflowManager.loadDynamicParams(state.selectedWorkflowId, state.dynamicParamValues)
-        val ready = ConnectionManager.nodeTypeRegistry.isPopulated()
-        if (snapshot.params == state.dynamicParams &&
-            snapshot.values == state.dynamicParamValues &&
-            ready == state.dynamicParamsRegistryReady
-        ) {
-            return
-        }
-        DebugLogger.d(TAG, "注册表就绪，重算动态参数：${snapshot.params.size} 个控件")
+        val update = VideoGenerationSupport.refreshDynamicParams(state) ?: return
+        DebugLogger.d(TAG, "注册表就绪，重算动态参数：${update.params.size} 个控件")
         _uiState.value = state.copy(
-            dynamicParams = snapshot.params,
-            dynamicParamValues = snapshot.values,
-            dynamicParamsRegistryReady = ready
+            dynamicParams = update.params,
+            dynamicParamValues = update.values,
+            dynamicParamsRegistryReady = update.registryReady
         )
     }
 
@@ -932,15 +868,8 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
      */
     fun advanceSeedIfNeeded() {
         val state = _uiState.value
-        if (!state.seedMode.advances) return
-        val constraints = WorkflowConstraintsProvider.getConstraints("seed", state.selectedWorkflow)
-        val next = nextSeed(
-            current = state.seed.toLongOrNull() ?: 0L,
-            step = state.seedMode.step,
-            min = constraints.min.toLong(),
-            max = constraints.max.toLong()
-        )
-        _uiState.value = state.copy(seed = next.toString(), seedError = null)
+        val next = VideoGenerationSupport.advanceSeed(state) ?: return
+        _uiState.value = state.copy(seed = next, seedError = null)
         savePreferences()
     }
 
@@ -1022,41 +951,20 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
     }
 
     // Primary LoRA chain operations (for single-model workflows like LTX 2.0)
-    fun onAddLora() {
-        val state = _uiState.value
-        val newChain = LoraChainManager.addLora(state.loraChain, state.availableLoras)
-        if (newChain === state.loraChain) return // No change
+    override fun withLoraChain(state: TextToVideoUiState, chain: List<LoraSelection>) =
+        state.copy(loraChain = chain)
 
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onAddLora() =
+        updateLoraChain(::savePreferences) { LoraChainManager.addLora(it.loraChain, it.availableLoras) }
 
-    fun onRemoveLora(index: Int) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.removeLora(state.loraChain, index)
-        if (newChain === state.loraChain) return // No change
+    fun onRemoveLora(index: Int) =
+        updateLoraChain(::savePreferences) { LoraChainManager.removeLora(it.loraChain, index) }
 
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onLoraNameChange(index: Int, name: String) =
+        updateLoraChain(::savePreferences) { LoraChainManager.updateLoraName(it.loraChain, index, name) }
 
-    fun onLoraNameChange(index: Int, name: String) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraName(state.loraChain, index, name)
-        if (newChain === state.loraChain) return // No change
-
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
-
-    fun onLoraStrengthChange(index: Int, strength: Float) {
-        val state = _uiState.value
-        val newChain = LoraChainManager.updateLoraStrength(state.loraChain, index, strength)
-        if (newChain === state.loraChain) return // No change
-
-        _uiState.value = state.copy(loraChain = newChain)
-        savePreferences()
-    }
+    fun onLoraStrengthChange(index: Int, strength: Float) =
+        updateLoraChain(::savePreferences) { LoraChainManager.updateLoraStrength(it.loraChain, index, strength) }
 
     // High noise LoRA chain operations
     fun onAddHighnoiseLora() {
@@ -1151,7 +1059,7 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
         MediaStateHolder.evict(MediaStateHolder.MediaKey.TtvPreview)
         _uiState.value = _uiState.value.copy(previewBitmap = null, currentVideoUri = null)
         // 播放已清空：注销裁剪保护（5.2）
-        clearPlayingVideo()
+        playingVideo.clear()
         // Clear prompt ID tracking to prevent restoration on subsequent screen navigations
         MediaStateHolder.clearCurrentTtvPromptId()
     }
@@ -1160,28 +1068,9 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
         lastClearedForPromptId = null // Reset tracking when manually clearing
         _uiState.value = _uiState.value.copy(previewBitmap = null, currentVideoUri = null)
         // 播放已清空：注销裁剪保护（5.2）
-        clearPlayingVideo()
+        playingVideo.clear()
         // Clear prompt ID tracking to prevent restoration on subsequent screen navigations
         MediaStateHolder.clearCurrentTtvPromptId()
-    }
-
-    /**
-     * Video length validation with special requirement for "steps of 4" (1, 5, 9, 13...).
-     * This is specific to video generation workflows.
-     */
-    private fun validateVideoLength(value: String): String? {
-        val num = value.toIntOrNull()
-        return when {
-            value.isEmpty() -> applicationContext?.getString(R.string.error_required)
-                ?: "Required"
-            num == null -> applicationContext?.getString(R.string.error_invalid_number)
-                ?: "Invalid number"
-            num !in 1..129 -> applicationContext?.getString(R.string.error_length_range)
-                ?: "Must be 1-129"
-            (num - 1) % 4 != 0 -> applicationContext?.getString(R.string.error_length_step)
-                ?: "Must be 1, 5, 9, 13... (steps of 4)"
-            else -> null
-        }
     }
 
     fun prepareWorkflow(): String? {
@@ -1227,8 +1116,10 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
             // Generation parameters
             steps = state.steps.toIntOrNull(),
             cfg = state.cfg.toFloatOrNull(),
-            samplerName = state.sampler,
-            scheduler = state.scheduler,
+            // 提交前兜底（1.3）：视频页的 sampler / scheduler 不落盘（见 VideoGenerationSupport.buildWorkflowValues），
+            // 取值来自缺省常量，但备份恢复 / 节点编辑等旁路仍可能把它们写脏，这里统一拦一道
+            samplerName = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers),
+            scheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers),
             denoise = state.denoise.toFloatOrNull(),
             seed = state.seed.toLongOrNull(),
             randomSeed = state.randomSeed,
@@ -1299,23 +1190,6 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
     }
 
     /**
-     * Stop listening for generation events.
-     * Note: We keep the refs if generation is still running,
-     * as the handler may still be called for completion events.
-     */
-    fun stopListening(generationViewModel: GenerationViewModel) {
-        generationViewModel.unregisterSubmittedCallback(OWNER_ID)
-        generationViewModel.unregisterEventHandler(OWNER_ID)
-        // Only clear refs if no generation is active (handler was actually unregistered)
-        // If generation is running, the handler is kept and needs the refs
-        if (!generationViewModel.generationState.value.isGenerating) {
-            if (generationViewModelRef == generationViewModel) {
-                generationViewModelRef = null
-            }
-        }
-    }
-
-    /**
      * Handle generation events from the GenerationViewModel.
      */
     private fun handleGenerationEvent(event: GenerationEvent) {
@@ -1380,7 +1254,7 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
                 // Clear preview bitmap so video player takes display precedence
                 _uiState.value = _uiState.value.copy(currentVideoUri = uri, previewBitmap = null)
                 // 播放方登记（5.2）：新视频开始播放，旧的那份同时注销
-                markPlayingVideo(MediaStateHolder.MediaKey.TtvVideo(promptId))
+                playingVideo.mark(MediaStateHolder.MediaKey.TtvVideo(promptId))
                 deleteLastPreviewImage()
                 generationViewModelRef?.completeGeneration(promptId)
             } else {

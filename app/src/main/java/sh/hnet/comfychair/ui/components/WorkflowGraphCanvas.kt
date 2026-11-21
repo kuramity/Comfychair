@@ -59,6 +59,9 @@ import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.workflow.FieldDisplayRegistry
 import sh.hnet.comfychair.workflow.InputValue
@@ -221,6 +224,67 @@ private data class AnimatedNodeState(
     val nodeData: WorkflowNode? = null,  // Current node data for rendering
     val isFadingOut: Boolean = false     // True when node is removed and fading out
 )
+
+/**
+ * 淡出收尾用的纯状态投影（P2-15）。
+ *
+ * 与 [AnimatedNodeState] 等分开：这里只保留判定需要的字段，让 JVM 单测不必构造
+ * Compose 的 `Animatable`。节点 / 便签 / 分组 / 连线四类动画状态都只有
+ * `alpha + isFadingOut` 两个字段参与收尾判定，因此共用同一份投影。
+ */
+internal data class FadeOutState(
+    val alpha: Float,
+    val isFadingOut: Boolean
+)
+
+/** 淡出协程的结束方式：正常播完 / 被外层 LaunchedEffect 取消。 */
+internal enum class FadeOutEnd { COMPLETED, CANCELLED }
+
+/** [resolveFadeOutOutcome] 的三种去向。 */
+internal sealed interface FadeOutOutcome {
+    /** 从动画状态表整体移除（元素已不在图中，不再绘制就是中性态）。 */
+    data object RemoveState : FadeOutOutcome
+
+    /** 保留状态并立即回到中性态（元素仍在图中：alpha=1、无淡出标记）。 */
+    data class KeepNeutral(val state: FadeOutState) : FadeOutOutcome
+
+    /** 状态已被更新的动画接管，本次收尾不得再动它。 */
+    data object KeepUntouched : FadeOutOutcome
+}
+
+/**
+ * 淡出收尾的状态迁移（P2-15）。
+ *
+ * 关键约束：**无论正常播完还是被取消，都不能把 `isFadingOut = true` 的中间态
+ * 留在动画状态表里**。淡出协程被取消（`graph.nodes` / `justDroppedNodeId` /
+ * `notes` / `renderedGroups` / `graph.edges` 变化会整体取消所在 LaunchedEffect
+ * 的子协程，`animateTo` 停在中间值）时若不收尾，该元素会被绘制循环当成
+ * "正在淡出"的离场元素，以中间 alpha 永久留在画面上。
+ *
+ * - 元素已不在图中：移除状态（旧行为，取消时也必须执行）；
+ * - 元素仍在图中（key 抖动 / 撤销删除）：恢复中性态，避免下帧从中间 alpha 起步；
+ * - 状态已被新动画替换：什么也不做，否则会误删同 id 重新加入后新建的状态。
+ *
+ * `end` 明确区分两条路径，当前落点相同；保留参数是为了让"取消也必须收尾"这条
+ * 语义在类型上显式可见，将来若两者需要不同处理不会漏。
+ */
+internal fun resolveFadeOutOutcome(
+    current: FadeOutState,
+    end: FadeOutEnd,
+    stillInGraph: Boolean,
+    stateStillOwnedByThisAnimation: Boolean
+): FadeOutOutcome {
+    if (!stateStillOwnedByThisAnimation) return FadeOutOutcome.KeepUntouched
+    if (stillInGraph) {
+        return FadeOutOutcome.KeepNeutral(current.copy(alpha = 1f, isFadingOut = false))
+    }
+    return when (end) {
+        // 正常播完：沿用旧行为，淡出结束即移除。
+        FadeOutEnd.COMPLETED -> FadeOutOutcome.RemoveState
+        // 被取消：同样必须移除 —— 这正是残影的成因（旧代码的 remove 在取消时不执行）。
+        FadeOutEnd.CANCELLED -> FadeOutOutcome.RemoveState
+    }
+}
 
 /**
  * Holds animatable position and alpha for a note.
@@ -508,6 +572,10 @@ fun WorkflowGraphCanvas(
     }
 
     // Animate nodes when graph changes (position + fade in/out)
+    // P2-15：淡出协程的 finally 里需要知道「这个节点现在还在不在图里」。
+    // rememberUpdatedState 让被取消的旧协程也能读到最新一帧的节点列表，
+    // 而不是启动淡出时那份已经过时的快照。
+    val latestGraphNodes by rememberUpdatedState(graph.nodes)
     LaunchedEffect(graph.nodes, justDroppedNodeId) {
         val currentNodeIds = graph.nodes.map { it.id }.toSet()
 
@@ -517,10 +585,49 @@ fun WorkflowGraphCanvas(
                 val state = animatedNodeStates[nodeId] ?: return@forEach
                 if (!state.isFadingOut && state.nodeData != null) {
                     // Start fade-out: mark as fading out and animate alpha to 0
-                    animatedNodeStates[nodeId] = state.copy(isFadingOut = true)
+                    // 用 copy 后的对象做"本次淡出"的身份标记：finally 里只有 map 里
+                    // 仍是这一份时才允许动它（节点重新加入会写入新状态）。
+                    val fadingState = state.copy(isFadingOut = true)
+                    animatedNodeStates[nodeId] = fadingState
                     launch {
-                        state.alpha.animateTo(0f, animationSpec)
-                        animatedNodeStates.remove(nodeId)
+                        var completed = false
+                        try {
+                            state.alpha.animateTo(0f, animationSpec)
+                            completed = true
+                        } finally {
+                            // P2-15：`graph.nodes` / `justDroppedNodeId` 变化会整体取消本
+                            // LaunchedEffect 及其子协程，animateTo 停在中间值 —— 旧代码把
+                            // remove 写在 animateTo 之后，取消时永远不执行，节点就以
+                            // isFadingOut=true 的中间 alpha 永久留在动画状态表里（残影）。
+                            // 清理必须放进 finally，并按状态区分去向（见纯函数 KDoc）。
+                            val latest = animatedNodeStates[nodeId]
+                            val outcome = resolveFadeOutOutcome(
+                                current = FadeOutState(
+                                    alpha = latest?.alpha?.value ?: state.alpha.value,
+                                    isFadingOut = latest?.isFadingOut ?: false
+                                ),
+                                end = if (completed) FadeOutEnd.COMPLETED else FadeOutEnd.CANCELLED,
+                                stillInGraph = latestGraphNodes.any { it.id == nodeId },
+                                stateStillOwnedByThisAnimation = latest === fadingState
+                            )
+                            when (outcome) {
+                                FadeOutOutcome.RemoveState ->
+                                    animatedNodeStates.remove(nodeId)
+                                is FadeOutOutcome.KeepNeutral -> {
+                                    // 不能在这里 suspend（协程已被取消，snapTo 会立刻抛
+                                    // CancellationException）：直接换一个 alpha=1 的
+                                    // Animatable，立即回到中性态。
+                                    animatedNodeStates[nodeId] = AnimatedNodeState(
+                                        x = state.x,
+                                        y = state.y,
+                                        alpha = Animatable(outcome.state.alpha),
+                                        nodeData = state.nodeData,
+                                        isFadingOut = outcome.state.isFadingOut
+                                    )
+                                }
+                                FadeOutOutcome.KeepUntouched -> Unit
+                            }
+                        }
                     }
                 }
             }
@@ -565,6 +672,8 @@ fun WorkflowGraphCanvas(
     }
 
     // Animate notes when notes change (position + fade in/out)
+    // P2-15（复核补充）：与节点同一套 finally 收尾，finally 里读取最新便签列表。
+    val latestNotes by rememberUpdatedState(notes)
     LaunchedEffect(notes, justDroppedNoteId) {
         val currentNoteIds = notes.map { it.id }.toSet()
 
@@ -573,10 +682,41 @@ fun WorkflowGraphCanvas(
             if (noteId !in currentNoteIds) {
                 val state = animatedNoteStates[noteId] ?: return@forEach
                 if (!state.isFadingOut && state.noteData != null) {
-                    animatedNoteStates[noteId] = state.copy(isFadingOut = true)
+                    val fadingState = state.copy(isFadingOut = true)
+                    animatedNoteStates[noteId] = fadingState
                     launch {
-                        state.alpha.animateTo(0f, animationSpec)
-                        animatedNoteStates.remove(noteId)
+                        var completed = false
+                        try {
+                            state.alpha.animateTo(0f, animationSpec)
+                            completed = true
+                        } finally {
+                            // 取消时 animateTo 停在中间值：必须收尾，否则便签会以
+                            // isFadingOut=true 的中间 alpha 永久留在状态表里（残影）。
+                            val latest = animatedNoteStates[noteId]
+                            val outcome = resolveFadeOutOutcome(
+                                current = FadeOutState(
+                                    alpha = latest?.alpha?.value ?: state.alpha.value,
+                                    isFadingOut = latest?.isFadingOut ?: false
+                                ),
+                                end = if (completed) FadeOutEnd.COMPLETED else FadeOutEnd.CANCELLED,
+                                stillInGraph = latestNotes.any { it.id == noteId },
+                                stateStillOwnedByThisAnimation = latest === fadingState
+                            )
+                            when (outcome) {
+                                FadeOutOutcome.RemoveState ->
+                                    animatedNoteStates.remove(noteId)
+                                is FadeOutOutcome.KeepNeutral -> {
+                                    animatedNoteStates[noteId] = AnimatedNoteState(
+                                        x = state.x,
+                                        y = state.y,
+                                        alpha = Animatable(outcome.state.alpha),
+                                        noteData = state.noteData,
+                                        isFadingOut = outcome.state.isFadingOut
+                                    )
+                                }
+                                FadeOutOutcome.KeepUntouched -> Unit
+                            }
+                        }
                     }
                 }
             }
@@ -619,6 +759,8 @@ fun WorkflowGraphCanvas(
     }
 
     // Animate groups when groups change (bounds + fade in/out)
+    // P2-15（复核补充）：分组淡出同样走 finally 收尾。
+    val latestGroups by rememberUpdatedState(renderedGroups)
     LaunchedEffect(renderedGroups) {
         val currentGroupIds = renderedGroups.map { it.id }.toSet()
 
@@ -627,10 +769,43 @@ fun WorkflowGraphCanvas(
             if (groupId !in currentGroupIds) {
                 val state = animatedGroupStates[groupId] ?: return@forEach
                 if (!state.isFadingOut && state.groupData != null) {
-                    animatedGroupStates[groupId] = state.copy(isFadingOut = true)
+                    val fadingState = state.copy(isFadingOut = true)
+                    animatedGroupStates[groupId] = fadingState
                     launch {
-                        state.alpha.animateTo(0f, animationSpec)
-                        animatedGroupStates.remove(groupId)
+                        var completed = false
+                        try {
+                            state.alpha.animateTo(0f, animationSpec)
+                            completed = true
+                        } finally {
+                            // 取消时 animateTo 停在中间值：必须收尾，否则分组会以
+                            // isFadingOut=true 的中间 alpha 永久留在状态表里（残影）。
+                            val latest = animatedGroupStates[groupId]
+                            val outcome = resolveFadeOutOutcome(
+                                current = FadeOutState(
+                                    alpha = latest?.alpha?.value ?: state.alpha.value,
+                                    isFadingOut = latest?.isFadingOut ?: false
+                                ),
+                                end = if (completed) FadeOutEnd.COMPLETED else FadeOutEnd.CANCELLED,
+                                stillInGraph = latestGroups.any { it.id == groupId },
+                                stateStillOwnedByThisAnimation = latest === fadingState
+                            )
+                            when (outcome) {
+                                FadeOutOutcome.RemoveState ->
+                                    animatedGroupStates.remove(groupId)
+                                is FadeOutOutcome.KeepNeutral -> {
+                                    animatedGroupStates[groupId] = AnimatedGroupState(
+                                        x = state.x,
+                                        y = state.y,
+                                        width = state.width,
+                                        height = state.height,
+                                        alpha = Animatable(outcome.state.alpha),
+                                        groupData = state.groupData,
+                                        isFadingOut = outcome.state.isFadingOut
+                                    )
+                                }
+                                FadeOutOutcome.KeepUntouched -> Unit
+                            }
+                        }
                     }
                 }
             }
@@ -670,6 +845,8 @@ fun WorkflowGraphCanvas(
     }
 
     // Animate edges when edges change (fade in/out only)
+    // P2-15（复核补充）：连线淡出同样走 finally 收尾。
+    val latestEdges by rememberUpdatedState(graph.edges)
     LaunchedEffect(graph.edges) {
         val currentEdgeKeys = graph.edges.map { edge ->
             EdgeKey(edge.sourceNodeId, edge.sourceOutputIndex, edge.targetNodeId, edge.targetInputName)
@@ -680,10 +857,46 @@ fun WorkflowGraphCanvas(
             if (edgeKey !in currentEdgeKeys) {
                 val state = animatedEdgeStates[edgeKey] ?: return@forEach
                 if (!state.isFadingOut && state.edgeData != null) {
-                    animatedEdgeStates[edgeKey] = state.copy(isFadingOut = true)
+                    val fadingState = state.copy(isFadingOut = true)
+                    animatedEdgeStates[edgeKey] = fadingState
                     launch {
-                        state.alpha.animateTo(0f, animationSpec)
-                        animatedEdgeStates.remove(edgeKey)
+                        var completed = false
+                        try {
+                            state.alpha.animateTo(0f, animationSpec)
+                            completed = true
+                        } finally {
+                            // 取消时 animateTo 停在中间值：必须收尾，否则连线会以
+                            // isFadingOut=true 的中间 alpha 永久留在状态表里（残影）。
+                            val latest = animatedEdgeStates[edgeKey]
+                            val outcome = resolveFadeOutOutcome(
+                                current = FadeOutState(
+                                    alpha = latest?.alpha?.value ?: state.alpha.value,
+                                    isFadingOut = latest?.isFadingOut ?: false
+                                ),
+                                end = if (completed) FadeOutEnd.COMPLETED else FadeOutEnd.CANCELLED,
+                                stillInGraph = latestEdges.any {
+                                    EdgeKey(
+                                        it.sourceNodeId,
+                                        it.sourceOutputIndex,
+                                        it.targetNodeId,
+                                        it.targetInputName
+                                    ) == edgeKey
+                                },
+                                stateStillOwnedByThisAnimation = latest === fadingState
+                            )
+                            when (outcome) {
+                                FadeOutOutcome.RemoveState ->
+                                    animatedEdgeStates.remove(edgeKey)
+                                is FadeOutOutcome.KeepNeutral -> {
+                                    animatedEdgeStates[edgeKey] = AnimatedEdgeState(
+                                        alpha = Animatable(outcome.state.alpha),
+                                        edgeData = state.edgeData,
+                                        isFadingOut = outcome.state.isFadingOut
+                                    )
+                                }
+                                FadeOutOutcome.KeepUntouched -> Unit
+                            }
+                        }
                     }
                 }
             }
@@ -1366,6 +1579,31 @@ fun WorkflowGraphCanvas(
             // Draw edges with alpha
             animatedEdges.forEach { (edge, alpha) ->
                 if (alpha > 0.01f) {
+                    // P2-14：连线视口剔除（节点/插槽早已剔除，只有连线还在全量绘制）。
+                    // 端点必须与 drawEdge 完全同源：nodePositionsMap 的节点坐标（含拖拽
+                    // 平移）+ 同一个 scaleSocketPosition（含拖拽节点 1.08 倍缩放）。
+                    // 端口节点暂缺时不做判断 —— drawEdge 自己会 return，跳过与否视觉等价。
+                    val sourceNode = nodePositionsMap[edge.sourceNodeId]
+                    val targetNode = nodePositionsMap[edge.targetNodeId]
+                    if (sourceNode != null && targetNode != null) {
+                        val from = scaleSocketPosition(
+                            sourceNode,
+                            sourceNode.x + sourceNode.width,
+                            sourceNode.y + calculateOutputY(sourceNode, edge.sourceOutputIndex),
+                            draggingNodeId,
+                            dragScale.value
+                        )
+                        val to = scaleSocketPosition(
+                            targetNode,
+                            targetNode.x,
+                            targetNode.y + calculateInputY(targetNode, edge.targetInputName),
+                            draggingNodeId,
+                            dragScale.value
+                        )
+                        if (!shouldDrawEdge(from, to, viewport)) {
+                            return@forEach
+                        }
+                    }
                     drawEdge(
                         edge = edge,
                         nodesById = nodePositionsMap,
@@ -2706,6 +2944,64 @@ internal fun isNodeVisible(
         viewportRight = viewport.right,
         viewportBottom = viewport.bottom,
         paddingPx = viewport.paddingPx
+    )
+}
+
+/**
+ * 连线视口剔除的常量外扩（图坐标单位）。
+ *
+ * 覆盖端点圆点半径 8、高亮线宽 8 的一半、抗锯齿与取整余量。端点本身与
+ * drawEdge 一样已过 [scaleSocketPosition]（拖拽缩放不再由余量兜底）；
+ * 曲线本身的外扩另按 [EDGE_CULL_CURVE_FACTOR] 随端点距离增长。
+ */
+internal const val EDGE_CULL_BASE_MARGIN = 96f
+
+/**
+ * 曲线控制点相对端点距离的最大水平外扩系数。
+ *
+ * 两个内置路由的控制点偏移上界：
+ * - [sh.hnet.comfychair.workflow.routing.CubicBezierRouter]：中段控制点偏移
+ *   `max(0.4 * 端点距离, 60)`，即 ≤ `0.4 * d + 60`；
+ * - [sh.hnet.comfychair.workflow.routing.CubicHermiteRouter]：切线幅值
+ *   `max(0.8 * d, 120)`，转成贝塞尔控制点后除以 3，即 ≤ `0.267 * d + 40`。
+ *
+ * 三次贝塞尔曲线位于四个控制点的凸包内，所以「端点包围盒 + 0.4d + 常量」一定
+ * 包住整条曲线。取 0.4 而不是 0.267 是给未来路由实现留的余量：**新增路由实现时，
+ * 必须保证控制点偏移不超过这个上界**，否则剔除可能把本来可见的连线判成不可见。
+ */
+internal const val EDGE_CULL_CURVE_FACTOR = 0.4f
+
+/**
+ * 是否值得绘制这条连线（视口剔除，P2-14）。
+ *
+ * 纯函数，不依赖 Compose 运行时，JVM 单测直接钉死边界行为。
+ * 判定用的是「端点包围盒 + 曲线凸包上界」与「视口 + [GraphViewport.paddingPx]」求交：
+ * 不相交时整条曲线（含描边与端点圆点）都在屏幕外，跳过 drawEdge 不会产生任何
+ * 可见差异；相交时照常绘制，不会出现"边缘连线突然消失"的闪烁。
+ *
+ * 视口退化成 0 面积（尚未完成测量）时不做剔除，与 [isNodeVisible] 同口径。
+ */
+internal fun shouldDrawEdge(
+    from: Offset,
+    to: Offset,
+    viewport: GraphViewport
+): Boolean {
+    if (viewport.right <= viewport.left || viewport.bottom <= viewport.top) return true
+    val dx = to.x - from.x
+    val dy = to.y - from.y
+    val distance = sqrt(dx * dx + dy * dy)
+    // 曲线外扩按端点距离线性增长：两个端点离得越远，控制点甩得越开。
+    val margin = viewport.paddingPx + EDGE_CULL_BASE_MARGIN + EDGE_CULL_CURVE_FACTOR * distance
+    return isNodeVisible(
+        nodeLeft = min(from.x, to.x),
+        nodeTop = min(from.y, to.y),
+        nodeRight = max(from.x, to.x),
+        nodeBottom = max(from.y, to.y),
+        viewportLeft = viewport.left,
+        viewportTop = viewport.top,
+        viewportRight = viewport.right,
+        viewportBottom = viewport.bottom,
+        paddingPx = margin
     )
 }
 

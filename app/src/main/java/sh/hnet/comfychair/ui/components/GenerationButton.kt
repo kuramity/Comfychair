@@ -54,6 +54,7 @@ import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.connection.rememberIsOffline
 import sh.hnet.comfychair.storage.AppSettings
+import sh.hnet.comfychair.ui.components.ripple.RippleSkinState
 import sh.hnet.comfychair.ui.components.ripple.rippleFeedback
 import sh.hnet.comfychair.ui.theme.ColorMath
 import sh.hnet.comfychair.ui.theme.Dimensions
@@ -76,6 +77,69 @@ internal const val TRAILING_GRADIENT_MIDPOINT_FRACTION = 0.5f
  * 静置走主按钮同源默认（深色 22% / 浅色 12%），打开提亮到 32%。
  */
 internal const val TRAILING_BORDER_OPEN_ALPHA = 0.32f
+
+/**
+ * 忙碌态按钮文字 alpha（v4.16.14，internal 供单测钉规格）。
+ *
+ * 忙碌态沿用 onPrimary（渐变上的主色文字），只降到 0.92 —— 肉眼几乎无差，但足以和
+ * 静置态区分"我在忙"。刻意**不用** M3 默认禁用文字色 onSurface@0.38：那在青蓝渐变底上
+ * 会糊成一片、看不清字。真禁用仍是 onSurface@0.38（灰底灰字，不许被忙碌态顺手带亮）。
+ */
+internal const val BUSY_CONTENT_ALPHA = 0.92f
+
+/**
+ * 生成主按钮的「忙碌 / 皮肤」判定结果（纯数据，v4.16.14 复核 BUSY-03/04）。
+ *
+ * @property enabled 按钮最终是否可点（[isEnabled] 已剔除离线）
+ * @property busy 是否本页忙碌（离线时恒 false）
+ * @property skinActive 是否启用皮肤（渐变 / 点阵 / 白边）
+ * @property busyContainerTransparent 忙碌态禁用容器是否透明（露出渐变）
+ */
+internal data class GenerationButtonSkin(
+    val enabled: Boolean,
+    val busy: Boolean,
+    val skinActive: Boolean,
+    val busyContainerTransparent: Boolean,
+)
+
+/**
+ * 生成主按钮的忙碌态判定（纯函数，供 JVM 单测钉住完整输入矩阵）。
+ *
+ * 为什么单独抽出来：组件内部无法从 `isEnabled=false` 反推"真禁用"还是"忙碌"，
+ * 而忙碌态又必须是**本页自己的**忙碌 ——
+ * 1. [isSubmitting] 来自 Activity 级共享的 GenerationViewModel（四页同一个实例），
+ *    A 页提交期间切到 B 页，B 页哪怕提示词为空也会看到 isSubmitting=true。调用方必须
+ *    先在页面侧按 ownerId 过滤（`isSubmitting && submitOwner == OWNER_ID`）再传进来；
+ * 2. 离线（强制离线 / 断网）一律按真禁用处理 —— 提交途中掉线不能让按钮继续亮着
+ *    忙碌皮肤，否则"离线灰底"的视觉承诺被打破（复核 BUSY-04）。
+ *
+ * @param isEnabled 页面传入的 enabled（本页输入合法 且 本页无提交）
+ * @param isOffline 强制离线或自动离线（rememberIsOffline 同值）
+ * @param isConnecting 连接检查在途（ConnectionManager 全局信号）
+ * @param isUploading 本页图片上传在途
+ * @param isFetching 本页取回结果在途
+ * @param isSubmitting 本页自己的提交闸门在途（页面侧已按 ownerId 过滤）
+ * @param dotFeedbackEnabled 波纹点阵皮肤总开关
+ */
+internal fun resolveGenerationButtonSkin(
+    isEnabled: Boolean,
+    isOffline: Boolean,
+    isConnecting: Boolean,
+    isUploading: Boolean,
+    isFetching: Boolean,
+    isSubmitting: Boolean,
+    dotFeedbackEnabled: Boolean,
+): GenerationButtonSkin {
+    val enabled = isEnabled && !isOffline
+    val busy = !isOffline && (isConnecting || isUploading || isFetching || isSubmitting)
+    return GenerationButtonSkin(
+        enabled = enabled,
+        busy = busy,
+        skinActive = RippleSkinState.skinActive(dotFeedbackEnabled, enabled, busy),
+        busyContainerTransparent =
+            RippleSkinState.busyContainerTransparent(busy, dotFeedbackEnabled),
+    )
+}
 
 /**
  * 下拉白边 override 的解析（v4.16.10 N1-2.1，纯函数供单测钉规格）。
@@ -163,6 +227,7 @@ private fun Color.shiftAccentHue(): Color =
  * @param isUploading Whether image upload is in progress (shows "Uploading...")
  * @param isFetching Whether result fetch is in progress (shows "Fetching...")
  * @param isConnecting Whether connection check is in progress (shows "Connecting...")
+ * @param isSubmitting 提交闸门是否在途（忙碌态信号，视觉保留皮肤但整体降档；见参数注释）
  * @param onGenerate Callback when Generate/Add to queue is clicked
  * @param onCancelCurrent Callback to cancel the currently executing job
  * @param onAddToFrontOfQueue Callback to add to front of queue
@@ -178,6 +243,18 @@ fun GenerationButton(
     isUploading: Boolean = false,
     isFetching: Boolean = false,
     isConnecting: Boolean = false,
+    /**
+     * v4.16.14：**本页自己的**提交闸门是否在途。
+     *
+     * 来源是 Activity 级共享的 `GenerationViewModel.isSubmitting`（四个生成页同一个实例），
+     * 页面必须按 ownerId 过滤后再传（`isSubmitting && submitOwner == 本页 OWNER_ID`）——
+     * 否则 A 页提交期间切到 B 页，B 页的空输入按钮会显示忙碌皮肤而不是真禁用灰底。
+     *
+     * 点击「生成」后 [isEnabled] 会因为 `!isSubmitting` 变 false —— 但这**不是**"提示词为空"
+     * 那种真禁用，只是提交往返期间的忙碌态。组件内部无法从 isEnabled 反推，必须单独接进来；
+     * 否则忙碌瞬间皮肤整层被拆掉，表现就是"点下生成、正在扩散的水波突然看不见"。
+     */
+    isSubmitting: Boolean = false,
     /** 上传进度 0–100（-1 = 未知/无上传）；v4.6.1 模块 D */
     uploadProgress: Int = -1,
     /**
@@ -265,11 +342,27 @@ fun GenerationButton(
         // rippleFeedback 只在 Initial pass 观察指针、绝不 consume，提交行为不受影响。
         // shape 取 RoundedCornerShape(28.dp) —— 等于按钮高度一半，才是真正的胶囊；
         val leadingInteraction = remember { MutableInteractionSource() }
-        // v5.x 皮肤（决策 1/2/4）：enabled 且皮肤总开关开 → 容器透明，双色渐变从底层露出；
-        // 禁用 → 渐变 null、容器回 M3 默认禁用灰，无渐变/白边/辉光/波纹，零特效。
-        // 总开关关闭时保留纯色 primary（等价旧版无特效形态），不能给透明容器（会只剩文字）。
-        val leadingEnabled = isEnabled && !isOffline
-        val leadingSkinActive = leadingEnabled && dotFeedbackEnabled
+        // v5.x 皮肤（决策 1/2/4）：皮肤总开关开 + 非"真禁用" → 容器透明，双色渐变从底层露出。
+        // v4.16.14：忙碌（提交/上传/取回/连接）与真禁用（提示词为空/离线）必须分开 ——
+        // 忙碌态保留渐变 + 点阵 + 白边 + 投影（整体乘 busyDim 压暗），只有真禁用才回灰底零特效。
+        // 判定抽成纯函数 resolveGenerationButtonSkin：离线一律真禁用；isSubmitting 必须是
+        // 本页自己的提交（页面侧已按 ownerId 过滤，避免 A 页提交把 B 页的空输入按钮带亮）。
+        val skin = resolveGenerationButtonSkin(
+            isEnabled = isEnabled,
+            isOffline = isOffline,
+            isConnecting = isConnecting,
+            isUploading = isUploading,
+            isFetching = isFetching,
+            isSubmitting = isSubmitting,
+            dotFeedbackEnabled = dotFeedbackEnabled,
+        )
+        val leadingEnabled = skin.enabled
+        val busy = skin.busy
+        val skinActive = skin.skinActive
+        val busyContainerTransparent = skin.busyContainerTransparent
+        // 真禁用文字色沿用 M3 默认 token（onSurface@0.38）——不手写常量，避免主题版本漂移
+        val defaultDisabledContentColor =
+            ButtonDefaults.elevatedButtonColors().disabledContentColor
         val accent = MaterialTheme.colorScheme.primary
         SplitButtonDefaults.ElevatedLeadingButton(
             onClick = {
@@ -314,11 +407,22 @@ fun GenerationButton(
                 // v4.16.6（Q2）：原 `else -> onSurface@12%` 是死分支 —— material3 1.5.0-alpha11 的
                 // ButtonColors.containerColor(enabled) 在 disabled 时读 disabledContainerColor 槽位、
                 // 不读 containerColor，数值恰与 M3 token 默认一致所以视觉没露馅。现在把禁用色
-                // 显式写进 disabled 槽位（意图与行为对齐）；禁用文字色不传 disabledContentColor，
-                // 保持 M3 默认 onSurface@0.38（写成 onPrimary 会在灰底上看不清）。
-                containerColor = if (leadingSkinActive) Color.Transparent else containerColor,
-                disabledContainerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
-                contentColor = contentColor
+                // 显式写进 disabled 槽位（意图与行为对齐）。
+                // v4.16.14：忙碌态禁用容器改透明（让皮肤渐变露出）；真禁用仍是 M3 禁用灰。
+                containerColor = if (skinActive) Color.Transparent else containerColor,
+                disabledContainerColor = if (busyContainerTransparent) {
+                    Color.Transparent
+                } else {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                },
+                contentColor = contentColor,
+                // v4.16.14：忙碌态文字用 onPrimary@0.92（渐变底上可读，静置态基本无差）；
+                // 真禁用保持 M3 默认 onSurface@0.38（灰底灰字）——真禁用不许被忙碌态带亮。
+                disabledContentColor = if (busyContainerTransparent) {
+                    contentColor.copy(alpha = BUSY_CONTENT_ALPHA)
+                } else {
+                    defaultDisabledContentColor
+                }
             ),
             interactionSource = leadingInteraction,
             modifier = Modifier
@@ -340,9 +444,12 @@ fun GenerationButton(
                     //（false = 完全不画，回 v4.16.6 之前的零绘制行为）。原先两个信号混用：
                     // 用户关掉波纹点阵后，可用按钮会画出禁用档白边（0.10 而非 0.22）。
                     enabled = leadingEnabled,
+                    // v4.16.14：忙碌态（提交/上传/取回/连接）保留皮肤 —— 点下生成的瞬间，
+                    // 正在扩散的水波不能因为 isEnabled 变 false 就整层消失。
+                    busy = busy,
                     skinEnabled = dotFeedbackEnabled,
                     // 渐变色不缓存（决策 7）：accent 变了重组时这里现取新值，绘制层下一帧跟随
-                    gradientColors = if (leadingSkinActive) {
+                    gradientColors = if (skinActive) {
                         listOf(accent, accent.shiftAccentHue())
                     } else {
                         null

@@ -120,11 +120,6 @@ object TemplateKeyRegistry {
         // 参考音频位：由 AudioSlotDetector + WorkflowManager.injectAudioSlots 专用处理，
         // 不登记的话动态参数引擎会把它渲染成一个多余的文本框（界面上出现两遍）
         "audio_filename",
-        // 时间线导演台的两个参数：由 TimelineSlotDetector 探测、片段编辑器生成、
-        // prepareImageToVideoWorkflowById 整体替换。不登记的话引擎会把 timeline_data
-        // 渲染成一个空的文本框（那段 JSON 用户没法手写），而真正的编辑器在别处
-        "timeline_data",
-        "generation_seconds",
         // 技能流的两个 md 字段：由 WorkflowManager.applySkillPrompt 读 assets 后整体替换，
         // 真正的选择器是配置面板底部的「技能提示词」下拉。不登记的话引擎会把它们当成普通
         // 文本框渲染出来（值就是占位符字面量），用户一滚动面板就被持久化成空串，
@@ -285,13 +280,6 @@ object TemplateKeyRegistry {
      */
     fun getStrictlyRequiredKeysForWorkflow(workflowType: WorkflowType, workflowJson: JSONObject): Set<String> {
         val base = REQUIRED_KEYS_BY_TYPE[workflowType] ?: return emptySet()
-
-        // 时间线导演台流不要求「必须有一张图」：它的图片参考藏在 timeline_data 里
-        // （节点根本没有图片输入口，工作流里也就不该有 LoadImage 节点），
-        // 视频片段才是这类工作流的主体。沿用 ITV 的 image 必需会让它永远加载不了。
-        if (workflowType == WorkflowType.ITV && TimelineSlotDetector.detect(workflowJson) != null) {
-            return base - "image"
-        }
 
         // For strictly required keys, we don't need to adjust for DualCLIPLoader or BasicGuider
         // since CLIP, CFG, and negative_text are optional now

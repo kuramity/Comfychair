@@ -1204,4 +1204,38 @@ class ViewerDismissGestureLogicTest {
             )
         )
     }
+
+    // ---------- 8. 透出收回时机（v4.16.14 修：松手即作废） ----------
+
+    /**
+     * 透出的第二个判据：手指必须还按在屏上。
+     *
+     * 这是"松手回弹瞬间闪一下图库"的根因反证。修复前只按位移判定：回弹期间位移
+     * 还在 10% 以上，遮罩目标就一直是 0.2，那条 120ms 淡出**在手指抬起后继续补完**
+     * （图库截图里的缩略图反而变得更清楚），之后才淡回纯黑 —— 观感就是松手瞬间
+     * 闪一下图片。加上 gestureActive 之后，收回与松手发生在同一帧。
+     */
+    @Test
+    fun `松手后即使位移还超过阈值也不再透出`() {
+        val h = 2000f
+        val deep = h * 0.15f // 远超 10% 阈值
+        // 手指还按着：透出
+        assertTrue(ViewerDismissGesture.shouldRevealMask(deep, h, gestureActive = true))
+        // 手指已松（回弹中）：一律收回，不管位移多深
+        assertFalse(ViewerDismissGesture.shouldRevealMask(deep, h, gestureActive = false))
+        // 松手 + 位移已经很浅：同样不透露
+        assertFalse(ViewerDismissGesture.shouldRevealMask(h * 0.02f, h, gestureActive = false))
+    }
+
+    /** 拖动中的透出阈值必须与 dismissMaskTargetAlpha 同口径（"≥ 10%" 才透出）。 */
+    @Test
+    fun `拖动中的透出阈值与遮罩映射同口径`() {
+        val h = 2000f
+        assertTrue(ViewerDismissGesture.shouldRevealMask(h * 0.10f, h, gestureActive = true))
+        assertFalse(ViewerDismissGesture.shouldRevealMask(h * 0.099f, h, gestureActive = true))
+        // 零位移 / 向上拖 / 屏高未测得：一律不透出（宁可黑也不透出错帧）
+        assertFalse(ViewerDismissGesture.shouldRevealMask(0f, h, gestureActive = true))
+        assertFalse(ViewerDismissGesture.shouldRevealMask(-100f, h, gestureActive = true))
+        assertFalse(ViewerDismissGesture.shouldRevealMask(100f, 0f, gestureActive = true))
+    }
 }

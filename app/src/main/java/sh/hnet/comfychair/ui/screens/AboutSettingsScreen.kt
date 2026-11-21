@@ -39,7 +39,7 @@ import kotlinx.coroutines.launch
 import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.ui.components.SettingsScreenScaffold
-import sh.hnet.comfychair.update.UpdateChecker
+import sh.hnet.comfychair.update.UpdateCleanupPolicy
 import sh.hnet.comfychair.update.UpdateRepository
 
 @Composable
@@ -103,20 +103,32 @@ fun AboutSettingsScreen(
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.clickable(enabled = !checkingUpdate) {
                     checkingUpdate = true
+                    // 手动检查统一走 UpdateRepository.manualCheck（v4.18.0）：
+                    // 1. R4：先看磁盘上有没有「校验通过且版本更高」的已下载包 → 直接给「安装」；
+                    // 2. R1：手动检查不受「一版只主动弹一次」的配额限制，有更新就弹；
+                    // 3. R3：确认已是最新时取消残留 Worker + 清通知，并给「已是最新」提示；
+                    // 4. 失败原因仍从 lastCheckError 透传（与原行为一致）。
+                    val appContext = context.applicationContext
                     scope.launch(Dispatchers.IO) {
-                        val info = UpdateChecker.checkForUpdate(BuildConfig.VERSION_CODE, manualCheck = true)
+                        // 已装版本用 PackageManager 读（不能用 BuildConfig：编译期常量，
+                        // 装完新版本后旧进程里读到的是旧值）。
+                        val result = UpdateRepository.manualCheck(
+                            appContext,
+                            UpdateCleanupPolicy.installedVersionCode(appContext).toInt()
+                        )
                         kotlinx.coroutines.withContext(Dispatchers.Main) {
                             checkingUpdate = false
-                            when {
-                                info != null -> {
-                                    UpdateRepository.publishAvailable(info)
+                            when (result) {
+                                is UpdateRepository.ManualCheckResult.UpdateAvailable ->
                                     showUpdateDialog = true
-                                }
-                                UpdateChecker.lastCheckError != null -> {
-                                    checkUpdateErrorArg = UpdateChecker.lastCheckError
+                                UpdateRepository.ManualCheckResult.ReadyToInstall ->
+                                    showUpdateDialog = true
+                                UpdateRepository.ManualCheckResult.AlreadyLatest ->
+                                    checkUpdateMessageRes = R.string.update_already_latest
+                                is UpdateRepository.ManualCheckResult.Failed -> {
+                                    checkUpdateErrorArg = result.message
                                     checkUpdateMessageRes = R.string.update_manual_check_failed
                                 }
-                                else -> checkUpdateMessageRes = R.string.update_already_latest
                             }
                         }
                     }
@@ -136,7 +148,17 @@ fun AboutSettingsScreen(
             if (showUpdateDialog) {
                 sh.hnet.comfychair.ui.components.shared.UpdateDialog(
                     showDialog = true,
-                    onDismiss = { showUpdateDialog = false }
+                    onDismiss = {
+                        showUpdateDialog = false
+                        // R1：忽略 = 放弃本次提示。只隐藏弹窗会把状态留在 AVAILABLE，
+                        // 回到主界面时 UpdateDialogHost 会把它再弹一次 —— 正是用户抱怨的
+                        // 「点了忽略还是每次都弹」。这里同步收回 IDLE。
+                        if (UpdateRepository.state.value.phase ==
+                            sh.hnet.comfychair.update.UpdatePhase.AVAILABLE
+                        ) {
+                            UpdateRepository.reset()
+                        }
+                    }
                 )
             }
 

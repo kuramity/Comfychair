@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- 下载完成通知（Android 13+ 运行时权限；被拒时静默跳过，弹窗仍是主入口） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- v4.18.0 R6：下载前判断当前是 WiFi 还是移动网络（普通权限，无运行时弹窗） -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- 屏幕适配（7.3，方案 B：明确只支持手机）。
 
@@ -42,6 +44,7 @@
         android:requiresSmallestWidthDp="320" />
 
     <application
+        android:name=".ComfyChairApp"
         android:allowBackup="true"
         android:largeHeap="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -134,7 +137,7 @@
             android:windowSoftInputMode="adjustResize" />
 
         <!-- UpdateInstallActivity - 通知栏「安装」的无界面中转（P0-7 复核 R2-L1）。
-             点击通知时先落到这里，由它在点击的这一刻重新做包名/签名校验
+             点击通知时先落到这里，由它在点击的这一刻重新做包名校验（签名由系统安装时校验）
              （AppInstaller.install → isApkTrusted）再拉起系统安装器，消除
              「通知已发出、尚未点击」期间替换 update.apk 的 TOCTOU 窗口。
              透明主题保证不闪界面；校验完立即 finish()。 -->

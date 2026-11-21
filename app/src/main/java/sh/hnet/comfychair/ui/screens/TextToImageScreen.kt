@@ -149,6 +149,8 @@ fun TextToImageScreen(
     // P1-4：提交在途（闸门持有中）。并入按钮 enabled 条件，连点时按钮本身即禁用，
     // 不再依赖 ViewModel 层静默丢弃来兜底。
     val isSubmitting by generationViewModel.isSubmitting.collectAsStateWithLifecycle()
+    // v4.16.14（复核 BUSY-03）：提交闸门是四页共享的，忙碌皮肤只属于提交方本页
+    val submitOwner by generationViewModel.submitOwnerId.collectAsStateWithLifecycle()
     val presetUiState by presetViewModel.uiState.collectAsStateWithLifecycle()
 
     // 3D 产物（文生3D）。入口的显隐只看工作流类型（`capabilities.is3DWorkflow`），
@@ -480,6 +482,8 @@ fun TextToImageScreen(
                     !isSubmitting,
                 isFetching = uiState.isFetching,
                 isConnecting = isConnecting,
+                // v4.16.14：本页自己的提交才算忙碌态（别页提交时本页仍按真禁用灰底）
+                isSubmitting = isSubmitting && submitOwner == TextToImageViewModel.OWNER_ID,
                 onGenerate = {
                     // S2Probe（v4.16.7 取证）：onGenerate 确实被调（区分"onClick 到达但
                     // 校验失败"与"onClick 根本没到达"两条路径）

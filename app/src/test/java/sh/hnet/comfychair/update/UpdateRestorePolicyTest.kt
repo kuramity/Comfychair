@@ -111,19 +111,30 @@ class UpdateRestorePolicyTest {
     @Test
     fun `恢复链路接线：先复验 sha256 再走安装闸门才允许置就绪`() {
         val full = readSource("src/main/java/sh/hnet/comfychair/update/UpdateRepository.kt")
-        val start = full.indexOf("fun restoreFromDisk(")
-        assertTrue("找不到 restoreFromDisk", start >= 0)
-        // 只看恢复方法本身：publishReady 里也有一处 READY_TO_INSTALL，全文搜索会误判
+        // v4.18.0：本地包复用逻辑从 restoreFromDisk 抽到 restoreLocalPackage（R4），
+        // 冷启动恢复改为「先试复用、再决定是否清理」。三闸门的顺序在这里钉住。
+        val start = full.indexOf("fun restoreLocalPackage(")
+        assertTrue("找不到 restoreLocalPackage", start >= 0)
+        // 只看到 restoreLocalPackage 之后的代码（同一分区内的辅助函数也在后面）
         val body = full.substring(start)
 
         val verify = body.indexOf("UpdateRestorePolicy.verify(")
         val trust = body.indexOf("AppInstaller.isApkTrusted(")
         val ready = body.indexOf("phase = UpdatePhase.READY_TO_INSTALL")
-        assertTrue("restoreFromDisk 必须调用 UpdateRestorePolicy.verify", verify >= 0)
-        assertTrue("restoreFromDisk 必须复用 AppInstaller.isApkTrusted 的包名/签名校验", trust >= 0)
+        assertTrue("restoreLocalPackage 必须调用 UpdateRestorePolicy.verify", verify >= 0)
+        assertTrue("restoreLocalPackage 必须复用 AppInstaller.isApkTrusted 的包名校验", trust >= 0)
         assertTrue(
-            "复验（$verify）与签名闸门（$trust）都必须排在置 READY_TO_INSTALL（$ready）之前",
+            "复验（$verify）与包名闸门（$trust）都必须排在置 READY_TO_INSTALL（$ready）之前",
             ready > verify && ready > trust
+        )
+        // 冷启动入口必须委托给复用检查（不能另起一条绕过闸门的恢复路径）
+        val restoreStart = full.indexOf("fun restoreFromDisk(")
+        assertTrue("找不到 restoreFromDisk", restoreStart >= 0)
+        val restoreEnd = if (start > restoreStart) start else full.length
+        val restoreBody = full.substring(restoreStart, restoreEnd)
+        assertTrue(
+            "restoreFromDisk 必须先调用 restoreLocalPackage（R4 唯一入口）",
+            restoreBody.contains("restoreLocalPackage(")
         )
     }
 

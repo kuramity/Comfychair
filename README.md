@@ -2,7 +2,7 @@
 
 An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 
-**Current version**: v4.16.13（二次开发版 / Community Edition）
+**Current version**: v4.19.2（二次开发版 / Community Edition）
 
 > **This project is a fork of [ComfyChair](https://github.com/legal-hkr/comfychair),
 > originally developed by Legal HKr, licensed under GPL-3.0.
@@ -182,7 +182,7 @@ ComfyChair provides a streamlined mobile interface for interacting with ComfyUI 
 这 4 个模板里的**模型名全部留空**，提示词也为空——不内置任何私有模型路径或示例内容。
 首次使用时，请在下拉框里选择**你自己服务器上**的模型。
 
-其余高级玩法（多阶段精修、SeedVR2 / VOSR2 放大、时间线导演台、
+其余高级玩法（多阶段精修、SeedVR2 / VOSR2 放大、
 技能提示词强化、MOSS 五模式、四视图等）在开源版里**不内置**，
 但你可以在 ComfyUI 里自己搭好后导出 API 格式，再从 App 导入使用——
 App 的功能代码全部保留，任何合规工作流都能导入。
@@ -255,8 +255,8 @@ Civitai 与 HuggingFace，未命中的会列成清单方便你手工补。
   `NetworkPolicy` + `CleartextGuardInterceptor` 在 OkHttp 层执行。
   **WebView 登录页、以及任何不走 `ComfyUIClient.secured()` 的新网络链路不在闸门内。**
 - **分享**：FileProvider 只声明 `cacheDir/share/` 与 `update/`，新增分享必须走 `ShareFileStore`。
-- **更新**：冷启动恢复安装包前会复验 sha256 与包名/签名；sha256 只防损坏/低成本替换，
-  认证性由签名校验承担。
+- **更新**：冷启动恢复安装包前会复验 sha256 与包名；sha256 只防损坏/低成本替换，
+  包名只拦「装成另一个 App」，签名认证由系统安装器在安装时校验。
 
 新增网络 / 分享 / 更新代码前请先读 [SECURITY.md](SECURITY.md)。
 
@@ -317,7 +317,7 @@ To connect to your ComfyUI server, you'll need:
 - **Architecture**: MVVM with ViewModels and StateFlow
 - **Navigation**: Jetpack Compose Navigation
 - **Build system**: Gradle with Kotlin DSL
-- **Testing**: 1435 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
+- **Testing**: 1775 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
 
 ## Contributing
 

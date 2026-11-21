@@ -116,6 +116,8 @@ fun TextToVideoScreen(
     // P1-4：提交在途（闸门持有中）。并入按钮 enabled 条件，连点时按钮本身即禁用，
     // 不再依赖 ViewModel 层静默丢弃来兜底。
     val isSubmitting by generationViewModel.isSubmitting.collectAsStateWithLifecycle()
+    // v4.16.14（复核 BUSY-03）：提交闸门是四页共享的，忙碌皮肤只属于提交方本页
+    val submitOwner by generationViewModel.submitOwnerId.collectAsStateWithLifecycle()
 
     // Check if THIS screen owns the currently executing job (for progress bar)
     val isThisScreenExecuting = queueState.executingOwnerId == TextToVideoViewModel.OWNER_ID
@@ -416,6 +418,8 @@ fun TextToVideoScreen(
                     !isSubmitting,
                 isFetching = uiState.isFetching,
                 isConnecting = isConnecting,
+                // v4.16.14：本页自己的提交才算忙碌态（别页提交时本页仍按真禁用灰底）
+                isSubmitting = isSubmitting && submitOwner == TextToVideoViewModel.OWNER_ID,
                 onGenerate = {
                     val workflowJson = textToVideoViewModel.prepareWorkflow()
                     if (workflowJson != null) {

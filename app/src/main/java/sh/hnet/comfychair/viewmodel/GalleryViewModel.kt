@@ -44,7 +44,22 @@ data class GalleryItem(
      * SaveImage 写预览图 `images`，不配对的话用户只能在图库看到 png、
      * 永远找不到 glb 的入口（v4.2.2 真机反馈的实际缺陷）。
      */
-    val threeD: ThreeDResultHolder.Result? = null
+    val threeD: ThreeDResultHolder.Result? = null,
+    /**
+     * 「源已不存在」：服务器上的原文件确认已被删除（/view 返回 **HTTP 404**）。
+     *
+     * 与「加载中」「已加载」构成图库条目的第三态：
+     * - 加载中：模糊/转圈占位，保存不可用；
+     * - 已加载：清晰原图，保存可用；
+     * - 源已不存在：显示本机缓存的低清副本（不盖模糊），右上角「已删除」角标，
+     *   保存可用但明确提示保存的是低清版。
+     *
+     * **只有 404 才会置 true**（见 `ComfyUIClient.isSourceMissingStatus`）：
+     * 超时、断网、5xx 一律不置位 —— 地铁里打开图库不能满屏「已删除」。
+     * 该标记随图库索引持久化，刷新合并时与本地旧值做逻辑或，
+     * 防止 ComfyUI「只删文件不删 /history」把标记冲掉。
+     */
+    val sourceMissing: Boolean = false
 ) {
     /**
      * Create a cache key for this item.
@@ -67,6 +82,20 @@ data class GalleryUiState(
     /** 当前列表是否已全部选中（决定「全选/取消全选」按钮的形态）。 */
     val isAllSelected: Boolean = false
 )
+
+/**
+ * 单条媒体「保存到相册」的结果档位（纯枚举，便于批量保存汇总提示）。
+ *
+ * [SAVED_LOWRES] 是本轮新增的第三态分支：源已不存在（/view 404）但本机有缓存时，
+ * 保存的是低清副本 —— 成功文案必须说清楚，不能让用户以为存下了原图。
+ */
+internal enum class SaveOutcome {
+    SAVED,
+    SAVED_LOWRES,
+    /** 源已不存在且本机连缓存都没有：只能拒绝保存并说明原因 */
+    NO_LOCAL_COPY,
+    FAILED
+}
 
 /**
  * Events emitted by gallery operations
@@ -190,7 +219,8 @@ class GalleryViewModel : ViewModel() {
     fun deleteItem(item: GalleryItem) {
         DebugLogger.i(TAG, "Deleting item: ${item.promptId}")
         viewModelScope.launch {
-            // G4：删除 = 移入回收站（阶段一，可恢复）。成功恒为 true（纯本地操作）
+            // G4：删除 = 移入回收站（阶段一，可恢复）。返回值 = 条目是否真的进站：
+            // 回收站落盘失败时 moveToTrash 返回空列表 → false，不能当成成功。
             val success = repository.deleteItem(item)
             if (success) {
                 DebugLogger.d(TAG, "Moved to trash")
@@ -240,54 +270,96 @@ class GalleryViewModel : ViewModel() {
 
     fun saveImageToGallery(context: Context, item: GalleryItem) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                val key = item.toCacheKey()
-                val bitmap = MediaCache.getBitmap(key)
-                    ?: MediaCache.fetchImage(key, item.subfolder, item.type)
-
-                if (bitmap == null) {
-                    _events.emit(GalleryEvent.ShowToast(R.string.error_save_image))
-                    return@withContext
-                }
-
-                // P1-22：成功/失败以真实写入结果为准（IS_PENDING 流程，不再假成功）
-                val saved = PhotoManager.saveBitmap(context, bitmap)
-                _events.emit(
-                    GalleryEvent.ShowToast(
-                        if (saved) R.string.msg_image_saved_to_gallery else R.string.error_save_image
-                    )
-                )
-            }
+            val outcome = saveImageItem(context, item)
+            _events.emit(GalleryEvent.ShowToast(saveOutcomeMessage(outcome, item.isVideo)))
         }
     }
 
     fun saveVideoToGallery(context: Context, item: GalleryItem) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                val key = item.toCacheKey()
-                val videoBytes = MediaCache.getVideoBytes(key)
-                    ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
-
-                if (videoBytes == null) {
-                    _events.emit(GalleryEvent.ShowToast(R.string.error_save_video))
-                    return@withContext
-                }
-
-                val saved = PhotoManager.saveVideoBytes(context, videoBytes)
-                _events.emit(
-                    GalleryEvent.ShowToast(
-                        if (saved) R.string.msg_video_saved_to_gallery else R.string.error_save_video
-                    )
-                )
-            }
+            val outcome = saveVideoItem(context, item)
+            _events.emit(GalleryEvent.ShowToast(saveOutcomeMessage(outcome, isVideo = true)))
         }
     }
+
+    /** 单条保存结果 → 提示文案（源已不存在时明确说"低清版"/"本机无缓存"） */
+    private fun saveOutcomeMessage(outcome: SaveOutcome, isVideo: Boolean): Int = when (outcome) {
+        SaveOutcome.SAVED ->
+            if (isVideo) R.string.msg_video_saved_to_gallery else R.string.msg_image_saved_to_gallery
+        // 视频的本地缓存不是"低分辨率"：文案必须说"本机缓存版"，不能说成低清图片
+        SaveOutcome.SAVED_LOWRES ->
+            if (isVideo) R.string.msg_video_saved_lowres else R.string.msg_image_saved_lowres
+        SaveOutcome.NO_LOCAL_COPY -> R.string.msg_image_source_missing_no_cache
+        SaveOutcome.FAILED -> if (isVideo) R.string.error_save_video else R.string.error_save_image
+    }
+
+    /**
+     * 保存一张图片（唯一实现，单条/批量共用）。
+     *
+     * `sourceMissing == true` 时**只读本机缓存**：原图已确认不在服务器上，
+     * 任何网络请求都只会再等一次 404/超时。本机也没有缓存 → NO_LOCAL_COPY，
+     * 由界面明确提示「原图已被删除，且本机无缓存」。
+     */
+    private suspend fun saveImageItem(context: Context, item: GalleryItem): SaveOutcome =
+        withContext(Dispatchers.IO) {
+            val key = item.toCacheKey()
+            // 已持久化的标记与本次会话的 404 标记任一成立都按第三态处理
+            val alreadyMissing = item.sourceMissing || MediaCache.isFileMissing(key)
+            val bitmap = if (alreadyMissing) {
+                MediaCache.getLocalImage(key)
+            } else {
+                MediaCache.getBitmap(key)
+                    ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            }
+
+            if (bitmap == null) {
+                return@withContext if (alreadyMissing) SaveOutcome.NO_LOCAL_COPY else SaveOutcome.FAILED
+            }
+
+            // P1-22：成功/失败以真实写入结果为准（IS_PENDING 流程，不再假成功）
+            if (!PhotoManager.saveBitmap(context, bitmap)) return@withContext SaveOutcome.FAILED
+            // 拉取过程中才确认 404 的情况也要报"低清版"：fetchImage 已回落到本机缓存
+            if (item.sourceMissing || MediaCache.isFileMissing(key)) {
+                SaveOutcome.SAVED_LOWRES
+            } else {
+                SaveOutcome.SAVED
+            }
+        }
+
+    /** 保存一个视频（与 [saveImageItem] 同一纪律：源已不存在时不联网，只用本机字节）。 */
+    private suspend fun saveVideoItem(context: Context, item: GalleryItem): SaveOutcome =
+        withContext(Dispatchers.IO) {
+            val key = item.toCacheKey()
+            val alreadyMissing = item.sourceMissing || MediaCache.isFileMissing(key)
+            val videoBytes = if (alreadyMissing) {
+                MediaCache.getLocalVideoBytes(key)
+            } else {
+                MediaCache.getVideoBytes(key)
+                    ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            }
+
+            if (videoBytes == null) {
+                return@withContext if (alreadyMissing) SaveOutcome.NO_LOCAL_COPY else SaveOutcome.FAILED
+            }
+
+            if (!PhotoManager.saveVideoBytes(context, videoBytes)) return@withContext SaveOutcome.FAILED
+            if (item.sourceMissing || MediaCache.isFileMissing(key)) {
+                SaveOutcome.SAVED_LOWRES
+            } else {
+                SaveOutcome.SAVED
+            }
+        }
 
     fun fetchFullImage(item: GalleryItem, onResult: (Bitmap?) -> Unit) {
         viewModelScope.launch {
             val key = item.toCacheKey()
-            val bitmap = MediaCache.getBitmap(key)
-                ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            // 源已不存在：不再请求原图，直接用本机缓存（720 档/旧磁盘）
+            val bitmap = if (item.sourceMissing) {
+                MediaCache.getLocalImage(key)
+            } else {
+                MediaCache.getBitmap(key)
+                    ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            }
             onResult(bitmap)
         }
     }
@@ -295,9 +367,13 @@ class GalleryViewModel : ViewModel() {
     fun fetchVideoUri(context: Context, item: GalleryItem, onResult: (Uri?) -> Unit) {
         viewModelScope.launch {
             val key = item.toCacheKey()
-            // Ensure bytes are cached
-            MediaCache.getVideoBytes(key)
-                ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            // Ensure bytes are cached（源已不存在：只用本机字节，不请求已删除的文件）
+            if (item.sourceMissing) {
+                MediaCache.getLocalVideoBytes(key)
+            } else {
+                MediaCache.getVideoBytes(key)
+                    ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            }
 
             // Get URI from cache (creates temp file from cached bytes)
             val uri = MediaCache.getVideoUri(key, context)
@@ -308,8 +384,13 @@ class GalleryViewModel : ViewModel() {
     fun shareImage(context: Context, item: GalleryItem) {
         viewModelScope.launch {
             val key = item.toCacheKey()
-            val bitmap = MediaCache.getBitmap(key)
-                ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            // 源已不存在：分享也只能用本机缓存，不发起原图请求
+            val bitmap = if (item.sourceMissing) {
+                MediaCache.getLocalImage(key)
+            } else {
+                MediaCache.getBitmap(key)
+                    ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            }
 
             if (bitmap == null) {
                 _events.emit(GalleryEvent.ShowToast(R.string.error_share_image))
@@ -350,8 +431,13 @@ class GalleryViewModel : ViewModel() {
     fun shareVideo(context: Context, item: GalleryItem) {
         viewModelScope.launch {
             val key = item.toCacheKey()
-            val videoBytes = MediaCache.getVideoBytes(key)
-                ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            // 源已不存在：分享只能用本机字节，不请求已删除的文件
+            val videoBytes = if (item.sourceMissing) {
+                MediaCache.getLocalVideoBytes(key)
+            } else {
+                MediaCache.getVideoBytes(key)
+                    ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            }
 
             if (videoBytes == null) {
                 _events.emit(GalleryEvent.ShowToast(R.string.error_share_video))
@@ -444,17 +530,24 @@ class GalleryViewModel : ViewModel() {
             // 同一次生成可能产出多张图（批量出图 4 张共用一个 promptId），
             // 以前按 promptId 去重后整批删，选中一张会连带删掉同批的其它三张。
             val successCount = repository.deleteItems(selectedItems)
-            val failCount = selectedItems.size - successCount
 
-            // Show result toast
-            if (failCount == 0) {
-                _events.emit(GalleryEvent.ShowToast(R.string.msg_items_deleted_success))
-            } else {
-                _events.emit(GalleryEvent.ShowToast(R.string.msg_some_items_failed_to_delete))
+            // 删除结果统一走纯判定。返回 0 条 = 一条都没进站（回收站落盘失败），
+            // 必须报失败——绝不能因为 failCount == 0 之类的边界提示成功。
+            val outcome = TrashDeleteOutcome.batch(successCount, selectedItems.size)
+            when (outcome) {
+                TrashDeleteResult.SUCCESS ->
+                    _events.emit(GalleryEvent.ShowToast(R.string.msg_items_deleted_success))
+                TrashDeleteResult.PARTIAL ->
+                    _events.emit(GalleryEvent.ShowToast(R.string.msg_some_items_failed_to_delete))
+                TrashDeleteResult.FAILED ->
+                    _events.emit(GalleryEvent.ShowToast(R.string.error_history_item_delete))
             }
 
-            // Clear selection after delete
-            clearSelection()
+            // 全部失败时**保留选择**：条目仍在列表里，用户可直接重试，不必重新勾选。
+            // 只有确实有条目进站（SUCCESS/PARTIAL）才清空选择。
+            if (outcome != TrashDeleteResult.FAILED) {
+                clearSelection()
+            }
         }
     }
 
@@ -470,50 +563,47 @@ class GalleryViewModel : ViewModel() {
         viewModelScope.launch {
             var successCount = 0
             var failCount = 0
+            var lowresImageCount = 0
+            var lowresVideoCount = 0
+            var noLocalCopyCount = 0
 
             for (item in selectedItems) {
-                val success = if (item.isVideo) {
-                    saveVideoToGalleryInternal(context, item)
+                val outcome = if (item.isVideo) {
+                    saveVideoItem(context, item)
                 } else {
-                    saveImageToGalleryInternal(context, item)
+                    saveImageItem(context, item)
                 }
-                if (success) successCount++ else failCount++
+                when (outcome) {
+                    SaveOutcome.SAVED -> successCount++
+                    SaveOutcome.SAVED_LOWRES -> {
+                        successCount++
+                        if (item.isVideo) lowresVideoCount++ else lowresImageCount++
+                    }
+                    SaveOutcome.NO_LOCAL_COPY -> {
+                        failCount++
+                        noLocalCopyCount++
+                    }
+                    SaveOutcome.FAILED -> failCount++
+                }
             }
 
-            // Show result toast
-            if (failCount == 0) {
-                _events.emit(GalleryEvent.ShowToast(R.string.msg_items_saved_to_gallery))
-            } else {
-                _events.emit(GalleryEvent.ShowToast(R.string.msg_some_items_failed_to_save))
+            // Show result toast：低清/本机缓存版成功也要说清楚；全部失败且原因都是"本机无缓存"
+            // 时给专门文案，不能只丢一句模糊的"部分保存失败"。
+            // 图片与视频分开措辞：视频缓存不是低分辨率，混选时用复数版"本机缓存版"。
+            val messageRes = when {
+                failCount == 0 && lowresImageCount > 0 && lowresVideoCount > 0 ->
+                    R.string.msg_saved_local_copies
+                failCount == 0 && lowresVideoCount > 0 -> R.string.msg_video_saved_lowres
+                failCount == 0 && lowresImageCount > 0 -> R.string.msg_image_saved_lowres
+                failCount == 0 -> R.string.msg_items_saved_to_gallery
+                successCount == 0 && noLocalCopyCount == failCount ->
+                    R.string.msg_image_source_missing_no_cache
+                else -> R.string.msg_some_items_failed_to_save
             }
+            _events.emit(GalleryEvent.ShowToast(messageRes))
 
             // Clear selection after save
             clearSelection()
-        }
-    }
-
-    private suspend fun saveImageToGalleryInternal(context: Context, item: GalleryItem): Boolean {
-        return withContext(Dispatchers.IO) {
-            val key = item.toCacheKey()
-            val bitmap = MediaCache.getBitmap(key)
-                ?: MediaCache.fetchImage(key, item.subfolder, item.type)
-
-            if (bitmap == null) return@withContext false
-
-            // P1-22：真实写入结果（IS_PENDING → 发布），失败返回 false 让调用方计入失败数
-            PhotoManager.saveBitmap(context, bitmap)
-        }
-    }
-
-    private suspend fun saveVideoToGalleryInternal(context: Context, item: GalleryItem): Boolean {
-        return withContext(Dispatchers.IO) {
-            val key = item.toCacheKey()
-            val videoBytes = MediaCache.getVideoBytes(key)
-                ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
-
-            if (videoBytes == null) return@withContext false
-
-            PhotoManager.saveVideoBytes(context, videoBytes)
         }
     }
 
@@ -566,8 +656,13 @@ class GalleryViewModel : ViewModel() {
     private suspend fun getImageShareUri(context: Context, item: GalleryItem, index: Int): Uri? {
         return withContext(Dispatchers.IO) {
             val key = item.toCacheKey()
-            val bitmap = MediaCache.getBitmap(key)
-                ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            // 源已不存在：分享载荷只能用本机缓存，不发原图请求
+            val bitmap = if (item.sourceMissing) {
+                MediaCache.getLocalImage(key)
+            } else {
+                MediaCache.getBitmap(key)
+                    ?: MediaCache.fetchImage(key, item.subfolder, item.type)
+            }
 
             if (bitmap == null) return@withContext null
 
@@ -588,8 +683,13 @@ class GalleryViewModel : ViewModel() {
     private suspend fun getVideoShareUri(context: Context, item: GalleryItem, index: Int): Uri? {
         return withContext(Dispatchers.IO) {
             val key = item.toCacheKey()
-            val videoBytes = MediaCache.getVideoBytes(key)
-                ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            // 源已不存在：分享载荷只能用本机字节
+            val videoBytes = if (item.sourceMissing) {
+                MediaCache.getLocalVideoBytes(key)
+            } else {
+                MediaCache.getVideoBytes(key)
+                    ?: MediaCache.fetchVideoBytes(key, item.subfolder, item.type)
+            }
 
             if (videoBytes == null) return@withContext null
 

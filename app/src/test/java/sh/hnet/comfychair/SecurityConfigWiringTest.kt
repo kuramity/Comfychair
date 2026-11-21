@@ -153,7 +153,11 @@ class SecurityConfigWiringTest {
             doc.contains("CleartextGuardInterceptor")
         )
         assertTrue(
-            "SECURITY.md 必须说明更新包 sha256 的信任模型",
+            "SECURITY.md 必须说明更新包 sha256 的信任模型（本地只校验包名，签名由系统安装器校验）",
+            doc.contains("签名认证由系统安装器在安装时校验")
+        )
+        assertFalse(
+            "装前签名比对已移除，SECURITY.md 不得再宣称本地做「包名 + 签名」校验",
             doc.contains("认证性由包名 + 签名校验承担")
         )
 
