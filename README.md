@@ -22,19 +22,45 @@ An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous
 
 ## Overview
 
-ComfyChair provides a streamlined mobile interface for interacting with ComfyUI servers, allowing you to generate and manage AI images and videos directly from your Android device. The app communicates with your ComfyUI server via its API, bringing the power of node-based AI generation to your mobile workflow.
+A streamlined mobile interface for ComfyUI servers — generate and manage AI images and videos on Android via the ComfyUI API.
 
-**Note**: This is an independent, community-developed project and is not officially affiliated with or endorsed by the ComfyUI team.
+**Note**: community-developed project, not officially affiliated with or endorsed by the ComfyUI team.
 
 ## Screenshots
 
 <img src="metadata/en-US/images/phoneScreenshots/1.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/2.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/3.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/4.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/5.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/6.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/7.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/8.png" width="200"/>
 
+## Recent changes (v4.16.13 → v4.19.2)
+
+**Fixed**
+
+- Update module: no more background data burn — retry cap 2, hard stop on failure, manual-only downloads
+- Sampler/scheduler: candidates from KSampler only; dirty custom values (`dpm++` etc.) sanitized on read and submit
+- Viewer flyback residue: both root causes fixed (branch-flag timing + mask fade-out)
+- Gallery crash after deleting photos (P0): negative padding on the trash badge replaced with `offset`; index write guards added
+- Back key no longer exits the app: returns to the connection page, queue and generation state kept
+- Xiaomi AV false positive: removed the pre-install signature read that tripped the heuristic
+- Failed trash writes no longer reported as success
+- Startup spinner capped at 3 s; interrupted node fade-out no longer leaves half-transparency
+
+**Added / changed**
+
+- "Source missing" third state: explicit-404-only mark per device, sharp low-res image with a "deleted" badge
+- Busy state keeps the dot-matrix animation while submitting (submit vs. invalid-input split)
+- Pager inertia restricted to queue mode
+- Non-WiFi download confirmation with size shown
+- Crash logging to app-private storage (Settings → App)
+- `Application` class extraction + global `CrashLogger`
+- Timeline director stage removed (private builds 30 → 29 prebuilt workflows)
+- TTV ↔ ITV dedupe: ~215 duplicated lines removed, behavior unchanged
+
+Full history: [CHANGELOG](app/src/main/assets/CHANGELOG.md).
+
 ## Features
 
 ### General
 
-- **Built-in updater**: Check for updates in-app, download in the background via a foreground service with a progress notification, verify SHA-256, and tap-to-install — with a redesigned update dialog (full release notes, current-vs-new version comparison, scrollable). Ships empty (no update source) and can point at any manifest you host
+- **Built-in updater**: in-app check, background download via foreground service, SHA-256 verify, tap-to-install; ships empty, can point at any manifest you host
 - **3D generation**: Text-to-3D and Image-to-3D with an interactive `.glb` viewer (Filament / SceneView) — orbit, pan, pinch-zoom, and gesture dismissal
 - **Danbooru tag library** (full APK): Offline tag database with search, simplified/traditional Chinese normalization, synonym suggestions and co-occurrence recommendations for prompt building
 - **Polished visuals**: Ripple + dot-burst effects on buttons, ambient particle overlay, adaptive accent colors (secondary = accent hue +35°), full Material 3 theming with custom color slots
@@ -182,23 +208,20 @@ ComfyChair provides a streamlined mobile interface for interacting with ComfyUI 
 这 4 个模板里的**模型名全部留空**，提示词也为空——不内置任何私有模型路径或示例内容。
 首次使用时，请在下拉框里选择**你自己服务器上**的模型。
 
-其余高级玩法（多阶段精修、SeedVR2 / VOSR2 放大、
-技能提示词强化、MOSS 五模式、四视图等）在开源版里**不内置**，
-但你可以在 ComfyUI 里自己搭好后导出 API 格式，再从 App 导入使用——
-App 的功能代码全部保留，任何合规工作流都能导入。
+- 高级工作流（多阶段精修 / SeedVR2·VOSR2 放大 / 技能提示词强化 / MOSS 五模式 / 四视图）开源版**不内置**
+- 在 ComfyUI 里自行搭建后导出 API 格式，从 App 导入即可使用
+- App 功能代码全部保留，任何合规工作流都能导入
 
 ### 3D 生成同样支持
 
-App 完整保留了**文生 3D / 图生 3D** 的界面、参数面板与 `.glb` 实时预览
-（Filament / SceneView）。开源版只是不内置 3D 工作流模板：
-把你在 ComfyUI 里搭好的 3D 工作流（Pixal3D、IDOL、TRELLIS 等）
-导出为 API 格式后在 App 里导入，即可生成并预览 3D 模型。
+- 文生 3D / 图生 3D 的界面、参数面板与 `.glb` 实时预览（Filament / SceneView）**完整保留**
+- 开源版只是不内置 3D 工作流模板
+- 把你在 ComfyUI 里搭好的 3D 工作流（Pixal3D、IDOL、TRELLIS 等）导出 API 格式导入即可
 
 ## 模型介绍数据（开源版为空表）
 
-`app/src/main/assets/model_intros.json` 在开源版里是**空表**（`count: 0`），
-因为模型介绍本身就是你服务器上的资产清单。要启用「模型介绍」功能，
-用随仓库提供的采集脚本从你自己的服务器生成：
+- `app/src/main/assets/model_intros.json` 开源版为**空表**（`count: 0`）——模型介绍是你服务器上的资产清单
+- 用随仓库脚本从你自己的服务器采集，两种来源任选：
 
 ```bash
 # 扫本地 models 目录（能算 SHA-256，Civitai 命中率最高）
@@ -212,9 +235,8 @@ python tools/collect_model_intros.py \
     --out app/src/main/assets/model_intros.json
 ```
 
-脚本会按 SHA-256 反查 Civitai（含作者/简介/标签）、搜不到再按文件名补查
-Civitai 与 HuggingFace，未命中的会列成清单方便你手工补。
-详见脚本头部注释。
+- 脚本按 SHA-256 反查 Civitai（含作者/简介/标签），搜不到再按文件名补查 Civitai 与 HuggingFace
+- 未命中的会列成清单方便你手工补，详见脚本头部注释
 
 ## Requirements
 
@@ -225,38 +247,24 @@ Civitai 与 HuggingFace，未命中的会列成清单方便你手工补。
 
 ## 设备适配（仅手机）
 
-本应用**只面向手机**（竖屏）。平板、折叠屏展开态等最小宽度 ≥ 600dp 的设备
-**未做适配**，不保证可用：
+本应用只面向手机（竖屏）；平板、折叠屏展开态等最小宽度 ≥ 600dp 的设备未适配：
 
-- 所有页面的尺寸都按手机宽度（约 320–430dp）设计，布局里是硬编码 dp，
-  没有使用 `WindowSizeClass`，也没有响应式/双栏布局。
-- 所有 Activity 都在 `AndroidManifest.xml` 里声明了 `screenOrientation="portrait"`。
-- 清单里的 `<supports-screens>`（`largeScreens` / `xlargeScreens` 为 `false`，
-  `requiresSmallestWidthDp=320`）在 API 13+ 上**只是声明，不是安装过滤**：
-  `largeScreens=false` 的实际效果是启用屏幕兼容模式，`requiresSmallestWidthDp`
-  也不再被系统用于筛选。**平板仍然可以安装本应用**，只是界面没有为它适配。
-- 竖屏锁定同样不是绝对的：从 Android 16（API 36）起，targetSdk ≥ 36 的应用在
-  smallest width ≥ 600dp 的屏幕上会被系统忽略 `screenOrientation`、`resizeableActivity`
-  与宽高比限制（官方行为变更 “Adaptive layouts”）。本应用因此在 `<application>`
-  里声明了 `android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY`
-  作为**临时** opt-out，把大屏拉回兼容模式；官方说明该 opt-out 在升到 API 37 后
-  失效，届时必须真正做响应式适配。
-
-这是产品决策（方案 B：明确只支持手机），不是遗漏 —— 后续若要支持平板 / 折叠屏展开态，
-需要单独做响应式适配（WindowSizeClass + 去掉硬编码 dp），不在当前范围内。
+- 布局按手机宽度（约 320–430dp）设计，硬编码 dp，未用 `WindowSizeClass`，无响应式/双栏布局
+- 所有 Activity 在 `AndroidManifest.xml` 声明 `screenOrientation="portrait"`
+- 清单里的 `<supports-screens>` 在 API 13+ **只是声明、不是安装过滤**——平板仍可安装，只是界面未适配
+- Android 16（API 36）起，targetSdk ≥ 36 的应用在大屏会被系统忽略竖屏锁定；本应用以
+  `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` 临时 opt-out（官方说明 API 37 起失效）
+- 支持平板需单独做响应式适配（`WindowSizeClass` + 去硬编码 dp），是产品决策（方案 B），不在当前范围
 
 ## 安全边界（已知残余风险）
 
-网络、分享与更新链路的强制约束，以及**尚未全域收口的残余面**统一记录在
-[SECURITY.md](SECURITY.md)。重点提醒（不要误以为已全域收口）：
+强制约束与**尚未全域收口的残余面**统一记录在 [SECURITY.md](SECURITY.md)。重点：
 
-- **明文策略**：平台 `network_security_config` 仍允许明文（Android 的 `<domain>` 不支持
-  CIDR 网段，改成禁止会让所有局域网 IP 服务器连不上）；「明文只发私网」由
-  `NetworkPolicy` + `CleartextGuardInterceptor` 在 OkHttp 层执行。
-  **WebView 登录页、以及任何不走 `ComfyUIClient.secured()` 的新网络链路不在闸门内。**
-- **分享**：FileProvider 只声明 `cacheDir/share/` 与 `update/`，新增分享必须走 `ShareFileStore`。
-- **更新**：冷启动恢复安装包前会复验 sha256 与包名；sha256 只防损坏/低成本替换，
-  包名只拦「装成另一个 App」，签名认证由系统安装器在安装时校验。
+- **明文策略**：平台层仍放行明文（`<domain>` 不支持 CIDR 网段）；「明文只发私网」由
+  `NetworkPolicy` + `CleartextGuardInterceptor` 在 OkHttp 层执行
+- **WebView 登录页及未走 `ComfyUIClient.secured()` 的链路不在闸门内**（已在 SECURITY.md 声明）
+- **分享**：FileProvider 只声明 `cacheDir/share/` 与 `update/`；新增分享必须走 `ShareFileStore`
+- **更新**：恢复安装包前复验 sha256 与包名；签名认证由系统安装器在安装时承担
 
 新增网络 / 分享 / 更新代码前请先读 [SECURITY.md](SECURITY.md)。
 
