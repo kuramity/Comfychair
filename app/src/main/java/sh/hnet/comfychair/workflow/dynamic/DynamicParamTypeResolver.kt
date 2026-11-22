@@ -67,7 +67,7 @@ object DynamicParamTypeResolver {
      * 选项的中文显示名在 UI 侧（DynamicParamSection.fixedComboLabel）。
      */
     private val FIXED_COMBO_OPTIONS: Map<String, List<String>> = mapOf(
-        // moss_mode 的固定选项（MOSS 五模式整合流专用；预置流 prebuilt_30 的 {{moss_mode}}）
+        // 出图模式占位符的固定选项（多档位采样模式，选项值由对应工作流的 defaults 提供）
         "moss_mode" to listOf("moss_25", "moss_spec25", "moss_50", "moss_c25", "moss_28")
     )
 
@@ -80,14 +80,14 @@ object DynamicParamTypeResolver {
      * 指定控件。与 FIXED_COMBO_OPTIONS 同时命中时**以下拉为准**（combo 检查在前；
      * 两表键集当前不相交，此规则只为未来重叠时行为确定）。
      *
-     * default 与预置流 defaults 保持一致（取值顺序 defaults 优先于控件 default，两处一致
-     * 才不会"面板初值"与"兜底语义"打架）：`lora*_on = false`（用户决策：默认全关）；
-     * `lora1/lora2_strength = 1.0`、`lora3_strength = 0.75`（与 prebuilt_33 defaults 相同）。
+     * default 与工作流 defaults 保持一致（取值顺序 defaults 优先于控件 default，两处一致
+     * 才不会"面板初值"与"兜底语义"打架）：`lora*_on = false`；
+     * `lora1/lora2_strength = 1.0`、`lora3_strength = 0.75`。
      * 强度范围按 rgthree LoRA 权重的合理区间取 `0..2`、步进 `0.05`（rgthree 支持负权重，
      * 但控件下限取 0 即可，不为负值放宽）。
      */
     private val FIXED_CONTROLS: Map<String, DynamicParamControl> = mapOf(
-        // MOSS 4K 三槽 LoRA 开关与强度（预置流 prebuilt_33 / prebuilt_34 的 {{lora*_on}} / {{lora*_strength}}）
+        // rgthree Power Lora Loader 三槽 LoRA 开关与强度（{{lora*_on}} / {{lora*_strength}}）
         "lora1_on" to DynamicParamControl.BoolField(default = false),
         "lora1_strength" to DynamicParamControl.NumberField(
             isInteger = false, min = 0.0, max = 2.0, step = 0.05, default = 1.0

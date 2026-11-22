@@ -1058,8 +1058,10 @@ private fun GalleryTrashPanel(
             val timeFormat = remember {
                 DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.getDefault())
             }
+            // 排序结果 remember 住：entries 不变的重组不再每次重排
+            val sortedEntries = remember(entries) { entries.sortedByDescending { it.deletedAt } }
             LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(entries.sortedByDescending { it.deletedAt }, key = { it.identityKey }) { entry ->
+                items(sortedEntries, key = { it.identityKey }) { entry ->
                     GalleryTrashEntryRow(
                         entry = entry,
                         onCurrentServer = entry.serverId == currentServerId,

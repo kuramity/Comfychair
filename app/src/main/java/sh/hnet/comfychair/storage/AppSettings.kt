@@ -532,6 +532,55 @@ object AppSettings {
     }
 
     // ============================================================
+    // 生成进度通知开关（后台 / 锁屏可见，默认开）
+    // ============================================================
+
+    private const val KEY_GENERATION_NOTIFICATIONS_ENABLED = "generation_notifications_enabled"
+
+    /**
+     * 生成相关通知（进度 / 完成 / 失败）是否启用，默认 **true**。
+     *
+     * 关闭后 [sh.hnet.comfychair.notify.GenerationNotifier] 的所有入口静默跳过，
+     * 已挂的通知一并撤掉；断线重连自动收尾（提示 / 状态复位）不受本开关影响。
+     */
+    fun isGenerationNotificationsEnabled(context: Context): Boolean {
+        return prefsOf(context).getBoolean(KEY_GENERATION_NOTIFICATIONS_ENABLED, true)  // Default: true
+    }
+
+    fun setGenerationNotificationsEnabled(context: Context, enabled: Boolean) {
+        prefsOf(context)
+            .edit()
+            .putBoolean(KEY_GENERATION_NOTIFICATIONS_ENABLED, enabled)
+            .apply()
+    }
+
+    // ============================================================
+    // 后台保持连接（v4.18.x 后台省流量的用户决策开关）
+    // ============================================================
+
+    private const val KEY_BACKGROUND_KEEP_CONNECTED = "background_keep_connected"
+
+    /**
+     * 「后台保持连接」开关，默认 **false**（v4.18.x 后台省流量的默认行为）。
+     *
+     * 关（默认）：降级态（小窗失焦 / 真后台）× 蜂窝网络时**断开 WebSocket**，
+     * 有任务在跑时改 15 分钟轮询 /queue —— 蜂窝流量下零常驻连接。
+     * 开：降级态也保持 WS 实时连接（心跳放宽到 4 分钟），出图完成零延迟推送，
+     * 代价是蜂窝网络下持续消耗数据流量（设置页文案已说明）。
+     * WiFi / 不限量网络下本开关无意义 —— 那种网络默认就保持连接。
+     */
+    fun isBackgroundKeepConnectedEnabled(context: Context): Boolean {
+        return prefsOf(context).getBoolean(KEY_BACKGROUND_KEEP_CONNECTED, false)  // Default: false
+    }
+
+    fun setBackgroundKeepConnectedEnabled(context: Context, enabled: Boolean) {
+        prefsOf(context)
+            .edit()
+            .putBoolean(KEY_BACKGROUND_KEEP_CONNECTED, enabled)
+            .apply()
+    }
+
+    // ============================================================
     // 更新下载回退开关（v4.12.0 安全阀）
     // ============================================================
 

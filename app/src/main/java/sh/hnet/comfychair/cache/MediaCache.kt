@@ -688,7 +688,10 @@ object MediaCache {
     fun hasLocalImage(key: MediaCacheKey, isVideo: Boolean = false): Boolean {
         val keyStr = key.keyString
         if (isVideo) {
-            return videoCache.get(keyStr) != null || readCachedBytes(key, isVideo = true) != null
+            val context = applicationContext ?: return false
+            // 与图片分支同口径只查文件存在性：readCachedBytes 会把整段视频字节读进
+            // 内存，而这里只需要「在不在」（saveEnabled 在主线程组合期反复调用）
+            return videoCache.get(keyStr) != null || resolveDiskCacheFile(context, key, true) != null
         }
         if (bitmapCache.get(keyStr) != null || thumbnailCache.get(keyStr) != null) return true
         val context = applicationContext ?: return false
@@ -1032,17 +1035,18 @@ object MediaCache {
                 return it
             }
 
-            // 离线：回落到磁盘缓存（只读）。那份磁盘数据是离线读取的唯一数据源，
-            // 与「内存优先」的内存缓存策略无关（见 CacheModePolicy）。
+            // 离线：只读本机缓存，不发请求。与 missing/localOnly 分支同口径走
+            // [getLocalImage]（覆盖 filesDir 720 持久化档 + 旧 cacheDir 原图/缩略图），
+            // 只读旧磁盘目录会让"本机有 720 档"的条目在离线查看器里空白。
             if (offlineReadOnly) {
                 return withContext(Dispatchers.IO) {
                     val bitmap = if (isVideo) {
                         getLocalVideoFrame(key)
                     } else {
-                        readBitmapOnlyFromDisk(context, key, false)
+                        getLocalImage(key)
                     }
                     bitmap?.let { cacheFullBitmap(keyStr, it) }
-                    DebugLogger.d(TAG, "fetchBitmap: $keyStr offline -> disk cache ${if (bitmap != null) "HIT" else "MISS"}")
+                    DebugLogger.d(TAG, "fetchBitmap: $keyStr offline -> local cache ${if (bitmap != null) "HIT" else "MISS"}")
                     bitmap
                 }
             }
@@ -1406,14 +1410,15 @@ object MediaCache {
         val context = applicationContext
         val client = comfyUIClient
 
-        // 离线：回落到磁盘缓存（与 fetchBitmap 同一口径，不发请求）。
+        // 离线：回落到本机缓存（与 fetchBitmap / localOnly 同口径走 [getLocalImage]，
+        // 覆盖 filesDir 720 持久化档 + 旧 cacheDir），不发请求。
         // context 为 null 时连磁盘都读不了，直接返回
         if (context == null) return ViewerImage(null, false)
         if (client == null || ConnectionManager.isOffline) {
-            val fromDisk = withContext(Dispatchers.IO) {
-                readBitmapOnlyFromDisk(context, key, false)
+            val fromLocal = withContext(Dispatchers.IO) {
+                getLocalImage(key)
             }
-            return ViewerImage(fromDisk, false)
+            return ViewerImage(fromLocal, false)
         }
 
         // 「源已不存在」：原图已被确认删除（404 已持久化进索引），不再请求 ——
@@ -1906,12 +1911,13 @@ object MediaCache {
                 return it
             }
 
-            // 离线：回落到磁盘缓存（只读）
+            // 离线：只读本机缓存（与 missing 分支同口径走 [getLocalImage]，覆盖
+            // filesDir 720 持久化档 + 旧 cacheDir），不发请求
             if (offlineReadOnly) {
                 return withContext(Dispatchers.IO) {
-                    val bitmap = readBitmapFromDisk(context, key)
+                    val bitmap = getLocalImage(key)
                     bitmap?.let { cacheFullBitmap(key.keyString, it, priority) }
-                    DebugLogger.d(TAG, "fetchImage: ${key.keyString} offline -> disk cache ${if (bitmap != null) "HIT" else "MISS"}")
+                    DebugLogger.d(TAG, "fetchImage: ${key.keyString} offline -> local cache ${if (bitmap != null) "HIT" else "MISS"}")
                     bitmap
                 }
             }
@@ -2516,6 +2522,11 @@ object MediaCache {
         videoUriCache.clear()
         videoDimensionsCache.clear()
         playingVideoKeys.clear()
+        // 断线/切服务器即会话知识失效，与 clearForRefresh 口径一致：
+        // missingKeys（404 短路标记）与 oversizedKeys（超限判定）都是"针对当时那台服务器"
+        // 学到的，换服务器后沿用旧标记会把同名键的文件误判成 404/超限。
+        missingKeys.clear()
+        oversizedKeys.clear()
         prefetchQueue.clear()
         inProgressKeys.clear()
         completionCallbacks.clear()

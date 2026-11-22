@@ -2,7 +2,7 @@
 
 An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 
-**Current version**: v4.19.5（二次开发版 / Community Edition）
+**Current version**: v4.20.0（二次开发版 / Community Edition）
 
 > **This project is a fork of [ComfyChair](https://github.com/legal-hkr/comfychair),
 > originally developed by Legal HKr, licensed under GPL-3.0.
@@ -30,24 +30,19 @@ A streamlined mobile interface for ComfyUI servers — generate and manage AI im
 
 <img src="metadata/en-US/images/phoneScreenshots/1.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/2.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/3.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/4.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/5.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/6.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/7.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/8.png" width="200"/>
 
-## Recent changes (v4.19.2 → v4.19.5)
+## Recent changes (v4.19.5 → v4.20.0)
+
+**Added**
+
+- Generation progress notification: persistent progress bar + completion banner, tap to return
+- Disconnect reconciliation: reconnect now classifies interrupted jobs into four terminal states (no more silent progress-bar disappearance)
+- Model intro detail page: tap an entry to open a full-screen detail view
+- LiteGraph converter supports rgthree `GetNode`/`SetNode` variables (auto-resolved on import)
 
 **Fixed**
 
-- Flyback gesture: photo no longer squashed when flying back (single scale factor, aspect ratio preserved)
-- Exiting the viewer: photo no longer vanishes early and its grid cell no longer turns black
-- Duplicate "moved to trash" notices: undo bar and Toast no longer overlap
-- "Source missing" mark no longer lost on restart (minimal index record backfilled)
-- Save-to-gallery toast now matches the quality actually saved
-- Screen rotation after returning to the connection page no longer auto-reconnects
-- Sampler/scheduler fallback checks the server list before defaulting; node-attribute-edit path now sanitized too
-- Nested dynamic params (rgthree LoRA loader) scanned one level deep; shown as toggle + number field
-
-**Added / changed**
-
-- MOSS 4K HD workflow (private builds only): two-stage sampling → latent upscale → face/hand detail fix → optional SeedVR2 4K; separate quick-preview workflow
-- Community params backfilled into the intro library: 84 models with real-usage modes (sampler/CFG/steps/scheduler) + a top-voted example prompt
-- Intro library synced: 145 → 170 entries, 24 new models, removed models no longer listed
+- Interrupted jobs during disconnect no longer vanish silently — failure is reported and cleaned up
+- Converter failure cases now show explicit Chinese warnings instead of a generic error
 
 Full history: [CHANGELOG](app/src/main/assets/CHANGELOG.md).
 
@@ -203,7 +198,7 @@ Full history: [CHANGELOG](app/src/main/assets/CHANGELOG.md).
 这 4 个模板里的**模型名全部留空**，提示词也为空——不内置任何私有模型路径或示例内容。
 首次使用时，请在下拉框里选择**你自己服务器上**的模型。
 
-- 高级工作流（多阶段精修 / SeedVR2·VOSR2 放大 / 技能提示词强化 / MOSS 五模式 / 四视图）开源版**不内置**
+- 高级工作流（多阶段精修 / SeedVR2·VOSR2 放大 / 技能提示词强化 / 四视图）开源版**不内置**
 - 在 ComfyUI 里自行搭建后导出 API 格式，从 App 导入即可使用
 - App 功能代码全部保留，任何合规工作流都能导入
 
@@ -320,7 +315,7 @@ To connect to your ComfyUI server, you'll need:
 - **Architecture**: MVVM with ViewModels and StateFlow
 - **Navigation**: Jetpack Compose Navigation
 - **Build system**: Gradle with Kotlin DSL
-- **Testing**: 1815 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
+- **Testing**: 1942 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
 
 ## Contributing
 

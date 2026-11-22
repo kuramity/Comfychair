@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.WorkflowManager
@@ -444,6 +445,9 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
     companion object {
         private const val TAG = "ImageToImage"
         const val OWNER_ID = "IMAGE_TO_IMAGE"
+
+        /** 等待 ensureConnection 回调的超时（对齐 GenerationViewModel 的提交闸门 30s） */
+        private const val CONNECTION_WAIT_TIMEOUT_MS = 30_000L
         private const val PREFS_NAME = "ImageToImageFragmentPrefs"
 
         // Global preferences (camelCase keys for BackupManager compatibility)
@@ -2333,7 +2337,8 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
 
         return when (state.mode) {
             ImageToImageMode.EDITING -> {
-                // Editing mode: only check for validation errors
+                // Editing mode: source image required, plus validation errors
+                state.sourceImage != null &&
                 state.stepsError == null &&
                 state.megapixelsError == null &&
                 state.cfgError == null
@@ -2356,10 +2361,20 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         val context = applicationContext ?: return null
 
         // Check connection before uploading
-        val connected = suspendCoroutine { cont ->
-            ConnectionManager.ensureConnection(context) { success ->
-                cont.resumeWith(Result.success(success))
+        // 超时兜底：ensureConnection 在"另一个重连会话已开始"的分支里**不会回调**
+        // （见 GenerationViewModel.armSubmitGateWatchdog 的注释），不设超时会永久挂起。
+        val connected = withTimeoutOrNull(CONNECTION_WAIT_TIMEOUT_MS) {
+            suspendCoroutine<Boolean> { cont ->
+                ConnectionManager.ensureConnection(context) { success ->
+                    cont.resumeWith(Result.success(success))
+                }
             }
+        } ?: run {
+            // 超时视为连接失败。此场景 ensureConnection 未回调、不会弹重连失败对话框，
+            // 主动提示，避免静默失败
+            DebugLogger.w(TAG, "等待连接超时（${CONNECTION_WAIT_TIMEOUT_MS}ms），视为连接失败")
+            _events.emit(ImageToImageEvent.ShowToast(R.string.msg_connection_lost))
+            return null
         }
         if (!connected) return null  // Dialog already shown by ensureConnection
 
@@ -2391,6 +2406,11 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         // v4.6.1 模块 D：上传前转 WebP（保持原分辨率），剥离 PNG 内嵌元数据，体积通常降到 10%–30%
         val sourceBytes = withContext(Dispatchers.IO) {
             UploadImageEncoder.encode(sourceImage, preserveAlpha = false)
+        }
+        if (sourceBytes == null) {
+            // WebP 编码失败（compress 返回 false）：空字节不能推进上传链路
+            _events.emit(ImageToImageEvent.ShowToast(R.string.error_save_image))
+            return null
         }
 
         // Upload source image
@@ -2435,6 +2455,10 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
                 // v4.6.1 模块 D：参考图同样转 WebP（保持分辨率）
                 UploadImageEncoder.encode(state.referenceImage1, preserveAlpha = false)
             }
+            if (ref1Bytes == null) {
+                _events.emit(ImageToImageEvent.ShowToast(R.string.error_save_image))
+                return null
+            }
             val ref1Result: UploadResult = withContext(Dispatchers.IO) {
                 kotlin.coroutines.suspendCoroutine { continuation ->
                     client.uploadImage(
@@ -2462,6 +2486,10 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
             val ref2Bytes = withContext(Dispatchers.IO) {
                 // v4.6.1 模块 D：参考图同样转 WebP（保持分辨率）
                 UploadImageEncoder.encode(state.referenceImage2, preserveAlpha = false)
+            }
+            if (ref2Bytes == null) {
+                _events.emit(ImageToImageEvent.ShowToast(R.string.error_save_image))
+                return null
             }
             val ref2Result: UploadResult = withContext(Dispatchers.IO) {
                 kotlin.coroutines.suspendCoroutine { continuation ->
@@ -2568,6 +2596,11 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
         // v4.6.1 模块 D：修复模式的合成图把遮罩写进 alpha 通道，**必须无损**，否则遮罩会被压坏
         val imageBytes = withContext(Dispatchers.IO) {
             UploadImageEncoder.encode(imageWithMask, preserveAlpha = true)
+        }
+        if (imageBytes == null) {
+            _events.emit(ImageToImageEvent.ShowToast(R.string.error_save_image))
+            imageWithMask.recycle()
+            return null
         }
 
         imageWithMask.recycle()

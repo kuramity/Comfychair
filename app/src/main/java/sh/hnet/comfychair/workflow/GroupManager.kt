@@ -60,7 +60,8 @@ object GroupManager {
         val newGroup = WorkflowGroup(
             id = idGenerator(),
             title = title,
-            memberNodeIds = memberIds
+            // 只收录图里实际存在的成员（43-50 行算出的有效集合），过滤掉请求里混入的幽灵 id
+            memberNodeIds = (validNodeIds + validNoteIds).toSet()
         )
 
         graph.groups.add(newGroup)

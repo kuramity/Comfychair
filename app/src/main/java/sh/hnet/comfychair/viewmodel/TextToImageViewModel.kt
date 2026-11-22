@@ -41,7 +41,6 @@ import sh.hnet.comfychair.workflow.ImageSlotDetector
 import sh.hnet.comfychair.workflow.WorkflowConstraintsProvider
 import sh.hnet.comfychair.workflow.dynamic.DynamicParam
 import sh.hnet.comfychair.viewmodel.base.BaseGenerationViewModel
-import java.io.IOException
 
 /**
  * Represents a workflow item in the unified workflow dropdown
@@ -1494,11 +1493,16 @@ class TextToImageViewModel : BaseGenerationViewModel<TextToImageUiState, TextToI
         val bitmap = _uiState.value.previewBitmap ?: run { onResult(false); return }
 
         try {
-            ctx.contentResolver.openOutputStream(uri)?.use { outputStream ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+            // openOutputStream 返回 null 表示打不开目标（如无效 URI），不能误报成功；
+            // catch 放宽为 Exception：PNG 压缩也可能抛 RuntimeException
+            val outputStream = ctx.contentResolver.openOutputStream(uri)
+            if (outputStream == null) {
+                onResult(false)
+                return
             }
+            outputStream.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             onResult(true)
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             onResult(false)
         }
     }

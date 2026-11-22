@@ -692,20 +692,33 @@
     <string name="model_list_empty">No hay modelos disponibles en el servidor</string>
     <!-- P3-10: ninguna aplicación puede abrir el enlace externo -->
     <string name="error_open_link_failed">No hay ninguna aplicación que pueda abrir este enlace</string>
-    <!-- MOSS 4K (prebuilt_33/34): etiquetas de parámetros dinámicos -->
-    <string name="dynamic_param_moss_steps2_label">Pasos (segunda pasada)</string>
-    <string name="dynamic_param_moss_cfg2_label">CFG (segunda pasada)</string>
-    <string name="dynamic_param_moss_sampler2_label">Muestreador (segunda pasada)</string>
-    <string name="dynamic_param_moss_scheduler2_label">Planificador (segunda pasada)</string>
-    <string name="dynamic_param_moss_detail_prompt_face_label">Prompt de detalle · rostro</string>
-    <string name="dynamic_param_moss_detail_prompt_body_label">Prompt de detalle · cuerpo</string>
-    <string name="dynamic_param_moss_lora1_on_label">Interruptor LoRA 1</string>
-    <string name="dynamic_param_moss_lora1_strength_label">Peso LoRA 1</string>
-    <string name="dynamic_param_moss_lora2_on_label">Interruptor LoRA 2</string>
-    <string name="dynamic_param_moss_lora2_strength_label">Peso LoRA 2</string>
-    <string name="dynamic_param_moss_lora3_on_label">Interruptor LoRA 3</string>
-    <string name="dynamic_param_moss_lora3_strength_label">Peso LoRA 3</string>
-    <string name="dynamic_param_moss_seedvr2_enabled_label">Ampliación 4K</string>
-    <string name="dynamic_param_moss_seedvr2_size_label">Tamaño objetivo de ampliación</string>
+    <!-- labels for dynamic params -->
+    <string name="dynamic_param_steps2_label">Pasos (segunda pasada)</string>
+    <string name="dynamic_param_cfg2_label">CFG (segunda pasada)</string>
+    <string name="dynamic_param_sampler2_label">Muestreador (segunda pasada)</string>
+    <string name="dynamic_param_scheduler2_label">Planificador (segunda pasada)</string>
+    <string name="dynamic_param_detail_prompt_face_label">Prompt de detalle · rostro</string>
+    <string name="dynamic_param_detail_prompt_body_label">Prompt de detalle · cuerpo</string>
+    <string name="dynamic_param_lora1_on_label">Interruptor LoRA 1</string>
+    <string name="dynamic_param_lora1_strength_label">Peso LoRA 1</string>
+    <string name="dynamic_param_lora2_on_label">Interruptor LoRA 2</string>
+    <string name="dynamic_param_lora2_strength_label">Peso LoRA 2</string>
+    <string name="dynamic_param_lora3_on_label">Interruptor LoRA 3</string>
+    <string name="dynamic_param_lora3_strength_label">Peso LoRA 3</string>
+    <string name="dynamic_param_seedvr2_enabled_label">Ampliación 4K</string>
+    <string name="dynamic_param_seedvr2_size_label">Tamaño objetivo de ampliación</string>
     <string name="sampler_param_detail_denoise_hand">Intensidad de retoque de manos</string>
+    <!-- Notificaciones de generación (fondo/pantalla de bloqueo; solo nombre de modo + progreso) -->
+    <string name="notify_generation_channel_progress_name">Progreso de generación</string>
+    <string name="notify_generation_channel_progress_desc">Muestra el progreso de la generación mientras la aplicación está en segundo plano</string>
+    <string name="notify_generation_channel_result_name">Resultados de generación</string>
+    <string name="notify_generation_channel_result_desc">Avisos de generación completada o fallida</string>
+    <string name="notify_generation_generic_title">Generación</string>
+    <string name="notify_generation_progress_text">Generando… %1$d%%</string>
+    <string name="notify_generation_progress_running">Generando…</string>
+    <string name="notify_generation_completed_title">Generación completada</string>
+    <string name="notify_generation_failed_title">Generación fallida</string>
+    <string name="notify_generation_action_cancel">Cancelar</string>
+    <string name="label_generation_notifications">Notificaciones de generación</string>
+    <string name="desc_generation_notifications">Muestra el progreso en la barra de notificaciones durante la generación y avisa al completar o fallar</string>
 </resources>

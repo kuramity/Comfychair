@@ -30,6 +30,7 @@ import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.queue.JobStatus
 import sh.hnet.comfychair.queue.resolveExecutionStartOwner
 import sh.hnet.comfychair.model.ThreeDResultHolder
+import sh.hnet.comfychair.notify.GenerationNotifier
 import sh.hnet.comfychair.prompt.SkillTextResult
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
@@ -495,6 +496,16 @@ class GenerationViewModel : ViewModel() {
                         progress = message.value,
                         maxProgress = message.max
                     )
+                    // 通知内部有节流与前后台判定：前台时零通知开销，后台时静默更新
+                    val notifyContext = applicationContext
+                    if (notifyContext != null) {
+                        GenerationNotifier.onProgress(
+                            notifyContext,
+                            currentState.ownerId,
+                            message.value,
+                            message.max
+                        )
+                    }
                 }
             }
             is WebSocketMessage.PreviewImage -> {
@@ -505,11 +516,18 @@ class GenerationViewModel : ViewModel() {
                 }
             }
             is WebSocketMessage.ExecutionError -> {
-                if (message.promptId == currentState.promptId || message.promptId == null) {
+                // 与 ExecutionComplete/ExecutionSuccess 同口径：不在生成态一律忽略，
+                // 否则 promptId == null 的广播错误会把空闲页面的状态误重置
+                if ((message.promptId == currentState.promptId || message.promptId == null) && currentState.isGenerating) {
                     // Dispatch error event BEFORE resetting state, so ownerId is still available
                     // for handler matching in dispatchEvent()
                     val errorMessage = applicationContext?.getString(R.string.error_generation_failed)
                         ?: "Generation failed"
+                    // 后台时把进度通知换成失败横幅（前台时撤掉，界面承担提示）
+                    applicationContext?.let {
+                        GenerationNotifier.onGenerationFailed(it, currentState.ownerId, errorMessage)
+                    }
+                    GenerationNotifier.registerCancelHandler(null)
                     dispatchEvent(GenerationEvent.Error(errorMessage))
                     resetGenerationState()
                 }
@@ -583,6 +601,14 @@ class GenerationViewModel : ViewModel() {
                             ownerId = owner,
                             contentType = contentType
                         )
+
+                        // 任务进入生成态：登记通知快照 + 注册通知「取消」按钮的处理器
+                        // （复位路径统一注销）。内部有前后台与开关判定，前台零开销。
+                        val notifyContext = applicationContext
+                        if (notifyContext != null) {
+                            GenerationNotifier.onGenerationStarted(notifyContext, owner)
+                        }
+                        GenerationNotifier.registerCancelHandler { cancelGeneration { _ -> } }
 
                         // If handler doesn't match new owner, clear it so correct screen can register
                         if (activeEventHandlerOwnerId != null && activeEventHandlerOwnerId != owner) {
@@ -1338,6 +1364,9 @@ class GenerationViewModel : ViewModel() {
             if (success) {
                 DebugLogger.i(TAG, "Generation cancelled successfully")
                 JobRegistry.markCancelled(executingId)
+                // 用户主动取消：撤掉进度通知并注销「取消」处理器（通知上已无任务可取消）
+                applicationContext?.let { GenerationNotifier.cancel(it) }
+                GenerationNotifier.registerCancelHandler(null)
                 resetGenerationState()
                 dispatchEvent(GenerationEvent.GenerationCancelled)
                 // 主动与服务器对齐：/interrupt 之后 ComfyUI 会立刻抓起下一个 pending 任务，
@@ -1361,6 +1390,9 @@ class GenerationViewModel : ViewModel() {
         client.clearQueue { success ->
             if (success) {
                 ownPendingIds.forEach { JobRegistry.removeJob(it) }
+                // 清排队（可能连同中断当前任务）：撤通知 + 注销取消处理器
+                applicationContext?.let { GenerationNotifier.cancel(it) }
+                GenerationNotifier.registerCancelHandler(null)
                 resetGenerationState()
                 dispatchEvent(GenerationEvent.GenerationCancelled)
                 mainHandler.postDelayed({ ConnectionManager.pollQueueStatus() }, QUEUE_SYNC_DELAY_MS)
@@ -1409,6 +1441,9 @@ class GenerationViewModel : ViewModel() {
                     } else {
                         DebugLogger.w(TAG, "clearQueueAndStopCurrent: interrupt failed")
                     }
+                    // 清空队列 + 停当前任务：撤通知 + 注销取消处理器
+                    applicationContext?.let { GenerationNotifier.cancel(it) }
+                    GenerationNotifier.registerCancelHandler(null)
                     purgeLocalPending()
                     resetGenerationState()
                     dispatchEvent(GenerationEvent.GenerationCancelled)
@@ -1591,6 +1626,16 @@ class GenerationViewModel : ViewModel() {
             "Job lost after $pollMissCount polls: ${Obfuscator.promptId(promptId)}"
         )
         pollMissCount = 0
+        // 后台时把进度通知换成失败横幅（前台时撤掉）；注销通知「取消」处理器
+        val notifyContext = applicationContext
+        if (notifyContext != null) {
+            GenerationNotifier.onGenerationFailed(
+                notifyContext,
+                generationOwnerId,
+                message
+            )
+        }
+        GenerationNotifier.registerCancelHandler(null)
         dispatchEvent(GenerationEvent.Error(message))
         JobRegistry.markFailed(promptId)
         resetGenerationState()
@@ -1614,7 +1659,10 @@ class GenerationViewModel : ViewModel() {
      * Check server for generation completion.
      * Called when returning from background or reconnecting after connection loss.
      * Queries the server's history API to see if the generation completed while we were away.
-     * If not in history, checks the queue to determine if still running or truly stale.
+     *
+     * 处置按 [resolveReconcileOutcome] 四分：有产物 → 完成收尾；history 明确报错 →
+     * 失败收尾（提示 + markFailed）；还在队列 → 继续轮询；都不满足 → 任务丢失，同样
+     * 按失败收尾（原实现是静默 reset，界面无提示——2026-11 修复）。
      */
     fun checkServerForCompletion(onResult: (completed: Boolean, promptId: String?) -> Unit = { _, _ -> }) {
         val state = _generationState.value
@@ -1639,13 +1687,40 @@ class GenerationViewModel : ViewModel() {
                     } else {
                         // Not in queue - retry history check in case it just completed
                         client.fetchHistory(state.promptId) { retryHistoryJson ->
-                            val retryOutputs = retryHistoryJson?.optJSONObject(state.promptId)?.optJSONObject("outputs")
-                            if (retryOutputs != null && retryOutputs.length() > 0) {
-                                dispatchCompletionEvent(state.promptId, state.contentType)
-                                onResult(true, state.promptId)
-                            } else {
-                                resetGenerationState()
-                                onResult(false, null)
+                            val retryEntry = retryHistoryJson?.optJSONObject(state.promptId)
+                            val retryOutputs = retryEntry?.optJSONObject("outputs")
+                            val retryStatusStr = retryEntry?.optJSONObject("status")
+                                ?.optString("status_str").orEmpty()
+                            // 重试那一次给了「刚跑完还没落 history」的宽限；第二次仍查不到
+                            // 且不在队列，就只能是失败或丢失了 —— 原实现这里静默
+                            // resetGenerationState()，进度条无声消失且不留任何提示。
+                            when (
+                                resolveReconcileOutcome(
+                                    outputsPresent = retryOutputs != null && retryOutputs.length() > 0,
+                                    historyStatusStr = retryStatusStr,
+                                    inQueue = false
+                                )
+                            ) {
+                                ReconcileOutcome.COMPLETED -> {
+                                    dispatchCompletionEvent(state.promptId, state.contentType)
+                                    onResult(true, state.promptId)
+                                }
+                                ReconcileOutcome.FAILED_REPORTED -> {
+                                    handleJobLost(
+                                        state.promptId,
+                                        applicationContext?.getString(R.string.error_generation_failed)
+                                            ?: "Generation failed"
+                                    )
+                                    onResult(false, null)
+                                }
+                                else -> {
+                                    handleJobLost(
+                                        state.promptId,
+                                        applicationContext?.getString(R.string.error_job_lost)
+                                            ?: "Task lost: the server no longer has this job. Please generate again."
+                                    )
+                                    onResult(false, null)
+                                }
                             }
                         }
                     }
@@ -1653,20 +1728,59 @@ class GenerationViewModel : ViewModel() {
                 return@fetchHistory
             }
 
-            val outputs = historyJson.optJSONObject(state.promptId)?.optJSONObject("outputs")
-            if (outputs != null && outputs.length() > 0) {
-                dispatchCompletionEvent(state.promptId, state.contentType)
-                onResult(true, state.promptId)
-            } else {
-                // Not in history with outputs - check if still in queue
-                checkIfPromptInQueue(client, state.promptId) { inQueue ->
-                    if (inQueue) {
-                        dispatchEvent(GenerationEvent.ClearPreviewForResume)
-                        startCompletionPolling(state.promptId, state.contentType)
-                        onResult(false, state.promptId)
-                    } else {
-                        resetGenerationState()
-                        onResult(false, null)
+            val entry = historyJson.optJSONObject(state.promptId)
+            val outputs = entry?.optJSONObject("outputs")
+            val statusStr = entry?.optJSONObject("status")?.optString("status_str").orEmpty()
+
+            // 断线期间失败的任务在 history 里有条目（status_str=error）但 outputs 为空。
+            // 原实现不查 status_str：这类任务会落进 else 分支查队列 → 失败任务已不在
+            // 队列 → 静默 resetGenerationState()，用户得不到任何失败提示。现在显式判定。
+            when (
+                resolveReconcileOutcome(
+                    outputsPresent = outputs != null && outputs.length() > 0,
+                    historyStatusStr = statusStr,
+                    inQueue = false
+                )
+            ) {
+                ReconcileOutcome.COMPLETED -> {
+                    dispatchCompletionEvent(state.promptId, state.contentType)
+                    onResult(true, state.promptId)
+                }
+                ReconcileOutcome.FAILED_REPORTED -> {
+                    handleJobLost(
+                        state.promptId,
+                        applicationContext?.getString(R.string.error_generation_failed)
+                            ?: "Generation failed"
+                    )
+                    onResult(false, null)
+                }
+                else -> {
+                    // Not in history with outputs - check if still in queue
+                    checkIfPromptInQueue(client, state.promptId) { inQueue ->
+                        when (
+                            resolveReconcileOutcome(
+                                outputsPresent = false,
+                                historyStatusStr = statusStr,
+                                inQueue = inQueue
+                            )
+                        ) {
+                            ReconcileOutcome.STILL_RUNNING -> {
+                                dispatchEvent(GenerationEvent.ClearPreviewForResume)
+                                startCompletionPolling(state.promptId, state.contentType)
+                                onResult(false, state.promptId)
+                            }
+                            else -> {
+                                // 不在队列也不在 history：任务已丢失（服务器重启/队列被清）。
+                                // 原实现静默 resetGenerationState() —— 改为与
+                                // pollForCompletion 同口径的 handleJobLost（提示 + markFailed）。
+                                handleJobLost(
+                                    state.promptId,
+                                    applicationContext?.getString(R.string.error_job_lost)
+                                        ?: "Task lost: the server no longer has this job. Please generate again."
+                                )
+                                onResult(false, null)
+                            }
+                        }
                     }
                 }
             }
@@ -1682,6 +1796,13 @@ class GenerationViewModel : ViewModel() {
         } else {
             GenerationEvent.ImageGenerated(promptId)
         }
+        // 后台时把进度通知更新为「已完成」（点击回 App）；前台时撤掉进度条。
+        // 完成即注销通知「取消」处理器 —— 通知上已经没有可取消的东西了。
+        val notifyContext = applicationContext
+        if (notifyContext != null) {
+            GenerationNotifier.onGenerationCompleted(notifyContext, generationOwnerId)
+        }
+        GenerationNotifier.registerCancelHandler(null)
         dispatchEvent(event)
         completeGeneration(promptId)  // Pass promptId to prevent clearing state for a different job
         // Clear JobRegistry state - ensures executingOwnerId is reset even when
@@ -1756,6 +1877,9 @@ class GenerationViewModel : ViewModel() {
                 ownerId = ownerId,
                 contentType = contentType
             )
+            // 重启恢复的生成态：登记通知快照（进后台时可展示），并接回「取消」处理器
+            GenerationNotifier.onGenerationStarted(context, ownerId)
+            GenerationNotifier.registerCancelHandler { cancelGeneration { _ -> } }
         }
     }
 
@@ -1764,7 +1888,11 @@ class GenerationViewModel : ViewModel() {
      */
     fun logout() {
         // Clear JobRegistry persisted state
-        applicationContext?.let { JobRegistry.clearPersistedState(it) }
+        applicationContext?.let {
+            JobRegistry.clearPersistedState(it)
+            GenerationNotifier.cancel(it)
+        }
+        GenerationNotifier.registerCancelHandler(null)
 
         // Logout from server (sets flag to prevent auto-reconnect, clears all caches including JobRegistry)
         ConnectionManager.logout()
@@ -1777,6 +1905,10 @@ class GenerationViewModel : ViewModel() {
         super.onCleared()
         webSocketMessageJob?.cancel()
         webSocketStateJob?.cancel()
+        // 本实例持有通知「取消」处理器的话一并释放（多实例共存时防止转发给已销毁实例）
+        if (generationOwnerId != null) {
+            GenerationNotifier.registerCancelHandler(null)
+        }
         // WebSocket is managed by ConnectionManager, don't close it here
         // as other ViewModels may still need it
     }

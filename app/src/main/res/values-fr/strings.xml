@@ -692,20 +692,33 @@
     <string name="model_list_empty">Aucun modèle disponible sur le serveur</string>
     <!-- P3-10 : aucune application ne peut ouvrir le lien externe -->
     <string name="error_open_link_failed">Aucune application capable d\'ouvrir ce lien</string>
-    <!-- MOSS 4K (prebuilt_33/34) : libellés des paramètres dynamiques -->
-    <string name="dynamic_param_moss_steps2_label">Étapes (2e passe)</string>
-    <string name="dynamic_param_moss_cfg2_label">CFG (2e passe)</string>
-    <string name="dynamic_param_moss_sampler2_label">Échantillonneur (2e passe)</string>
-    <string name="dynamic_param_moss_scheduler2_label">Planificateur (2e passe)</string>
-    <string name="dynamic_param_moss_detail_prompt_face_label">Prompt de détail · visage</string>
-    <string name="dynamic_param_moss_detail_prompt_body_label">Prompt de détail · corps</string>
-    <string name="dynamic_param_moss_lora1_on_label">Interrupteur LoRA 1</string>
-    <string name="dynamic_param_moss_lora1_strength_label">Poids LoRA 1</string>
-    <string name="dynamic_param_moss_lora2_on_label">Interrupteur LoRA 2</string>
-    <string name="dynamic_param_moss_lora2_strength_label">Poids LoRA 2</string>
-    <string name="dynamic_param_moss_lora3_on_label">Interrupteur LoRA 3</string>
-    <string name="dynamic_param_moss_lora3_strength_label">Poids LoRA 3</string>
-    <string name="dynamic_param_moss_seedvr2_enabled_label">Agrandissement 4K</string>
-    <string name="dynamic_param_moss_seedvr2_size_label">Taille cible de l\'agrandissement</string>
+    <!-- labels for dynamic params -->
+    <string name="dynamic_param_steps2_label">Étapes (2e passe)</string>
+    <string name="dynamic_param_cfg2_label">CFG (2e passe)</string>
+    <string name="dynamic_param_sampler2_label">Échantillonneur (2e passe)</string>
+    <string name="dynamic_param_scheduler2_label">Planificateur (2e passe)</string>
+    <string name="dynamic_param_detail_prompt_face_label">Prompt de détail · visage</string>
+    <string name="dynamic_param_detail_prompt_body_label">Prompt de détail · corps</string>
+    <string name="dynamic_param_lora1_on_label">Interrupteur LoRA 1</string>
+    <string name="dynamic_param_lora1_strength_label">Poids LoRA 1</string>
+    <string name="dynamic_param_lora2_on_label">Interrupteur LoRA 2</string>
+    <string name="dynamic_param_lora2_strength_label">Poids LoRA 2</string>
+    <string name="dynamic_param_lora3_on_label">Interrupteur LoRA 3</string>
+    <string name="dynamic_param_lora3_strength_label">Poids LoRA 3</string>
+    <string name="dynamic_param_seedvr2_enabled_label">Agrandissement 4K</string>
+    <string name="dynamic_param_seedvr2_size_label">Taille cible de l\'agrandissement</string>
     <string name="sampler_param_detail_denoise_hand">Intensité de correction des mains</string>
+    <!-- Notifications de génération (arrière-plan/écran verrouillé ; nom du mode + progression uniquement) -->
+    <string name="notify_generation_channel_progress_name">Progression de la génération</string>
+    <string name="notify_generation_channel_progress_desc">Affiche la progression de la génération lorsque l\'application est en arrière-plan</string>
+    <string name="notify_generation_channel_result_name">Résultats de génération</string>
+    <string name="notify_generation_channel_result_desc">Alertes de génération terminée ou échouée</string>
+    <string name="notify_generation_generic_title">Génération</string>
+    <string name="notify_generation_progress_text">Génération… %1$d%%</string>
+    <string name="notify_generation_progress_running">Génération…</string>
+    <string name="notify_generation_completed_title">Génération terminée</string>
+    <string name="notify_generation_failed_title">Génération échouée</string>
+    <string name="notify_generation_action_cancel">Annuler</string>
+    <string name="label_generation_notifications">Notifications de génération</string>
+    <string name="desc_generation_notifications">Affiche la progression dans la barre de notifications pendant la génération et signale la fin ou l\'échec</string>
 </resources>

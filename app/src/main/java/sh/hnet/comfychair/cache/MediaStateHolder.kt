@@ -154,6 +154,13 @@ object MediaStateHolder {
     private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var persistJob: Job? = null
 
+    /**
+     * 保护 [persistJob]「检查 + 赋值」原子性的锁（见 [schedulePersist]）。
+     * schedulePersist 可能来自不同线程（UI 生命周期回调、落盘协程自身的补排），
+     * 不加锁时两个线程可同时通过 isActive 检查、各起一个落盘协程并发写同一份文件。
+     */
+    private val persistLock = Any()
+
     /** 防抖窗口：这段时间内没有新的脏数据才真正写盘，把连续写入并成一次。 */
     private const val PERSIST_DEBOUNCE_MS = 800L
 
@@ -323,6 +330,15 @@ object MediaStateHolder {
     private const val LARGE_BITMAP_BYTES = 32 * 1024 * 1024
 
     /**
+     * 视频字节驻留内存的体积上限（128MB）。
+     *
+     * 视频没有位图那样的"降采样"可用——要么整段进堆、要么不进。超长/高码率的视频
+     * 动辄几百 MB，整段塞进 videoBytes 会让堆瞬间膨胀、后续解码处处 OOM；
+     * 超限时改为只落盘不驻留（需要时走磁盘路径读出），与 LARGE_BITMAP_BYTES 同一目的。
+     */
+    private const val MAX_VIDEO_BYTES = 128L * 1024 * 1024
+
+    /**
      * 落盘前把超大位图缩到预览尺寸；已经够小的原样返回（调用方据此判断要不要回收临时位图）。
      */
     private fun downscaleForPreview(bitmap: Bitmap): Bitmap {
@@ -469,6 +485,26 @@ object MediaStateHolder {
         }
 
         if (isMemoryFirstMode) {
+            // 超过内存上限的视频不驻留：只写盘、不进 videoBytes（视频整段无法缩小，
+            // 只能整段跳过，见 MAX_VIDEO_BYTES）。放在"驱逐同类型旧视频"之前——
+            // 新内容没进内存时，不该把还驻留着、可能尚未落盘的旧视频逐出。
+            if (bytes.size > MAX_VIDEO_BYTES) {
+                DebugLogger.w(
+                    TAG,
+                    "视频超出内存上限 ${MAX_VIDEO_BYTES / (1024 * 1024)} MB，已跳过内存驻留" +
+                        "（key=${key.baseFilename}, size=${bytes.size}）"
+                )
+                context?.let { ctx ->
+                    try {
+                        // 落盘与磁盘优先分支同一写法，写完同样按总量上限裁一次旧视频
+                        File(ctx.filesDir, key.filename(serverId)).writeBytes(bytes)
+                        trimVideoFiles(ctx, serverId)
+                    } catch (_: Exception) {
+                        // Ignore write failures
+                    }
+                }
+                return
+            }
             // Memory-first: store in memory, mark as dirty for later persistence
             // 同类型只保留最新一份：视频键带 promptId，每生成一个视频就是新键，而旧键
             // 没有任何删除点（evict 按 key 精确匹配）——留着就是每个视频几十 MB 常驻不退。
@@ -692,15 +728,20 @@ object MediaStateHolder {
             DebugLogger.d(TAG, "schedulePersist: media cache disabled, persist SKIPPED (dirty: ${dirtyVersions.size})")
             return
         }
-        if (persistJob?.isActive == true) return
-        persistJob = persistScope.launch {
-            delay(PERSIST_DEBOUNCE_MS)
-            persistToDisk(context.applicationContext)
-            // 落盘期间可能又攒了新的脏数据（连续出图/连续换图），补排一次。
-            // 必须先把句柄清掉，否则下面的 schedulePersist 会因为"上一个任务还活着"而直接返回。
-            persistJob = null
-            if (dirtyVersions.isNotEmpty()) {
-                schedulePersist(context.applicationContext)
+        // 「检查 + 赋值」必须原子（persistLock）：不加锁时两个线程可同时通过
+        // isActive 检查、各 launch 一个落盘协程，两个协程并发写同一份磁盘文件
+        // （内容交错损坏）。launch 的创建与赋值放进锁内，协程体本身仍在锁外执行。
+        synchronized(persistLock) {
+            if (persistJob?.isActive == true) return
+            persistJob = persistScope.launch {
+                delay(PERSIST_DEBOUNCE_MS)
+                persistToDisk(context.applicationContext)
+                // 落盘期间可能又攒了新的脏数据（连续出图/连续换图），补排一次。
+                // 必须先把句柄清掉，否则下面的 schedulePersist 会因为"上一个任务还活着"而直接返回。
+                persistJob = null
+                if (dirtyVersions.isNotEmpty()) {
+                    schedulePersist(context.applicationContext)
+                }
             }
         }
     }
@@ -938,6 +979,16 @@ object MediaStateHolder {
                     val promptId = file.name
                         .removePrefix(fullPrefix)
                         .removeSuffix(".mp4")
+                    // 冷启动读入同样过内存上限：超限文件整段 readBytes 会把堆顶爆，
+                    // 跳过读入也不回调（不驻留内存），需要时走 getVideoBytes 的磁盘路径读出。
+                    if (file.length() > MAX_VIDEO_BYTES) {
+                        DebugLogger.w(
+                            TAG,
+                            "视频超出内存上限 ${MAX_VIDEO_BYTES / (1024 * 1024)} MB，已跳过冷启动读入" +
+                                "（key=${file.name}, size=${file.length()}）"
+                        )
+                        return@let
+                    }
                     val bytes = file.readBytes()
                     onLoaded(promptId, bytes)
                 }

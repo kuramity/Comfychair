@@ -618,7 +618,17 @@ private fun IntEditor(
     onValueChange: (Int) -> Unit,
     context: android.content.Context
 ) {
-    var textValue by remember(value) { mutableStateOf(value) }
+    // 不以 value 为 remember key：上报后的外部回写会重建 state 并把输入框打回
+    // 规范化文本，破坏"0."这类中间态。真正的外部修改走下方 LaunchedEffect 同步。
+    var textValue by remember { mutableStateOf(value) }
+    // 外部值真正变化时同步输入框（别处改值这里必须跟随）。判据用解析后的数值：
+    // 用户输入"5"上报后父级回传"5"，解析值相同 → 不同步，中间态保留；
+    // 外部改成其他数值 → 解析值不同 → 覆盖。与 FloatEditor 保持同口径。
+    LaunchedEffect(value) {
+        if (value.toIntOrNull() != textValue.toIntOrNull()) {
+            textValue = value
+        }
+    }
     val error = ValidationUtils.validateInt(textValue, context, min, max)
 
     // Construct range hint
@@ -661,7 +671,18 @@ private fun FloatEditor(
     onValueChange: (Float) -> Unit,
     context: android.content.Context
 ) {
-    var textValue by remember(value) { mutableStateOf(value) }
+    // 不以 value 为 remember key：上报后的外部回写会重建 state 并把输入框打回
+    // 规范化文本，破坏"0."这类中间态。真正的外部修改走下方 LaunchedEffect 同步。
+    var textValue by remember { mutableStateOf(value) }
+    // 外部值真正变化时同步输入框（别处改值这里必须跟随）。判据用解析后的数值：
+    // 用户输入"0."上报 0.0 后父级回传"0.0"，两者解析值相同 → 不同步，
+    // 中间态保留（否则光标跳位、后续按键得到"0.05"）；外部改成其他数值 →
+    // 解析值不同 → 覆盖。与 IntEditor 保持同口径。
+    LaunchedEffect(value) {
+        if (value.toFloatOrNull() != textValue.toFloatOrNull()) {
+            textValue = value
+        }
+    }
     val error = ValidationUtils.validateFloat(textValue, context, min, max)
 
     // Construct range hint

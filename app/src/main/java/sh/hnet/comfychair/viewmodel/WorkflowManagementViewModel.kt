@@ -713,6 +713,7 @@ class WorkflowManagementViewModel : ViewModel() {
             showImportDialog = false,
             pendingImportJsonContent = "",
             importSelectedType = null,
+            importTypeDropdownExpanded = false,
             importName = "",
             importDescription = "",
             importNameError = null,
@@ -1063,9 +1064,10 @@ class WorkflowManagementViewModel : ViewModel() {
                 val jsonContent = result.getOrThrow()
                 val writeSuccess = withContext(Dispatchers.IO) {
                     try {
-                        context.contentResolver.openOutputStream(uri)?.use { stream ->
-                            stream.write(jsonContent.toByteArray(Charsets.UTF_8))
-                        }
+                        // openOutputStream 返回 null 表示打不开目标（如无效 URI），不能误报成功
+                        val stream = context.contentResolver.openOutputStream(uri)
+                            ?: return@withContext false
+                        stream.use { it.write(jsonContent.toByteArray(Charsets.UTF_8)) }
                         true
                     } catch (e: Exception) {
                         false

@@ -33,7 +33,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -41,6 +40,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.taglibrary.data.CooccurTable
@@ -196,8 +196,17 @@ fun TagDetailScreen(
             AliasGroup(stringResource(R.string.tag_alias_ja), jaAliases)
             AliasGroup(stringResource(R.string.tag_alias_en), enAliases)
 
-            // 常见搭配（共现库提取）：点一下直接加进正向提示词
-            val partners = remember(tagName) { CooccurTable.partners(tagName) }
+            // 常见搭配（共现库提取）：点一下直接加进正向提示词。
+            // 共现库是懒加载（标签库初始化成功后才 ensureLoaded）：详情页可能先于它打开，
+            // 不能用 remember(tagName) 把当时的空列表钉死——isLoaded 是普通变量（非 State，
+            // Compose 观察不到），这里轮询等表就绪后重查一次。
+            val partners by produceState(
+                initialValue = CooccurTable.partners(tagName),
+                tagName
+            ) {
+                while (!CooccurTable.isLoaded) delay(50)
+                value = CooccurTable.partners(tagName)
+            }
             if (partners.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(18.dp))
                 Text(

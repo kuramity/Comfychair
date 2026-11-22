@@ -527,7 +527,7 @@ fun ImageToVideoScreen(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = stringResource(R.string.msg_timeline_director_removed),
+                    text = stringResource(R.string.msg_workflow_feature_removed),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error
                 )

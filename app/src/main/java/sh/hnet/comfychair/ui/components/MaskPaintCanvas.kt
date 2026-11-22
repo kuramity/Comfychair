@@ -35,6 +35,47 @@ enum class ImageScaleMode {
 }
 
 /**
+ * 蒙版编辑绘制画笔缓存（模式参考 WorkflowGraphCanvas 的 GraphPaintCache）：
+ * 原先在 Canvas 绘制 lambda 内每帧 new Paint + new PorterDuffXfermode（native 对象）。
+ * 这些画笔只在 Compose 绘制线程访问，且每次使用前都会重设 style / strokeWidth
+ * （color、join、cap、xfermode 全程不变），跨帧复用不串味。
+ */
+private class MaskEditorPaints {
+    /** 蒙版笔迹：全红（透明度在图层合成时统一应用） */
+    val maskPaint = android.graphics.Paint().apply {
+        color = android.graphics.Color.argb(255, 255, 0, 0)
+        style = android.graphics.Paint.Style.STROKE
+        strokeJoin = android.graphics.Paint.Join.ROUND
+        strokeCap = android.graphics.Paint.Cap.ROUND
+        isAntiAlias = true
+    }
+
+    /** 橡皮擦预览：半透明灰 */
+    val erasePaint = android.graphics.Paint().apply {
+        color = android.graphics.Color.argb(100, 128, 128, 128)
+        style = android.graphics.Paint.Style.STROKE
+        strokeJoin = android.graphics.Paint.Join.ROUND
+        strokeCap = android.graphics.Paint.Cap.ROUND
+        isAntiAlias = true
+    }
+
+    /** 图层合成画笔：蒙版层整体半透明 */
+    val layerPaint = android.graphics.Paint().apply {
+        alpha = 180
+    }
+
+    /** 橡皮擦落笔：CLEAR 模式切穿图层（Xfermode 为 native 对象，随画笔一起只建一次） */
+    val clearPaint = android.graphics.Paint().apply {
+        color = android.graphics.Color.TRANSPARENT
+        style = android.graphics.Paint.Style.STROKE
+        strokeJoin = android.graphics.Paint.Join.ROUND
+        strokeCap = android.graphics.Paint.Cap.ROUND
+        isAntiAlias = true
+        xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
+    }
+}
+
+/**
  * Composable that displays an image with a mask painting overlay.
  * Uses Canvas API for direct drawing with native Path objects.
  *
@@ -64,6 +105,8 @@ fun MaskPaintCanvas(
     var lastPoint by remember { mutableStateOf(Offset.Zero) }
     // Counter to force recomposition when path is modified
     var pathUpdateCounter by remember { mutableStateOf(0L) }
+    // 绘制缓存：画笔（含 Xfermode）用 remember 持有，不随每帧重建
+    val paints = remember { MaskEditorPaints() }
 
     // Calculate image rect based on scale mode
     fun calculateImageRect(canvasWidth: Int, canvasHeight: Int, imageWidth: Int, imageHeight: Int): Rect {
@@ -238,26 +281,13 @@ fun MaskPaintCanvas(
 
         // Draw mask paths using native canvas for proper transformation
         // Use full opacity for strokes - transparency is applied when layer is composited
-        val maskPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.argb(255, 255, 0, 0) // Full red (transparency applied at layer level)
-            style = android.graphics.Paint.Style.STROKE
-            strokeJoin = android.graphics.Paint.Join.ROUND
-            strokeCap = android.graphics.Paint.Cap.ROUND
-            isAntiAlias = true
-        }
+        // 画笔为 remember 缓存（MaskEditorPaints），style / strokeWidth 在使用前重设
+        val maskPaint = paints.maskPaint
 
-        val erasePaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.argb(100, 128, 128, 128) // Gray for eraser preview
-            style = android.graphics.Paint.Style.STROKE
-            strokeJoin = android.graphics.Paint.Join.ROUND
-            strokeCap = android.graphics.Paint.Cap.ROUND
-            isAntiAlias = true
-        }
+        val erasePaint = paints.erasePaint
 
         // Paint used when compositing the mask layer back - applies uniform transparency
-        val layerPaint = android.graphics.Paint().apply {
-            alpha = 180 // Semi-transparent overlay for the entire mask
-        }
+        val layerPaint = paints.layerPaint
 
         // Draw mask overlay with layer support for eraser (PorterDuff.Mode.CLEAR needs a layer)
         if (sourceImage != null && imgRect.width > 0 && imgRect.height > 0) {
@@ -280,14 +310,7 @@ fun MaskPaintCanvas(
             )
 
             // Paint for erasing (cuts through the layer)
-            val clearPaint = android.graphics.Paint().apply {
-                color = android.graphics.Color.TRANSPARENT
-                style = android.graphics.Paint.Style.STROKE
-                strokeJoin = android.graphics.Paint.Join.ROUND
-                strokeCap = android.graphics.Paint.Cap.ROUND
-                isAntiAlias = true
-                xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-            }
+            val clearPaint = paints.clearPaint
 
             // Draw all paths in order - this allows paint after erase to work correctly
             maskPaths.forEach { pathData ->

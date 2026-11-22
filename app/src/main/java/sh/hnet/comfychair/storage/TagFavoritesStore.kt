@@ -149,7 +149,11 @@ private class FileTagFavoritesIo(private val file: File) : TagFavoritesIo {
     override fun readText(): String = file.readText()
 
     override fun writeText(text: String) {
-        file.writeText(text)
+        // 原子写（复用同包 GalleryMetadataCache 的 writeTextAtomically）：
+        // .tmp → fsync → 原子改名覆盖。原实现 File.writeText 先截断再写，
+        // 进程中途被杀会留下半截 JSON，下次启动解析失败、用户收藏整份作废
+        //（解析失败后本模块会拒绝写入，等于收藏永久不可用）。
+        GalleryMetadataCache.writeTextAtomically(file, text)
     }
 
     override fun backupCorrupt(): String? {

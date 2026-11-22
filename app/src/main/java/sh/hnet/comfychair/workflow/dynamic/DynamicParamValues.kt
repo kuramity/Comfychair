@@ -8,8 +8,11 @@ import org.json.JSONObject
  * 与 [sh.hnet.comfychair.WorkflowManager.escapeForJson] 是同一份实现——后者委托到这里，
  * 避免两处各写一套导致行为分叉。
  */
+/** 兜底匹配：前面已单独转义 `\n` `\r` `\t` `\b` `\f`（替换后不再含控制字符），不会重复命中 */
+private val REMAINING_CONTROL_CHARS = Regex("[\\x00-\\x1F]")
+
 internal fun escapeJsonString(input: String): String {
-    return input
+    val escaped = input
         .replace("\\", "\\\\")
         .replace("\"", "\\\"")
         .replace("\n", "\\n")
@@ -17,6 +20,10 @@ internal fun escapeJsonString(input: String): String {
         .replace("\t", "\\t")
         .replace("\b", "\\b")
         .replace("\u000C", "\\f")
+    // 其余 \u0000-\u001F 控制字符转成 \uXXXX，避免非法控制字符混进 JSON 字符串字面量
+    return REMAINING_CONTROL_CHARS.replace(escaped) { match ->
+        String.format("\\u%04x", match.value[0].code)
+    }
 }
 
 /**

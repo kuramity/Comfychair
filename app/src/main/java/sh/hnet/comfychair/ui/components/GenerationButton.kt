@@ -1,7 +1,12 @@
 package sh.hnet.comfychair.ui.components
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -46,6 +51,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -297,6 +303,25 @@ fun GenerationButton(
 
     // 波纹点阵皮肤总开关（v4.12.x）：组合时读一次，置 false 时两个按钮都恢复无特效形态
     val context = LocalContext.current
+
+    // 生成通知的运行时权限（Android 13+ POST_NOTIFICATIONS）。
+    // 请求时机 = 用户点「生成」那一刻：即将开始一个可能较长的任务，"同意后可以在通知栏
+    // 看进度"语义最自然（与更新弹窗点"立即更新"时请求同一套理由）；拒绝不阻塞生成。
+    // 已授权 / Android 12- 时 launch 也不会弹（系统对拒绝后的重复请求同样静默），零成本。
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* 授权与否都不影响生成本身；被拒时通知静默跳过 */ }
+
+    fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     val dotFeedbackEnabled = remember(context) {
         AppSettings.isRippleDotFeedbackEnabled(context)
     }
@@ -376,6 +401,8 @@ fun GenerationButton(
                             "ts=${SystemClock.uptimeMillis()} bounds=$latestBounds"
                     )
                 }
+                // 首次点生成时请求通知权限（见上方 launcher 注释）；同步调用、不阻塞提交
+                requestNotificationPermissionIfNeeded()
                 if (imeClickFix) {
                     // S2 修复（v4.16.7 方向 A1）：先同步提交生成，clearFocus 推后一帧。
                     // 键盘收起会触发 imePadding 逐帧重排、按钮在窗口里位移 246px（R4

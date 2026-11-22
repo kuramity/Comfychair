@@ -604,7 +604,9 @@ class UpdateDownloadWorker(
         val needed = if (total > 0) total - resumeFrom else 0L
         if (needed > 0) {
             val usable = part.usableSpace
-            if (usable in 1 until needed + 32L * 1024 * 1024) {
+            // usable == 0 / 负值（分区不可用或已满）同样必须拦截：原先的区间写法
+            // 恰好把 0 排除在外，"剩余 0 可用"时会跳过预检直接下到一半撑爆
+            if (usable < needed + 32L * 1024 * 1024) {
                 // 抛 DiskFullException 让分型器归为不可恢复（重试解决不了磁盘满）
                 throw DownloadPolicy.DiskFullException(usable, needed)
             }

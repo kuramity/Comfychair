@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.WorkflowManager
@@ -435,6 +436,9 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         private const val TAG = "ImageToVideo"
         const val OWNER_ID = "IMAGE_TO_VIDEO"
         private const val PREFS_NAME = "ImageToVideoFragmentPrefs"
+
+        /** 等待 ensureConnection 回调的超时（对齐 GenerationViewModel 的提交闸门 30s） */
+        private const val CONNECTION_WAIT_TIMEOUT_MS = 30_000L
 
         // Global preferences (camelCase keys for BackupManager compatibility)
         private const val KEY_SELECTED_WORKFLOW_ID = "selectedWorkflowId"
@@ -1471,10 +1475,20 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         val context = applicationContext ?: return null
 
         // Check connection before uploading
-        val connected = suspendCoroutine { cont ->
-            ConnectionManager.ensureConnection(context) { success ->
-                cont.resumeWith(Result.success(success))
+        // 超时兜底：ensureConnection 在"另一个重连会话已开始"的分支里**不会回调**
+        // （见 GenerationViewModel.armSubmitGateWatchdog 的注释），不设超时会永久挂起。
+        val connected = withTimeoutOrNull(CONNECTION_WAIT_TIMEOUT_MS) {
+            suspendCoroutine<Boolean> { cont ->
+                ConnectionManager.ensureConnection(context) { success ->
+                    cont.resumeWith(Result.success(success))
+                }
             }
+        } ?: run {
+            // 超时视为连接失败。此场景 ensureConnection 未回调、不会弹重连失败对话框，
+            // 主动提示，避免静默失败
+            DebugLogger.w(TAG, "等待连接超时（${CONNECTION_WAIT_TIMEOUT_MS}ms），视为连接失败")
+            _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_connection_lost))
+            return null
         }
         if (!connected) return null  // Dialog already shown by ensureConnection
 
@@ -1483,7 +1497,7 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         // 旧版「时间线导演台」工作流：功能已移除，直接明确告知，
         // 不让用户白等一次因为 timeline_data 没人维护而必然失败的提交
         if (state.legacyTimelineUnsupported) {
-            _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_timeline_director_removed))
+            _events.emit(ImageToVideoEvent.ShowToast(R.string.msg_workflow_feature_removed))
             return null
         }
 
@@ -1628,6 +1642,11 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
                 bitmapToUpload.recycle()
             }
             bytes
+        }
+        if (imageBytes == null) {
+            // WebP 编码失败（compress 返回 false）：空字节不能推进上传链路
+            _events.emit(ImageToVideoEvent.ShowToast(R.string.error_save_image))
+            return null
         }
 
         data class UploadResult(val filename: String?, val failureType: ConnectionFailure)

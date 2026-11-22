@@ -48,6 +48,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -65,6 +66,10 @@ import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.viewmodel.SettingsEvent
 import sh.hnet.comfychair.viewmodel.SettingsViewModel
 import sh.hnet.comfychair.workflow.routing.RouterProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -81,6 +86,7 @@ fun ApplicationSettingsScreen(
     onNavigateToAppearance: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val isLivePreviewEnabled by viewModel.isLivePreviewEnabled.collectAsStateWithLifecycle()
     val isMemoryFirstCache by viewModel.isMemoryFirstCache.collectAsStateWithLifecycle()
     val isMediaCacheDisabled by viewModel.isMediaCacheDisabled.collectAsStateWithLifecycle()
@@ -91,6 +97,8 @@ fun ApplicationSettingsScreen(
     val edgeRouterId by viewModel.edgeRouterId.collectAsStateWithLifecycle()
     val isPromptSpellCheckEnabled by viewModel.isPromptSpellCheckEnabled.collectAsStateWithLifecycle()
     val isPromptExpandEnabled by viewModel.isPromptExpandEnabled.collectAsStateWithLifecycle()
+    val isGenerationNotificationsEnabled by viewModel.isGenerationNotificationsEnabled.collectAsStateWithLifecycle()
+    val isBackgroundKeepConnectedEnabled by viewModel.isBackgroundKeepConnectedEnabled.collectAsStateWithLifecycle()
 
     // State and effects
     // Backup/restore state
@@ -121,13 +129,18 @@ fun ApplicationSettingsScreen(
         ActivityResultContracts.CreateDocument("text/plain")
     ) { uri ->
         uri?.let { saveUri ->
-            try {
-                context.contentResolver.openOutputStream(saveUri)?.use { outputStream ->
-                    outputStream.write(DebugLogger.exportToString().toByteArray(Charsets.UTF_8))
+            // 导出（读全部日志）与写出都是磁盘 IO，移到 IO 线程；Toast 回主线程弹
+            scope.launch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(saveUri)?.use { outputStream ->
+                            outputStream.write(DebugLogger.exportToString().toByteArray(Charsets.UTF_8))
+                        }
+                    }
+                    Toast.makeText(context, R.string.msg_debug_log_saved, Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, R.string.error_debug_log_save, Toast.LENGTH_SHORT).show()
                 }
-                Toast.makeText(context, R.string.msg_debug_log_saved, Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                Toast.makeText(context, R.string.error_debug_log_save, Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -505,6 +518,56 @@ fun ApplicationSettingsScreen(
                     Switch(
                         checked = isPromptExpandEnabled,
                         onCheckedChange = { viewModel.setPromptExpandEnabled(context, it) }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Generation notifications toggle（后台/锁屏进度 + 完成/失败提醒）
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = stringResource(R.string.label_generation_notifications),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = stringResource(R.string.desc_generation_notifications),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = isGenerationNotificationsEnabled,
+                        onCheckedChange = { viewModel.setGenerationNotificationsEnabled(context, it) }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // 后台保持连接开关（v4.18.x 后台省流量：默认关，蜂窝下保持 WS 的用户知情选择）
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = stringResource(R.string.label_background_keep_connected),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = stringResource(R.string.desc_background_keep_connected),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = isBackgroundKeepConnectedEnabled,
+                        onCheckedChange = { viewModel.setBackgroundKeepConnectedEnabled(context, it) }
                     )
                 }
 
@@ -914,8 +977,13 @@ fun ApplicationSettingsScreen(
 @Composable
 private fun CrashLogViewerDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     // 打开对话框时快照一次即可：崩溃日志只会在进程崩溃时新增，当前进程还活着就不会变
-    val files = remember { CrashLogger.listCrashFiles(context) }
+    // 列目录是磁盘 IO，放到 IO 线程异步加载，不再阻塞组合期主线程
+    var files by remember { mutableStateOf<List<File>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { files = CrashLogger.listCrashFiles(context) }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -948,18 +1016,23 @@ private fun CrashLogViewerDialog(onDismiss: () -> Unit) {
                         onClick = {
                             val clipboard = context.getSystemService(ClipboardManager::class.java)
                             if (clipboard != null) {
-                                clipboard.setPrimaryClip(
-                                    ClipData.newPlainText(
-                                        // 剪贴板预览标题也用应用名（已翻译的常量），不硬编码中文
-                                        context.getString(R.string.app_name),
-                                        CrashLogger.exportAll(context)
+                                // exportAll 要读全部崩溃文件，磁盘 IO 移到 IO 线程；
+                                // 剪贴板写入与 Toast 在 IO 完成后回主线程做
+                                scope.launch {
+                                    val text = withContext(Dispatchers.IO) { CrashLogger.exportAll(context) }
+                                    clipboard.setPrimaryClip(
+                                        ClipData.newPlainText(
+                                            // 剪贴板预览标题也用应用名（已翻译的常量），不硬编码中文
+                                            context.getString(R.string.app_name),
+                                            text
+                                        )
                                     )
-                                )
-                                Toast.makeText(
-                                    context,
-                                    R.string.msg_copied_to_clipboard,
-                                    Toast.LENGTH_SHORT
-                                ).show()
+                                    Toast.makeText(
+                                        context,
+                                        R.string.msg_copied_to_clipboard,
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
                             } else {
                                 Toast.makeText(
                                     context,

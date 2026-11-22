@@ -32,14 +32,16 @@ object UploadImageEncoder {
      * 编码为 WebP 字节。
      *
      * @param preserveAlpha 需要保留 alpha 通道时用无损（修复模式的遮罩合成图）
+     * @return 编码失败（compress 返回 false）时返回 null——空字节不能推进上传链路
      */
-    fun encode(bitmap: Bitmap, preserveAlpha: Boolean): ByteArray {
+    fun encode(bitmap: Bitmap, preserveAlpha: Boolean): ByteArray? {
         val outputStream = ByteArrayOutputStream()
-        if (preserveAlpha) {
+        val compressed = if (preserveAlpha) {
             bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, 100, outputStream)
         } else {
             bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, WEBP_QUALITY, outputStream)
         }
+        if (!compressed) return null
         return outputStream.toByteArray()
     }
 }

@@ -45,6 +45,16 @@ class LiteGraphConverter(
     )
 
     /**
+     * 连线消解的最终结果（rgthree GetNode/SetNode 支持的核心载体）：
+     * - Connection：真实上游节点（id + 输出槽位），写回消费者的输入
+     * - Literal：SetNode 仅持 widget 值时内联到消费者 widget 字段的字面量
+     */
+    private sealed class ResolvedSource {
+        data class Connection(val nodeId: Int, val slot: Int) : ResolvedSource()
+        data class Literal(val value: Any) : ResolvedSource()
+    }
+
+    /**
      * Internal representation of a LiteGraph node (for group membership calculation)
      */
     private data class NodePosition(
@@ -113,11 +123,20 @@ class LiteGraphConverter(
         // Reroute node types that should be skipped
         private val REROUTE_NODE_TYPES = setOf("Reroute", "ReroutePrimitive")
 
+        // rgthree 变量节点（纯前端 JS 实现，后端 /object_info 里查不到，不能产出 API 节点）：
+        // SetNode 把一个值发布成具名变量，GetNode 按变量名取回那个值。
+        // 两者转换时都要按变量映射消解后丢弃，否则会被当未知节点原样输出。
+        private val RGTHREE_VAR_SET_TYPES = setOf("SetNode")
+        private val RGTHREE_VAR_GET_TYPES = setOf("GetNode")
+
         /** 沿 reroute 链上溯的最大层数（病态数据/环路的硬闸门） */
         private const val MAX_REROUTE_DEPTH = 32
 
         /** 嵌套 subgraph 的最大展开层数 */
         private const val MAX_SUBGRAPH_DEPTH = 16
+
+        /** rgthree 变量链的最大消解深度（与 MAX_REROUTE_DEPTH 同风格，防病态数据深递归） */
+        private const val MAX_VAR_CHAIN_DEPTH = 32
 
         // Control widget values (frontend-only, appear after seed inputs in widgets_values)
         // These are not in server's /object_info and must be detected by value
@@ -158,6 +177,35 @@ class LiteGraphConverter(
         // 主图的「link id -> 源(节点,槽位)」解析器（reroute 链上溯的终点查询）
         val mainLinkResolver: (Int) -> Pair<Int, Int>? = { linkId ->
             linkMap[linkId]?.let { it.srcNodeId to it.srcSlotIdx }
+        }
+
+        // rgthree 变量映射：变量名 -> 定义该变量的 SetNode（重名取 id 最小，其余丢弃）
+        val variableMap = buildVariableMap(nodesArray)
+        if (variableMap.isNotEmpty()) {
+            DebugLogger.i(TAG, "Found ${variableMap.size} rgthree SetNode variables")
+        }
+
+        // 子图外部输入的解析入口：穿透 reroute 与 rgthree GetNode 的连线型来源，
+        // 避免子图内部节点引用到被丢弃的虚拟节点。GetNode 消解出字面量（SetNode 仅持
+        // widget 值）时无法以「连线」表达，返回 null 并记录——子图输入槽会退回自己的
+        // widget 值兜底（见 flattenSubgraph 的 widgetValueMap 逻辑）。
+        val subgraphExternalResolver: (Int) -> Pair<Int, Int>? = { linkId ->
+            val link = linkMap[linkId]
+            if (link == null) {
+                null
+            } else {
+                when (val source = resolveLinkSource(
+                    link, { nodeId -> mainNodeById[nodeId] }, mainLinkResolver, variableMap, warnings
+                )) {
+                    is ResolvedSource.Connection -> source.nodeId to source.slot
+                    is ResolvedSource.Literal -> {
+                        DebugLogger.w(TAG, "rgthree SetNode 的 widget 值无法内联到子图外部输入（link #$linkId），断开")
+                        warnings.add("rgthree SetNode widget value could not be inlined into a subgraph input (link #$linkId), connection dropped")
+                        null
+                    }
+                    null -> null
+                }
+            }
         }
 
         // Calculate max node and link IDs for subgraph flattening offsets
@@ -205,7 +253,7 @@ class LiteGraphConverter(
                     linkIdOffset = currentLinkOffset,
                     depth = 1,
                     visitedSubgraphs = setOf(subgraphDef.id),
-                    resolveExternalLink = mainLinkResolver,
+                    resolveExternalLink = subgraphExternalResolver,
                     warnings = warnings
                 )
 
@@ -251,6 +299,11 @@ class LiteGraphConverter(
             // Skip reroute nodes
             if (nodeType in REROUTE_NODE_TYPES) continue
 
+            // rgthree Get/Set：纯前端虚拟节点，后端没有对应实现。
+            // 引用它们的连线在 convertNode 里按变量映射消解（见 resolveLinkSource），
+            // 这里直接丢弃：不产出 API 节点、不进组。没有任何 GetNode 引用的 SetNode 同样丢弃。
+            if (nodeType in RGTHREE_VAR_GET_TYPES || nodeType in RGTHREE_VAR_SET_TYPES) continue
+
             // Store position for group membership calculation
             val pos = node.optJSONArray("pos")
             val size = node.optJSONArray("size")
@@ -278,7 +331,8 @@ class LiteGraphConverter(
                 node,
                 linkMap,
                 { nodeId -> mainNodeById[nodeId] },
-                mainLinkResolver
+                mainLinkResolver,
+                variableMap
             )
             if (apiNode != null) {
                 apiNodes.put(nodeId.toString(), apiNode)
@@ -572,10 +626,28 @@ class LiteGraphConverter(
             while (hops++ < MAX_REROUTE_DEPTH) {
                 val node = localNodeById[currentId]
                 if (node == null) {
-                    // 不是本子图的节点（可能是虚拟输入节点或外部节点），按原值返回
-                    return toGlobal(currentId) to currentSlot
+                    // 虚拟 input/output 节点（id 可能是合成值）不是本子图的实体节点，按原值返回；
+                    // 其余查不到的是悬空连线（link 引用了不存在的节点 id），断开并记录
+                    if (currentId == subgraphDef.inputNodeId || currentId == subgraphDef.outputNodeId) {
+                        return toGlobal(currentId) to currentSlot
+                    }
+                    DebugLogger.w(TAG, "子图 '${subgraphDef.name}'：连线引用了不存在的节点 #$currentId，断开这条连线")
+                    warnings.add(
+                        "Subgraph \"${subgraphDef.name}\": 连线引用了不存在的节点 #$currentId，该连线已断开"
+                    )
+                    return null
                 }
                 if (node.optString("type", "") !in REROUTE_NODE_TYPES) {
+                    // 子图内的 rgthree Get/Set 节点暂不支持变量消解（变量作用域跨子图）：
+                    // 断开引用它的连线，避免输出里出现指向已丢弃节点的悬空引用
+                    val rgthreeType = node.optString("type", "")
+                    if (rgthreeType in RGTHREE_VAR_GET_TYPES || rgthreeType in RGTHREE_VAR_SET_TYPES) {
+                        DebugLogger.w(TAG, "子图内 rgthree $rgthreeType（节点 #$currentId）暂不支持消解，断开这条连线")
+                        warnings.add(
+                            "Subgraph \"${subgraphDef.name}\": reference to rgthree $rgthreeType #$currentId was dropped (not supported inside subgraphs)"
+                        )
+                        return null
+                    }
                     return toGlobal(currentId) to currentSlot
                 }
                 if (!visited.add(currentId)) {
@@ -734,6 +806,16 @@ class LiteGraphConverter(
 
             // Skip reroute nodes
             if (nodeType in REROUTE_NODE_TYPES) continue
+
+            // 子图内的 rgthree Get/Set 节点暂不支持变量消解，直接丢弃并记录
+            //（引用它们的连线由 resolveLocalReroute 的同名检查断开）
+            if (nodeType in RGTHREE_VAR_GET_TYPES || nodeType in RGTHREE_VAR_SET_TYPES) {
+                DebugLogger.w(TAG, "子图 '${subgraphDef.name}' 内的 rgthree $nodeType(#$oldNodeId) 暂不支持消解，已丢弃")
+                warnings.add(
+                    "Subgraph \"${subgraphDef.name}\": rgthree $nodeType #$oldNodeId is not supported inside subgraphs and was dropped"
+                )
+                continue
+            }
 
             // Skip note nodes (handled separately in main conversion)
             if (nodeType in NOTE_NODE_TYPES) continue
@@ -1006,13 +1088,182 @@ class LiteGraphConverter(
     }
 
     /**
+     * 扫描主图全部节点，收集 rgthree 变量映射：变量名 → 定义该变量的 SetNode。
+     *
+     * 变量名取 widgets_values[0]（SetNode 的 input 名是类型名，不是变量名）。
+     * 同一变量名被多个 SetNode 定义时取节点 id 最小的（确定性优先），其余丢弃并记录 warn。
+     */
+    private fun buildVariableMap(nodesArray: JSONArray): Map<String, JSONObject> {
+        val map = mutableMapOf<String, JSONObject>()
+        val duplicateNames = mutableSetOf<String>()
+        for (i in 0 until nodesArray.length()) {
+            val node = nodesArray.optJSONObject(i) ?: continue
+            if (node.optString("type", "") !in RGTHREE_VAR_SET_TYPES) continue
+            val nodeId = node.optInt("id", -1)
+            if (nodeId == -1) continue
+            val varName = node.optJSONArray("widgets_values")?.optString(0, "") ?: ""
+            if (varName.isEmpty()) {
+                DebugLogger.w(TAG, "rgthree SetNode #$nodeId 的变量名为空，不进变量映射")
+                continue
+            }
+            val existing = map[varName]
+            if (existing == null) {
+                map[varName] = node
+            } else {
+                duplicateNames.add(varName)
+                if (nodeId < existing.optInt("id", Int.MAX_VALUE)) {
+                    map[varName] = node
+                }
+            }
+        }
+        for (name in duplicateNames) {
+            DebugLogger.w(TAG, "变量 \"$name\" 被多个 SetNode 定义，取 id 最小的 #${map[name]?.optInt("id", -1)}，其余丢弃")
+        }
+        return map
+    }
+
+    /**
+     * 解析一条连线的最终来源（rgthree GetNode/SetNode 消解 + reroute 穿透）。
+     *
+     * 指向 GetNode 的连线**不能**原样保留 GetNode 的 id（后端没有这个节点，输出即悬空），
+     * 必须按变量映射消解到 SetNode 的真实上游或其 widget 字面量，见 [resolveSourceFrom]。
+     *
+     * @return null 表示这条连线应断开（Get/Set 专属原因已写入 warnings；普通 reroute
+     *         上溯失败只记日志，由调用方补通用说明）
+     */
+    private fun resolveLinkSource(
+        link: Link,
+        nodeLookup: (Int) -> JSONObject?,
+        linkResolver: (Int) -> Pair<Int, Int>?,
+        variableMap: Map<String, JSONObject>,
+        warnings: MutableList<String>
+    ): ResolvedSource? {
+        return resolveSourceFrom(
+            link.srcNodeId, link.srcSlotIdx, nodeLookup, linkResolver, variableMap,
+            mutableSetOf(), warnings
+        )
+    }
+
+    /**
+     * 从 (节点, 槽位) 出发递归消解连线的最终来源：
+     * 1. 先沿 reroute 链上溯（复用 [resolveThroughReroutes]）；
+     * 2. 停在 GetNode/SetNode 上时按变量映射找定义该变量的 SetNode（[visitedSetNodes] 防环，
+     *    [MAX_VAR_CHAIN_DEPTH] 防超长链），再解析 SetNode 的值来源——有上游连线则继续递归消解，仅持 widget 值则返回
+     *    [ResolvedSource.Literal]，两者皆无则断开并记录。
+     *
+     * @return null 表示这条连线应断开（原因已写入 warnings）
+     */
+    private fun resolveSourceFrom(
+        startNodeId: Int,
+        startSlot: Int,
+        nodeLookup: (Int) -> JSONObject?,
+        linkResolver: (Int) -> Pair<Int, Int>?,
+        variableMap: Map<String, JSONObject>,
+        visitedSetNodes: MutableSet<Int>,
+        warnings: MutableList<String>,
+        depth: Int = 0
+    ): ResolvedSource? {
+        if (depth >= MAX_VAR_CHAIN_DEPTH) {
+            DebugLogger.w(TAG, "rgthree 变量链超过 $MAX_VAR_CHAIN_DEPTH 层（节点 #$startNodeId），断开这条连线")
+            warnings.add("rgthree variable chain exceeds $MAX_VAR_CHAIN_DEPTH levels (node #$startNodeId), connection dropped")
+            return null
+        }
+        val afterReroute = resolveThroughReroutes(startNodeId, startSlot, nodeLookup, linkResolver)
+            ?: return null
+        val node = nodeLookup(afterReroute.first)
+        if (node == null) {
+            // 悬空连线：源节点 id 在图里不存在（主图没有虚拟 input/output 占位节点，
+            // 这里查不到即真悬空）。原样保留会让 ComfyUI 执行时才报 node not found
+            // 且无法定位是哪条连线坏的，这里断开并记录
+            DebugLogger.w(TAG, "连线引用了不存在的节点 #${afterReroute.first}，断开这条连线")
+            warnings.add("连线引用了不存在的节点 #${afterReroute.first}，该连线已断开")
+            return null
+        }
+        val nodeType = node.optString("type", "")
+        if (nodeType !in RGTHREE_VAR_GET_TYPES && nodeType !in RGTHREE_VAR_SET_TYPES) {
+            return ResolvedSource.Connection(afterReroute.first, afterReroute.second)
+        }
+
+        // 命中 Get/Set：变量名取 widgets_values[0]
+        val nodeId = node.optInt("id", -1)
+        val varName = node.optJSONArray("widgets_values")?.optString(0, "") ?: ""
+        if (varName.isEmpty()) {
+            DebugLogger.w(TAG, "rgthree $nodeType #$nodeId 的变量名为空，断开引用它的连线")
+            warnings.add("rgthree $nodeType #$nodeId has an empty variable name, connection dropped")
+            return null
+        }
+        val setNode = variableMap[varName]
+        if (setNode == null) {
+            DebugLogger.w(TAG, "rgthree GetNode #$nodeId 的变量 \"$varName\" 找不到对应 SetNode，断开这条连线")
+            warnings.add("rgthree GetNode #$nodeId: no SetNode defines variable \"$varName\", connection dropped")
+            return null
+        }
+        val setId = setNode.optInt("id", -1)
+        if (!visitedSetNodes.add(setId)) {
+            DebugLogger.w(TAG, "rgthree 变量 \"$varName\" 的 SetNode 链成环（#$setId），断开这条连线")
+            warnings.add("rgthree variable \"$varName\": SetNode chain forms a cycle (#$setId), connection dropped")
+            return null
+        }
+
+        // SetNode 的值来源一：上游连线 → 继续递归消解（上游还可能是 Reroute/GetNode/SetNode）
+        var upstreamLinkId = -1
+        val setInputs = setNode.optJSONArray("inputs")
+        if (setInputs != null) {
+            for (i in 0 until setInputs.length()) {
+                val inp = setInputs.optJSONObject(i) ?: continue
+                val linkId = inp.optInt("link", -1)
+                if (linkId != -1) {
+                    upstreamLinkId = linkId
+                    break
+                }
+            }
+        }
+        if (upstreamLinkId != -1) {
+            val upstream = linkResolver(upstreamLinkId)
+            if (upstream == null) {
+                DebugLogger.w(TAG, "rgthree SetNode #$setId（\"$varName\"）的上游 link #$upstreamLinkId 解析失败，断开这条连线")
+                warnings.add("rgthree SetNode #$setId (\"$varName\"): upstream link #$upstreamLinkId is unresolvable, connection dropped")
+                return null
+            }
+            return resolveSourceFrom(
+                upstream.first, upstream.second, nodeLookup, linkResolver, variableMap, visitedSetNodes, warnings,
+                depth + 1
+            )
+        }
+
+        // SetNode 的值来源二：widget 值（widgets_values[1]，["变量名", 值] 形态）
+        val widgetValue = setNode.optJSONArray("widgets_values")?.opt(1)
+        if (widgetValue == null || widgetValue == JSONObject.NULL) {
+            DebugLogger.w(TAG, "rgthree SetNode #$setId（\"$varName\"）的值来源既不是连线也不是 widget 值，断开这条连线")
+            warnings.add("rgthree SetNode #$setId (\"$varName\"): value source is neither an upstream link nor a widget value, connection dropped")
+            return null
+        }
+        return ResolvedSource.Literal(widgetValue)
+    }
+
+    /**
+     * 判断消费者的某个输入字段能否接受字面量（rgthree SetNode 仅持 widget 值时内联用）。
+     * 优先按服务器节点定义判型；定义缺失时退回 LiteGraph 输入条目自带的类型。
+     * 纯连接类型（MODEL/CLIP 等）与 forceInput 字段塞不进字面量，必须断开连线并记录。
+     */
+    private fun canInlineLiteral(consumerType: String, inputName: String, liteInput: JSONObject): Boolean {
+        val inputDef = getNodeDefinition(consumerType)?.inputs?.firstOrNull { it.name == inputName }
+        if (inputDef != null) {
+            return !inputDef.forceInput && !isConnectionOnlyType(inputDef.type)
+        }
+        val liteType = liteInput.optString("type", "")
+        return liteType.isNotEmpty() && !isConnectionOnlyType(liteType)
+    }
+
+    /**
      * Convert a single LiteGraph node to API format
      */
     private fun convertNode(
         node: JSONObject,
         linkMap: Map<Int, Link>,
         nodeLookup: (Int) -> JSONObject?,
-        linkResolver: (Int) -> Pair<Int, Int>?
+        linkResolver: (Int) -> Pair<Int, Int>?,
+        variableMap: Map<String, JSONObject>
     ): Pair<JSONObject?, List<String>> {
         val warnings = mutableListOf<String>()
         val nodeType = node.optString("type", "")
@@ -1049,23 +1300,42 @@ class LiteGraphConverter(
                 if (inputName.isNotEmpty() && linkId != -1) {
                     val link = linkMap[linkId]
                     if (link != null) {
-                        // 指向 Reroute 的连线必须上溯到真实源节点，否则输出里会引用不存在的节点
-                        val source = resolveThroughReroutes(
-                            link.srcNodeId, link.srcSlotIdx, nodeLookup, linkResolver
-                        )
-                        if (source != null) {
-                            // Connection format: [srcNodeId, srcSlotIdx]
-                            val connection = JSONArray().apply {
-                                put(source.first.toString())
-                                put(source.second)
+                        // 连线消解：穿透 Reroute 链 + rgthree GetNode/SetNode 变量消解
+                        //（GetNode 不能作为输入源出现在输出里，后端没有这个节点）
+                        val warningsBefore = warnings.size
+                        when (val source = resolveLinkSource(link, nodeLookup, linkResolver, variableMap, warnings)) {
+                            is ResolvedSource.Connection -> {
+                                // Connection format: [srcNodeId, srcSlotIdx]
+                                val connection = JSONArray().apply {
+                                    put(source.nodeId.toString())
+                                    put(source.slot)
+                                }
+                                inputs.put(inputName, connection)
                             }
-                            inputs.put(inputName, connection)
-                        } else {
-                            DebugLogger.w(
-                                TAG,
-                                "Node #$nodeId ($nodeType): 输入 '$inputName' 的源节点无法解析（link #$linkId），已断开"
-                            )
-                            warnings.add("Node \"$nodeType\" (#$nodeId): input \"$inputName\" was disconnected (unresolvable source)")
+                            is ResolvedSource.Literal -> {
+                                // SetNode 仅持 widget 值：字段是 widget 类型时内联字面量；
+                                // 纯连接类型塞不进字面量 → 如实记录并断开
+                                if (canInlineLiteral(nodeType, inputName, input)) {
+                                    inputs.put(inputName, source.value)
+                                } else {
+                                    DebugLogger.w(
+                                        TAG,
+                                        "Node #$nodeId ($nodeType): 输入 '$inputName' 无法接受 rgthree SetNode 的 widget 值，断开这条连线"
+                                    )
+                                    warnings.add("Node \"$nodeType\" (#$nodeId): input \"$inputName\" cannot accept the rgthree SetNode widget value, connection dropped")
+                                }
+                            }
+                            null -> {
+                                // Get/Set 专属失败原因已在 resolveLinkSource 里记录；
+                                // 未命中 Get/Set（普通 reroute 上溯失败等）时补一条通用断开说明
+                                if (warnings.size == warningsBefore) {
+                                    DebugLogger.w(
+                                        TAG,
+                                        "Node #$nodeId ($nodeType): 输入 '$inputName' 的源节点无法解析（link #$linkId），已断开"
+                                    )
+                                    warnings.add("Node \"$nodeType\" (#$nodeId): input \"$inputName\" was disconnected (unresolvable source)")
+                                }
+                            }
                         }
                     }
                 }

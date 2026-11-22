@@ -8,6 +8,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Log severity levels
@@ -58,17 +59,16 @@ object DebugLogger {
     private const val MAX_ENTRIES = 1000
 
     /**
-     * 条目版本号，每次内容变化 +1。
+     * 条目版本号，每次内容变化 +1（AtomicInteger：并发自增不丢号）。
      *
      * 供日志查看界面判断"要不要重新取一遍"——它按 500ms 轮询，原先每次都全量拷贝
      * （`entries.toList()`）再 clear+addAll 整个列表。达到 1000 条上限后条目数恒定但内容
      * 仍在变，所以不能只看 size，必须有版本号。
      */
-    @Volatile
-    private var version = 0
+    private val version = AtomicInteger(0)
 
     /** 当前版本号（轻量读，无拷贝）。 */
-    fun currentVersion(): Int = version
+    fun currentVersion(): Int = version.get()
 
     private const val LOGCAT_ENABLED = false
     private const val LOGCAT_TAG = "ComfyChair"
@@ -108,12 +108,13 @@ object DebugLogger {
 
         entries.add(entry)
 
-        // Trim old entries if over limit
-        while (entries.size > MAX_ENTRIES) {
-            entries.removeAt(0)
+        // Trim old entries if over limit：批量删到上限以下 —— CopyOnWriteArrayList 上
+        // subList().clear() 是一次数组复制，而逐条 removeAt(0) 每条都复制整个数组。
+        if (entries.size > MAX_ENTRIES) {
+            entries.subList(0, entries.size - MAX_ENTRIES).clear()
         }
 
-        version++
+        version.incrementAndGet()
 
         // Temporary: Also output to LogCat for real-time debugging
         if (LOGCAT_ENABLED) {
@@ -157,7 +158,7 @@ object DebugLogger {
      */
     fun clear() {
         entries.clear()
-        version++
+        version.incrementAndGet()
     }
 
     /**

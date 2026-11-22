@@ -258,25 +258,25 @@ private fun samplerParamHint(stageParam: SamplerStageRegistry.StageParam): Strin
  */
 @Composable
 private fun fixedParamLabel(placeholder: String): String? = when (placeholder) {
-    "moss_mode" -> stringResource(R.string.dynamic_param_moss_mode_label)
-    // MOSS 4K（prebuilt_33/34）第二段采样（潜空间放大精修，节点 858）
-    "steps2" -> stringResource(R.string.dynamic_param_moss_steps2_label)
-    "cfg2" -> stringResource(R.string.dynamic_param_moss_cfg2_label)
-    "sampler2" -> stringResource(R.string.dynamic_param_moss_sampler2_label)
-    "scheduler2" -> stringResource(R.string.dynamic_param_moss_scheduler2_label)
-    // MOSS 4K 细节修复（DetailerForEach 734/739/789/730）的两条独立提示词
-    "detail_prompt_face" -> stringResource(R.string.dynamic_param_moss_detail_prompt_face_label)
-    "detail_prompt_body" -> stringResource(R.string.dynamic_param_moss_detail_prompt_body_label)
-    // MOSS 4K 三个 LoRA 槽（Power Lora Loader 707/851/924）的开关与权重
-    "lora1_on" -> stringResource(R.string.dynamic_param_moss_lora1_on_label)
-    "lora1_strength" -> stringResource(R.string.dynamic_param_moss_lora1_strength_label)
-    "lora2_on" -> stringResource(R.string.dynamic_param_moss_lora2_on_label)
-    "lora2_strength" -> stringResource(R.string.dynamic_param_moss_lora2_strength_label)
-    "lora3_on" -> stringResource(R.string.dynamic_param_moss_lora3_on_label)
-    "lora3_strength" -> stringResource(R.string.dynamic_param_moss_lora3_strength_label)
-    // MOSS 4K SeedVR2 惰性放大开关（CRZSwitch 960）与目标分辨率（713.resolution）
-    "seedvr2_enabled" -> stringResource(R.string.dynamic_param_moss_seedvr2_enabled_label)
-    "seedvr2_size" -> stringResource(R.string.dynamic_param_moss_seedvr2_size_label)
+    "moss_mode" -> stringResource(R.string.dynamic_param_mode_label)
+    // 第二段采样（潜空间放大精修）
+    "steps2" -> stringResource(R.string.dynamic_param_steps2_label)
+    "cfg2" -> stringResource(R.string.dynamic_param_cfg2_label)
+    "sampler2" -> stringResource(R.string.dynamic_param_sampler2_label)
+    "scheduler2" -> stringResource(R.string.dynamic_param_scheduler2_label)
+    // 细节修复的两条独立提示词
+    "detail_prompt_face" -> stringResource(R.string.dynamic_param_detail_prompt_face_label)
+    "detail_prompt_body" -> stringResource(R.string.dynamic_param_detail_prompt_body_label)
+    // 三个 LoRA 槽的开关与权重
+    "lora1_on" -> stringResource(R.string.dynamic_param_lora1_on_label)
+    "lora1_strength" -> stringResource(R.string.dynamic_param_lora1_strength_label)
+    "lora2_on" -> stringResource(R.string.dynamic_param_lora2_on_label)
+    "lora2_strength" -> stringResource(R.string.dynamic_param_lora2_strength_label)
+    "lora3_on" -> stringResource(R.string.dynamic_param_lora3_on_label)
+    "lora3_strength" -> stringResource(R.string.dynamic_param_lora3_strength_label)
+    // 惰性放大开关与目标分辨率
+    "seedvr2_enabled" -> stringResource(R.string.dynamic_param_seedvr2_enabled_label)
+    "seedvr2_size" -> stringResource(R.string.dynamic_param_seedvr2_size_label)
     else -> null
 }
 
@@ -288,11 +288,11 @@ private fun fixedParamLabel(placeholder: String): String? = when (placeholder) {
 @Composable
 private fun fixedComboLabels(placeholder: String): Map<String, String> = when (placeholder) {
     "moss_mode" -> mapOf(
-        "moss_25" to stringResource(R.string.moss_mode_moss_25),
-        "moss_spec25" to stringResource(R.string.moss_mode_moss_spec25),
-        "moss_50" to stringResource(R.string.moss_mode_moss_50),
-        "moss_c25" to stringResource(R.string.moss_mode_moss_c25),
-        "moss_28" to stringResource(R.string.moss_mode_moss_28)
+        "moss_25" to stringResource(R.string.moss_mode_opt_25),
+        "moss_spec25" to stringResource(R.string.moss_mode_opt_spec25),
+        "moss_50" to stringResource(R.string.moss_mode_opt_50),
+        "moss_c25" to stringResource(R.string.moss_mode_opt_c25),
+        "moss_28" to stringResource(R.string.moss_mode_opt_28)
     )
     else -> emptyMap()
 }

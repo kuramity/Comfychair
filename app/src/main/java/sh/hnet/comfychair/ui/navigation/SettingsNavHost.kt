@@ -1,5 +1,8 @@
 package sh.hnet.comfychair.ui.navigation
 
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -34,6 +37,7 @@ import sh.hnet.comfychair.ui.screens.AppearanceSettingsScreen
 import sh.hnet.comfychair.ui.screens.ChangelogScreen
 import sh.hnet.comfychair.ui.screens.ApplicationSettingsScreen
 import androidx.compose.material.icons.filled.MenuBook
+import sh.hnet.comfychair.ui.screens.ModelIntroDetailScreen
 import sh.hnet.comfychair.ui.screens.ModelIntroScreen
 import sh.hnet.comfychair.ui.screens.ServerSettingsScreen
 import sh.hnet.comfychair.ui.screens.WorkflowsSettingsScreen
@@ -254,7 +258,24 @@ fun SettingsNavHost(
             }
 
             composable(SettingsRoute.ModelIntro.route) {
-                ModelIntroScreen(onBack = { navController.popBackStack() })
+                ModelIntroScreen(
+                    onBack = { navController.popBackStack() },
+                    onOpenDetail = { intro ->
+                        navController.navigate(SettingsRoute.ModelIntroDetail.createRoute(intro.file))
+                    }
+                )
+            }
+
+            // 模型介绍详情页（v4.17 二级页面）：转场只做淡入淡出（200/150ms），不做 slide
+            composable(
+                SettingsRoute.ModelIntroDetail.route,
+                enterTransition = { fadeIn(tween(200)) },
+                exitTransition = { fadeOut(tween(150)) },
+                popEnterTransition = { fadeIn(tween(200)) },
+                popExitTransition = { fadeOut(tween(150)) },
+            ) { backStackEntry ->
+                val file = backStackEntry.arguments?.getString(SettingsRoute.ModelIntroDetail.ARG_FILE).orEmpty()
+                ModelIntroDetailScreen(file = file, onBack = { navController.popBackStack() })
             }
 
             composable(SettingsRoute.Application.route) {

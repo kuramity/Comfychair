@@ -16,7 +16,7 @@ import java.io.File
  *
  * 两类用例：
  * 1. **真实数据**（assets 内置那份）——钉住合并去重的具体数字（已合并 36 / 孤儿 11）
- *    与三层树规模（8 类 / LoRA 92 条全在），数据换版时在这里响铃提醒同步改数字；
+ *    与三层树规模（8 类 / LoRA 94 条全在），数据换版时在这里响铃提醒同步改数字；
  * 2. **构造数据**——未知 kind 排序、「未分类」兜底、展开/折叠摊平这些边界行为。
  *
  * 合并只在内存展示层完成（[splitArchiveKeys] / [buildCategories] / [buildCategorizedRows]），
@@ -102,7 +102,7 @@ class ModelIntroTreeTest {
     // ---------------- Q4-3 三层树构建（真实数据） ----------------
 
     @Test
-    fun `真实数据三层树_8类170条_LoRA92条全在`() {
+    fun `真实数据三层树_8类173条_LoRA94条全在`() {
         val intros = loadRealIntros()
         assumeTrue("model_intros.json 不可用时跳过", intros != null)
 
@@ -111,14 +111,14 @@ class ModelIntroTreeTest {
         assertEquals("条目总数不丢", intros.size, categories.sumOf { it.total })
 
         val byKind = categories.associateBy { it.kind }
-        // 派工单口径：背景去除 2 / 大模型 15 / 图像编码器 3 / 扩散模型 33 / LoRA 92 /
+        // 派工单口径：背景去除 2 / 大模型 15 / 图像编码器 3 / 扩散模型 34 / LoRA 94 /
         // 放大模型 5 / VAE 18 / 几何估计 2
-        // （扩散模型 29 → 33、LoRA 75 → 92 为 2026-11-21 模型库巡检同步后更新，其余不变）
+        // （扩散模型 33 → 34、LoRA 92 → 94 为 2026-11-22 模型库同步后更新：新增5删2 → 173条）
         assertEquals(2, byKind.getValue("背景去除").total)
         assertEquals(15, byKind.getValue("大模型").total)
         assertEquals(3, byKind.getValue("图像编码器").total)
-        assertEquals(33, byKind.getValue("扩散模型").total) // 2026-11-21 模型库巡检同步后更新（29 → 33）
-        assertEquals(92, byKind.getValue("LoRA").total)     // 2026-11-21 模型库巡检同步后更新（75 → 92）
+        assertEquals(34, byKind.getValue("扩散模型").total) // 2026-11-22 模型库同步后更新（新增5删2 → 173条）
+        assertEquals(94, byKind.getValue("LoRA").total)     // 2026-11-22 模型库同步后更新（新增5删2 → 173条）
         assertEquals(5, byKind.getValue("放大模型").total)
         assertEquals(18, byKind.getValue("VAE").total)
         assertEquals(2, byKind.getValue("几何估计").total)
@@ -131,7 +131,7 @@ class ModelIntroTreeTest {
     }
 
     @Test
-    fun `真实数据LoRA按目录段分组_展开后92条条目行都在`() {
+    fun `真实数据LoRA按目录段分组_展开后94条条目行都在`() {
         val intros = loadRealIntros()
         assumeTrue("model_intros.json 不可用时跳过", intros != null)
         val effects = loadRealEffects()
@@ -141,9 +141,9 @@ class ModelIntroTreeTest {
         val lora = categories.first { it.kind == "LoRA" }
         // LoRA 有分组（rel 目录段）且分组条目数与总数自洽
         assertTrue("LoRA 应按目录段分组", lora.groups.isNotEmpty())
-        assertEquals(92, lora.total) // 2026-11-21 模型库巡检同步后更新（75 → 92）
+        assertEquals(94, lora.total) // 2026-11-22 模型库同步后更新（新增5删2 → 173条）
 
-        // 摊平 + 全部展开：LoRA 类别下 92 条条目行一条不少
+        // 摊平 + 全部展开：LoRA 类别下 94 条条目行一条不少
         val fullExpanded = buildCategorizedRows(
             categories,
             archiveNodeName = "LoRA 效果档案（11 条）",
@@ -155,7 +155,7 @@ class ModelIntroTreeTest {
         val loraEntries = fullExpanded
             .filterIsInstance<IntroRow.Entry>()
             .filter { (it.intro.kind ?: "") == "LoRA" }
-        assertEquals("LoRA 条目行数", 92, loraEntries.size) // 2026-11-21 模型库巡检同步后更新（75 → 92）
+        assertEquals("LoRA 条目行数", 94, loraEntries.size) // 2026-11-22 模型库同步后更新（新增5删2 → 173条）
     }
 
     // ---------------- 构造数据：边界行为 ----------------

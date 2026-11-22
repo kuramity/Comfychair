@@ -683,8 +683,7 @@
     <string name="sampler_param_pe_model">强化模型</string>
     <string name="sampler_param_pe_model_hint">用来改写提示词的本地 gguf 模型。越大的模型指令遵循越好、也越吃显存：4B 约 4.5GB，9B(Q4_K_M) 约 5.5GB —— 8GB 卡两者都放得下，因为强化跑完会自动卸载再出图。</string>
     <string name="sampler_param_pe_mmproj">视觉投影</string>
-    <!-- MOSS 4K（prebuilt_33）的手部修复去噪强度：detail_denoise2 会被 detail_ 前缀
-         + denoise2 后缀误配进竖叉流「分次补采」标签，此处给专属文案 -->
+    <!-- 动态参数标签 -->
     <string name="sampler_param_detail_denoise_hand">手部修复去噪强度</string>
     <string name="sampler_param_steps">步数</string>
     <string name="sampler_param_cfg">CFG</string>
@@ -727,8 +726,8 @@
     <string name="error_save_audio">音频上传失败</string>
     <string name="action_delete_selected">删除所选</string>
 
-    <!-- 已移除功能的拦截提示（旧版「时间线导演台」工作流） -->
-    <string name="msg_timeline_director_removed">这条工作流用到了已移除的「时间线导演台」，请改用其他视频工作流</string>
+    <!-- 已移除功能的拦截提示 -->
+    <string name="msg_workflow_feature_removed">这条工作流用到了已移除的功能，请改用其他工作流</string>
 
     <!-- 超大图（原图超过下载上限时的降级提示） -->
     <string name="viewer_large_image_notice">原图过大，已显示压缩版</string>
@@ -759,28 +758,27 @@
     <string name="node_params_out_of_range">已超出允许范围，生成时会自动取 %1$s</string>
     <!-- App 端固定 COMBO 选项（DynamicParamTypeResolver.FIXED_COMBO_OPTIONS）：
          MOSS 五模式整合流（prebuilt_30）。提交用标识符，这里只是显示标签 -->
-    <string name="dynamic_param_moss_mode_label">出图模式</string>
-    <!-- MOSS 4K（prebuilt_33/34）动态参数标签：第二段采样、细节修复提示词、
-         三个 LoRA 槽开关/权重、SeedVR2 惰性放大开关与目标分辨率 -->
-    <string name="dynamic_param_moss_steps2_label">第二段步数</string>
-    <string name="dynamic_param_moss_cfg2_label">第二段 CFG</string>
-    <string name="dynamic_param_moss_sampler2_label">第二段采样器</string>
-    <string name="dynamic_param_moss_scheduler2_label">第二段调度器</string>
-    <string name="dynamic_param_moss_detail_prompt_face_label">细节提示词·面部</string>
-    <string name="dynamic_param_moss_detail_prompt_body_label">细节提示词·身体</string>
-    <string name="dynamic_param_moss_lora1_on_label">LoRA 1 开关</string>
-    <string name="dynamic_param_moss_lora1_strength_label">LoRA 1 权重</string>
-    <string name="dynamic_param_moss_lora2_on_label">LoRA 2 开关</string>
-    <string name="dynamic_param_moss_lora2_strength_label">LoRA 2 权重</string>
-    <string name="dynamic_param_moss_lora3_on_label">LoRA 3 开关</string>
-    <string name="dynamic_param_moss_lora3_strength_label">LoRA 3 权重</string>
-    <string name="dynamic_param_moss_seedvr2_enabled_label">4K 放大</string>
-    <string name="dynamic_param_moss_seedvr2_size_label">放大目标尺寸</string>
-    <string name="moss_mode_moss_25">25步</string>
-    <string name="moss_mode_moss_spec25">Spectrum加速</string>
-    <string name="moss_mode_moss_50">50步</string>
-    <string name="moss_mode_moss_c25">comfy版25步</string>
-    <string name="moss_mode_moss_28">28双采</string>
+    <string name="dynamic_param_mode_label">出图模式</string>
+    <!-- 动态参数标签 -->
+    <string name="dynamic_param_steps2_label">第二段步数</string>
+    <string name="dynamic_param_cfg2_label">第二段 CFG</string>
+    <string name="dynamic_param_sampler2_label">第二段采样器</string>
+    <string name="dynamic_param_scheduler2_label">第二段调度器</string>
+    <string name="dynamic_param_detail_prompt_face_label">细节提示词·面部</string>
+    <string name="dynamic_param_detail_prompt_body_label">细节提示词·身体</string>
+    <string name="dynamic_param_lora1_on_label">LoRA 1 开关</string>
+    <string name="dynamic_param_lora1_strength_label">LoRA 1 权重</string>
+    <string name="dynamic_param_lora2_on_label">LoRA 2 开关</string>
+    <string name="dynamic_param_lora2_strength_label">LoRA 2 权重</string>
+    <string name="dynamic_param_lora3_on_label">LoRA 3 开关</string>
+    <string name="dynamic_param_lora3_strength_label">LoRA 3 权重</string>
+    <string name="dynamic_param_seedvr2_enabled_label">4K 放大</string>
+    <string name="dynamic_param_seedvr2_size_label">放大目标尺寸</string>
+    <string name="moss_mode_opt_25">25步</string>
+    <string name="moss_mode_opt_spec25">Spectrum加速</string>
+    <string name="moss_mode_opt_50">50步</string>
+    <string name="moss_mode_opt_c25">comfy版25步</string>
+    <string name="moss_mode_opt_28">28双采</string>
 
     <!-- 标签库：收藏 / 最近使用 / 常见搭配（标签库其它字符串历史写在默认文件里，新增的按规范放这里） -->
     <string name="tag_favorite">收藏</string>
@@ -817,6 +815,29 @@
     <string name="model_intro_kind">分类</string>
     <string name="model_intro_effect_archive">LoRA 效果档案（%1$d 条）</string>
     <string name="model_intro_effect_archive_orphan_only">仅效果档案收录</string>
+    <!-- 模型介绍详情页（v4.17）：抽屉「查看完整详情」进入，20 个候选区块完整版 -->
+    <string name="model_intro_detail_title">模型详情</string>
+    <string name="model_intro_open_detail">查看完整详情</string>
+    <string name="model_intro_style_tags">风格</string>
+    <string name="model_intro_lora_weight">LoRA 权重</string>
+    <string name="model_intro_lora_weight_range">%1$s – %2$s</string>
+    <string name="model_intro_lora_weight_range_default">%1$s – %2$s · 默认 %3$s</string>
+    <string name="model_intro_lora_weight_min_only">不低于 %1$s</string>
+    <string name="model_intro_lora_weight_max_only">不超过 %1$s</string>
+    <string name="model_intro_lora_weight_default_only">推荐 %1$s</string>
+    <string name="model_intro_community_params">社区常用</string>
+    <string name="model_intro_community_base">基于 %1$d 张带参样本</string>
+    <string name="model_intro_community_count">· %1$d 张图</string>
+    <string name="model_intro_community_notice">社区数据，仅供参考</string>
+    <string name="model_intro_community_prompt">社区提示词</string>
+    <string name="model_intro_negative_prompt">负面提示词</string>
+    <string name="model_intro_expand">展开全文</string>
+    <string name="model_intro_collapse">收起</string>
+    <string name="model_intro_confidence_note">置信度说明</string>
+    <string name="model_intro_intro_missing">该模型暂无完整介绍，以下仅保留基本信息。</string>
+    <string name="model_intro_copy_params">复制推荐参数</string>
+    <string name="model_intro_copied">已复制</string>
+    <string name="model_intro_source_from">来源 %1$s</string>
     <string name="model_list_loading">正在加载模型列表…</string>
     <!-- Q3-3 (v4.16.5): 模型下拉四态 —— 失败（可重试）与"服务器真没模型"严格区分 -->
     <string name="model_list_load_failed">模型列表加载失败，点此重试</string>
@@ -1003,4 +1024,20 @@
     <string name="msg_trash_purge_pending">%1$d 项服务器删除失败，已留在回收站待重试</string>
     <string name="msg_trash_kept_other_server">%1$d 项属于其它服务器，保留在回收站</string>
     <string name="button_undo">撤销</string>
+    <!-- 生成进度通知（后台 / 锁屏可见；只显示模式名 + 进度，不含提示词与图片） -->
+    <string name="notify_generation_channel_progress_name">生成进度</string>
+    <string name="notify_generation_channel_progress_desc">应用在后台时于通知栏显示生成进度</string>
+    <string name="notify_generation_channel_result_name">生成结果</string>
+    <string name="notify_generation_channel_result_desc">生成完成与失败的提醒</string>
+    <string name="notify_generation_generic_title">生成任务</string>
+    <string name="notify_generation_progress_text">生成中… %1$d%%</string>
+    <string name="notify_generation_progress_running">生成中…</string>
+    <string name="notify_generation_completed_title">生成完成</string>
+    <string name="notify_generation_failed_title">生成失败</string>
+    <string name="notify_generation_action_cancel">取消</string>
+    <string name="label_generation_notifications">生成通知</string>
+    <string name="desc_generation_notifications">生成期间在通知栏显示进度，完成或失败时提醒</string>
+    <!-- v4.18.x 后台省流量：后台保持连接开关（默认关） -->
+    <string name="label_background_keep_connected">后台保持连接</string>
+    <string name="desc_background_keep_connected">切到后台或小窗时仍保持实时连接，出图完成立刻收到推送。关闭（推荐）更省流量：蜂窝网络下会断开连接，结果改为批量获取；Wi-Fi 下始终保持连接。开启后蜂窝网络会持续消耗流量。</string>
 </resources>

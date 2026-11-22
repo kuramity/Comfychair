@@ -14,6 +14,9 @@ object PngMetadataExtractor {
         0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A
     )
 
+    /** zTXt 解压字节上限：恶意超大膨胀流到顶即停，防止 OOM（工作流 JSON 远小于此）。 */
+    private const val MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024
+
     /**
      * Extract the "prompt" metadata from a PNG file.
      * Parses PNG chunks to find tEXt or zTXt chunk with keyword "prompt".
@@ -200,11 +203,16 @@ object PngMetadataExtractor {
 
             val outputStream = ByteArrayOutputStream()
             val buffer = ByteArray(1024)
+            var totalWritten = 0
 
             while (!inflater.finished()) {
                 val count = inflater.inflate(buffer)
-                if (count == 0 && inflater.needsInput()) break
+                // count == 0 时 needsDictionary 也要退出：否则 inflate 恒返 0 且
+                // needsInput 为 false，本线程永久卡死（无预设字典即按截断处理）。
+                if (count == 0 && (inflater.needsInput() || inflater.needsDictionary())) break
                 outputStream.write(buffer, 0, count)
+                totalWritten += count
+                if (totalWritten > MAX_DECOMPRESSED_BYTES) break
             }
 
             inflater.end()

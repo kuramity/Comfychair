@@ -365,6 +365,10 @@ object JobRegistry {
     /**
      * Mark a job as failed.
      *
+     * 与 [markCompleted] 同构：executing 指针清理与落盘是无条件的 ——
+     * execution_error 是广播事件，外部任务（ownJobs 无条目）失败时同样要清掉
+     * executingPromptId，否则进度条会停在已死任务上，直到下次 /queue 对账才自愈。
+     *
      * @param promptId The prompt ID of the failed job
      */
     @Synchronized
@@ -374,24 +378,26 @@ object JobRegistry {
 
         if (job != null) {
             DebugLogger.w(TAG, "Job failed: ${Obfuscator.promptId(promptId)} (owner: ${job.ownerId})")
-
-            // Remove the failed job
-            val newJobs = currentState.ownJobs - promptId
-            jobRegistrationSeq.remove(promptId)
-
-            // Clear executing state if this was the executing job
-            val isCurrentlyExecuting = currentState.executingPromptId == promptId
-
-            _queueState.value = currentState.copy(
-                executingPromptId = if (isCurrentlyExecuting) null else currentState.executingPromptId,
-                executingOwnerId = if (isCurrentlyExecuting) null else currentState.executingOwnerId,
-                executingContentType = if (isCurrentlyExecuting) null else currentState.executingContentType,
-                ownJobs = newJobs
-            )
-
-            // 失败也要落盘，理由同 markCompleted
-            persist()
+        } else {
+            DebugLogger.d(TAG, "External job failed: ${Obfuscator.promptId(promptId)}")
         }
+
+        // Remove the failed job
+        val newJobs = currentState.ownJobs - promptId
+        jobRegistrationSeq.remove(promptId)
+
+        // Clear executing state if this was the executing job
+        val isCurrentlyExecuting = currentState.executingPromptId == promptId
+
+        _queueState.value = currentState.copy(
+            executingPromptId = if (isCurrentlyExecuting) null else currentState.executingPromptId,
+            executingOwnerId = if (isCurrentlyExecuting) null else currentState.executingOwnerId,
+            executingContentType = if (isCurrentlyExecuting) null else currentState.executingContentType,
+            ownJobs = newJobs
+        )
+
+        // 失败也要落盘，理由同 markCompleted
+        persist()
     }
 
     /**
@@ -619,28 +625,33 @@ object JobRegistry {
             val jobs = mutableMapOf<String, TrackedJob>()
 
             for (i in 0 until jobsArray.length()) {
-                val jobObj = jobsArray.getJSONObject(i)
-                val promptId = jobObj.getString("promptId")
-                val ownerId = jobObj.getString("ownerId")
-                val contentType = try {
-                    ContentType.valueOf(jobObj.getString("contentType"))
-                } catch (e: IllegalArgumentException) {
-                    ContentType.IMAGE
-                }
-                val status = try {
-                    JobStatus.valueOf(jobObj.getString("status"))
-                } catch (e: IllegalArgumentException) {
-                    JobStatus.PENDING
-                }
+                // 单条损坏只跳过该条并继续：整块 catch 会因一条缺字段把其余完好条目一起丢掉
+                try {
+                    val jobObj = jobsArray.getJSONObject(i)
+                    val promptId = jobObj.getString("promptId")
+                    val ownerId = jobObj.getString("ownerId")
+                    val contentType = try {
+                        ContentType.valueOf(jobObj.getString("contentType"))
+                    } catch (e: IllegalArgumentException) {
+                        ContentType.IMAGE
+                    }
+                    val status = try {
+                        JobStatus.valueOf(jobObj.getString("status"))
+                    } catch (e: IllegalArgumentException) {
+                        JobStatus.PENDING
+                    }
 
-                // Only restore pending/executing jobs (completed/failed don't need restoration)
-                if (status == JobStatus.PENDING || status == JobStatus.EXECUTING) {
-                    jobs[promptId] = TrackedJob(
-                        promptId = promptId,
-                        ownerId = ownerId,
-                        contentType = contentType,
-                        status = JobStatus.PENDING  // Reset to pending, will validate against server
-                    )
+                    // Only restore pending/executing jobs (completed/failed don't need restoration)
+                    if (status == JobStatus.PENDING || status == JobStatus.EXECUTING) {
+                        jobs[promptId] = TrackedJob(
+                            promptId = promptId,
+                            ownerId = ownerId,
+                            contentType = contentType,
+                            status = JobStatus.PENDING  // Reset to pending, will validate against server
+                        )
+                    }
+                } catch (e: Exception) {
+                    DebugLogger.w(TAG, "Skipping malformed job entry #$i: ${e.message}")
                 }
             }
 
@@ -662,6 +673,9 @@ object JobRegistry {
         submittedPrompts.clear()
         jobRegistrationSeq.clear()
         _queueState.value = QueueState()
+        // clear 也要落盘：否则 prefs 里留着旧任务，本会话若再无其它 persist 触发点，
+        // 下次启动 restoreState 会把已清的任务恢复成幽灵任务。
+        persist()
     }
 
     /**

@@ -3,10 +3,12 @@ package sh.hnet.comfychair.ui.components.shared
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -26,10 +28,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.model.LoraEffectTable
 import sh.hnet.comfychair.model.ModelIntro
 import sh.hnet.comfychair.model.splitIntroText
+import sh.hnet.comfychair.ui.screens.sourceLabel
 import sh.hnet.comfychair.ui.util.withStableKeys
 
 /**
@@ -62,10 +66,17 @@ internal fun modelSubtitle(intro: ModelIntro?, missingBadge: String = ""): Strin
  * 高度约束正确，长内容正常上下滑动，还能拖拽高度、下滑关闭。
  *
  * 内容全部来自预生成的中文数据（见 [sh.hnet.comfychair.model.ModelIntroTable]），这里只排版。
+ *
+ * v4.17 视觉统一：与详情页（ModelIntroDetailScreen）共用同一套排版语言——
+ * 区块标题 titleMedium + onSurface（中性色）、长文行高 ×1.75（中文可读性）、
+ * 参数两列键值 + tnum。抽屉保留为快速预览，完整 20 区块版走 [onOpenDetail]。
+ *
+ * @param onOpenDetail 「查看完整详情」回调（进二级页面）；null 时不显示该入口
+ *        （保持旧签名兼容——不接导航的调用点行为不变）
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
+fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit, onOpenDetail: (() -> Unit)? = null) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     ModalBottomSheet(
@@ -103,7 +114,7 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
             Spacer(Modifier.height(12.dp))
             Text(
                 text = intro.summary ?: stringResource(R.string.model_intro_none),
-                style = MaterialTheme.typography.bodyMedium
+                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 24.5.sp)
             )
 
             // 分类：数据侧的中文枚举（大模型/扩散模型/LoRA/…），未知新类型原样显示，
@@ -120,7 +131,7 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
             (intro.effect ?: LoraEffectTable.lookup(intro.file))?.let {
                 Spacer(Modifier.height(12.dp))
                 SectionTitle(stringResource(R.string.model_intro_effect))
-                Text(it, style = MaterialTheme.typography.bodyMedium)
+                Text(it, style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 24.5.sp))
             }
 
             // 文件已移除的条目不再显示「实际使用参数」——那是指向一个已经删掉的模型的
@@ -155,6 +166,7 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
 
             // 数据来源：3D 模型（Pixal3D 全家桶）来自 HuggingFace，Civitai 上没有它们。
             // unknown 与空值都不显示 —— 宁可少一行，不给用户看"未知"。
+            // （sourceLabel 已提升为详情页同款 internal 纯函数，两处共用一份映射）
             sourceLabel(intro.source)?.let { label ->
                 Spacer(Modifier.height(12.dp))
                 SectionTitle(stringResource(R.string.model_intro_source))
@@ -202,7 +214,8 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
                         items(keyedChunks, key = { it.key }) { item ->
                             Text(
                                 text = item.value,
-                                style = MaterialTheme.typography.bodySmall,
+                                // 长文行高覆盖：12sp × 1.75 = 21sp（保持字号，只动行距）
+                                style = MaterialTheme.typography.bodySmall.copy(lineHeight = 21.sp),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -219,6 +232,14 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
             }
 
             Spacer(Modifier.height(20.dp))
+            if (onOpenDetail != null) {
+                TextButton(
+                    onClick = onOpenDetail,
+                    modifier = Modifier.align(Alignment.End)
+                ) {
+                    Text(stringResource(R.string.model_intro_open_detail))
+                }
+            }
             TextButton(
                 onClick = onDismiss,
                 modifier = Modifier.align(Alignment.End)
@@ -234,38 +255,44 @@ fun ModelIntroSheet(intro: ModelIntro, onDismiss: () -> Unit) {
 private fun SectionTitle(text: String) {
     Text(
         text = text,
-        style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.primary
+        style = MaterialTheme.typography.titleMedium,
+        color = MaterialTheme.colorScheme.onSurface
     )
 }
 
 /**
  * 数据来源的展示名；`unknown` 与空值返回 null（界面整块不显示）。
  *
+ * v4.17 起实现移到 ModelIntroDetailScreen.kt（internal，详情页与抽屉共用一份）。
  * 品牌名不进 strings.xml：它们不是可翻译文本，翻译成"拥抱脸"只会更糟。
  */
-private fun sourceLabel(source: String?): String? = when (source?.trim()?.lowercase()) {
-    "civitai" -> "Civitai"
-    "huggingface" -> "HuggingFace"
-    else -> null
-}
 
 /** 作者原文滚动框的固定高度：给个上界，内层才滚得动，也不至于一屏塞不下别的。 */
 private val AUTHOR_TEXT_HEIGHT = 300.dp
 
 /**
- * 键值对逐行展示（「步数：28 步」）。
+ * 键值对逐行展示（v4.17 起两列布局）。
  *
- * 用户明确要求"一个字段一行、冒号分隔"—— 原先拼成一整行
+ * 用户明确要求"一个字段一行"—— 原先拼成一整行
  * "28 步 · CFG 1 · euler"，长参数名挤在一起没法看。
+ * v4.17 统一为详情页同款两列：键 labelMedium + onSurfaceVariant（min 72dp、左对齐）、
+ * 值 bodyMedium + tnum + onSurface（关键信息不用 3:1 的 onSurfaceVariant）。
  */
 @Composable
 private fun KeyValueRows(entries: Map<String, String>) {
     entries.forEach { (key, value) ->
-        Text(
-            text = "$key：$value",
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(vertical = 1.dp)
-        )
+        Row(modifier = Modifier.padding(vertical = 1.dp)) {
+            Text(
+                text = key,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.widthIn(min = 72.dp)
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings = "tnum"),
+                modifier = Modifier.weight(1f)
+            )
+        }
     }
 }

@@ -33,6 +33,7 @@ import sh.hnet.comfychair.util.ShareFileStore
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 import java.io.File
+import java.util.Collections
 
 /**
  * 读取图片生成参数时只取文件头部这么多字节。
@@ -317,7 +318,11 @@ class MediaViewerViewModel : ViewModel() {
     val events: SharedFlow<MediaViewerEvent> = _events.asSharedFlow()
 
     // Metadata state
-    private val cachedMetadata = mutableMapOf<Int, GenerationMetadata?>()
+    // 多条 IO 协程并发写入（批量预取）+ 主线程读/clear：用同步包装保证单次操作安全。
+    // 不能换 ConcurrentHashMap——它的 value 不允许 null，而这里的 null 是合法的
+    // "负缓存"值（标记查过但没有元数据）。
+    private val cachedMetadata: MutableMap<Int, GenerationMetadata?> =
+        Collections.synchronizedMap(mutableMapOf())
     private val _currentMetadata = MutableStateFlow<GenerationMetadata?>(null)
     val currentMetadata: StateFlow<GenerationMetadata?> = _currentMetadata.asStateFlow()
 
@@ -834,18 +839,23 @@ class MediaViewerViewModel : ViewModel() {
             // 这里刻意不要求"先连上服务器"：移入回收站是纯本地操作，离线时也应当能做；
             // 服务器文件的联动删除只发生在阶段二，且只认服务器响应。
             // P1-19 粒度约束原样保留：条目身份 = (promptId, filename)。
-            val identities = GalleryRepository.getInstance().moveToTrash(
-                listOf(
-                    GalleryItem(
-                        promptId = item.promptId,
-                        filename = item.filename,
-                        subfolder = item.subfolder,
-                        type = item.type,
-                        isVideo = item.isVideo,
-                        index = item.index
+            // 回收站落盘（原子写 + fsync + 写后读回）不能压在 Main 线程，与
+            // GalleryRepository.deleteItem 同一口径走 IO；withContext 结束后自动
+            // 回到主线程，后面的 UI 状态更新照旧。
+            val identities = withContext(Dispatchers.IO) {
+                GalleryRepository.getInstance().moveToTrash(
+                    listOf(
+                        GalleryItem(
+                            promptId = item.promptId,
+                            filename = item.filename,
+                            subfolder = item.subfolder,
+                            type = item.type,
+                            isVideo = item.isVideo,
+                            index = item.index
+                        )
                     )
                 )
-            )
+            }
 
             // 返回空列表 = 没进站（回收站落盘失败或异常兜底）。此时条目仍在
             // 图库里，查看器队列不能移除 —— 不移除、不填撤销槽、不提示成功，
@@ -939,15 +949,21 @@ class MediaViewerViewModel : ViewModel() {
     /**
      * 撤销刚才的"移入回收站"（阶段一回退）。
      *
+     * suspend：restoreFromTrash 落盘含原子写 + fsync + 写后读回，不能压在 Main 线程
+     * （与 GalleryRepository.deleteItem 同一口径），调用方需在协程中调用
+     * （撤销条 onClick 经 scope.launch 进入）。
+     *
      * 两侧同时恢复：图库列表侧走 Repository.restoreFromTrash（删墓碑 + 按保存的
      * index 找回原位置）；查看器队列侧把条目插回删除前的下标（"恢复原队列位置"）。
      * 槽位已被超时关闭 / 被新删除顶掉 → 静默返回 false（回收站界面仍可恢复，
      * 这里不弹"撤销失败"吓人——用户点到的多半是刚过期的条）。
      */
-    fun undoTrashMove(): Boolean {
+    suspend fun undoTrashMove(): Boolean {
         val undo = _trashUndo.value ?: return false
         _trashUndo.value = null
-        val restored = GalleryRepository.getInstance().restoreFromTrash(undo.trashIdentity)
+        val restored = withContext(Dispatchers.IO) {
+            GalleryRepository.getInstance().restoreFromTrash(undo.trashIdentity)
+        }
         if (!restored) {
             viewModelScope.launch {
                 _events.emit(MediaViewerEvent.ShowToast(R.string.error_history_item_delete))

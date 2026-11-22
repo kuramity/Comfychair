@@ -11,6 +11,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.storage.PreferencesMaintenance
 import sh.hnet.comfychair.ui.screens.LoginScreen
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme
@@ -41,5 +42,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * 小窗/分屏失焦上报（v4.18.x 后台省流量）：与主容器同口径，把窗口焦点变化喂给
+     * AppLifecycleMonitor —— 连接页在小窗里收球时同样要进入降级态。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        AppLifecycleMonitor.reportWindowFocus(hasFocus, isInMultiWindowMode)
     }
 }

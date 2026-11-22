@@ -241,8 +241,12 @@ class GalleryViewModel : ViewModel() {
      * 恢复后列表顺序与元数据一致（条目带着原 index 插回；墓碑已抹除）。
      */
     fun restoreTrashEntry(identityKey: String) {
-        val restored = repository.restoreFromTrash(identityKey)
         viewModelScope.launch {
+            // L6：回收站/墓碑的落盘（原子写 + fsync + 写后读回）不能压在 Main 线程；
+            // 修法与 MediaViewerViewModel.undoTrashMove 一致（切 IO），结果回主线程发事件。
+            val restored = withContext(Dispatchers.IO) {
+                repository.restoreFromTrash(identityKey)
+            }
             _events.emit(
                 GalleryEvent.ShowToast(
                     if (restored) R.string.msg_trash_restored else R.string.msg_trash_restore_failed

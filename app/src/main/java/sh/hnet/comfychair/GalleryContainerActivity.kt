@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.ui.components.ConnectionAlertDialog
 import sh.hnet.comfychair.ui.components.shared.ProvideFilamentEngine
 import sh.hnet.comfychair.ui.screens.GalleryScreen
@@ -133,5 +134,13 @@ class GalleryContainerActivity : ComponentActivity() {
         intent.flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
         startActivity(intent)
         finish()
+    }
+
+    /**
+     * 小窗/分屏失焦上报（v4.18.x 后台省流量）：与主容器同口径，小窗收球时进入降级态。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        AppLifecycleMonitor.reportWindowFocus(hasFocus, isInMultiWindowMode)
     }
 }

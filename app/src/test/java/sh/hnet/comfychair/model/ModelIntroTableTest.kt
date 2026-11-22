@@ -443,5 +443,138 @@ class ModelIntroTableTest {
         org.junit.Assert.assertTrue(hit.authorParams.isEmpty())
         org.junit.Assert.assertTrue(hit.tags.isEmpty())
         org.junit.Assert.assertTrue(hit.usedIn.isEmpty())
+        // 2026-11-22 新增字段：默认值全空，界面据此整块不渲染
+        assertNull(hit.loraWeight)
+        assertNull(hit.localPositioning)
+        assertNull(hit.communitySamples)
+        assertNull(hit.communityPrompt)
+        assertNull(hit.confidenceNote)
+        assertEquals(false, hit.introMissing)
+        org.junit.Assert.assertTrue(hit.communityParams.isEmpty())
+    }
+
+    // ---------------- 2026-11-22 详情页字段（loraWeight / community* / confidenceNote）----------------
+
+    @Test
+    fun `loraWeight区间形态解析`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors",
+               "loraWeight":{"min":0.5,"max":1.0,"default":null,"source":"intro_original","quote":"0.5 to 1.0"}}}}"""
+        )
+        val lw = ModelIntroTable.lookup("w.safetensors")!!.loraWeight!!
+        assertEquals(0.5, lw.min!!, 1e-9)
+        assertEquals(1.0, lw.max!!, 1e-9)
+        assertNull(lw.default)
+        assertEquals("intro_original", lw.source)
+        assertEquals(LoraWeightShape.RANGE, lw.shape)
+    }
+
+    @Test
+    fun `loraWeight区间加默认形态解析`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors",
+               "loraWeight":{"min":0.6,"max":1.0,"default":0.8}}}}"""
+        )
+        val lw = ModelIntroTable.lookup("w.safetensors")!!.loraWeight!!
+        assertEquals(0.8, lw.default!!, 1e-9)
+        assertEquals(LoraWeightShape.RANGE_WITH_DEFAULT, lw.shape)
+    }
+
+    @Test
+    fun `loraWeight单边界形态_null保持形态语义`() {
+        // 只有 min（不低于）/ 只有 max（不超过）/ 只有 default（推荐）——null 不许被脑补成 0 或 1
+        ModelIntroTable.setTableJsonForTest(
+            """
+            {"models":{
+              "a.safetensors":{"file":"a.safetensors","loraWeight":{"min":0.7,"max":null,"default":null}},
+              "b.safetensors":{"file":"b.safetensors","loraWeight":{"min":null,"max":1.2,"default":null}},
+              "c.safetensors":{"file":"c.safetensors","loraWeight":{"min":null,"max":null,"default":0.8}}
+            }}
+            """.trimIndent()
+        )
+        val a = ModelIntroTable.lookup("a.safetensors")!!.loraWeight!!
+        assertEquals(LoraWeightShape.MIN_ONLY, a.shape)
+        assertNull(a.max)
+        val b = ModelIntroTable.lookup("b.safetensors")!!.loraWeight!!
+        assertEquals(LoraWeightShape.MAX_ONLY, b.shape)
+        assertNull(b.min)
+        val c = ModelIntroTable.lookup("c.safetensors")!!.loraWeight!!
+        assertEquals(LoraWeightShape.DEFAULT_ONLY, c.shape)
+        assertNull(c.min)
+        assertNull(c.max)
+    }
+
+    @Test
+    fun `loraWeight负值与超范围值原样保留`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors",
+               "loraWeight":{"min":-3.0,"max":5.0}}}}"""
+        )
+        val lw = ModelIntroTable.lookup("w.safetensors")!!.loraWeight!!
+        assertEquals(-3.0, lw.min!!, 1e-9)
+        assertEquals(5.0, lw.max!!, 1e-9)
+    }
+
+    @Test
+    fun `loraWeight空壳不建对象`() {
+        // 四个值全 null 的坏档条目直接不给对象，界面整块不显示
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors",
+               "loraWeight":{"min":null,"max":null,"default":null}}}}"""
+        )
+        assertNull(ModelIntroTable.lookup("w.safetensors")!!.loraWeight)
+    }
+
+    @Test
+    fun `communityParams按预设顺序解析`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors",
+               "communityParams":{
+                 "steps":{"value":"30","count":17},
+                 "cfg":{"value":"3","count":12},
+                 "sampler":{"value":"Euler a","count":17},
+                 "scheduler":{"value":"normal","count":2}}}}}"""
+        )
+        val cp = ModelIntroTable.lookup("w.safetensors")!!.communityParams
+        // JSON 里写的是乱序，读出来必须固定为 sampler → cfg → steps → scheduler
+        assertEquals(listOf("sampler", "cfg", "steps", "scheduler"), cp.keys.toList())
+        assertEquals("Euler a", cp["sampler"]!!.value)
+        assertEquals(12, cp["cfg"]!!.count)
+    }
+
+    @Test
+    fun `communitySamples与communityPrompt解析`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors",
+               "communitySamples":{"total":50,"withMeta":33,"withParams":22},
+               "communityPrompt":{"positive":"masterpiece","negative":"bad hands","likes":5}}}}"""
+        )
+        val hit = ModelIntroTable.lookup("w.safetensors")!!
+        assertEquals(22, hit.communitySamples!!.withParams)
+        assertEquals(50, hit.communitySamples!!.total)
+        assertEquals("masterpiece", hit.communityPrompt!!.positive)
+        assertEquals("bad hands", hit.communityPrompt!!.negative)
+    }
+
+    @Test
+    fun `confidenceNote与localPositioning与introMissing解析`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors",
+               "confidenceNote":"medium：命名匹配推断",
+               "local_positioning":"动漫插画 + 真实皮肤质感",
+               "introMissing":true}}}"""
+        )
+        val hit = ModelIntroTable.lookup("w.safetensors")!!
+        assertEquals("medium：命名匹配推断", hit.confidenceNote)
+        assertEquals("动漫插画 + 真实皮肤质感", hit.localPositioning)
+        assertEquals(true, hit.introMissing)
+    }
+
+    @Test
+    fun `introMissing为字符串true也宽容读取`() {
+        ModelIntroTable.setTableJsonForTest(
+            """{"models":{"w.safetensors":{"file":"w.safetensors","introMissing":"true"}}}"""
+        )
+        assertEquals(true, ModelIntroTable.lookup("w.safetensors")!!.introMissing)
     }
 }

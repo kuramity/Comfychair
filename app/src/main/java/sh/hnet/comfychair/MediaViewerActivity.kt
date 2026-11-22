@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.ui.components.SharedVideoPlayer
 import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.screens.MediaViewerScreen
@@ -412,5 +413,13 @@ class MediaViewerActivity : ComponentActivity() {
                 singleBitmap = bitmap
             )
         }
+    }
+
+    /**
+     * 小窗/分屏失焦上报（v4.18.x 后台省流量）：查看器在小窗里收球时同样进入降级态。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        AppLifecycleMonitor.reportWindowFocus(hasFocus, isInMultiWindowMode)
     }
 }

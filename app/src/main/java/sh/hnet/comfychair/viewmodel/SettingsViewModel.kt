@@ -27,6 +27,8 @@ import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheCleanupPolicy
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.lifecycle.BackgroundDegradationCoordinator
+import sh.hnet.comfychair.notify.GenerationNotifier
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.storage.BackupManager
@@ -137,6 +139,16 @@ class SettingsViewModel : ViewModel() {
     private val _isPromptExpandEnabled = MutableStateFlow(false)
     val isPromptExpandEnabled: StateFlow<Boolean> = _isPromptExpandEnabled.asStateFlow()
 
+    /** 生成通知开关（进度 / 完成 / 失败，后台与锁屏可见） */
+    private val _isGenerationNotificationsEnabled = MutableStateFlow(true)
+    val isGenerationNotificationsEnabled: StateFlow<Boolean> =
+        _isGenerationNotificationsEnabled.asStateFlow()
+
+    /** 后台保持连接开关（降级态 × 蜂窝是否维持 WS；默认关，v4.18.x 后台省流量） */
+    private val _isBackgroundKeepConnectedEnabled = MutableStateFlow(false)
+    val isBackgroundKeepConnectedEnabled: StateFlow<Boolean> =
+        _isBackgroundKeepConnectedEnabled.asStateFlow()
+
     // P3-11：事件流必须有缓冲并允许丢弃最旧事件。
     // 原配置 replay=0 + extraBufferCapacity=0 时，没有收集者（页面切走、或因配置变更
     // 尚未重新订阅）的 emit 会永久挂起，把它后面的语句一起卡住 —— 比如清缓存成功后
@@ -169,6 +181,8 @@ class SettingsViewModel : ViewModel() {
         _edgeRouterId.value = AppSettings.getEdgeRouterId(context)
         _isPromptSpellCheckEnabled.value = AppSettings.isPromptSpellCheckEnabled(context)
         _isPromptExpandEnabled.value = AppSettings.isPromptExpandEnabled(context)
+        _isGenerationNotificationsEnabled.value = AppSettings.isGenerationNotificationsEnabled(context)
+        _isBackgroundKeepConnectedEnabled.value = AppSettings.isBackgroundKeepConnectedEnabled(context)
 
         // Initialize debug logger with saved state
         DebugLogger.setEnabled(_isDebugLoggingEnabled.value)
@@ -507,6 +521,33 @@ class SettingsViewModel : ViewModel() {
     }
 
     /**
+     * 生成通知开关。关闭时立即撤掉已挂的生成通知（进度条不留残影）；
+     * 开启只影响之后的任务，已结束的任务不补发通知。
+     */
+    fun setGenerationNotificationsEnabled(context: Context, enabled: Boolean) {
+        viewModelScope.launch {
+            AppSettings.setGenerationNotificationsEnabled(context, enabled)
+            _isGenerationNotificationsEnabled.value = enabled
+            if (!enabled) {
+                GenerationNotifier.cancel(context)
+            }
+        }
+    }
+
+    /**
+     * 后台保持连接开关（降级态 × 蜂窝是否维持 WS）。默认关（省流量）；
+     * 打开即接受蜂窝下的持续流量代价。变更后让降级协调器立即重评，
+     * 降级态中切换即刻生效（前台时本开关不产生任何行为差异）。
+     */
+    fun setBackgroundKeepConnectedEnabled(context: Context, enabled: Boolean) {
+        viewModelScope.launch {
+            AppSettings.setBackgroundKeepConnectedEnabled(context, enabled)
+            _isBackgroundKeepConnectedEnabled.value = enabled
+            BackgroundDegradationCoordinator.onKeepConnectedSettingChanged()
+        }
+    }
+
+    /**
      * Set whether memory-first caching should be enabled.
      * When disabled, switches to disk-first mode and forces media cache to be enabled.
      */
@@ -698,9 +739,10 @@ class SettingsViewModel : ViewModel() {
             result.onSuccess { json ->
                 val writeSuccess = withContext(Dispatchers.IO) {
                     try {
-                        context.contentResolver.openOutputStream(uri)?.use { outputStream ->
-                            outputStream.write(json.toByteArray(Charsets.UTF_8))
-                        }
+                        // openOutputStream 返回 null 表示打不开目标（如无效 URI），不能误报成功
+                        val outputStream = context.contentResolver.openOutputStream(uri)
+                            ?: return@withContext false
+                        outputStream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
                         true
                     } catch (e: Exception) {
                         false
@@ -825,6 +867,7 @@ class SettingsViewModel : ViewModel() {
         val newEdgeRouterId = AppSettings.getEdgeRouterId(context)
         val newPromptSpellCheck = AppSettings.isPromptSpellCheckEnabled(context)
         val newPromptExpand = AppSettings.isPromptExpandEnabled(context)
+        val newGenerationNotifications = AppSettings.isGenerationNotificationsEnabled(context)
 
         // If debug logging was enabled before restore, keep it enabled
         val finalDebugLogging = if (preserveDebugLogging && !restoredDebugLogging) {
@@ -848,6 +891,7 @@ class SettingsViewModel : ViewModel() {
         _edgeRouterId.value = newEdgeRouterId
         _isPromptSpellCheckEnabled.value = newPromptSpellCheck
         _isPromptExpandEnabled.value = newPromptExpand
+        _isGenerationNotificationsEnabled.value = newGenerationNotifications
 
         // Update DebugLogger state to match
         DebugLogger.setEnabled(finalDebugLogging)

@@ -287,14 +287,35 @@ class ComfyUIClient(
     // Separate OkHttpClient for WebSocket connections
     // WebSockets need longer timeouts since data may not arrive for extended periods
     // pingInterval keeps the connection alive during long operations
-    private val webSocketClient = secured(
+    //
+    // v4.18.x 后台省流量：pingInterval 改为**按需构建**（base 不带 ping + newBuilder 注入），
+    // 间隔由 [updateWebSocketPingInterval] 维护 —— 后台降级时与 ConnectionManager 的应用层
+    // 心跳同步放宽（前台 30s / 不限量后台 120s / 蜂窝后台 240s），两条心跳合计的联网频率
+    // 从每 30 秒一次降到每 2-4 分钟一次。newBuilder 共享连接池与线程池，openWebSocket
+    // 频率低（建连时才调用），多建一个配置对象可忽略不计。
+    private val webSocketClientBase = secured(
         OkHttpClient.Builder()
             .addInterceptor(authInterceptor)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)      // No read timeout for WebSocket
             .writeTimeout(10, TimeUnit.SECONDS)
-            .pingInterval(30, TimeUnit.SECONDS)    // Keep connection alive with pings
     ).build()
+
+    /** 当前生效的协议层 ping 间隔（秒；@Volatile：写侧在协调器协程，读侧在建连线程） */
+    @Volatile
+    private var webSocketPingIntervalSec = 30L
+
+    private fun webSocketClient(): OkHttpClient = webSocketClientBase.newBuilder()
+        .pingInterval(webSocketPingIntervalSec, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * 更新协议层 ping 间隔（秒）。只影响**之后新建**的 WebSocket（在跑的连接保持旧节奏，
+     * 降级断连 / 回前台重连时自然切到新值 —— 降级策略本来就伴随断连/保连切换）。
+     */
+    fun updateWebSocketPingInterval(intervalSec: Long) {
+        webSocketPingIntervalSec = intervalSec
+    }
 
     // Client for large transfers (uploads/downloads) - timeouts disabled, stall detection handles them
     // This allows slow but progressing transfers to complete while detecting truly stalled connections
@@ -596,7 +617,7 @@ class ComfyUIClient(
             .build()
 
         // Open WebSocket connection using dedicated WebSocket client with longer timeouts
-        webSocket = webSocketClient.newWebSocket(request, listener)
+        webSocket = webSocketClient().newWebSocket(request, listener)
 
         return true
     }
@@ -1035,10 +1056,14 @@ class ComfyUIClient(
      * Fetch all execution history
      * Used to get all generation history for the gallery
      *
+     * @param maxItems 服务端返回的条数上限（ComfyUI 的 `/history?max_items=N`，实测
+     *   server.py:1139 支持，另支持 offset）。v4.18.x 后台省流量：全量拉取每条都带完整
+     *   prompt JSON，历史攒多后一次可达数十 MB —— 默认传 100 条（图库旧条目由本地索引
+     *   兜底，合并语义只增不减，不会丢图）。传 null = 不带参数（旧行为，全量）。
      * @param callback Called with the result:
      *                 - historyJson: The full history JSON object with all prompts, or null on error
      */
-    fun fetchAllHistory(callback: (historyJson: JSONObject?) -> Unit) {
+    fun fetchAllHistory(maxItems: Int? = null, callback: (historyJson: JSONObject?) -> Unit) {
         // P0：回调只投递一次。
         //
         // OkHttp 正常只会回调一次，但旧实现的 onResponse 里 `callback(historyJson)`
@@ -1054,7 +1079,7 @@ class ComfyUIClient(
             return
         }
 
-        val url = "$baseUrl/history"
+        val url = historyUrl(baseUrl, maxItems)
 
         val request = Request.Builder()
             .url(url)
@@ -2095,5 +2120,17 @@ internal class SingleDeliveryGuard(
 
     /** 是否已经投递过（排障/单测用）。 */
     fun hasDelivered(): Boolean = delivered
+}
+
+/**
+ * `/history` 请求 URL 的纯构造（v4.18.x 抽出以便 JVM 单测钉住）。
+ *
+ * @param baseUrl 服务器根地址（如 `http://192.168.1.10:8188`）
+ * @param maxItems 条数上限；null = 不带参数（全量，旧行为）。服务端实测支持
+ *   `?max_items=N`（server.py:1139），这里保证只拼数字，非法值由服务端解析。
+ */
+internal fun historyUrl(baseUrl: String, maxItems: Int?): String {
+    if (maxItems == null) return "$baseUrl/history"
+    return "$baseUrl/history?max_items=$maxItems"
 }
 

@@ -157,6 +157,13 @@
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
 
+        <!-- 生成进度通知上「取消」按钮的接收器。
+             exported=false：仅本 App 的 PendingIntent 能触发（通知动作广播由系统派发，
+             带 origin 校验）。不持有任何状态，转发给 GenerationNotifier.requestCancel。 -->
+        <receiver
+            android:name=".notify.GenerationNotificationActionReceiver"
+            android:exported="false" />
+
         <!-- FileProvider for sharing images -->
         <provider
             android:name="androidx.core.content.FileProvider"

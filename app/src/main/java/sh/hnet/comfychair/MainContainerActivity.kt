@@ -42,6 +42,7 @@ import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.connection.WebSocketState
+import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.model.AuthCredentials
 import sh.hnet.comfychair.navigation.MainRoute
 import sh.hnet.comfychair.repository.GalleryRepository
@@ -614,6 +615,25 @@ class MainContainerActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         // ViewModel handles cleanup automatically via onCleared()
+    }
+
+    /**
+     * 小窗/分屏失焦上报（v4.18.x 后台省流量）：小窗收成悬浮球时 Activity 仍 Resumed、
+     * 不触发 onStop，只有这里能感知 —— 失焦 + 多窗口态 = 进入「可见但失焦」降级态
+     * （AppLifecycleMonitor 合成 MULTI_WINDOW_UNFOCUSED），拿回焦点即恢复。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        AppLifecycleMonitor.reportWindowFocus(hasFocus, isInMultiWindowMode)
+    }
+
+    /**
+     * TopResumed 辅助信号上报（API 29+，minSdk 33 直接可用）：与窗口焦点同口径，
+     * 只在多窗口态下并入失焦标记；非多窗口的叠页由 ProcessLifecycleOwner 的 ON_STOP 兜底。
+     */
+    override fun onTopResumedActivityChanged(isTopResumedActivity: Boolean) {
+        super.onTopResumedActivityChanged(isTopResumedActivity)
+        AppLifecycleMonitor.reportTopResumedChanged(isTopResumedActivity, isInMultiWindowMode)
     }
 }
 

@@ -228,8 +228,11 @@ fun MediaViewerScreen(
     //
     // remember 仍以条目列表指纹为 key：删图会让 pager 整段重建，档位与越界状态
     // 照旧回到中性值（与提升前的行为一致）。
-    val itemsKey = uiState.items.map { viewerItemKey(it.promptId, it.filename) }
-        .joinToString("\u0001")
+    // 指纹字符串 remember 住：items 引用不变的重组不再每次 map + joinToString
+    val itemsKey = remember(uiState.items) {
+        uiState.items.map { viewerItemKey(it.promptId, it.filename) }
+            .joinToString("\u0001")
+    }
 
     // 并排预览三级手势的进度状态（语义见 ViewerSideBySide：0 = 全屏；1 = 并排；1.5 = 临时缩小档）
     var sideProgress by remember(itemsKey) { mutableFloatStateOf(0f) }
@@ -498,8 +501,10 @@ fun MediaViewerScreen(
                                         translationX = overscrollPx
                                     }
                             ) {
+                                // asImageBitmap 每次重组都会新建包装对象，remember 住同一份 ImageBitmap
+                                val snapshotBitmap = remember(gallerySnapshot) { gallerySnapshot.asImageBitmap() }
                                 Image(
-                                    bitmap = gallerySnapshot.asImageBitmap(),
+                                    bitmap = snapshotBitmap,
                                     contentDescription = null,
                                     contentScale = ContentScale.FillBounds,
                                     modifier = Modifier.fillMaxSize()
@@ -1378,7 +1383,7 @@ fun MediaViewerScreen(
                         text = stringResource(R.string.msg_trash_moved),
                         style = MaterialTheme.typography.bodyMedium
                     )
-                    TextButton(onClick = { viewModel.undoTrashMove() }) {
+                    TextButton(onClick = { scope.launch { viewModel.undoTrashMove() } }) {
                         Text(stringResource(R.string.button_undo))
                     }
                 }

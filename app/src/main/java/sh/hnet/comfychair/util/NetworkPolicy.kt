@@ -51,7 +51,15 @@ object NetworkPolicy {
         if (withoutZone == "localhost") return true
         if (withoutZone.endsWith(".local") || withoutZone.endsWith(".lan")) return true
         // 无点短名（如 myserver）：只能在内网解析，按私网处理
-        if (!withoutZone.contains('.')) return true
+        if (!withoutZone.contains('.')) {
+            // 无点但可能是 IP 字面量的其他写法：InetAddress 接受十进制整数（3689964177）
+            // 与十六进制（0x...）形式并能路由到公网，不能当内网短名放行。
+            // 注意：单字符 "0" 等纯数字串也会被拒绝——"0" 不是合法主机名，
+            // 且主机名不允许全数字，拒绝方向安全，这是有意为之。
+            if (withoutZone.all { it.isDigit() }) return false
+            if (withoutZone.startsWith("0x", ignoreCase = true)) return false
+            return true
+        }
 
         return false
     }
@@ -63,6 +71,9 @@ object NetworkPolicy {
         for (i in parts.indices) {
             val part = parts[i]
             if (part.isEmpty() || part.length > 3 || !part.all { it in '0'..'9' }) return null
+            // 前导零拒绝：传统解析按八进制（"010" = 8，公网段），本类按十进制会误判
+            // 成私网 → 放行型安全判据必须收紧；标准写法不受影响（单字符 "0" 仍合法）。
+            if (part.length > 1 && part[0] == '0') return null
             val octet = part.toIntOrNull() ?: return null
             if (octet > 255) return null
             octets[i] = octet

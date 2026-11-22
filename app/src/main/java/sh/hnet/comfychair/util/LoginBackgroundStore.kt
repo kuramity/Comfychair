@@ -55,11 +55,12 @@ object LoginBackgroundStore {
                 val bitmap = BitmapFactory.decodeFileDescriptor(pfd.fileDescriptor, null, options)
                     ?: return@withContext false
 
-                file(context).outputStream().use { out ->
+                // compress 返回 false = 编码失败（此时文件可能是 0 字节），不能谎报成功
+                val compressed = file(context).outputStream().use { out ->
                     bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
                 }
                 bitmap.recycle()
-                true
+                compressed
             } ?: false
         } catch (e: Exception) {
             Log.w(TAG, "背景图保存失败", e)

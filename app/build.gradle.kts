@@ -60,8 +60,8 @@ android {
         // versionCode 与版本名**解耦**：每次发版 +1，只保证单调递增（Android 的硬性要求）。
         // ⚠️ 发版前务必同时改这两行：只 cp 改文件名不改这里，会得到一个 versionCode
         //    与上一版完全相同的包（装不上也分不清，v0.9.33 踩过）。
-        versionCode = 146
-        versionName = "v4.19.5"
+        versionCode = 148
+        versionName = "v4.20.0"
 
         // 更新清单地址注入 BuildConfig（空字符串 = 未配置更新源）
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"$updateManifestUrl\"")
@@ -158,6 +158,8 @@ dependencies {
     // Lifecycle and ViewModel for Compose
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.lifecycle.runtime.compose)
+    // 进程级前后台判定（ProcessLifecycleOwner 的 ON_START/ON_STOP）—— 后台降级的基础信号之一
+    implementation(libs.lifecycle.process)
 
     // Navigation Compose
     implementation(libs.navigation.compose)

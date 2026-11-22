@@ -65,7 +65,9 @@ object GalleryMetadataCache {
      * 刷新合并（mergeMetadata）与 404 标记写入（markSourceMissing）会来自不同协程：
      * 两边都是"读整份 → 改 → 写整份"，不加锁时后写的一方会覆盖先写的一方
      * —— 刚标记的 sourceMissing 可能在一次并发刷新后丢失（角标消失、重新白等超时）。
-     * 锁只包住这些短小的读改写段，I/O 本身仍在调用方的 IO 线程上。
+     * 墓碑的写入入口（addTombstones / removeTombstonesFromFiles）同样是
+     * "读整份 → 改 → 写整份"，并发删除与恢复（回收站）交错时同样丢更新，
+     * 所以共用这把锁。锁只包住这些短小的读改写段，I/O 本身仍在调用方的 IO 线程上。
      */
     private val indexWriteLock = Any()
 
@@ -423,37 +425,41 @@ object GalleryMetadataCache {
      * @return 是否**真的落盘并校验通过**。false 时调用方必须当作"删除未持久化"
      *         处理（内存里的隐藏状态与磁盘会不一致，重启后图片会复现），不能记成功。
      */
-    fun addTombstones(context: Context, serverId: String, keys: Set<String>): Boolean {
-        if (keys.isEmpty()) return true
-        try {
-            val target = getTombstoneFile(context, serverId)
-            // R7：目标文件本身读不出来时，先备份成 .corrupt-* 再覆盖 —— 否则这次
-            // "可读子集 + 新键"的整份重写会把旧的不可解析删除记录永久抹掉。
-            backupTombstoneIfUnreadable(target)
-            val merged = loadTombstones(context, serverId) + keys
-            // JSONArray.toString() 会把 NUL 转义成 `\u0000` 六个字符；写出去的字节里
-            // 不能出现真正的 0x00（真 NUL 会让部分解析器把字符串截断）。校验里一并钉住。
-            // 写后读回：解析失败/条数不一致一律回滚，绝不留下"写成功但读不出来"的墓碑。
-            val ok = writeTextAtomicallyVerified(
-                file = target,
-                content = tombstoneJson(merged),
-                label = "删除墓碑",
-                verify = { text -> isTombstoneDocumentConsistent(text, merged) }
-            )
-            if (ok) {
-                DebugLogger.i(TAG, "Recorded ${keys.size} deletion tombstone(s) for server $serverId")
-            } else {
-                DebugLogger.e(
-                    TAG,
-                    "删除墓碑写入失败（已回滚），本次 ${keys.size} 条删除未持久化: $serverId"
+    fun addTombstones(context: Context, serverId: String, keys: Set<String>): Boolean =
+        synchronized(indexWriteLock) {
+            if (keys.isEmpty()) return@synchronized true
+            try {
+                val target = getTombstoneFile(context, serverId)
+                // R7：目标文件本身读不出来时，先备份成 .corrupt-* 再覆盖 —— 否则这次
+                // "可读子集 + 新键"的整份重写会把旧的不可解析删除记录永久抹掉。
+                backupTombstoneIfUnreadable(target)
+                // 只合并**本文件自己的**墓碑 + 新键：跨文件合并在读取端（loadTombstones）
+                // 已经做过了，写入端再复制会让"在 A 服务器删图"把 B 服务器的墓碑整批
+                // 拷进 A 的文件（每份文件都趋向包含全部墓碑，纯膨胀，删不掉）。
+                val merged = loadTombstonesFromFiles(listOf(target)) + keys
+                // JSONArray.toString() 会把 NUL 转义成 `\u0000` 六个字符；写出去的字节里
+                // 不能出现真正的 0x00（真 NUL 会让部分解析器把字符串截断）。校验里一并钉住。
+                // 写后读回：解析失败/条数不一致一律回滚，绝不留下"写成功但读不出来"的墓碑。
+                val ok = writeTextAtomicallyVerified(
+                    file = target,
+                    content = tombstoneJson(merged),
+                    label = "删除墓碑",
+                    verify = { text -> isTombstoneDocumentConsistent(text, merged) }
                 )
+                if (ok) {
+                    DebugLogger.i(TAG, "Recorded ${keys.size} deletion tombstone(s) for server $serverId")
+                } else {
+                    DebugLogger.e(
+                        TAG,
+                        "删除墓碑写入失败（已回滚），本次 ${keys.size} 条删除未持久化: $serverId"
+                    )
+                }
+                ok
+            } catch (e: Exception) {
+                DebugLogger.e(TAG, "Failed to record deletion tombstones: ${e.message}")
+                false
             }
-            return ok
-        } catch (e: Exception) {
-            DebugLogger.e(TAG, "Failed to record deletion tombstones: ${e.message}")
-            return false
         }
-    }
 
     /**
      * 墓碑文件读不出来（截断/编码坏）时先备份成 `.corrupt-*`，**不删原文件**。
@@ -527,13 +533,16 @@ object GalleryMetadataCache {
      *
      * 只有"可读文件写回清理版失败"才返回 false —— 那种情况下键仍是生效的，
      * 恢复确实不会生效，调用方必须取消。
+     *
+     * 与 [addTombstones] 共用 [indexWriteLock]：两边都是"读整份 → 改 → 写整份"，
+     * 并发删除与恢复交错时后写会覆盖先写（丢更新）。
      */
     internal fun removeTombstonesFromFiles(
         files: List<File>,
         keys: Set<String>,
         serverId: String = ""
-    ): Boolean {
-        if (keys.isEmpty()) return true
+    ): Boolean = synchronized(indexWriteLock) {
+        if (keys.isEmpty()) return@synchronized true
         var allOk = true
         for (file in files) {
             val text = try {
@@ -573,7 +582,7 @@ object GalleryMetadataCache {
         } else {
             DebugLogger.e(TAG, "墓碑清理未全部成功（恢复可能未生效），server $serverId")
         }
-        return allOk
+        allOk
     }
 
     fun loadTombstones(context: Context, serverId: String): Set<String> =

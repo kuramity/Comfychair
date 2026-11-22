@@ -34,8 +34,18 @@ object SharedVideoPlayer {
 
     private const val TAG = "SharedVideoPlayer"
 
-    /** 空闲释放的延迟窗口（ms）：覆盖"预览 → 全屏"这类快速切换，避免来回重建 */
+    /** 空闲释放的延迟窗口（ms）：[releaseWhenIdle] 的默认延迟，覆盖"预览 → 全屏"这类快速切换，避免整个播放器被来回重建 */
     private const val RELEASE_WHEN_IDLE_DELAY_MS = 250L
+
+    /**
+     * 消费者注销宽限（ms）：最后一个消费者 [unregisterConsumer] 时延迟这么久才真正 [ExoPlayer.stop]。
+     *
+     * 比 [RELEASE_WHEN_IDLE_DELAY_MS] 短是刻意为之：unregister 走的是轻量 stop（视频重置、
+     * 解码器保留），只需兜住同一次组合切换里 unregister → register 的瞬时空窗；
+     * 而空闲释放走的是重量级 release（解码器 + Surface 全部归还），才需要 250ms。
+     * 拉长到 250 只会让用户关掉视频后声音/资源多占一会儿，不改数值。
+     */
+    private const val UNREGISTER_GRACE_MS = 100L
 
     /** 可压低音量场景（通知提示音等）下的播放音量 */
     private const val DUCK_VOLUME = 0.2f
@@ -131,7 +141,7 @@ object SharedVideoPlayer {
                 }
                 pendingStopRunnable = null
             }
-            handler.postDelayed(pendingStopRunnable!!, 100)
+            handler.postDelayed(pendingStopRunnable!!, UNREGISTER_GRACE_MS)
         }
     }
 

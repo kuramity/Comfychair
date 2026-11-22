@@ -6,6 +6,59 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
+ * LoRA 权重建议（从作者原文里按固定模式抽出来的，抽不到就是 null）。
+ *
+ * 字段可空是**有语义的**：四种形态各有画法（见 ModelIntroDetailScreen 的权重条）——
+ * - min+max：区间；min+max+default：区间 + 默认点；
+ * - 只有 min：「不低于 x」（单边界，不是区间）；只有 max：「不超过 x」；
+ * - 只有 default：「推荐 x」（单点）。
+ * 绝不能把单边界脑补成区间，那会把「可以更高」画成「只能在这段」。
+ */
+data class LoraWeightSuggestion(
+    val min: Double? = null,
+    val max: Double? = null,
+    val default: Double? = null,
+    /** 抽取来源（当前数据全部是 `intro_original`），界面不显示，留着溯源 */
+    val source: String? = null,
+    /** 原文引用片段（作者原话），界面不显示，留着核对 */
+    val quote: String? = null,
+) {
+    /** 形态枚举（纯函数，供 JVM 单测钉住判定优先级）。 */
+    val shape: LoraWeightShape
+        get() = when {
+            min != null && max != null && default != null -> LoraWeightShape.RANGE_WITH_DEFAULT
+            min != null && max != null -> LoraWeightShape.RANGE
+            min != null -> LoraWeightShape.MIN_ONLY
+            max != null -> LoraWeightShape.MAX_ONLY
+            default != null -> LoraWeightShape.DEFAULT_ONLY
+            else -> LoraWeightShape.EMPTY
+        }
+}
+
+/** [LoraWeightSuggestion] 的形态（决定权重条的画法与文案）。 */
+enum class LoraWeightShape { RANGE, RANGE_WITH_DEFAULT, MIN_ONLY, MAX_ONLY, DEFAULT_ONLY, EMPTY }
+
+/** 社区常用参数的单项：值 + 支持它的样本数（count < 3 时界面不显示数字）。 */
+data class CommunityParam(
+    val value: String,
+    val count: Int = 0,
+)
+
+/** 社区样本统计。基数取 [withParams]（带参数的样本数），**不是** [total]。 */
+data class CommunitySamples(
+    val total: Int = 0,
+    val withMeta: Int = 0,
+    val withParams: Int = 0,
+)
+
+/** 社区高频提示词（正/负向，likes 是点赞数，界面暂不显示）。 */
+data class CommunityPrompt(
+    val positive: String? = null,
+    val negative: String? = null,
+    val likes: Int = 0,
+)
+
+/**
  * 单个模型的介绍条目。
  *
  * 所有面向用户的文本（summary / params / companions）都是**预生成好的中文**——
@@ -68,6 +121,34 @@ data class ModelIntro(
      * 界面据此打「文件已移除」角标，避免用户照着配却怎么都跑不通。
      */
     val missing: Boolean = false,
+    /** LoRA 权重建议（只有 LoRA 条目可能有，见 [LoraWeightSuggestion] 的形态说明）。 */
+    val loraWeight: LoraWeightSuggestion? = null,
+    /** 风格定位（数据侧人工概括，如「动漫插画 + 真实皮肤质感」），界面拆成 chips。 */
+    val localPositioning: String? = null,
+    /**
+     * 社区常用参数（ Civitai 带参图片统计出的众数）：键是英文枚举
+     * （sampler / cfg / steps / scheduler），值带样本数。
+     *
+     * 与 [params]（你的工作流实际值）、[authorParams]（作者建议）是**三个独立视角**，
+     * 界面并列显示、绝不合并——冲突时让用户自己看哪个信得过。
+     */
+    val communityParams: Map<String, CommunityParam> = emptyMap(),
+    /** 社区样本统计（显示基数用 withParams，不是 total）。 */
+    val communitySamples: CommunitySamples? = null,
+    /** 社区高频提示词（正向在 positive、负向在 negative，都是长文本）。 */
+    val communityPrompt: CommunityPrompt? = null,
+    /**
+     * 置信度说明（数据侧的匹配说明，如「命名/触发词匹配推断，非哈希级确认」）。
+     * 有值就显示——它是在告诉用户"这条介绍可能认错了模型"。
+     */
+    val confidenceNote: String? = null,
+    /**
+     * 数据侧标记「这条条目没有完整介绍」（只有模板套话与基本信息）。
+     *
+     * 与 [missing]（文件已移除）是两回事：missing 指本地文件没了，introMissing 指
+     * 数据本身就薄。界面据此显示占位说明，不渲染只有套话的完整介绍区。
+     */
+    val introMissing: Boolean = false,
 ) {
     /**
      * 这条介绍值不值得给用户一个「查看」入口。
@@ -360,6 +441,25 @@ object ModelIntroTable {
                 source = o.strOrNull("source"),
                 // 数据侧 2026-11-15 起改用 removed（missing 是旧键名，兼容读一轮）
                 missing = o.lenientBoolean("removed") || o.lenientBoolean("missing"),
+                loraWeight = o.loraWeightOrNull("loraWeight"),
+                localPositioning = o.strOrNull("local_positioning"),
+                communityParams = o.communityParams("communityParams"),
+                communitySamples = o.optJSONObject("communitySamples")?.let {
+                    CommunitySamples(
+                        total = it.optInt("total", 0),
+                        withMeta = it.optInt("withMeta", 0),
+                        withParams = it.optInt("withParams", 0),
+                    )
+                },
+                communityPrompt = o.optJSONObject("communityPrompt")?.let {
+                    CommunityPrompt(
+                        positive = it.strOrNull("positive"),
+                        negative = it.strOrNull("negative"),
+                        likes = it.optInt("likes", 0),
+                    )
+                },
+                confidenceNote = o.strOrNull("confidenceNote"),
+                introMissing = o.lenientBoolean("introMissing"),
             )
             out[key.lowercase()] = intro
             // 相对路径也建一份索引，供同名文件消歧
@@ -405,6 +505,53 @@ object ModelIntroTable {
     private fun JSONObject.strOrNull(key: String): String? {
         if (!has(key) || isNull(key)) return null
         return optString(key, "").takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * LoRA 权重建议（`{"min":0.7,"max":null,"default":null,...}`）。
+     *
+     * 数值字段用 optDouble 读，缺失/JSON null 一律归 null（**null 是形态语义**，见
+     * [LoraWeightSuggestion]）；字符串形态的数字也能读（optDouble 对 "0.7" 宽容），
+     * 读不到（非数字串）返回 NaN → 归 null，不抛异常。
+     */
+    private fun JSONObject.loraWeightOrNull(key: String): LoraWeightSuggestion? {
+        val obj = optJSONObject(key) ?: return null
+        fun num(field: String): Double? =
+            obj.optDouble(field, Double.NaN).takeIf { !it.isNaN() }
+        val suggestion = LoraWeightSuggestion(
+            min = num("min"),
+            max = num("max"),
+            default = num("default"),
+            source = obj.strOrNull("source"),
+            quote = obj.strOrNull("quote"),
+        )
+        // 四个值全是 null 的空壳（数据坏档）直接不建对象，界面整块不显示
+        return if (suggestion.shape == LoraWeightShape.EMPTY) null else suggestion
+    }
+
+    /**
+     * 社区常用参数（`{"sampler":{"value":"Euler a","count":17},...}`）。
+     *
+     * 键序按 [COMMUNITY_PARAM_ORDER] 固定（采样器 → CFG → 步数 → 调度器），未列出的新键
+     * 排后面——与 [strMap] 处理 params 的理由相同：org.json 底层是 HashMap，键序不保证。
+     */
+    private fun JSONObject.communityParams(key: String): Map<String, CommunityParam> {
+        val obj = optJSONObject(key) ?: return emptyMap()
+        val out = LinkedHashMap<String, CommunityParam>()
+        for (k in COMMUNITY_PARAM_ORDER) {
+            val item = obj.optJSONObject(k) ?: continue
+            val value = item.optString("value", "")
+            if (value.isNotBlank()) out[k] = CommunityParam(value = value, count = item.optInt("count", 0))
+        }
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (k in out) continue
+            val item = obj.optJSONObject(k) ?: continue
+            val value = item.optString("value", "")
+            if (k.isNotBlank() && value.isNotBlank()) out[k] = CommunityParam(value, item.optInt("count", 0))
+        }
+        return out
     }
 
     private fun JSONObject.strList(key: String): List<String> {
@@ -453,4 +600,7 @@ object ModelIntroTable {
     private val PARAM_ORDER = listOf(
         "步数", "CFG", "采样器", "调度器", "降噪", "推荐分辨率", "权重", "触发词"
     )
+
+    /** 社区常用参数键的显示顺序（英文枚举键 → 界面按此序显示中文标签）。 */
+    private val COMMUNITY_PARAM_ORDER = listOf("sampler", "cfg", "steps", "scheduler")
 }

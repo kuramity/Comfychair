@@ -53,6 +53,20 @@ sealed class SettingsRoute(val route: String) {
     data object ModelIntro : SettingsRoute("model_intro_settings")
 
     /**
+     * 模型介绍详情页（v4.17，二级页面）：从介绍抽屉的「查看完整详情」进入。
+     *
+     * 与 TagDetail 同一带参数路由模式：参数是介绍条目的 file 键（表的主键，稳定），
+     * 模型文件名可能含中文/空格/`:` 等，必须编码。
+     */
+    data object ModelIntroDetail : SettingsRoute("model_intro_detail/{file}") {
+        /** 参数名（供 NavHost 取值）。 */
+        const val ARG_FILE = "file"
+
+        /** 构造详情页路由（文件名可能含 `/` 等特殊字符，必须编码）。 */
+        fun createRoute(file: String): String = "model_intro_detail/${Uri.encode(file)}"
+    }
+
+    /**
      * 更新日志（离线只读 assets/CHANGELOG.md）。
      *
      * 二级页面：从「关于」页的更新日志卡片进入，不进底部导航 ——

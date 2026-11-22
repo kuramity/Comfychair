@@ -715,7 +715,7 @@
     <string name="sampler_param_pe_model">Enhancer model</string>
     <string name="sampler_param_pe_model_hint">Local gguf model used for rewriting. A bigger model follows instructions better but needs more VRAM: 4B ≈ 4.5 GB, 9B Q4_K_M ≈ 5.5 GB — both fit an 8 GB card, because the enhancer unloads itself before generation starts.</string>
     <string name="sampler_param_pe_mmproj">Vision projector</string>
-    <!-- MOSS 4K (prebuilt_33) hand-repair denoise: the placeholder detail_denoise2 would
+    <!-- hand-repair denoise labels: the placeholder detail_denoise2 would
          otherwise collide with the shucha refine-round label ("refine 2 denoise") -->
     <string name="sampler_param_detail_denoise_hand">Hand fix denoise</string>
     <string name="sampler_param_steps">Steps</string>
@@ -798,6 +798,29 @@
     <string name="model_intro_kind">Category</string>
     <string name="model_intro_effect_archive">LoRA effect archive (%1$d)</string>
     <string name="model_intro_effect_archive_orphan_only">Only in the effect archive (no model info yet)</string>
+    <!-- Model intro detail page (v4.17): full 20-section layout, entered from the intro sheet -->
+    <string name="model_intro_detail_title">Model details</string>
+    <string name="model_intro_open_detail">View full details</string>
+    <string name="model_intro_style_tags">Style</string>
+    <string name="model_intro_lora_weight">LoRA weight</string>
+    <string name="model_intro_lora_weight_range">%1$s – %2$s</string>
+    <string name="model_intro_lora_weight_range_default">%1$s – %2$s · default %3$s</string>
+    <string name="model_intro_lora_weight_min_only">No lower than %1$s</string>
+    <string name="model_intro_lora_weight_max_only">No higher than %1$s</string>
+    <string name="model_intro_lora_weight_default_only">Recommended %1$s</string>
+    <string name="model_intro_community_params">Community favorites</string>
+    <string name="model_intro_community_base">Based on %1$d sample images with params</string>
+    <string name="model_intro_community_count">· %1$d images</string>
+    <string name="model_intro_community_notice">Community data, for reference only</string>
+    <string name="model_intro_community_prompt">Community prompt</string>
+    <string name="model_intro_negative_prompt">Negative prompt</string>
+    <string name="model_intro_expand">Show all</string>
+    <string name="model_intro_collapse">Collapse</string>
+    <string name="model_intro_confidence_note">Confidence note</string>
+    <string name="model_intro_intro_missing">No full intro for this model — only basic info is available.</string>
+    <string name="model_intro_copy_params">Copy recommended params</string>
+    <string name="model_intro_copied">Copied</string>
+    <string name="model_intro_source_from">Source %1$s</string>
     <string name="model_list_loading">Loading model list…</string>
     <!-- Q3-3 (v4.16.5): model dropdown four states — failed (retryable) vs genuinely empty -->
     <string name="model_list_load_failed">Failed to load the model list — tap to retry</string>
@@ -868,7 +891,7 @@
     <string name="action_delete_selected">Delete selected</string>
 
     <!-- Friendly interception for a removed feature (legacy Timeline Director workflow) -->
-    <string name="msg_timeline_director_removed">This workflow uses the removed Timeline Director. Please use another video workflow.</string>
+    <string name="msg_workflow_feature_removed">This workflow uses a removed feature. Please use another workflow.</string>
 
     <!-- 超大图（原图超过下载上限时的降级提示） -->
     <string name="viewer_large_image_notice">Original too large — showing compressed preview</string>
@@ -900,28 +923,27 @@
     <!-- App-side fixed COMBO option (DynamicParamTypeResolver.FIXED_COMBO_OPTIONS): the MOSS
          five-mode integrated flow (prebuilt_30). Values are submitted as identifiers; these
          are display labels only -->
-    <string name="dynamic_param_moss_mode_label">Generation mode</string>
-    <!-- MOSS 4K (prebuilt_33/34) dynamic-param labels: second sampler pass, detail prompts,
-         three LoRA slots and the SeedVR2 lazy upscale switch -->
-    <string name="dynamic_param_moss_steps2_label">Second pass steps</string>
-    <string name="dynamic_param_moss_cfg2_label">Second pass CFG</string>
-    <string name="dynamic_param_moss_sampler2_label">Second pass sampler</string>
-    <string name="dynamic_param_moss_scheduler2_label">Second pass scheduler</string>
-    <string name="dynamic_param_moss_detail_prompt_face_label">Detail prompt · face</string>
-    <string name="dynamic_param_moss_detail_prompt_body_label">Detail prompt · body</string>
-    <string name="dynamic_param_moss_lora1_on_label">LoRA 1 switch</string>
-    <string name="dynamic_param_moss_lora1_strength_label">LoRA 1 weight</string>
-    <string name="dynamic_param_moss_lora2_on_label">LoRA 2 switch</string>
-    <string name="dynamic_param_moss_lora2_strength_label">LoRA 2 weight</string>
-    <string name="dynamic_param_moss_lora3_on_label">LoRA 3 switch</string>
-    <string name="dynamic_param_moss_lora3_strength_label">LoRA 3 weight</string>
-    <string name="dynamic_param_moss_seedvr2_enabled_label">4K upscale</string>
-    <string name="dynamic_param_moss_seedvr2_size_label">Upscale target size</string>
-    <string name="moss_mode_moss_25">25 steps</string>
-    <string name="moss_mode_moss_spec25">25 steps (Spectrum)</string>
-    <string name="moss_mode_moss_50">50 steps</string>
-    <string name="moss_mode_moss_c25">25 steps (Comfy)</string>
-    <string name="moss_mode_moss_28">28-step dual sampling</string>
+    <string name="dynamic_param_mode_label">Generation mode</string>
+    <!-- 动态参数标签 -->
+    <string name="dynamic_param_steps2_label">Second pass steps</string>
+    <string name="dynamic_param_cfg2_label">Second pass CFG</string>
+    <string name="dynamic_param_sampler2_label">Second pass sampler</string>
+    <string name="dynamic_param_scheduler2_label">Second pass scheduler</string>
+    <string name="dynamic_param_detail_prompt_face_label">Detail prompt · face</string>
+    <string name="dynamic_param_detail_prompt_body_label">Detail prompt · body</string>
+    <string name="dynamic_param_lora1_on_label">LoRA 1 switch</string>
+    <string name="dynamic_param_lora1_strength_label">LoRA 1 weight</string>
+    <string name="dynamic_param_lora2_on_label">LoRA 2 switch</string>
+    <string name="dynamic_param_lora2_strength_label">LoRA 2 weight</string>
+    <string name="dynamic_param_lora3_on_label">LoRA 3 switch</string>
+    <string name="dynamic_param_lora3_strength_label">LoRA 3 weight</string>
+    <string name="dynamic_param_seedvr2_enabled_label">4K upscale</string>
+    <string name="dynamic_param_seedvr2_size_label">Upscale target size</string>
+    <string name="moss_mode_opt_25">25 steps</string>
+    <string name="moss_mode_opt_spec25">25 steps (Spectrum)</string>
+    <string name="moss_mode_opt_50">50 steps</string>
+    <string name="moss_mode_opt_c25">25 steps (Comfy)</string>
+    <string name="moss_mode_opt_28">28-step dual sampling</string>
     <string name="update_channel_name">App update</string>
     <string name="update_channel_desc">Notifications for update download progress and readiness</string>
     <string name="update_dialog_title">App update</string>
@@ -984,6 +1006,22 @@
     <string name="update_action_cancel">Cancel</string>
     <!-- v4.8.2 取消失败不再假装成功 -->
     <string name="generation_cancel_failed">Cancel failed: the server did not acknowledge. The task is still running.</string>
+    <!-- 生成进度通知（后台 / 锁屏可见；只显示模式名 + 进度，不含提示词与图片） -->
+    <string name="notify_generation_channel_progress_name">Generation progress</string>
+    <string name="notify_generation_channel_progress_desc">Shows generation progress while the app is in the background</string>
+    <string name="notify_generation_channel_result_name">Generation results</string>
+    <string name="notify_generation_channel_result_desc">Completion and failure alerts for generations</string>
+    <string name="notify_generation_generic_title">Generation</string>
+    <string name="notify_generation_progress_text">Generating… %1$d%%</string>
+    <string name="notify_generation_progress_running">Generating…</string>
+    <string name="notify_generation_completed_title">Generation complete</string>
+    <string name="notify_generation_failed_title">Generation failed</string>
+    <string name="notify_generation_action_cancel">Cancel</string>
+    <string name="label_generation_notifications">Generation notifications</string>
+    <string name="desc_generation_notifications">Show progress in the notification shade while generating, and alert on completion or failure</string>
+    <!-- v4.18.x 后台省流量：后台保持连接开关（默认关） -->
+    <string name="label_background_keep_connected">Keep connection in background</string>
+    <string name="desc_background_keep_connected">Stay connected for instant results while the app is minimized or in a floating window. Off (recommended) saves data: on mobile networks the connection is closed and results arrive in batches. On Wi-Fi the connection is always kept. Enabling this consumes mobile data continuously.</string>
     <!-- v4.6.1 模块 A：取消归属校验提示 -->
     <string name="generation_cancel_not_owner">The running task was not started from this screen; cancel skipped</string>
     <string name="generation_cancel_no_active">No active task to cancel</string>

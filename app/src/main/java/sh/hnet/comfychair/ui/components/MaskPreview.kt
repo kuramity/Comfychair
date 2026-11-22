@@ -18,6 +18,36 @@ import androidx.compose.ui.unit.IntSize
 import sh.hnet.comfychair.viewmodel.MaskPathData
 
 /**
+ * 蒙版预览绘制画笔缓存（模式参考 WorkflowGraphCanvas 的 GraphPaintCache / MaskPaintCanvas
+ * 的 MaskEditorPaints）：原先在 Canvas 绘制 lambda 内每帧 new Paint + new PorterDuffXfermode
+ * （native 对象）。画笔只在 Compose 绘制线程访问，且每次使用前都会重设 style / strokeWidth
+ * （color、join、cap、xfermode 全程不变），跨帧复用不串味。
+ *
+ * 与编辑态（MaskEditorPaints）分开定义：预览蒙版是半透明红（alpha 180 直接画在笔迹上），
+ * 也没有橡皮预览/图层合成画笔，合并会让两条绘制路径互相牵扯。
+ */
+private class MaskPreviewPaints {
+    /** 蒙版笔迹：半透明红 */
+    val maskPaint = android.graphics.Paint().apply {
+        color = android.graphics.Color.argb(180, 255, 0, 0)
+        style = android.graphics.Paint.Style.STROKE
+        strokeJoin = android.graphics.Paint.Join.ROUND
+        strokeCap = android.graphics.Paint.Cap.ROUND
+        isAntiAlias = true
+    }
+
+    /** 橡皮擦落笔：CLEAR 模式切穿图层（Xfermode 为 native 对象，随画笔一起只建一次） */
+    val clearPaint = android.graphics.Paint().apply {
+        color = android.graphics.Color.TRANSPARENT
+        style = android.graphics.Paint.Style.STROKE
+        strokeJoin = android.graphics.Paint.Join.ROUND
+        strokeCap = android.graphics.Paint.Cap.ROUND
+        isAntiAlias = true
+        xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
+    }
+}
+
+/**
  * A read-only composable that displays a source image with mask overlay.
  * This is used for previewing the combined source image and mask without allowing editing.
  * The image is scaled to fill the container (center crop) and clipped to bounds.
@@ -33,6 +63,8 @@ fun MaskPreview(
     modifier: Modifier = Modifier
 ) {
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
+    // 绘制缓存：画笔（含 Xfermode）用 remember 持有，不随每帧重建
+    val paints = remember { MaskPreviewPaints() }
 
     // Calculate image rect for centerCrop scaling (fills the canvas, may crop image)
     fun calculateImageRect(canvasWidth: Int, canvasHeight: Int, imageWidth: Int, imageHeight: Int): Rect {
@@ -78,23 +110,11 @@ fun MaskPreview(
 
         // Draw mask paths using native canvas for proper transformation
         if (sourceImage != null && imgRect.width > 0 && imgRect.height > 0) {
-            val maskPaint = android.graphics.Paint().apply {
-                color = android.graphics.Color.argb(180, 255, 0, 0) // Semi-transparent red
-                style = android.graphics.Paint.Style.STROKE
-                strokeJoin = android.graphics.Paint.Join.ROUND
-                strokeCap = android.graphics.Paint.Cap.ROUND
-                isAntiAlias = true
-            }
+            // 画笔为 remember 缓存（MaskPreviewPaints），style / strokeWidth 在使用前重设
+            val maskPaint = paints.maskPaint
 
             // Paint for erasing (cuts through the layer)
-            val clearPaint = android.graphics.Paint().apply {
-                color = android.graphics.Color.TRANSPARENT
-                style = android.graphics.Paint.Style.STROKE
-                strokeJoin = android.graphics.Paint.Join.ROUND
-                strokeCap = android.graphics.Paint.Cap.ROUND
-                isAntiAlias = true
-                xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-            }
+            val clearPaint = paints.clearPaint
 
             // Save layer for the mask overlay - this allows CLEAR mode to work
             val layerBounds = android.graphics.RectF(0f, 0f, size.width, size.height)

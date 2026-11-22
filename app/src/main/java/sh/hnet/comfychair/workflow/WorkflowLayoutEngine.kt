@@ -579,8 +579,9 @@ class WorkflowLayoutEngine {
 
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
-        var maxX = Float.MIN_VALUE
-        var maxY = Float.MIN_VALUE
+        // Float.MIN_VALUE 是最小正数（1.4E-45）不是负向极值，maxX/maxY 必须用 -Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
 
         // Include nodes in bounds
         graph.nodes.forEach { node ->

@@ -112,7 +112,28 @@ internal object PreviewFramePolicy {
  */
 object ConnectionManager {
     private const val TAG = "Connection"
+
+    /**
+     * 应用层心跳间隔（发送 `{"type":"ping"}`）。
+     *
+     * v4.18.x 后台省流量：前台维持 30 秒现状；进入降级态（小窗失焦 / 真后台）由
+     * [sh.hnet.comfychair.lifecycle.BackgroundDegradationCoordinator] 通过
+     * [updateKeepaliveInterval] 放宽（UNMETERED 2 分钟 / 蜂窝 4 分钟，配合 OkHttp
+     * 协议层 pingInterval 同步放宽，见 ComfyUIClient.updateWebSocketPingInterval）。
+     */
     private const val KEEPALIVE_INTERVAL_MS = 30000L
+
+    /** 当前生效的心跳间隔（@Volatile：写侧在协调器协程，读侧在心跳协程循环） */
+    @Volatile
+    private var keepaliveIntervalMs = KEEPALIVE_INTERVAL_MS
+
+    /**
+     * 后台降级是否已挂起 WS（与 [reconnectBlocked] 分开的独立标记）：
+     * 只有降级挂起自己置的 reconnectBlocked 才允许在回前台时解除 ——
+     * 登出 / 认证失败设下的阻断不受回前台影响。
+     */
+    @Volatile
+    private var backgroundSuspended = false
 
     /** 重连退避封顶：2s→4s→8s→16s→30s，之后保持 30s 一次，直到连上或被显式阻断。 */
     private const val MAX_RECONNECT_BACKOFF_MS = 30_000L
@@ -253,6 +274,19 @@ object ConnectionManager {
     private var modelListWatchdog: Job? = null
 
     /**
+     * /object_info 闸门的**请求序号**（每次成功进闸自增）。
+     *
+     * 与 [modelListGeneration]（连接会话代次）不同：它按"进闸请求"计数，用来识别
+     * 看门狗提前放行后谁是当前闸门的持有者。看门狗 60 秒触发 [SingleFlight.exit] 时
+     * 原回调可能仍在飞；此后新请求 [fetchServerData] 成功 tryEnter，旧回调迟到时
+     * 若在 finally 里无条件 exit，会把新请求持有的闸门错放出去（第三条链路即可真正
+     * 并发在飞，两个回调交错写 [\_modelCache]）。自增只发生在闸门持有者内
+     * （tryEnter 互斥），@Volatile 保证 OkHttp 回调线程读到最新值。
+     */
+    @Volatile
+    private var objectInfoFetchSerial = 0L
+
+    /**
      * 自增模型列表会话代次并取消看门狗。
      *
      * 在 [connect] 建立新会话与 [disconnect] 断开时调用：此后任何在飞的 `/object_info`
@@ -344,6 +378,13 @@ object ConnectionManager {
      */
     @Volatile
     private var reconnectBlocked = false
+    /**
+     * 心跳协程句柄。跨线程读写（与上方 [modelListWatchdog] 同族）：startKeepalive 在
+     * 连接成功回调里写入，stopKeepalive 在 onFailure / onClosed / disconnect 里取消并
+     * 置空，不同 OkHttp 回调线程之间没有 happens-before，不加 @Volatile 时可能读到
+     * 旧句柄、把已停掉的心跳再取消一遍而漏掉现行的那份。
+     */
+    @Volatile
     private var keepaliveJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -1468,7 +1509,8 @@ object ConnectionManager {
         keepaliveJob?.cancel()
         keepaliveJob = scope.launch {
             while (isActive && _webSocketState.value is WebSocketState.Connected) {
-                delay(KEEPALIVE_INTERVAL_MS)
+                // 每轮读当前间隔（v4.18.x：降级放宽 / 回前台收紧，值由 updateKeepaliveInterval 维护）
+                delay(keepaliveIntervalMs)
                 if (_webSocketState.value is WebSocketState.Connected) {
                     _client?.sendWebSocketMessage("{\"type\":\"ping\"}")
                 }
@@ -1482,6 +1524,64 @@ object ConnectionManager {
     private fun stopKeepalive() {
         keepaliveJob?.cancel()
         keepaliveJob = null
+    }
+
+    /**
+     * 更新应用层心跳间隔（v4.18.x 后台省流量）。
+     *
+     * 放宽（30s → 120s/240s）：写变量即可，心跳循环每轮读值，旧 delay 最多 30 秒后生效，
+     * 行为平滑；收紧（120s/240s → 30s，即回前台）：立即重启心跳协程，否则最长要等
+     * 一个旧间隔（2-4 分钟）才恢复前台节奏。
+     */
+    fun updateKeepaliveInterval(intervalMs: Long) {
+        val previous = keepaliveIntervalMs
+        keepaliveIntervalMs = intervalMs
+        if (intervalMs < previous && keepaliveJob?.isActive == true) {
+            startKeepalive()
+        }
+    }
+
+    /**
+     * 后台降级：主动挂起 WebSocket（v4.18.x，蜂窝 + 未开「后台保持连接」时）。
+     *
+     * 与 [disconnect] 的本质区别：**只断 WS 通道，连接会话（client / 凭据 / 状态流）原样保留**
+     * —— 解除挂起（[resumeWebSocketFromSuspension]）直接 [openWebSocket] 秒回，无需重走握手。
+     *
+     * 处理顺序：置阻断（拦新重连）→ 取消已在退避睡眠的重连 job（否则它到点仍会
+     * testConnection + openWebSocket，把刚挂起的连接又建回来）→ 走 [closeWebSocketInternal]
+     * 干净收尾（停心跳 + 作废回调 + 关 socket + Disconnected，不落 Failed —— 挂起不是
+     * 故障，不该触发模态告警）。
+     */
+    @Synchronized
+    fun suspendWebSocketForBackground(reason: String) {
+        if (backgroundSuspended) return
+        backgroundSuspended = true
+        DebugLogger.i(TAG, "后台降级：挂起 WebSocket（$reason）")
+        reconnectBlocked = true
+        pendingReconnectJob?.cancel()
+        pendingReconnectJob = null
+        closeWebSocketInternal()
+    }
+
+    /**
+     * 解除降级挂起：恢复被 [suspendWebSocketForBackground] 断开的 WebSocket。
+     *
+     * 触发场景：回前台，或降级态中策略切回「保持连接」（WiFi 恢复 / 用户打开开关）。
+     * 只处理降级挂起（[backgroundSuspended]）；登出 / 认证失败设下的 [reconnectBlocked]
+     * 不动。连接会话仍在（HTTP 层 Connected）且 WS 不在 Connected/Connecting 时直接重建；
+     * 若期间 WS 因别的原因已断，重建失败的 onFailure 会照常走自动重连兜底。
+     */
+    fun resumeWebSocketFromSuspension() {
+        if (!backgroundSuspended) return
+        backgroundSuspended = false
+        reconnectBlocked = false
+        reconnectAttempts = 0
+        if (_client == null) return
+        if (connectionState.value !is ConnectionState.Connected) return
+        val wsState = _webSocketState.value
+        if (wsState is WebSocketState.Connected || wsState is WebSocketState.Connecting) return
+        DebugLogger.i(TAG, "解除降级挂起：恢复 WebSocket 连接")
+        openWebSocket()
     }
 
     /**
@@ -1664,6 +1764,10 @@ object ConnectionManager {
         }
 
         DebugLogger.i(TAG, "Fetching server data from /object_info")
+        // 本次进闸的请求序号：自增只发生在闸门持有者内（tryEnter 互斥，天然串行）。
+        // 回调 finally 里用它判断"自己是否仍是闸门持有者"——看门狗会提前 exit 放行
+        // 新请求，迟到回调不能再无条件 exit（否则错放新请求的闸门）。
+        val serialAtStart = ++objectInfoFetchSerial
         // 本次拉取的会话代次：回调与磁盘预填都按它判新旧（G7 指令 3「不得在过渡态下
         // 发起而再次被吞」的落点 —— 过渡态/旧会话的迟到响应一律丢弃）
         val generationAtStart = modelListGeneration
@@ -1752,9 +1856,19 @@ object ConnectionManager {
                     markCategoriesFailed("Failed to fetch server data")
                 }
             } finally {
-                // 成功、失败、回调内异常三条路径都必须释放闸门——忘记复位会让
-                // 之后所有补拉/手点被永久跳过（见 [SingleFlight] 类注释）
-                objectInfoFetchGate.exit()
+                // 成功、失败、回调内异常三条路径都要释放闸门——忘记复位会让之后所有
+                // 补拉/手点被永久跳过（见 [SingleFlight] 类注释）。但仅当自己仍是最后一个
+                // 进闸的请求时才释放：看门狗可能已提前 exit 并放行了新请求（序号已变），
+                // 迟到回调此时无条件 exit 会把新请求持有的闸门错放出去，第三条链路
+                // 就能真正并发在飞。序号相等时本回调就是持有者（exit 幂等，重复释放无害）。
+                if (serialAtStart == objectInfoFetchSerial) {
+                    objectInfoFetchGate.exit()
+                } else {
+                    DebugLogger.i(
+                        TAG,
+                        "跳过迟到回调的闸门释放：请求序号 $serialAtStart 已过期（当前 $objectInfoFetchSerial），闸门归新请求"
+                    )
+                }
             }
         }
     }

@@ -121,6 +121,9 @@ private class GraphPaintCache {
     val noteTitle = Paint()
     val noteContent = Paint()
 
+    /** 分组标题画笔：drawGroup 内每帧每分组 new Paint 的热点，同 noteTitle 口径复用。 */
+    val groupTitle = Paint()
+
     /** 节点圆角裁剪路径：每个节点用 rewind 重写同一个 Path，避免每帧每节点分配原生 Path。 */
     val nodeClipPath = Path()
 }
@@ -1568,7 +1571,8 @@ fun WorkflowGraphCanvas(
                         colors = colors,
                         alpha = alpha,
                         showEditIcon = isEditMode,
-                        editIconDrawable = editIconDrawable
+                        editIconDrawable = editIconDrawable,
+                        paints = graphPaintCache
                     )
                 }
             }
@@ -2599,7 +2603,9 @@ private fun DrawScope.drawGroup(
     colors: CanvasColors,
     alpha: Float = 1f,
     showEditIcon: Boolean = false,
-    editIconDrawable: Drawable? = null
+    editIconDrawable: Drawable? = null,
+    // 绘制缓存（Paint 复用），由调用方 remember 持有，与 drawNote 同口径
+    paints: GraphPaintCache
 ) {
     val groupColor = colors.groupColor
 
@@ -2627,7 +2633,7 @@ private fun DrawScope.drawGroup(
     // Draw title text and edit icon
     drawContext.canvas.nativeCanvas.apply {
         val titleColorArgb = groupColor.copy(alpha = alpha).toArgb()
-        val titlePaint = android.graphics.Paint().apply {
+        val titlePaint = paints.groupTitle.apply {
             color = titleColorArgb
             textSize = fontSize
             typeface = android.graphics.Typeface.DEFAULT_BOLD

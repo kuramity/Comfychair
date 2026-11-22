@@ -20,6 +20,8 @@ import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
+import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.GalleryMetadataCache
@@ -347,6 +349,16 @@ class GalleryRepository private constructor() {
         periodicRefreshJob = scope.launch {
             while (true) {
                 delay(PERIODIC_REFRESH_INTERVAL_MS)
+                // v4.18.x 后台省流量（首要元凶修复）：后台完全停掉周期刷新 ——
+                // 旧行为是后台每 5 分钟全量拉一次 /history（每条带完整 prompt JSON，
+                // 估算 150~860 MB/天），正是安全管家报「后台耗流量」的主犯。
+                // 现在只有前台才发请求；回前台 / 收到任务完成事件的拉取由调用方另起。
+                if (!BackgroundDegradationPolicy.shouldPeriodicHistoryRefresh(
+                        AppLifecycleMonitor.visibility.value
+                    )
+                ) {
+                    continue
+                }
                 if (comfyUIClient != null && !_isLoading.value && !_isRefreshing.value) {
                     loadGalleryInternal(isRefresh = true)
                 }
@@ -440,7 +452,12 @@ class GalleryRepository private constructor() {
                 // 外层 try/catch 根本捕不到，直接进程崩溃。现在两道防护：
                 // ① 延续 isActive 判定；② client.fetchAllHistory 内部只投递一次。
                 awaitCallbackOnce<JSONObject?> { deliver ->
-                    client.fetchAllHistory { history -> deliver(history) }
+                    // v4.18.x：带 max_items 上限（服务端支持 ?max_items=N）。全量响应每条
+                    // 含完整 prompt JSON，历史攒多后一次可达数十 MB；上限外的旧条目由
+                    // 本地索引合并兜底（mergeMetadata 只增不减），不会从图库消失。
+                    client.fetchAllHistory(maxItems = BackgroundDegradationPolicy.HISTORY_MAX_ITEMS) { history ->
+                        deliver(history)
+                    }
                 }
             }
 
@@ -640,6 +657,16 @@ class GalleryRepository private constructor() {
     private val _trashEntries = MutableStateFlow<List<GalleryTrashEntry>>(emptyList())
     val trashEntries: StateFlow<List<GalleryTrashEntry>> = _trashEntries.asStateFlow()
 
+    /**
+     * _trashEntries「读快照 → 计算 → 全量覆盖写盘 → 回写」的互斥锁。
+     *
+     * 四个写入口（moveToTrashInternal / restoreFromTrash / finishLocalCleanup / markEntry）
+     * 调用线程不同（部分 IO、部分主线程），无锁时后写方会用旧快照覆盖先写方，
+     * 刚进回收站的条目会从磁盘消失（图库与回收站都找不到）。锁内只做磁盘 IO，
+     * 不含 suspend 调用（四个入口均为普通函数）。
+     */
+    private val trashEntriesLock = Any()
+
     private var trashLoaded = false
 
     /** 首次访问时从磁盘加载回收站（幂等；purge/restore 内部会自触发，UI 打开回收站前也应调用一次）。 */
@@ -685,18 +712,22 @@ class GalleryRepository private constructor() {
                 deletedAt = now
             )
         }
-        val previousEntries = _trashEntries.value
-        val merged = dedupeTrash(previousEntries, fresh) { it.identityKey }
-        // R2：先落盘再动内存。回收站写失败时**取消这次删除**——否则墓碑（下发在
-        // removeFromGallery）会让图片从图库消失，而回收站里没有记录，用户永远恢复不了。
-        // context 为空 = 无法落盘，按失败处理（不能把「没写」当成「写成功」）。
-        val persisted = applicationContext?.let { GalleryTrashStorage.saveAll(it, merged) } ?: false
-        if (!persisted) {
-            _trashEntries.value = previousEntries
-            DebugLogger.e(TAG, "回收站落盘失败，已取消本次移入回收站（列表/墓碑保持不动）")
-            return emptyList()
+        // 读快照 → 计算 → 全量覆盖写盘 → 回写整段持锁；失败路径非局部返回，成功把 merged 带出去
+        val merged = synchronized(trashEntriesLock) {
+            val previousEntries = _trashEntries.value
+            val merged = dedupeTrash(previousEntries, fresh) { it.identityKey }
+            // R2：先落盘再动内存。回收站写失败时**取消这次删除**——否则墓碑（下发在
+            // removeFromGallery）会让图片从图库消失，而回收站里没有记录，用户永远恢复不了。
+            // context 为空 = 无法落盘，按失败处理（不能把「没写」当成「写成功」）。
+            val persisted = applicationContext?.let { GalleryTrashStorage.saveAll(it, merged) } ?: false
+            if (!persisted) {
+                _trashEntries.value = previousEntries
+                DebugLogger.e(TAG, "回收站落盘失败，已取消本次移入回收站（列表/墓碑保持不动）")
+                return emptyList()
+            }
+            _trashEntries.value = merged
+            merged
         }
-        _trashEntries.value = merged
         // 列表、墓碑立刻生效；evictMedia = false 是"可恢复"的前提
         removeFromGallery(
             keys = items.mapTo(mutableSetOf()) {
@@ -720,32 +751,37 @@ class GalleryRepository private constructor() {
      */
     fun restoreFromTrash(identityKey: String): Boolean {
         ensureTrashLoaded()
-        val entry = _trashEntries.value.firstOrNull { it.identityKey == identityKey } ?: return false
-        val remaining = _trashEntries.value.filterNot { it.identityKey == identityKey }
-        val key = GalleryMetadataCache.itemIdentityKey(entry.item.promptId, entry.item.filename)
+        // 从读到回写整段持锁（含墓碑清理）：中途出锁的话，另一个写入口可能在这段
+        // 间隙用旧快照全量覆盖写盘，把刚进站的条目从磁盘上抹掉。
+        val entry = synchronized(trashEntriesLock) {
+            val entry = _trashEntries.value.firstOrNull { it.identityKey == identityKey } ?: return false
+            val remaining = _trashEntries.value.filterNot { it.identityKey == identityKey }
+            val key = GalleryMetadataCache.itemIdentityKey(entry.item.promptId, entry.item.filename)
 
-        // R2：顺序改为"先删墓碑（恢复意图落盘）→ 再落盘回收站剩余条目 → 最后动内存"。
-        // 墓碑删不掉就整体取消：条目还在回收站，用户可重试，图库保持原样。
-        val context = applicationContext
-        val tombstonesCleared = context?.let {
-            GalleryMetadataCache.removeTombstones(it, entry.serverId, setOf(key))
-        } ?: false
-        if (!tombstonesCleared) {
-            DebugLogger.e(TAG, "墓碑清理失败，取消本次恢复（条目仍在回收站）: ${entry.item.filename}")
-            return false
-        }
-        synchronized(pendingDeletions) { pendingDeletions.remove(key) }
+            // R2：顺序改为"先删墓碑（恢复意图落盘）→ 再落盘回收站剩余条目 → 最后动内存"。
+            // 墓碑删不掉就整体取消：条目还在回收站，用户可重试，图库保持原样。
+            val context = applicationContext
+            val tombstonesCleared = context?.let {
+                GalleryMetadataCache.removeTombstones(it, entry.serverId, setOf(key))
+            } ?: false
+            if (!tombstonesCleared) {
+                DebugLogger.e(TAG, "墓碑清理失败，取消本次恢复（条目仍在回收站）: ${entry.item.filename}")
+                return false
+            }
+            synchronized(pendingDeletions) { pendingDeletions.remove(key) }
 
-        val persisted = context?.let { GalleryTrashStorage.saveAll(it, remaining) } ?: false
-        if (persisted) {
-            _trashEntries.value = remaining
-        } else {
-            // 墓碑已清 = 图库侧的恢复已经生效；回收站记录没能删掉，重启后这条会重复出现，
-            // 用户可再清一次。内存保持与磁盘一致（条目仍显示在回收站），不静默。
-            DebugLogger.e(
-                TAG,
-                "回收站记录未能落盘（恢复已生效，该条目可能在回收站重复出现）: ${entry.item.filename}"
-            )
+            val persisted = context?.let { GalleryTrashStorage.saveAll(it, remaining) } ?: false
+            if (persisted) {
+                _trashEntries.value = remaining
+            } else {
+                // 墓碑已清 = 图库侧的恢复已经生效；回收站记录没能删掉，重启后这条会重复出现，
+                // 用户可再清一次。内存保持与磁盘一致（条目仍显示在回收站），不静默。
+                DebugLogger.e(
+                    TAG,
+                    "回收站记录未能落盘（恢复已生效，该条目可能在回收站重复出现）: ${entry.item.filename}"
+                )
+            }
+            entry
         }
 
         val items = _galleryItems.value.toMutableList()
@@ -913,23 +949,27 @@ class GalleryRepository private constructor() {
         if (context != null) {
             GalleryMetadataCache.removeFromIndex(context, serverId, setOf(tombstoneKey))
         }
-        _trashEntries.value = _trashEntries.value.filterNot { it.identityKey == entry.identityKey }
-        val persisted = applicationContext?.let { GalleryTrashStorage.saveAll(it, _trashEntries.value) } ?: false
-        if (!persisted) {
-            // 服务器文件已删、回收站记录没删掉：下次启动这条会重新出现，可再清一次
-            // （服务器侧是幂等 404）。这里必须明确记失败，不能让人以为已经清理干净。
-            DebugLogger.e(TAG, "回收站清理结果未能落盘（条目可能在下次启动重现）: ${entry.item.filename}")
+        synchronized(trashEntriesLock) {
+            _trashEntries.value = _trashEntries.value.filterNot { it.identityKey == entry.identityKey }
+            val persisted = applicationContext?.let { GalleryTrashStorage.saveAll(it, _trashEntries.value) } ?: false
+            if (!persisted) {
+                // 服务器文件已删、回收站记录没删掉：下次启动这条会重新出现，可再清一次
+                // （服务器侧是幂等 404）。这里必须明确记失败，不能让人以为已经清理干净。
+                DebugLogger.e(TAG, "回收站清理结果未能落盘（条目可能在下次启动重现）: ${entry.item.filename}")
+            }
         }
     }
 
     /** 更新单条回收站记录的重试标记并落盘（条目**留在**回收站，列表不减）。 */
     private fun markEntry(identityKey: String, pendingRetry: Boolean, error: String?) {
-        _trashEntries.value = _trashEntries.value.map {
-            if (it.identityKey == identityKey) it.copy(pendingRetry = pendingRetry, lastError = error) else it
-        }
-        val persisted = applicationContext?.let { GalleryTrashStorage.saveAll(it, _trashEntries.value) } ?: false
-        if (!persisted) {
-            DebugLogger.e(TAG, "回收站待重试标记未能落盘（重启后仍会重新探测）: $identityKey")
+        synchronized(trashEntriesLock) {
+            _trashEntries.value = _trashEntries.value.map {
+                if (it.identityKey == identityKey) it.copy(pendingRetry = pendingRetry, lastError = error) else it
+            }
+            val persisted = applicationContext?.let { GalleryTrashStorage.saveAll(it, _trashEntries.value) } ?: false
+            if (!persisted) {
+                DebugLogger.e(TAG, "回收站待重试标记未能落盘（重启后仍会重新探测）: $identityKey")
+            }
         }
     }
 

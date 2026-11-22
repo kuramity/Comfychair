@@ -94,8 +94,10 @@ class WorkflowParser {
                         templateKeys.add(key)
                         // Also track the placeholder name for the graph
                         allTemplateVars.add(placeholderName)
-                        // Track mapped field: (nodeId, inputName) -> placeholderName
-                        mappedFields[Pair(nodeId, key)] = placeholderName
+                        // Track mapped field: (nodeId, inputName) -> placeholderName。
+                        // 同一输入含多个占位符时保留第一个，避免后匹配的覆盖先匹配的
+                        //（当前结构是单值映射，无法完整表达多占位符字段）
+                        mappedFields.putIfAbsent(Pair(nodeId, key), placeholderName)
                     }
                 }
             }
@@ -312,8 +314,11 @@ class WorkflowParser {
         for (key in inputsJson.keys()) {
             val value = inputsJson.get(key)
             result[key] = when {
-                // Connection format: ["nodeId", outputIndex]
-                value is JSONArray && value.length() == 2 -> {
+                // Connection format: ["nodeId", outputIndex]。与 LiteGraphConverter 的判据同口径：
+                // 连线首元素一定是 String、第二元素是数字；数值型 2 元字面量（如 [11, 0]）
+                // 不能被当成连线，否则序列化回写会把原始数值改写成 ["11", 0]（数据损坏）
+                value is JSONArray && value.length() == 2 &&
+                    value.opt(0) is String && value.opt(1) is Number -> {
                     try {
                         InputValue.Connection(
                             sourceNodeId = value.getString(0),

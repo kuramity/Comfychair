@@ -690,20 +690,33 @@
     <string name="model_list_empty">Keine Modelle auf dem Server verfügbar</string>
     <!-- P3-10: kein Gerät/keine App kann den externen Link öffnen -->
     <string name="error_open_link_failed">Keine App zum Öffnen dieses Links gefunden</string>
-    <!-- MOSS 4K (prebuilt_33/34): Labels für dynamische Parameter -->
-    <string name="dynamic_param_moss_steps2_label">Schritte (zweiter Durchlauf)</string>
-    <string name="dynamic_param_moss_cfg2_label">CFG (zweiter Durchlauf)</string>
-    <string name="dynamic_param_moss_sampler2_label">Sampler (zweiter Durchlauf)</string>
-    <string name="dynamic_param_moss_scheduler2_label">Scheduler (zweiter Durchlauf)</string>
-    <string name="dynamic_param_moss_detail_prompt_face_label">Detailprompt · Gesicht</string>
-    <string name="dynamic_param_moss_detail_prompt_body_label">Detailprompt · Körper</string>
-    <string name="dynamic_param_moss_lora1_on_label">LoRA 1 (Ein/Aus)</string>
-    <string name="dynamic_param_moss_lora1_strength_label">LoRA 1 (Stärke)</string>
-    <string name="dynamic_param_moss_lora2_on_label">LoRA 2 (Ein/Aus)</string>
-    <string name="dynamic_param_moss_lora2_strength_label">LoRA 2 (Stärke)</string>
-    <string name="dynamic_param_moss_lora3_on_label">LoRA 3 (Ein/Aus)</string>
-    <string name="dynamic_param_moss_lora3_strength_label">LoRA 3 (Stärke)</string>
-    <string name="dynamic_param_moss_seedvr2_enabled_label">4K-Hochskalierung</string>
-    <string name="dynamic_param_moss_seedvr2_size_label">Zielgröße der Hochskalierung</string>
+    <!-- labels for dynamic params -->
+    <string name="dynamic_param_steps2_label">Schritte (zweiter Durchlauf)</string>
+    <string name="dynamic_param_cfg2_label">CFG (zweiter Durchlauf)</string>
+    <string name="dynamic_param_sampler2_label">Sampler (zweiter Durchlauf)</string>
+    <string name="dynamic_param_scheduler2_label">Scheduler (zweiter Durchlauf)</string>
+    <string name="dynamic_param_detail_prompt_face_label">Detailprompt · Gesicht</string>
+    <string name="dynamic_param_detail_prompt_body_label">Detailprompt · Körper</string>
+    <string name="dynamic_param_lora1_on_label">LoRA 1 (Ein/Aus)</string>
+    <string name="dynamic_param_lora1_strength_label">LoRA 1 (Stärke)</string>
+    <string name="dynamic_param_lora2_on_label">LoRA 2 (Ein/Aus)</string>
+    <string name="dynamic_param_lora2_strength_label">LoRA 2 (Stärke)</string>
+    <string name="dynamic_param_lora3_on_label">LoRA 3 (Ein/Aus)</string>
+    <string name="dynamic_param_lora3_strength_label">LoRA 3 (Stärke)</string>
+    <string name="dynamic_param_seedvr2_enabled_label">4K-Hochskalierung</string>
+    <string name="dynamic_param_seedvr2_size_label">Zielgröße der Hochskalierung</string>
     <string name="sampler_param_detail_denoise_hand">Denoising der Handreparatur</string>
+    <!-- Generierungsbenachrichtigungen (Hintergrund/Sperrbildschirm; nur Modusname + Fortschritt) -->
+    <string name="notify_generation_channel_progress_name">Generierungsfortschritt</string>
+    <string name="notify_generation_channel_progress_desc">Zeigt den Generierungsfortschritt an, während die App im Hintergrund ist</string>
+    <string name="notify_generation_channel_result_name">Generierungsergebnisse</string>
+    <string name="notify_generation_channel_result_desc">Hinweise zu abgeschlossenen und fehlgeschlagenen Generierungen</string>
+    <string name="notify_generation_generic_title">Generierung</string>
+    <string name="notify_generation_progress_text">Generierung… %1$d%%</string>
+    <string name="notify_generation_progress_running">Generierung…</string>
+    <string name="notify_generation_completed_title">Generierung abgeschlossen</string>
+    <string name="notify_generation_failed_title">Generierung fehlgeschlagen</string>
+    <string name="notify_generation_action_cancel">Abbrechen</string>
+    <string name="label_generation_notifications">Generierungsbenachrichtigungen</string>
+    <string name="desc_generation_notifications">Zeigt während der Generierung den Fortschritt im Benachrichtigungsfeld und meldet Abschluss oder Fehlschlag</string>
 </resources>

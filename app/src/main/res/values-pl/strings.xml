@@ -692,20 +692,33 @@
     <string name="model_list_empty">Brak dostępnych modeli na serwerze</string>
     <!-- P3-10: żadna aplikacja nie może otworzyć linku zewnętrznego -->
     <string name="error_open_link_failed">Brak aplikacji, która może otworzyć ten link</string>
-    <!-- MOSS 4K (prebuilt_33/34): etykiety parametrów dynamicznych -->
-    <string name="dynamic_param_moss_steps2_label">Kroki (drugi przebieg)</string>
-    <string name="dynamic_param_moss_cfg2_label">CFG (drugi przebieg)</string>
-    <string name="dynamic_param_moss_sampler2_label">Sampler (drugi przebieg)</string>
-    <string name="dynamic_param_moss_scheduler2_label">Scheduler (drugi przebieg)</string>
-    <string name="dynamic_param_moss_detail_prompt_face_label">Prompt szczegółów · twarz</string>
-    <string name="dynamic_param_moss_detail_prompt_body_label">Prompt szczegółów · ciało</string>
-    <string name="dynamic_param_moss_lora1_on_label">Przełącznik LoRA 1</string>
-    <string name="dynamic_param_moss_lora1_strength_label">Waga LoRA 1</string>
-    <string name="dynamic_param_moss_lora2_on_label">Przełącznik LoRA 2</string>
-    <string name="dynamic_param_moss_lora2_strength_label">Waga LoRA 2</string>
-    <string name="dynamic_param_moss_lora3_on_label">Przełącznik LoRA 3</string>
-    <string name="dynamic_param_moss_lora3_strength_label">Waga LoRA 3</string>
-    <string name="dynamic_param_moss_seedvr2_enabled_label">Powiększanie do 4K</string>
-    <string name="dynamic_param_moss_seedvr2_size_label">Docelowy rozmiar powiększenia</string>
+    <!-- labels for dynamic params -->
+    <string name="dynamic_param_steps2_label">Kroki (drugi przebieg)</string>
+    <string name="dynamic_param_cfg2_label">CFG (drugi przebieg)</string>
+    <string name="dynamic_param_sampler2_label">Sampler (drugi przebieg)</string>
+    <string name="dynamic_param_scheduler2_label">Scheduler (drugi przebieg)</string>
+    <string name="dynamic_param_detail_prompt_face_label">Prompt szczegółów · twarz</string>
+    <string name="dynamic_param_detail_prompt_body_label">Prompt szczegółów · ciało</string>
+    <string name="dynamic_param_lora1_on_label">Przełącznik LoRA 1</string>
+    <string name="dynamic_param_lora1_strength_label">Waga LoRA 1</string>
+    <string name="dynamic_param_lora2_on_label">Przełącznik LoRA 2</string>
+    <string name="dynamic_param_lora2_strength_label">Waga LoRA 2</string>
+    <string name="dynamic_param_lora3_on_label">Przełącznik LoRA 3</string>
+    <string name="dynamic_param_lora3_strength_label">Waga LoRA 3</string>
+    <string name="dynamic_param_seedvr2_enabled_label">Powiększanie do 4K</string>
+    <string name="dynamic_param_seedvr2_size_label">Docelowy rozmiar powiększenia</string>
     <string name="sampler_param_detail_denoise_hand">Siła retuszu dłoni</string>
+    <!-- Powiadomienia o generowaniu (tło/ekran blokady; tylko nazwa trybu + postęp) -->
+    <string name="notify_generation_channel_progress_name">Postęp generowania</string>
+    <string name="notify_generation_channel_progress_desc">Pokazuje postęp generowania, gdy aplikacja jest w tle</string>
+    <string name="notify_generation_channel_result_name">Wyniki generowania</string>
+    <string name="notify_generation_channel_result_desc">Powiadomienia o zakończeniu lub niepowodzeniu generowania</string>
+    <string name="notify_generation_generic_title">Generowanie</string>
+    <string name="notify_generation_progress_text">Generowanie… %1$d%%</string>
+    <string name="notify_generation_progress_running">Generowanie…</string>
+    <string name="notify_generation_completed_title">Generowanie zakończone</string>
+    <string name="notify_generation_failed_title">Generowanie nieudane</string>
+    <string name="notify_generation_action_cancel">Anuluj</string>
+    <string name="label_generation_notifications">Powiadomienia o generowaniu</string>
+    <string name="desc_generation_notifications">Pokazuje postęp na pasku powiadomień podczas generowania i informuje o zakończeniu lub niepowodzeniu</string>
 </resources>

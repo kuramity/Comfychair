@@ -115,7 +115,7 @@ internal sealed interface IntroRow {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ModelIntroScreen(onBack: () -> Unit) {
+fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}) {
     val context = LocalContext.current
     var entries by remember { mutableStateOf<List<ModelIntro>>(emptyList()) }
     var expanded by remember { mutableStateOf(emptySet<String>()) }
@@ -295,7 +295,15 @@ fun ModelIntroScreen(onBack: () -> Unit) {
     }
 
     detail?.let { intro ->
-        ModelIntroSheet(intro = intro, onDismiss = { detail = null })
+        ModelIntroSheet(
+            intro = intro,
+            onDismiss = { detail = null },
+            // v4.17：抽屉是快速预览，「查看完整详情」进二级页面（20 区块完整版）
+            onOpenDetail = {
+                detail = null
+                onOpenDetail(intro)
+            }
+        )
     }
 }
 
