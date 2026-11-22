@@ -1498,6 +1498,15 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
         val length = state.length.toIntOrNull() ?: return null
         val fps = state.fps.toIntOrNull() ?: return null
 
+        // 提交前兜底（1.3）：与文生视频同理，取值来自缺省常量，仍在进占位符替换前统一清洗。
+        // 改了值就同步回界面（与文生图 prepareWorkflowJson 同口径：下拉框不该继续显示脏值）
+        val safeSampler = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers)
+        val safeScheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers)
+        if (safeSampler != state.sampler || safeScheduler != state.scheduler) {
+            DebugLogger.w(TAG, "采样参数非法，已纠正为 sampler=$safeSampler, scheduler=$safeScheduler")
+            _uiState.update { it.copy(sampler = safeSampler, scheduler = safeScheduler) }
+        }
+
         _uiState.update { it.copy(isUploading = true) }
         return try {
             // 逐张上传已填图位。一张都没填时直接放弃：注入器会把整条图片链路删光，
@@ -1562,8 +1571,8 @@ class ImageToVideoViewModel : BaseGenerationViewModel<ImageToVideoUiState, Image
                 steps = state.steps.toIntOrNull(),
                 cfg = state.cfg.toFloatOrNull(),
                 // 提交前兜底（1.3）：与文生视频同理，取值来自缺省常量，仍在进占位符替换前统一清洗
-                samplerName = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers),
-                scheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers),
+                samplerName = safeSampler,
+                scheduler = safeScheduler,
                 denoise = state.denoise.toFloatOrNull(),
                 seed = state.seed.toLongOrNull(),
                 randomSeed = state.randomSeed,

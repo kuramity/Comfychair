@@ -683,6 +683,9 @@
     <string name="sampler_param_pe_model">强化模型</string>
     <string name="sampler_param_pe_model_hint">用来改写提示词的本地 gguf 模型。越大的模型指令遵循越好、也越吃显存：4B 约 4.5GB，9B(Q4_K_M) 约 5.5GB —— 8GB 卡两者都放得下，因为强化跑完会自动卸载再出图。</string>
     <string name="sampler_param_pe_mmproj">视觉投影</string>
+    <!-- MOSS 4K（prebuilt_33）的手部修复去噪强度：detail_denoise2 会被 detail_ 前缀
+         + denoise2 后缀误配进竖叉流「分次补采」标签，此处给专属文案 -->
+    <string name="sampler_param_detail_denoise_hand">手部修复去噪强度</string>
     <string name="sampler_param_steps">步数</string>
     <string name="sampler_param_cfg">CFG</string>
     <string name="sampler_param_denoise">去噪强度</string>
@@ -757,6 +760,22 @@
     <!-- App 端固定 COMBO 选项（DynamicParamTypeResolver.FIXED_COMBO_OPTIONS）：
          MOSS 五模式整合流（prebuilt_30）。提交用标识符，这里只是显示标签 -->
     <string name="dynamic_param_moss_mode_label">出图模式</string>
+    <!-- MOSS 4K（prebuilt_33/34）动态参数标签：第二段采样、细节修复提示词、
+         三个 LoRA 槽开关/权重、SeedVR2 惰性放大开关与目标分辨率 -->
+    <string name="dynamic_param_moss_steps2_label">第二段步数</string>
+    <string name="dynamic_param_moss_cfg2_label">第二段 CFG</string>
+    <string name="dynamic_param_moss_sampler2_label">第二段采样器</string>
+    <string name="dynamic_param_moss_scheduler2_label">第二段调度器</string>
+    <string name="dynamic_param_moss_detail_prompt_face_label">细节提示词·面部</string>
+    <string name="dynamic_param_moss_detail_prompt_body_label">细节提示词·身体</string>
+    <string name="dynamic_param_moss_lora1_on_label">LoRA 1 开关</string>
+    <string name="dynamic_param_moss_lora1_strength_label">LoRA 1 权重</string>
+    <string name="dynamic_param_moss_lora2_on_label">LoRA 2 开关</string>
+    <string name="dynamic_param_moss_lora2_strength_label">LoRA 2 权重</string>
+    <string name="dynamic_param_moss_lora3_on_label">LoRA 3 开关</string>
+    <string name="dynamic_param_moss_lora3_strength_label">LoRA 3 权重</string>
+    <string name="dynamic_param_moss_seedvr2_enabled_label">4K 放大</string>
+    <string name="dynamic_param_moss_seedvr2_size_label">放大目标尺寸</string>
     <string name="moss_mode_moss_25">25步</string>
     <string name="moss_mode_moss_spec25">Spectrum加速</string>
     <string name="moss_mode_moss_50">50步</string>

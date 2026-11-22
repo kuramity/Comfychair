@@ -159,6 +159,16 @@ internal object TrashDeleteOutcome {
         successCount < requestedCount -> TrashDeleteResult.PARTIAL
         else -> TrashDeleteResult.SUCCESS
     }
+
+    /**
+     * 删除成功后「已移入回收站」Toast 是否由 ViewModel 发（remainingCount = 删除后队列剩余条数）。
+     *
+     * 契约：**只在队列删空时发**。还有剩余项时撤销条（MediaViewerScreen 的 trashUndo 槽）
+     * 正在显示，文字同为「已移入回收站」，提示由撤销条独占 —— 此时再发 Toast，
+     * 屏幕上会出现两条相同提示交叉淡入重叠（真机录屏确认的缺陷）。
+     * 删空时撤销槽被清掉、没有"就地撤销"的位置，Toast 是唯一反馈，必须发。
+     */
+    fun shouldEmitTrashToast(remainingCount: Int): Boolean = remainingCount <= 0
 }
 
 /**
@@ -875,7 +885,11 @@ class MediaViewerViewModel : ViewModel() {
                 // No more items, close viewer（队列都删空了就没有"就地撤销"的位置，
                 // 条目仍在回收站里，可去图库回收站界面恢复）
                 _trashUndo.value = null
-                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_trash_moved))
+                // 删空后撤销条已被清掉，这里必须发 Toast，否则用户收不到任何成功反馈
+                //（是否发由 shouldEmitTrashToast 判定，契约见该函数注释）
+                if (TrashDeleteOutcome.shouldEmitTrashToast(currentItems.size)) {
+                    _events.emit(MediaViewerEvent.ShowToast(R.string.msg_trash_moved))
+                }
                 _events.emit(MediaViewerEvent.ItemDeleted)
                 _events.emit(MediaViewerEvent.Close)
             } else {
@@ -894,7 +908,8 @@ class MediaViewerViewModel : ViewModel() {
                     currentVideoUri = null,
                     isLoading = true
                 )
-                _events.emit(MediaViewerEvent.ShowToast(R.string.msg_trash_moved))
+                // 还有剩余项：撤销条正在显示（文字同为「已移入回收站」），提示由撤销条独占，
+                // 此处不再发 Toast —— 否则真机上两条相同提示重叠（shouldEmitTrashToast 判 false）
                 _events.emit(MediaViewerEvent.ItemDeleted)
                 loadCurrentItem()
             }
@@ -1036,12 +1051,15 @@ class MediaViewerViewModel : ViewModel() {
         val key = item.toCacheKey()
 
         withContext(Dispatchers.IO) {
-            // 源已不存在：允许保存，但只能保存本机缓存的低清版（原图在服务器上已删除）。
+            // 源已不存在：允许保存，但只能保存本机缓存副本（原图在服务器上已删除）。
             // 判定同时看持久化字段与本次会话的 404 标记：查看器队列是进入时的快照，
             // item.sourceMissing 可能还没跟上刚刚发生的 404。
             val sourceMissing = item.sourceMissing || MediaCache.isFileMissing(key)
+            // 带档位标注地取本机副本（R3-3）：本机可能缓存着全尺寸原图（查看器看过的
+            // 原图 / 升级前的旧磁盘原图），命中的就是原图 —— 文案不能再说「已保存低清版」
+            val localCopy = if (sourceMissing) MediaCache.getLocalImageWithQuality(key) else null
             val bitmap = if (sourceMissing) {
-                MediaCache.getLocalImage(key)
+                localCopy?.first
             } else {
                 MediaCache.getBitmap(key)
                     ?: MediaCache.fetchImage(key, item.subfolder, item.type)
@@ -1065,7 +1083,10 @@ class MediaViewerViewModel : ViewModel() {
                 MediaViewerEvent.ShowToast(
                     when {
                         !saved -> R.string.error_save_image
-                        sourceMissing -> R.string.msg_image_saved_lowres
+                        // 只有实际存下的是低清档（720 统一档 / 旧缩略图）才说「低清版」；
+                        // 命中全尺寸副本时按普通成功提示
+                        sourceMissing && localCopy?.second == MediaCache.LocalImageQuality.LOW_RES ->
+                            R.string.msg_image_saved_lowres
                         else -> R.string.msg_image_saved_to_gallery
                     }
                 )

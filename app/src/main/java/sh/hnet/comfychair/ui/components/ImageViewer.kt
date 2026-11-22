@@ -283,7 +283,11 @@ fun ImageViewer(
      */
     val resetViewerLayers: (ViewerExitReason) -> Unit = { reason ->
         exitCommitted = true
-        isFlyBackAnimating = false
+        // 这里刻意**不复位** isFlyBackAnimating：飞回正常播完后它是 true，
+        // 渲染层据此保持「图片停在格子里」的落格帧，直到组件销毁。
+        // 一旦在这里置 false，渲染层会回落到 else 分支画出全屏帧（残影）或
+        // 因旧的 alpha=0 兜底而瞬间消失（格子变黑）。
+        // 组件退出即销毁，remember 状态清空，不需要手工复位。
         pendingSingleTap = false
         // G4：删除手势状态一并复位（宿主退出时若有在途进站动画，取消它并上报
         // 手势相位结束——宿主页的横向冻结标志不能带着 true 退出）
@@ -670,29 +674,23 @@ fun ImageViewer(
                             rotationZ = 0f
                         }
                     } else {
-                        // E4 二次修复兜底：已经提交退出（exitCommitted = true 由 requestViewerExit /
-                        // resetViewerLayers 设置，且全仓没有任何地方把它设回 false）时，内容层一律不画。
-                        // 这样即便某条路径又把 isFlyBackAnimating 翻回了 false（例如宿主页的退出清理
-                        // resetViewerLayers），也绝不会再画出 scale=1 的全屏回落帧。
-                        if (exitCommitted) {
-                            alpha = 0f
-                            // rotationZ 同样显式归零：graphicsLayer 属性块跨帧复用，
-                            // 兜底分支也必须保持"每帧写全"的复位纪律
-                            rotationZ = 0f
-                        } else {
-                            val effScaleFactor = deleteVisuals?.scale ?: visuals.scale
-                            scaleX = currentScale * effScaleFactor * sideScale
-                            scaleY = currentScale * effScaleFactor * sideScale
-                            // N8：横向自由拖动位移叠加在平移上（透出程度仍只看 dismissY）。
-                            // G4：删除模式下 dismissX 恒 0（updateDismissDrag 锁死横轴），
-                            // 这里不需要分支——位移源头就是轴间仲裁本身
-                            translationX = currentOffset.x + dismissX
-                            translationY = currentOffset.y + dismissY
-                            alpha = deleteVisuals?.alpha ?: visuals.alpha
-                            // rotationZ 必须**每帧显式赋值**：graphicsLayer 的属性块跨帧复用，
-                            // 不写会残留上一次删除手势的倾角（删除结束、日常拖动带歪图）
-                            rotationZ = deleteVisuals?.rotationDeg ?: 0f
-                        }
+                        // 非飞回分支：松手前跟手 / 双指收缩 / 系统返回等退出路径。
+                        // 飞回一旦起步，isFlyBackAnimating 恒为 true（正常播完不复位、
+                        // resetViewerLayers 也不再复位它），退出路径不会再落到这里画
+                        // scale=1 的全屏帧。旧的 exitCommitted→alpha=0 兜底已删——
+                        // 它会让退出一开始图片整个消失、Viewer 暗背景未撤，格子变黑。
+                        val effScaleFactor = deleteVisuals?.scale ?: visuals.scale
+                        scaleX = currentScale * effScaleFactor * sideScale
+                        scaleY = currentScale * effScaleFactor * sideScale
+                        // N8：横向自由拖动位移叠加在平移上（透出程度仍只看 dismissY）。
+                        // G4：删除模式下 dismissX 恒 0（updateDismissDrag 锁死横轴），
+                        // 这里不需要分支——位移源头就是轴间仲裁本身
+                        translationX = currentOffset.x + dismissX
+                        translationY = currentOffset.y + dismissY
+                        alpha = deleteVisuals?.alpha ?: visuals.alpha
+                        // rotationZ 必须**每帧显式赋值**：graphicsLayer 的属性块跨帧复用，
+                        // 不写会残留上一次删除手势的倾角（删除结束、日常拖动带歪图）
+                        rotationZ = deleteVisuals?.rotationDeg ?: 0f
                     }
                 }
                 .pointerInput(Unit) {

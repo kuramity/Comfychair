@@ -49,8 +49,9 @@ class SamplerOptionsSanitizeTest {
         val serverSchedulers = listOf("simple", "shifted_tangent")
         // 服务器认识的、App 内置清单里没有的值必须放行（内置清单可能落后于服务端）
         assertEquals("shifted_tangent", SamplerOptions.sanitizeScheduler("shifted_tangent", serverSchedulers))
-        // 服务器不认识的、哪怕内置清单里有，也必须回退（提交上去一定 400）
-        assertEquals("normal", SamplerOptions.sanitizeScheduler("karras", serverSchedulers))
+        // 服务器不认识的、哪怕内置清单里有，也必须回退（提交上去一定 400）。
+        // 清单里没有 normal → 回退值本身也要在清单里确认，落到清单第一个 simple
+        assertEquals("simple", SamplerOptions.sanitizeScheduler("karras", serverSchedulers))
     }
 
     @Test
@@ -101,6 +102,57 @@ class SamplerOptionsSanitizeTest {
         assertNotEquals("dpm++", fallbackScheduler)
     }
 
+    // ---------- 回退值自身的清单校验（F1：回退不能制造第二次 400） ----------
+
+    @Test
+    fun `服务器清单没有 normal 时回退到清单第一个`() {
+        // 极端情况：服务器只认两个非默认调度器。回退 normal 会被 validate_inputs 再 400，
+        // 所以回退值必须落在候选清单内 —— 取清单第一个
+        assertEquals(
+            "simple",
+            SamplerOptions.sanitizeScheduler("dpm++", listOf("simple", "shifted_tangent"))
+        )
+        assertEquals(
+            "simple",
+            SamplerOptions.sanitizeScheduler("", listOf("simple", "shifted_tangent"))
+        )
+    }
+
+    @Test
+    fun `服务器清单没有 euler 时回退到清单第一个（sampler）`() {
+        assertEquals(
+            "heun",
+            SamplerOptions.sanitizeSampler("dpm++", listOf("heun", "lms"))
+        )
+    }
+
+    @Test
+    fun `清单里有默认值时仍优先默认值`() {
+        // 服务器清单含 normal / euler：回退值就是默认值本身（旧行为不变）
+        assertEquals(
+            "normal",
+            SamplerOptions.sanitizeScheduler("dpm++", listOf("normal", "simple"))
+        )
+        assertEquals(
+            "euler",
+            SamplerOptions.sanitizeSampler("dpm++", listOf("lms", "euler"))
+        )
+    }
+
+    @Test
+    fun `清洗结果必须落在候选清单内（反证：回退值不再自证合法）`() {
+        // 对任意服务器清单与任意非法值：清洗结果必须 ∈ 清单 —— 否则清洗只是换了个 400。
+        // 反证：把回退逻辑改回「硬编码 normal/euler 不查清单」后，
+        // 服务器清单缺默认值的那两条断言（本类前两个 F1 用例）会红。
+        val servers = listOf("shifted_tangent", "heun", "simple")
+        for (dirty in listOf("dpm++", "", "not_a_sampler", "Karras")) {
+            val s = SamplerOptions.sanitizeSampler(dirty, servers)
+            assertTrue("sampler 清洗结果 $s 不在服务器清单里", s in servers)
+            val sc = SamplerOptions.sanitizeScheduler(dirty, servers)
+            assertTrue("scheduler 清洗结果 $sc 不在服务器清单里", sc in servers)
+        }
+    }
+
     // ---------- 读取口径（清单未知不判废，见 sanitize*OnLoad） ----------
 
     @Test
@@ -119,9 +171,10 @@ class SamplerOptionsSanitizeTest {
 
     @Test
     fun `读取时清单已知就严格判废`() {
-        // 反证：读取口径如果退化成恒等函数，这三条会红 —— 脏数据永远不会被自愈
-        assertEquals("normal", SamplerOptions.sanitizeSchedulerOnLoad("dpm++", listOf("simple", "karras")))
-        assertEquals("normal", SamplerOptions.sanitizeSchedulerOnLoad("karras", listOf("simple")))
+        // 反证：读取口径如果退化成恒等函数，这两条会红 —— 脏数据永远不会被自愈。
+        // 两个清单都不含 normal：F1 后回退值本身也要在清单里确认，落到清单第一个
+        assertEquals("simple", SamplerOptions.sanitizeSchedulerOnLoad("dpm++", listOf("simple", "karras")))
+        assertEquals("simple", SamplerOptions.sanitizeSchedulerOnLoad("karras", listOf("simple")))
         assertEquals("euler", SamplerOptions.sanitizeSamplerOnLoad("dpm++", listOf("euler", "lms")))
     }
 }

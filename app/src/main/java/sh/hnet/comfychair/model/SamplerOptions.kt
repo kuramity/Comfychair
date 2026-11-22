@@ -24,14 +24,6 @@ object SamplerOptions {
         "nearest-exact", "bilinear", "area", "bicubic", "lanczos"
     )
 
-    /**
-     * 默认 scheduler 在 [SCHEDULERS] 里的下标（`SCHEDULERS[6]` == `normal`）。
-     *
-     * 必须与 [SCHEDULERS] 里 `normal` 的位置同步：清洗回退值走这个下标，
-     * 不是硬编码字符串（清单调整时只改一处）。
-     */
-    private const val DEFAULT_SCHEDULER_INDEX = 6
-
     /** 清洗失败时的 scheduler 兜底值（= `SCHEDULERS[6]`），与各页面 UiState / [GenerationParameters] 缺省一致。 */
     const val DEFAULT_SCHEDULER = "normal"
 
@@ -47,13 +39,18 @@ object SamplerOptions {
      *
      * @param value 待清洗的取值（可能来自持久化 / 记忆状态）
      * @param available 服务器 `/object_info` 报的可用清单；**空表表示还没同步**，此时用内置 [SAMPLERS]
-     * @return 合法则原样返回；否则返回 [DEFAULT_SAMPLER]（`euler`）
+     * @return 合法则原样返回；否则优先回退 [DEFAULT_SAMPLER]（`euler`），清单里没有 euler
+     *         时取清单第一个值（清单为空则原样返回，绝不引入新的非法值）
      */
     fun sanitizeSampler(value: String, available: List<String> = emptyList()): String {
         val valid = available.ifEmpty { SAMPLERS }
         if (value in valid) return value
-        // 内置清单恒非空，first() 安全；写成 getOrElse 是为了清单被误改空时不崩
-        return SAMPLERS.getOrElse(0) { DEFAULT_SAMPLER }
+        // 回退值本身也要在候选清单里确认（清单非空时即服务器清单）：服务器没有 euler 时，
+        // 硬回退 euler 只会换来第二次 400 —— 此时退而取清单第一个值
+        if (DEFAULT_SAMPLER in valid) return DEFAULT_SAMPLER
+        // 清单为空（仅当内置清单被误改空的极端情形）无从清洗：保持原值不动，
+        // 交给服务器报错 —— 绝不引入一个自己都不认识的新非法值
+        return valid.firstOrNull() ?: value
     }
 
     /**
@@ -64,12 +61,15 @@ object SamplerOptions {
      *
      * @param value 待清洗的取值
      * @param available 服务器报的可用清单；空表表示还没同步，此时用内置 [SCHEDULERS]
-     * @return 合法则原样返回；否则返回 `SCHEDULERS[6]`（`normal`，与 UiState 缺省一致）
+     * @return 合法则原样返回；否则优先回退 `normal`（与 UiState 缺省一致），清单里没有 normal
+     *         时取清单第一个值（清单为空则原样返回）
      */
     fun sanitizeScheduler(value: String, available: List<String> = emptyList()): String {
         val valid = available.ifEmpty { SCHEDULERS }
         if (value in valid) return value
-        return SCHEDULERS.getOrElse(DEFAULT_SCHEDULER_INDEX) { DEFAULT_SCHEDULER }
+        // 与 [sanitizeSampler] 同口径：回退值 normal 不在服务器清单时，取清单第一个
+        if (DEFAULT_SCHEDULER in valid) return DEFAULT_SCHEDULER
+        return valid.firstOrNull() ?: value
     }
 
     /**

@@ -9,6 +9,11 @@ import sh.hnet.comfychair.workflow.TemplateKeyRegistry
  * 遍历工作流节点，找出所有**值恰好为** `{{xxx}}` 的输入，建立
  * `占位符 → (class_type, 输入名)` 映射，并过滤掉「已识别」的占位符（设计约束 1）。
  *
+ * 输入值可以是两种形态：
+ * - 直接子键的字符串（`"steps": "{{my_steps}}"`）
+ * - 嵌套**一层** dict 的字符串子值（rgthree Power Lora Loader 形态：
+ *   `"lora_1": {"on": "{{lora1_on}}", ...}`）——此时 `inputName` 记为「父键.子键」路径
+ *
  * 只认「整个值就是占位符」的形态（`"steps": "{{my_steps}}"`）：只有这种形态才能唯一确定
  * `(class_type, 输入名)`，进而查到真实类型。嵌在更大字符串里的 `{{x}}` 不参与索引
  * （它的类型无从推导），但 [sh.hnet.comfychair.workflow.dynamic.DynamicParamValues.applyDynamicParams]
@@ -48,18 +53,33 @@ object DynamicParamScanner {
             val inputs = node.optJSONObject("inputs") ?: continue
 
             for (inputName in inputs.keys().asSequence().toList()) {
-                // 连线是 JSONArray，optString 取不出占位符形态；非字符串（数值/布尔）同样不会命中
-                val match = WHOLE_VALUE_PLACEHOLDER.find(inputs.optString(inputName, "")) ?: continue
-                val placeholder = match.groupValues[1]
-                // 设计约束 1：只接管「未识别」的占位符
-                if (TemplateKeyRegistry.isRecognizedPlaceholder(placeholder)) continue
-                if (found.containsKey(placeholder)) continue
-                found[placeholder] = DynamicParamRef(
-                    placeholder = placeholder,
-                    nodeId = nodeId,
-                    classType = classType,
-                    inputName = inputName
-                )
+                val raw = inputs.opt(inputName)
+                // 直接子键的字符串值（原行为）；或嵌套一层 dict 的字符串子值（rgthree Power Lora Loader 形态）
+                val candidates: List<Pair<String, String>> = when (raw) {
+                    is String -> listOf(inputName to raw)
+                    is JSONObject -> raw.keys().asSequence().toList().mapNotNull { sub ->
+                        // 只接字符串子值；嵌套里的数组/数字/布尔/null 一律跳过
+                        val v = raw.opt(sub)
+                        if (v is String) "$inputName.$sub" to v else null
+                    }
+                    // 连线（JSONArray）/ 数值 / 布尔 / null 不参与索引
+                    else -> emptyList()
+                }
+                for ((path, value) in candidates) {
+                    val match = WHOLE_VALUE_PLACEHOLDER.find(value) ?: continue
+                    val placeholder = match.groupValues[1]
+                    // 设计约束 1：只接管「未识别」的占位符
+                    if (TemplateKeyRegistry.isRecognizedPlaceholder(placeholder)) continue
+                    if (found.containsKey(placeholder)) continue
+                    found[placeholder] = DynamicParamRef(
+                        placeholder = placeholder,
+                        nodeId = nodeId,
+                        classType = classType,
+                        // 嵌套命中时是「父键.子键」路径（如 lora_1.on）；类型推导对查不到的
+                        // 输入名一律退化为文本框（设计约束 2），路径形式不会破坏 lookup
+                        inputName = path
+                    )
+                }
             }
         }
         return found.values.toList()

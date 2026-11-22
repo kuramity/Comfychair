@@ -221,4 +221,50 @@ class SourceMissingStateTest {
         )
         assertFalse(MediaViewerItem.fromJson(legacy).sourceMissing)
     }
+
+    // ============================================================
+    // 5. 补记合并（mergeMissingRecord）：仅缓存恢复的条目标记也要落盘
+    // ============================================================
+
+    @Test
+    fun `索引缺记录时补记带标记的最小条目`() {
+        // 仅磁盘缓存恢复的条目不在索引里：404 时必须补记一条带标记的记录，
+        // 否则标记只留在内存列表、重启即丢（第三态丢失）
+        val existing = listOf(item(filename = "kept.png"))
+        val record = item(filename = "recovered.png", index = 0)
+        val merged = GalleryMetadataCache.mergeMissingRecord(existing, record)
+
+        assertEquals(2, merged.size)
+        // 补记条目排在末尾（本地独有在后，与 mergeItems 的顺序口径一致）
+        val recovered = merged.last()
+        assertEquals("recovered.png", recovered.filename)
+        assertTrue(recovered.sourceMissing)
+        // 原有条目不受影响
+        assertFalse(merged.first().sourceMissing)
+        // 补记后序号连续（renumberByPosition 统一重排）
+        assertEquals(listOf(0, 1), merged.map { it.index })
+    }
+
+    @Test
+    fun `索引已有记录时只置标记不重复补记`() {
+        val existing = listOf(item(filename = "kept.png"), item(filename = "dup.png"))
+        val record = item(filename = "dup.png")
+        val merged = GalleryMetadataCache.mergeMissingRecord(existing, record)
+
+        // 不追加：条目数与顺序原样，只把已有条目的标记置 true（applySourceMissing 原语义）
+        assertEquals(2, merged.size)
+        assertEquals(listOf("kept.png", "dup.png"), merged.map { it.filename })
+        assertTrue(merged.single { it.filename == "dup.png" }.sourceMissing)
+        assertFalse(merged.single { it.filename == "kept.png" }.sourceMissing)
+    }
+
+    @Test
+    fun `补记已带标记的原样追加`() {
+        val existing = listOf(item(filename = "kept.png"))
+        val record = item(filename = "recovered.png", sourceMissing = true)
+        val merged = GalleryMetadataCache.mergeMissingRecord(existing, record)
+        assertEquals(2, merged.size)
+        assertTrue(merged.last().sourceMissing)
+        assertTrue(merged.first().sourceMissing.not())
+    }
 }

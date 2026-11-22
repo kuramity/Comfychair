@@ -638,22 +638,46 @@ object MediaCache {
     }
 
     /**
+     * 「源已不存在」条目本机副本的清晰度档位（保存文案按实际档位选，R3-3）。
+     */
+    enum class LocalImageQuality {
+        /** 全尺寸副本（内存原图缓存 / 旧磁盘原图缓存）—— 保存的就是原图 */
+        FULL_SIZE,
+
+        /** 低清副本（720 统一档 / 旧缩略图）—— 保存的不是原图 */
+        LOW_RES
+    }
+
+    /**
      * 取本机已有的图片副本（纯本地：内存 → 持久化 720 档 → 旧磁盘缓存 → 旧缩略图）。
      *
      * 专门给「源已不存在」条目用：服务器文件没了，保存/兜底展示只能用本机缓存。
      * 顺序按清晰度优先（原图缓存 > 720 统一档 > 512 缩略图），全部不命中返回 null
      * —— 调用方据此提示「原图已被删除，且本机无缓存」并禁用保存。
      */
-    fun getLocalImage(key: MediaCacheKey): Bitmap? {
+    fun getLocalImage(key: MediaCacheKey): Bitmap? = getLocalImageWithQuality(key)?.first
+
+    /**
+     * [getLocalImage] 的带档位标注版：位图与查找顺序完全一致，另标出命中的档位。
+     *
+     * 给「源已不存在」条目的保存路径选文案用：命中 [LocalImageQuality.FULL_SIZE]
+     * （查看器看过的原图还在内存缓存 / 升级前旧磁盘原图）时保存的就是原图，
+     * 提示不能再写「已保存低清版」。
+     */
+    fun getLocalImageWithQuality(key: MediaCacheKey): Pair<Bitmap, LocalImageQuality>? {
         val keyStr = key.keyString
-        bitmapCache.get(keyStr)?.let { return it }
-        val context = applicationContext ?: return thumbnailCache.get(keyStr)
-        thumbnailCache.get(keyStr)?.let { return it }
+        bitmapCache.get(keyStr)?.let { return it to LocalImageQuality.FULL_SIZE }
+        val context = applicationContext
+        if (context == null) {
+            return thumbnailCache.get(keyStr)?.let { it to LocalImageQuality.LOW_RES }
+        }
+        thumbnailCache.get(keyStr)?.let { return it to LocalImageQuality.LOW_RES }
         // filesDir 持久化统一档（720 长边 JPEG，v4.16.1）
-        readPersistBitmap(context, resolvePersistFile(context, key, false))?.let { return it }
-        // 旧 cacheDir 原图 / 旧缩略图（升级兼容）
-        readBitmapFromDisk(context, key)?.let { return it }
-        return readThumbFromDisk(context, key)
+        readPersistBitmap(context, resolvePersistFile(context, key, false))
+            ?.let { return it to LocalImageQuality.LOW_RES }
+        // 旧 cacheDir 原图 / 旧缩略图（升级兼容）：前者是升级前缓存的全尺寸原图
+        readBitmapFromDisk(context, key)?.let { return it to LocalImageQuality.FULL_SIZE }
+        return readThumbFromDisk(context, key)?.let { it to LocalImageQuality.LOW_RES }
     }
 
     /**

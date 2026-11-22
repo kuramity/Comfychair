@@ -692,4 +692,20 @@
     <string name="model_list_empty">Aucun modèle disponible sur le serveur</string>
     <!-- P3-10 : aucune application ne peut ouvrir le lien externe -->
     <string name="error_open_link_failed">Aucune application capable d\'ouvrir ce lien</string>
+    <!-- MOSS 4K (prebuilt_33/34) : libellés des paramètres dynamiques -->
+    <string name="dynamic_param_moss_steps2_label">Étapes (2e passe)</string>
+    <string name="dynamic_param_moss_cfg2_label">CFG (2e passe)</string>
+    <string name="dynamic_param_moss_sampler2_label">Échantillonneur (2e passe)</string>
+    <string name="dynamic_param_moss_scheduler2_label">Planificateur (2e passe)</string>
+    <string name="dynamic_param_moss_detail_prompt_face_label">Prompt de détail · visage</string>
+    <string name="dynamic_param_moss_detail_prompt_body_label">Prompt de détail · corps</string>
+    <string name="dynamic_param_moss_lora1_on_label">Interrupteur LoRA 1</string>
+    <string name="dynamic_param_moss_lora1_strength_label">Poids LoRA 1</string>
+    <string name="dynamic_param_moss_lora2_on_label">Interrupteur LoRA 2</string>
+    <string name="dynamic_param_moss_lora2_strength_label">Poids LoRA 2</string>
+    <string name="dynamic_param_moss_lora3_on_label">Interrupteur LoRA 3</string>
+    <string name="dynamic_param_moss_lora3_strength_label">Poids LoRA 3</string>
+    <string name="dynamic_param_moss_seedvr2_enabled_label">Agrandissement 4K</string>
+    <string name="dynamic_param_moss_seedvr2_size_label">Taille cible de l\'agrandissement</string>
+    <string name="sampler_param_detail_denoise_hand">Intensité de correction des mains</string>
 </resources>

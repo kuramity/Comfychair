@@ -196,6 +196,12 @@ private fun samplerParamLabel(stageParam: SamplerStageRegistry.StageParam): Stri
         "pe_on" -> return stringResource(R.string.sampler_param_pe_on)
         "pe_model" -> return stringResource(R.string.sampler_param_pe_model)
         "pe_mmproj" -> return stringResource(R.string.sampler_param_pe_mmproj)
+        // MOSS 4K（prebuilt_33）的手部修复强度：`detail_denoise2` 会被 `detail_` 前缀 + 后缀
+        // `denoise2` 误配进竖叉流的「分次补采」标签（「补采 2 去噪强度」），文案完全对不上。
+        // 完整占位符名 detail_denoise2 在 prebuilt_11 不存在，此处覆盖不影响竖叉流；
+        // 而同工作流的 detail_denoise（面部）与 prebuilt_11 同名、语义兼容（都是细节段去噪），
+        // 继续走通用「去噪强度」标签，不在本分支覆盖。
+        "detail_denoise2" -> return stringResource(R.string.sampler_param_detail_denoise_hand)
     }
     return when (stageParam.paramKey) {
     "steps" -> stringResource(R.string.sampler_param_steps)
@@ -253,6 +259,24 @@ private fun samplerParamHint(stageParam: SamplerStageRegistry.StageParam): Strin
 @Composable
 private fun fixedParamLabel(placeholder: String): String? = when (placeholder) {
     "moss_mode" -> stringResource(R.string.dynamic_param_moss_mode_label)
+    // MOSS 4K（prebuilt_33/34）第二段采样（潜空间放大精修，节点 858）
+    "steps2" -> stringResource(R.string.dynamic_param_moss_steps2_label)
+    "cfg2" -> stringResource(R.string.dynamic_param_moss_cfg2_label)
+    "sampler2" -> stringResource(R.string.dynamic_param_moss_sampler2_label)
+    "scheduler2" -> stringResource(R.string.dynamic_param_moss_scheduler2_label)
+    // MOSS 4K 细节修复（DetailerForEach 734/739/789/730）的两条独立提示词
+    "detail_prompt_face" -> stringResource(R.string.dynamic_param_moss_detail_prompt_face_label)
+    "detail_prompt_body" -> stringResource(R.string.dynamic_param_moss_detail_prompt_body_label)
+    // MOSS 4K 三个 LoRA 槽（Power Lora Loader 707/851/924）的开关与权重
+    "lora1_on" -> stringResource(R.string.dynamic_param_moss_lora1_on_label)
+    "lora1_strength" -> stringResource(R.string.dynamic_param_moss_lora1_strength_label)
+    "lora2_on" -> stringResource(R.string.dynamic_param_moss_lora2_on_label)
+    "lora2_strength" -> stringResource(R.string.dynamic_param_moss_lora2_strength_label)
+    "lora3_on" -> stringResource(R.string.dynamic_param_moss_lora3_on_label)
+    "lora3_strength" -> stringResource(R.string.dynamic_param_moss_lora3_strength_label)
+    // MOSS 4K SeedVR2 惰性放大开关（CRZSwitch 960）与目标分辨率（713.resolution）
+    "seedvr2_enabled" -> stringResource(R.string.dynamic_param_moss_seedvr2_enabled_label)
+    "seedvr2_size" -> stringResource(R.string.dynamic_param_moss_seedvr2_size_label)
     else -> null
 }
 
