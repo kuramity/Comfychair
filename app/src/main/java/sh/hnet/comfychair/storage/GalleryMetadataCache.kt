@@ -235,6 +235,50 @@ object GalleryMetadataCache {
         }
 
     /**
+     * 「带标记的最小条目」并入索引列表（纯函数，JVM 单测直接钉住；文件 IO 见
+     * [markSourceMissingOrInsert]）。
+     *
+     * 条目已在索引里 → 只把标记置 true（[applySourceMissing] 原语义，无差异返回原表）；
+     * 索引里没有（仅磁盘缓存恢复、从未写进索引的条目）→ 追加到末尾并强制带标记，
+     * 顺序交给 [renumberByPosition] 统一重排。
+     */
+    internal fun mergeMissingRecord(
+        items: List<GalleryItem>,
+        record: GalleryItem
+    ): List<GalleryItem> {
+        val identity = itemIdentityKey(record.promptId, record.filename)
+        return if (items.any { itemIdentityKey(it.promptId, it.filename) == identity }) {
+            applySourceMissing(items, setOf(identity))
+        } else {
+            renumberByPosition(items + record.copy(sourceMissing = true))
+        }
+    }
+
+    /**
+     * 把「源已不存在（/view 404）」标记写进本地索引；索引里没有该条目时**补记一条最小记录**。
+     *
+     * 背景：条目只从磁盘缓存恢复（索引读不出来后由缓存键重建、或索引里从未写过）时，
+     * [markSourceMissing] 会因「索引里没有对应条目」而放弃 —— 标记只留在内存列表，
+     * 重启 App 后随内存列表一起消失，第三态丢失。这里改为把带标记的最小条目补进索引，
+     * 让重启后的加载（索引合并对 sourceMissing 做逻辑或）重新认出第三态。
+     * 索引读取失败仍然返回 false（与 [markSourceMissing] 同口径，不谎报已持久化）。
+     *
+     * @param record 索引缺记录时用于补记的最小条目（promptId/filename/type/isVideo 齐全，
+     *               subfolder 按磁盘缓存恢复的口径为空串；是否已存在由本函数判断）
+     * @return true = 标记已持久化（含补记、含原本就是 true 的无差异情形）
+     */
+    fun markSourceMissingOrInsert(context: Context, serverId: String, record: GalleryItem): Boolean =
+        synchronized(indexWriteLock) {
+            val existing = loadMetadata(context, serverId) ?: run {
+                DebugLogger.w(TAG, "无法标记源已不存在：索引读取失败（server $serverId）")
+                return@synchronized false
+            }
+            val updated = mergeMissingRecord(existing, record)
+            if (updated == existing) return@synchronized true
+            writeMetadata(context, serverId, updated)
+        }
+
+    /**
      * 抹掉「源已不存在」标记（用户在图库/查看器里显式重试时用）。
      *
      * 文件被放回服务器后，重试成功即可恢复成正常条目；重试再 404 会重新标记。

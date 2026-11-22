@@ -186,7 +186,18 @@ class GalleryRepository private constructor() {
         }
 
         scope.launch(Dispatchers.IO) {
-            val ok = GalleryMetadataCache.markSourceMissing(context, serverId, setOf(identity))
+            // 索引里没有该条目（仅磁盘缓存恢复、从未写进索引的条目）时补记一条最小记录：
+            // 旧路径 markSourceMissing 会直接放弃，标记只在内存列表里、重启即丢（R3-2）。
+            // 字段口径与 recoverFromCachedKeys 的缓存恢复条目一致（subfolder 空、按扩展名判视频）
+            val recoveredRecord = GalleryItem(
+                promptId = key.promptId,
+                filename = key.filename,
+                subfolder = "",
+                type = key.type,
+                isVideo = VIDEO_EXTENSIONS.any { key.filename.lowercase().endsWith(it) },
+                index = 0
+            )
+            val ok = GalleryMetadataCache.markSourceMissingOrInsert(context, serverId, recoveredRecord)
             if (ok) {
                 DebugLogger.i(TAG, "源已不存在（404）已写入索引: ${key.filename}")
             } else {

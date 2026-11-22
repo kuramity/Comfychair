@@ -411,6 +411,24 @@ object ConnectionManager {
         private set
 
     /**
+     * 「抑制自动连」请求的代次：每次 [logout] / [suppressAutoConnectOnce] 置位时递增。
+     *
+     * 连接页（LoginScreen）用「记住自己处理过的代次」代替「读完即清」来消费抑制请求 ——
+     * 旧做法（读标志后立刻 [clearLogoutFlag]）在配置变更（旋转/深色模式）导致 Compose 重建时，
+     * LaunchedEffect 会再跑一遍而标志已被清掉，抑制失效、自动连了回去。
+     * 代次是单调递增的：连接页重建后从 savedInstanceState 恢复「已处理代次」，
+     * 与当前代次相等就跳过重判，抑制判定得以跨重建保留。
+     */
+    var autoConnectSuppressionEpoch: Long = 0
+        private set
+
+    /** 置位抑制请求并推进代次（[logout] 与 [suppressAutoConnectOnce] 的共同入口）。 */
+    private fun armAutoConnectSuppression() {
+        isUserInitiatedLogout = true
+        autoConnectSuppressionEpoch++
+    }
+
+    /**
      * Clear the logout flag. Called after login screen checks it.
      */
     fun clearLogoutFlag() {
@@ -431,7 +449,7 @@ object ConnectionManager {
      * 外部只能「请求抑制一次」，不能把标志长期置真。
      */
     fun suppressAutoConnectOnce() {
-        isUserInitiatedLogout = true
+        armAutoConnectSuppression()
         DebugLogger.d(TAG, "suppressAutoConnectOnce: 回连接页，抑制一次性自动重连（不登出）")
     }
 
@@ -682,7 +700,7 @@ object ConnectionManager {
      */
     fun logout() {
         DebugLogger.i(TAG, "User initiated logout")
-        isUserInitiatedLogout = true
+        armAutoConnectSuppression()
         pendingReconnectJob?.cancel()
         pendingReconnectJob = null
         reconnectBlocked = true  // 登出后不得自动回连

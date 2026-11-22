@@ -690,4 +690,20 @@
     <string name="model_list_empty">Keine Modelle auf dem Server verfügbar</string>
     <!-- P3-10: kein Gerät/keine App kann den externen Link öffnen -->
     <string name="error_open_link_failed">Keine App zum Öffnen dieses Links gefunden</string>
+    <!-- MOSS 4K (prebuilt_33/34): Labels für dynamische Parameter -->
+    <string name="dynamic_param_moss_steps2_label">Schritte (zweiter Durchlauf)</string>
+    <string name="dynamic_param_moss_cfg2_label">CFG (zweiter Durchlauf)</string>
+    <string name="dynamic_param_moss_sampler2_label">Sampler (zweiter Durchlauf)</string>
+    <string name="dynamic_param_moss_scheduler2_label">Scheduler (zweiter Durchlauf)</string>
+    <string name="dynamic_param_moss_detail_prompt_face_label">Detailprompt · Gesicht</string>
+    <string name="dynamic_param_moss_detail_prompt_body_label">Detailprompt · Körper</string>
+    <string name="dynamic_param_moss_lora1_on_label">LoRA 1 (Ein/Aus)</string>
+    <string name="dynamic_param_moss_lora1_strength_label">LoRA 1 (Stärke)</string>
+    <string name="dynamic_param_moss_lora2_on_label">LoRA 2 (Ein/Aus)</string>
+    <string name="dynamic_param_moss_lora2_strength_label">LoRA 2 (Stärke)</string>
+    <string name="dynamic_param_moss_lora3_on_label">LoRA 3 (Ein/Aus)</string>
+    <string name="dynamic_param_moss_lora3_strength_label">LoRA 3 (Stärke)</string>
+    <string name="dynamic_param_moss_seedvr2_enabled_label">4K-Hochskalierung</string>
+    <string name="dynamic_param_moss_seedvr2_size_label">Zielgröße der Hochskalierung</string>
+    <string name="sampler_param_detail_denoise_hand">Denoising der Handreparatur</string>
 </resources>

@@ -6,6 +6,7 @@ import org.json.JSONObject
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.NodeAttributeEdits
 import sh.hnet.comfychair.model.LoraSelection
+import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.model.WorkflowDefaults
 import sh.hnet.comfychair.storage.WorkflowFilePolicy
 import sh.hnet.comfychair.storage.WorkflowValuesStorage
@@ -2328,7 +2329,9 @@ object WorkflowManager {
      *
      * @param processedJson The workflow JSON after placeholder replacement
      * @param workflowId The workflow ID to load edits for
-     * @return The JSON with node attribute edits applied
+     * @return The JSON with node attribute edits applied（sampler_name / scheduler 的字符串
+     *         编辑值会先过 [SamplerOptions] 清洗 —— 本函数是所有 prepare* 的共同入口，
+     *         在这里拦住节点属性编辑这条绕过页面清洗的旁路）
      */
     private fun applyNodeAttributeEdits(processedJson: String, workflowId: String): String {
         // Load edits from storage
@@ -2373,17 +2376,35 @@ object WorkflowManager {
                     nodeEdits.forEach { (inputName, value) ->
                         // Only apply if input exists (don't add new inputs)
                         if (inputs.has(inputName)) {
-                            when (value) {
-                                is String -> inputs.put(inputName, value)
-                                is Int -> inputs.put(inputName, value)
-                                is Long -> inputs.put(inputName, value.toInt())
-                                is Float -> inputs.put(inputName, value.toDouble())
-                                is Double -> inputs.put(inputName, value)
-                                is Boolean -> inputs.put(inputName, value)
-                                else -> inputs.put(inputName, value.toString())
+                            // 采样参数旁路清洗：节点属性编辑直接写字段，不走各页面
+                            // prepareWorkflowJson 里的提交前清洗，是 400 防线的一条旁路 ——
+                            // 备份恢复 / 服务器切换留下的非法 sampler_name/scheduler 会原样
+                            // 进 validate_inputs() 判成 "Value not in list" 返回 400。
+                            // 清单口径与页面一致：服务器清单为空（/object_info 未同步）时退回内置清单
+                            val safeValue = when {
+                                inputName == "sampler_name" && value is String ->
+                                    SamplerOptions.sanitizeSampler(
+                                        value,
+                                        ConnectionManager.modelCache.value.samplers
+                                    )
+                                inputName == "scheduler" && value is String ->
+                                    SamplerOptions.sanitizeScheduler(
+                                        value,
+                                        ConnectionManager.modelCache.value.schedulers
+                                    )
+                                else -> value
+                            }
+                            when (safeValue) {
+                                is String -> inputs.put(inputName, safeValue)
+                                is Int -> inputs.put(inputName, safeValue)
+                                is Long -> inputs.put(inputName, safeValue.toInt())
+                                is Float -> inputs.put(inputName, safeValue.toDouble())
+                                is Double -> inputs.put(inputName, safeValue)
+                                is Boolean -> inputs.put(inputName, safeValue)
+                                else -> inputs.put(inputName, safeValue.toString())
                             }
                             modified = true
-                            DebugLogger.d(TAG, "Applied edit: node $nodeId, $inputName = $value")
+                            DebugLogger.d(TAG, "Applied edit: node $nodeId, $inputName = $safeValue")
                         }
                     }
                 }

@@ -12,7 +12,7 @@ import java.io.File
  * LoRA 效果档案表的查询逻辑测试。
  *
  * 两类用例：
- * 1. **真实数据**（assets 内置那份）——钉住总量特征（有值 47 条 / 孤儿 5 条），数据换版时
+ * 1. **真实数据**（assets 内置那份）——钉住总量特征（有值 47 条 / 孤儿 11 条），数据换版时
  *    这里会响铃提醒同步改数字，而不是悄悄漂移；
  * 2. **注入构造数据**——null 安全、大小写、排序这些边界行为。
  *
@@ -60,11 +60,12 @@ class LoraEffectTableTest {
     }
 
     @Test
-    fun `真实数据孤儿条目5条`() {
+    fun `真实数据孤儿条目11条`() {
         assumeTrue("assets 不可用时跳过", loadRealTable())
         val known = loadKnownModelFiles()
         assumeTrue("model_intros.json 不可用时跳过", known != null)
-        assertEquals(5, LoraEffectTable.orphans(known!!).size)
+        // 2026-11-21 模型库巡检同步后更新（孤儿 5 → 11）
+        assertEquals(11, LoraEffectTable.orphans(known!!).size)
     }
 
     @Test

@@ -6,7 +6,7 @@ import org.junit.Test
 import java.io.File
 
 /**
- * E4 残影**二次**修复（v4.19.2）的接线钉。
+ * E4 残影修复链的接线钉（含 v4.19.2 之后为修黑格做的回退修复）。
  *
  * ## 契约的演变
  *
@@ -14,26 +14,33 @@ import java.io.File
  *   由纯函数 flyBackEndStateAfterCompletion 换算终态。结果残影换了形态：
  *   关分支的那一帧 graphicsLayer 落进 else 分支，画出 scale=1 / 位移 0 /
  *   alpha=1 的**全屏极清晰图**（用户真机截图确证）——关闭动作本身就是残影来源。
- * - v4.19.2（本次）：**两层修复**——
- *   ① 修改 1：飞回正常播完**不关** isFlyBackAnimating。动画末帧 flyBackAnimatable
- *     已到 1f，飞回分支经 flyBackTargetFactors 插值出的正是「图片停在目标格子里」，
- *     那是正确的最后一帧；组件马上被 requestViewerExit 销毁，标志位无需手工复位。
- *     配套删除了 flyBackEndStateAfterCompletion / FlyBackEndState（死代码）。
- *   ② 修改 2：graphicsLayer 回落分支（else）最前面加硬兜底——exitCommitted 已置位
- *     时 alpha = 0f 一律不画。防的是别处把 isFlyBackAnimating 翻回 false
- *     （resetViewerLayers :286 会，它由宿主页退出清理调用，合法保留）。
+ * - v4.19.2（第二次修复）：**两层**——
+ *   ① 修改 1（保留至今，刻意设计）：飞回正常播完**不关** isFlyBackAnimating。动画末帧
+ *     flyBackAnimatable 已到 1f，飞回分支经 flyBackTargetFactors 插值出的正是「图片停在
+ *     目标格子里」，那是正确的最后一帧；组件马上被 requestViewerExit 销毁，标志位无需
+ *     手工复位。配套删除了 flyBackEndStateAfterCompletion / FlyBackEndState（死代码）。
+ *   ② 修改 2（本轮已回退）：graphicsLayer 回落分支（else）最前面加硬兜底——exitCommitted
+ *     已置位时 alpha = 0f 一律不画，防"别处把 isFlyBackAnimating 翻回 false 后画出全屏帧"。
+ *     但代价是退出一开始图片整个消失、而 Viewer 暗背景/遮罩还没撤 → 用户看到「格子黑 +
+ *     屏幕暗」（真机截图确证）。
+ *
+ * - 本轮（第三次修复）：删掉修改 2 的 alpha=0 兜底，并让 resetViewerLayers **不再复位**
+ *   isFlyBackAnimating（旧实现置 false 正是渲染层回落 else 分支、再叠加兜底变黑的源头）。
+ *   飞回一旦起步标志位就恒为 true 直到组件销毁，else 分支在飞回退出路径上不会再被走到，
+ *   兜底失去存在意义。
  *
  * ## 为什么是源码级接线钉、且必须按块截取
  *
- * 手势链路 JVM 单测跑不了，钉只能钉源码结构。全文件搜 `isFlyBackAnimating = false`
- * 会撞上 resetViewerLayers 里**合法保留**的那一行（机制状态复位，兜底已由修改 2
- * 覆盖），所以断言一律先按大括号配对截出目标块，再在块内判断。
+ * 手势链路 JVM 单测跑不了，钉只能钉源码结构。飞回收尾块与 resetViewerLayers 是两处不同的
+ * 代码块（分别由第一条与 ViewerExitWiringTest 钉住），alpha=0f 兜底是全文结构（第三条钉）。
+ * 涉及块内判断的断言一律先按大括号配对截出目标块，再在块内判断，避免误伤同名其它代码。
  *
  * ## 反证（会话内实测）
  *
- * - 修改 1 回退成 `isFlyBackAnimating = false` → 第一条变红（实测贴入会话记录）；
- * - 修改 2 的守卫条件失效（`if (exitCommitted)` 改 `if (false)`）→
- *   第三条变红（同现实测）。
+ * - 飞回收尾块内加回 `isFlyBackAnimating = false`（第一次修复写法）→ 第一条变红；
+ * - resetViewerLayers 块内加回 `isFlyBackAnimating = false`（B-2 旧写法）→
+ *   ViewerExitWiringTest「复位函数…」一条变红；
+ * - 把 alpha=0f 兜底加回 ImageViewer → 第三条「渲染层不得再有 alpha 全透明兜底」变红。
  */
 class FlyBackResidueRegressionTest {
 
@@ -134,32 +141,22 @@ class FlyBackResidueRegressionTest {
     }
 
     /**
-     * 新契约（修改 2）：graphicsLayer 回落分支必须先判 exitCommitted 兜底、
-     * 再算正常视觉。钉的是位置关系：`if (exitCommitted) {` 必须出现在
-     * 飞回分支起点之后、`val effScaleFactor` 之前，且兜底分支内写全
-     * alpha = 0f 与 rotationZ = 0f。
-     * 反证：把守卫条件改成 `if (false) {`（等价于删掉兜底），本测试立即变红。
+     * 接线钉（B-1）：上一轮的 exitCommitted→alpha=0f 硬兜底必须整体删除。
+     *
+     * 它本意防"标志被别处翻回 false 后画出全屏回落帧"，但代价是退出一开始图片整个
+     * 消失、而 Viewer 暗背景/遮罩还没撤 → 用户看到「格子黑 + 屏幕暗」（真机截图确证）。
+     * 配合 B-2（resetViewerLayers 不再复位 isFlyBackAnimating），飞回一旦起步标志位就
+     * 恒为 true 直到组件销毁，else 分支在飞回退出路径上不会再被走到，兜底失去存在意义，
+     * 且它本身就是黑格元凶，必须删干净。
+     * 反证：把 `alpha = 0f` 兜底加回 ImageViewer，本测试立即变红。
      */
     @Test
-    fun `回落分支必须先判 exitCommitted 兜底再算全屏视觉`() {
-        val source = source(imageViewerPath)
-        val effIdx = source.indexOf("val effScaleFactor")
-        assertTrue("找不到回落分支视觉计算起点 val effScaleFactor", effIdx >= 0)
-        // 回落分支属于 graphicsLayer：其前面的飞回分支起点（637 处）
-        val flyIdx = source.lastIndexOf("if (isFlyBackAnimating) {", effIdx)
-        assertTrue("val effScaleFactor 必须位于 graphicsLayer 飞回分支之后", flyIdx >= 0)
-        val guardIdx = source.lastIndexOf("if (exitCommitted) {", effIdx)
-        assertTrue(
-            "回落分支内必须先有 if (exitCommitted) 硬兜底（置于 val effScaleFactor 之前）：" +
-                "宿主页退出清理 resetViewerLayers 会把 isFlyBackAnimating 翻回 false，" +
-                "没有兜底就再闪一帧 scale=1 的全屏图",
-            guardIdx in (flyIdx + 1) until effIdx
-        )
-        val guardRegion = source.substring(guardIdx, effIdx)
-        assertTrue("兜底分支必须 alpha = 0f（内容层不绘制）", guardRegion.contains("alpha = 0f"))
-        assertTrue(
-            "兜底分支必须显式 rotationZ = 0f（属性块跨帧复用，复位纪律）",
-            guardRegion.contains("rotationZ = 0f")
+    fun `渲染层不得再有 alpha 全透明兜底`() {
+        val viewer = source(imageViewerPath)
+        assertFalse(
+            "ImageViewer 全文不得出现 alpha = 0f：该兜底会让退出一开始图片整个消失、" +
+                "Viewer 暗背景未撤 → 格子变黑（真机复现），已随 B-2 一并删除",
+            viewer.contains("alpha = 0f")
         )
     }
 

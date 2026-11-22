@@ -715,6 +715,9 @@
     <string name="sampler_param_pe_model">Enhancer model</string>
     <string name="sampler_param_pe_model_hint">Local gguf model used for rewriting. A bigger model follows instructions better but needs more VRAM: 4B ≈ 4.5 GB, 9B Q4_K_M ≈ 5.5 GB — both fit an 8 GB card, because the enhancer unloads itself before generation starts.</string>
     <string name="sampler_param_pe_mmproj">Vision projector</string>
+    <!-- MOSS 4K (prebuilt_33) hand-repair denoise: the placeholder detail_denoise2 would
+         otherwise collide with the shucha refine-round label ("refine 2 denoise") -->
+    <string name="sampler_param_detail_denoise_hand">Hand fix denoise</string>
     <string name="sampler_param_steps">Steps</string>
     <string name="sampler_param_cfg">CFG</string>
     <string name="sampler_param_denoise">Denoise</string>
@@ -898,6 +901,22 @@
          five-mode integrated flow (prebuilt_30). Values are submitted as identifiers; these
          are display labels only -->
     <string name="dynamic_param_moss_mode_label">Generation mode</string>
+    <!-- MOSS 4K (prebuilt_33/34) dynamic-param labels: second sampler pass, detail prompts,
+         three LoRA slots and the SeedVR2 lazy upscale switch -->
+    <string name="dynamic_param_moss_steps2_label">Second pass steps</string>
+    <string name="dynamic_param_moss_cfg2_label">Second pass CFG</string>
+    <string name="dynamic_param_moss_sampler2_label">Second pass sampler</string>
+    <string name="dynamic_param_moss_scheduler2_label">Second pass scheduler</string>
+    <string name="dynamic_param_moss_detail_prompt_face_label">Detail prompt · face</string>
+    <string name="dynamic_param_moss_detail_prompt_body_label">Detail prompt · body</string>
+    <string name="dynamic_param_moss_lora1_on_label">LoRA 1 switch</string>
+    <string name="dynamic_param_moss_lora1_strength_label">LoRA 1 weight</string>
+    <string name="dynamic_param_moss_lora2_on_label">LoRA 2 switch</string>
+    <string name="dynamic_param_moss_lora2_strength_label">LoRA 2 weight</string>
+    <string name="dynamic_param_moss_lora3_on_label">LoRA 3 switch</string>
+    <string name="dynamic_param_moss_lora3_strength_label">LoRA 3 weight</string>
+    <string name="dynamic_param_moss_seedvr2_enabled_label">4K upscale</string>
+    <string name="dynamic_param_moss_seedvr2_size_label">Upscale target size</string>
     <string name="moss_mode_moss_25">25 steps</string>
     <string name="moss_mode_moss_spec25">25 steps (Spectrum)</string>
     <string name="moss_mode_moss_50">50 steps</string>

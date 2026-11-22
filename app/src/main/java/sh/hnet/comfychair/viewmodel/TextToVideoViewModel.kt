@@ -1087,6 +1087,17 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
         val length = state.length.toIntOrNull() ?: return null
         val fps = state.fps.toIntOrNull() ?: return null
 
+        // 提交前兜底（1.3）：视频页的 sampler / scheduler 不落盘（见 VideoGenerationSupport.buildWorkflowValues），
+        // 取值来自缺省常量，但备份恢复 / 节点编辑等旁路仍可能把它们写脏，这里统一拦一道。
+        // 改了值就同步回界面（与文生图 prepareWorkflowJson 同口径：下拉框不该继续显示脏值，
+        // 下次提交也不必再清洗一遍）
+        val safeSampler = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers)
+        val safeScheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers)
+        if (safeSampler != state.sampler || safeScheduler != state.scheduler) {
+            DebugLogger.w(TAG, "采样参数非法，已纠正为 sampler=$safeSampler, scheduler=$safeScheduler")
+            _uiState.update { it.copy(sampler = safeSampler, scheduler = safeScheduler) }
+        }
+
         val baseWorkflow = WorkflowManager.prepareVideoWorkflowById(
             workflowId = state.selectedWorkflowId,
             positivePrompt = state.positivePrompt,
@@ -1118,8 +1129,8 @@ class TextToVideoViewModel : BaseGenerationViewModel<TextToVideoUiState, TextToV
             cfg = state.cfg.toFloatOrNull(),
             // 提交前兜底（1.3）：视频页的 sampler / scheduler 不落盘（见 VideoGenerationSupport.buildWorkflowValues），
             // 取值来自缺省常量，但备份恢复 / 节点编辑等旁路仍可能把它们写脏，这里统一拦一道
-            samplerName = SamplerOptions.sanitizeSampler(state.sampler, state.availableSamplers),
-            scheduler = SamplerOptions.sanitizeScheduler(state.scheduler, state.availableSchedulers),
+            samplerName = safeSampler,
+            scheduler = safeScheduler,
             denoise = state.denoise.toFloatOrNull(),
             seed = state.seed.toLongOrNull(),
             randomSeed = state.randomSeed,

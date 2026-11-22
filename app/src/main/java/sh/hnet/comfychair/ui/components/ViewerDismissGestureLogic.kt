@@ -250,8 +250,10 @@ object ViewerDismissGesture {
      * E4：飞回目标的 graphicsLayer 因子换算。
      *
      * 图片内容（Fit 矩形，居中于容器、未变换）最终要正好落在格子矩形上：
-     * - 目标缩放 = 格子边长 / 内容边长（X/Y 各自算，E4"落到格子时尺寸 = 其他缩略图"；
-     *   格子缩略图是 Crop 语义，飞回图按 X/Y 拉到格子比例与它视觉一致）
+     * - 目标缩放 = 等比 Fit，两轴共用同一个因子 = min(格子宽/内容宽, 格子高/内容高)
+     *   （Viewer 内容层是 ContentScale.Fit 且无 clip：飞回必须等比，否则竖图飞进方格
+     *   会被压扁，真机已复现。取 min 不取 max —— max 是填满格子的 Crop 语义，无 clip
+     *   时图片会溢出、盖住相邻格子；min 保证完整装进格子，宽高比不同时只留少量空边）
      * - 目标平移 = 格子中心 − 容器中心（graphicsLayer 缩放以层中心为锚点，内容又
      *   居中于层 → 缩放不改变内容中心位置，平移直接对准格子中心即可）
      *
@@ -270,9 +272,17 @@ object ViewerDismissGesture {
             cellRect.width > 0f && cellRect.height > 0f &&
             cellRect.width.isFinite() && cellRect.height.isFinite()
         if (!valid) return FlyBackFactors(1f, 1f, 0f, 0f, 1f)
+        // 飞回终点必须等比：两轴用同一个缩放因子，否则竖图飞进方格会被压扁（真机已复现）。
+        // 取 min 而不是 max：Viewer 内容层没有 clip，用 max（填满格子）会让图片溢出、
+        // 盖住相邻格子。min 保证完整装进格子，代价是宽高比不同时留少量空边——
+        // 这比变形正确得多。
+        val scale = minOf(
+            cellRect.width / contentWidth,
+            cellRect.height / contentHeight
+        )
         return FlyBackFactors(
-            scaleX = cellRect.width / contentWidth,
-            scaleY = cellRect.height / contentHeight,
+            scaleX = scale,
+            scaleY = scale,
             translationX = cellRect.centerX - containerWidth / 2f,
             translationY = cellRect.centerY - containerHeight / 2f,
             alpha = 1f
@@ -965,12 +975,20 @@ enum class ViewerExitReason {
 object ViewerExitCleanup {
 
     /**
-     * 页内必须复位的字段（ImageViewer）。
+     * 页内退出清理涉及的字段（ImageViewer）——多数复位，isFlyBackAnimating 是例外。
      *
-     * 每一项都是"机制状态"（标志位 / 在途协程），复位它们不会改变当前帧画面：
+     * 每一项都是"机制状态"（标志位 / 在途协程），复位它们都不会改变当前帧画面；
+     * 唯一刻意**不复位**的是 isFlyBackAnimating（见其条目），保持 true 才能停在落格帧。
      * - exitCommitted：本页已发起退出的标志位。置位后不得再启动任何收尾动画、
      *   不得再累计新的退出意图（防"两次淡出"与重复 finish）；
-     * - isFlyBackAnimating：飞回收尾的在途标志位（下滑路径专用）；
+     * - isFlyBackAnimating：飞回收尾在途标志位（下滑路径专用）。**例外：resetViewerLayers
+     *   刻意不复位它**（ImageViewer.kt :284-309 复位体内没有对它的赋值）——飞回正常播完
+     *   它保持 true，graphicsLayer 据此停在「图片落格」末帧直到组件销毁；一旦置 false，
+     *   图层会回落全屏帧（残影）或触发旧的 alpha=0 黑格兜底（该兜底本轮已删）。行为
+     *   正确性由 ViewerExitWiringTest「复位函数…」钉与 FlyBackResidueRegressionTest 反证钉
+     *   保证。仍列在 PAGE_FIELDS 而非挪进 KEPT_FIELDS：① 它是清理流程管辖的页内机制标志，
+     *   配套 flyBackJob 在此一并回收；② ViewerExitCleanupTest.kt:66 钉住 plan 必含此项，
+     *   且「复位与保留字段互斥」(:96) 禁止把它同时放进 KEPT_FIELDS；
      * - pendingSingleTap：退出后不该再补发一次"单击切换 UI"；
      * - zoomJob / settleJob / flyBackJob：在途动画协程。转场被中断或取消也必须
      *   回收，不允许留着一个还在往已销毁的图层里写值（任务书实施指令 2/3）。

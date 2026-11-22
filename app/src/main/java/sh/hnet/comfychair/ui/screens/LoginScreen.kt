@@ -42,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -133,6 +134,17 @@ fun LoginScreen() {
     var warningMessage by remember { mutableStateOf<String?>(null) }
     var comfyUIClient by remember { mutableStateOf<ComfyUIClient?>(null) }
     var hasAutoConnected by remember { mutableStateOf(false) }
+    // ── 自动连抑制的「进站判定」（R1-L1，跨配置变更保留）────────────────────────
+    //
+    // suppressAutoConnectOnce() / logout() 会置位 ConnectionManager 的抑制标志并推进代次；
+    // 旧做法在 LaunchedEffect 里读完标志立刻清掉，配置变更（旋转/深色模式）导致 Compose
+    // 重建后 LaunchedEffect 再跑一遍时标志已被清 —— 抑制失效，自动连了回去。
+    //
+    // 现在把「本次进入是否被抑制」记在 rememberSaveable 里（重建后原样恢复），
+    // 判定时机改为「抑制代次与已处理代次不一致时」重判一次（幂等，见下方 refresh 函数）：
+    // 重建后代次一致 → 不重判，抑制状态保留；新抑制请求（登出/返回键）→ 代次变化 → 重判。
+    var autoConnectSuppressed by rememberSaveable { mutableStateOf(false) }
+    var handledSuppressionEpoch by rememberSaveable { mutableStateOf(-1L) }
     // 私网证书指纹不一致时提供「重新信任」入口；公网不提供（必须失败）
     var retrustServer by remember { mutableStateOf<Server?>(null) }
     // 公网自签证书首次连接：必须由用户显式确认后才能信任
@@ -416,11 +428,27 @@ fun LoginScreen() {
         }
     }
 
+    // 「新抑制请求才重判」的幂等判定（R1-L1）：代次没变（含配置变更重建后恢复的
+    // 已处理代次）就跳过 —— 抑制状态跨重建保留；代次变了（登出/返回键的新请求）才
+    // 重新读标志并消费。ON_RESUME 与 LaunchedEffect 都调它，两处先后到达都正确。
+    fun refreshAutoConnectSuppression() {
+        val epoch = ConnectionManager.autoConnectSuppressionEpoch
+        if (epoch != handledSuppressionEpoch) {
+            handledSuppressionEpoch = epoch
+            autoConnectSuppressed = ConnectionManager.isUserInitiatedLogout
+            ConnectionManager.clearLogoutFlag()
+        }
+    }
+
     // Reset state when activity resumes (e.g., after logout or back navigation)
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
+                // 消费新置位的抑制请求（登出 / 返回键回连接页）。重建恢复时已处理代次
+                // 与当前代次一致，这里不会重判 —— 抑制状态由 rememberSaveable 保留
+                refreshAutoConnectSuppression()
+
                 // Reload servers in case they were modified
                 servers = serverStorage.getServers()
                 selectedServer = serverStorage.getSelectedServerId()?.let { id -> servers.find { it.id == id } }
@@ -442,11 +470,14 @@ fun LoginScreen() {
         }
     }
 
-    // Auto-connect on fresh app launch (if enabled in settings, we have a selected server, user didn't explicitly logout, and not in offline mode)
+    // Auto-connect on fresh app launch (if enabled in settings, we have a selected server,
+    // user didn't explicitly logout, and not in offline mode)
     LaunchedEffect(Unit) {
+        // 先幂等地消费一次抑制请求（兜底 ON_RESUME 早于首帧组合的时序差异）：
+        // 判定结果在 autoConnectSuppressed 里，配置变更重建后同样保留
+        refreshAutoConnectSuppression()
         val isAutoConnectEnabled = AppSettings.isAutoConnectEnabled(context)
-        val shouldAutoConnect = isAutoConnectEnabled && !ConnectionManager.isUserInitiatedLogout && !isOfflineMode
-        ConnectionManager.clearLogoutFlag()
+        val shouldAutoConnect = isAutoConnectEnabled && !autoConnectSuppressed && !isOfflineMode
 
         if (!hasAutoConnected && shouldAutoConnect && selectedServer != null) {
             hasAutoConnected = true

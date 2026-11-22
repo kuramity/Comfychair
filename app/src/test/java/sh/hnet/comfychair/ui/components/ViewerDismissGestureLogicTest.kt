@@ -745,8 +745,8 @@ class ViewerDismissGestureLogicTest {
             contentHeight = 320f,
             cellRect = ViewerRect(left = 120f, top = 280f, width = 80f, height = 80f)
         )
-        // scale = 格子边 / 内容边；X/Y 各自算（格子是正方形、内容不一定，允许轻微变形
-        // 与缩略图 Crop 语义一致）
+        // scale = 格子边 / 内容边；等比 Fit，两轴共用同一因子
+        // （正方形内容进正方形格子，min/max 取值相同，与 Crop 语义在数值上恰好重合）
         assertEquals(0.25f, target.scaleX, 0.0001f)
         assertEquals(0.25f, target.scaleY, 0.0001f)
         // 平移 = 格子中心 - 容器中心：(160, 320) - (160, 320) = 0
@@ -767,8 +767,9 @@ class ViewerDismissGestureLogicTest {
         )
         assertEquals(-120f, target.translationX, 0.0001f)
         assertEquals(-180f, target.translationY, 0.0001f)
-        // 内容是全屏比例 320x640 → X/Y 缩放不同（等边格子把内容拉成方形）
-        assertEquals(0.25f, target.scaleX, 0.0001f)
+        // 内容比例 320x640 飞进 80x80 方格：等比 Fit 取 min=80/640，两轴共用同一因子
+        // （旧的两轴独立写法给出 scaleX=0.25 / scaleY=0.125，会把竖图压扁，已废弃）
+        assertEquals(0.125f, target.scaleX, 0.0001f)
         assertEquals(0.125f, target.scaleY, 0.0001f)
     }
 
@@ -796,6 +797,51 @@ class ViewerDismissGestureLogicTest {
             cellRect = ViewerRect(0f, 0f, Float.NaN, 80f)
         )
         assertEquals(1f, identity2.scaleX, 0.0001f)
+    }
+
+    @Test
+    fun `飞回目标因子竖图飞进方格等比不变形`() {
+        // 真机复现场景：竖图 1024x1536 飞进 200x200 方格。
+        // 旧的两轴独立写法给出 scaleX=200/1024≈0.195、scaleY=200/1536≈0.130（压扁）；
+        // 等比 Fit 两轴必须相等，取 min=200/1536。
+        val target = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 1024f,
+            contentHeight = 1536f,
+            cellRect = ViewerRect(0f, 0f, 200f, 200f)
+        )
+        assertEquals(target.scaleX, target.scaleY, 0.0001f)
+        assertEquals(200f / 1536f, target.scaleX, 0.0001f)
+    }
+
+    @Test
+    fun `飞回目标因子横图飞进方格等比不变形`() {
+        // 横图 1920x1080 飞进 200x200 方格：旧写法 scaleX=200/1920≈0.104、
+        // scaleY=200/1080≈0.185（拉变形）；等比必须两轴相等，取 min=200/1920。
+        val target = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 1920f,
+            contentHeight = 1080f,
+            cellRect = ViewerRect(0f, 0f, 200f, 200f)
+        )
+        assertEquals(target.scaleX, target.scaleY, 0.0001f)
+        assertEquals(200f / 1920f, target.scaleX, 0.0001f)
+    }
+
+    @Test
+    fun `飞回目标因子正方形等比且等于格子边比内容边`() {
+        // 正方形内容 512x512 进 200x200：两轴相等，且都 = 200/512（格子边 / 内容边）。
+        val target = ViewerDismissGesture.flyBackTargetFactors(
+            containerWidth = containerW,
+            containerHeight = containerH,
+            contentWidth = 512f,
+            contentHeight = 512f,
+            cellRect = ViewerRect(0f, 0f, 200f, 200f)
+        )
+        assertEquals(200f / 512f, target.scaleX, 0.0001f)
+        assertEquals(target.scaleX, target.scaleY, 0.0001f)
     }
 
     @Test

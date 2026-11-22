@@ -201,7 +201,13 @@ class ViewerExitWiringTest {
             "val resetViewerLayers: (ViewerExitReason) -> Unit = { reason ->"
         )
         assertTrue("缺 exitCommitted = true", hasStatement(body, "exitCommitted = true"))
-        assertTrue(hasStatement(body, "isFlyBackAnimating = false"))
+        // B-2：resetViewerLayers 刻意**不**复位 isFlyBackAnimating——保留飞回落格帧直到
+        // 组件销毁。块内出现任何对 isFlyBackAnimating 的赋值，都说明有人把残影修复翻了
+        // 回去（置 false 会让渲染层回落全屏帧 / 触发旧的 alpha=0 黑格兜底）。
+        assertFalse(
+            "resetViewerLayers 不得复位 isFlyBackAnimating",
+            body.lines().any { it.trim().startsWith("isFlyBackAnimating =") }
+        )
         assertTrue(hasStatement(body, "pendingSingleTap = false"))
         for (job in listOf("zoomJob", "settleJob", "flyBackJob")) {
             assertTrue("$job 必须在统一复位里被取消", hasStatement(body, "$job?.cancel()"))

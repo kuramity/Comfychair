@@ -71,6 +71,37 @@ object DynamicParamTypeResolver {
         "moss_mode" to listOf("moss_25", "moss_spec25", "moss_50", "moss_c25", "moss_28")
     )
 
+    /**
+     * App 端固定控件类型：占位符名 → 控件描述（与 FIXED_COMBO_OPTIONS 同思路的"登记即接管"）。
+     *
+     * 用于「占位符落在连接类型字段下」的情形：rgthree Power Lora Loader 的 `lora_1` 在服务器
+     * `/object_info` 里是连接类型而非 widget，查不到字段定义，类型推导退化成单行文本框，
+     * 逼用户手打 `true` / `0.75`（移动端易错）。命中本表的占位符**无视服务器定义**，直接渲染成
+     * 指定控件。与 FIXED_COMBO_OPTIONS 同时命中时**以下拉为准**（combo 检查在前；
+     * 两表键集当前不相交，此规则只为未来重叠时行为确定）。
+     *
+     * default 与预置流 defaults 保持一致（取值顺序 defaults 优先于控件 default，两处一致
+     * 才不会"面板初值"与"兜底语义"打架）：`lora*_on = false`（用户决策：默认全关）；
+     * `lora1/lora2_strength = 1.0`、`lora3_strength = 0.75`（与 prebuilt_33 defaults 相同）。
+     * 强度范围按 rgthree LoRA 权重的合理区间取 `0..2`、步进 `0.05`（rgthree 支持负权重，
+     * 但控件下限取 0 即可，不为负值放宽）。
+     */
+    private val FIXED_CONTROLS: Map<String, DynamicParamControl> = mapOf(
+        // MOSS 4K 三槽 LoRA 开关与强度（预置流 prebuilt_33 / prebuilt_34 的 {{lora*_on}} / {{lora*_strength}}）
+        "lora1_on" to DynamicParamControl.BoolField(default = false),
+        "lora1_strength" to DynamicParamControl.NumberField(
+            isInteger = false, min = 0.0, max = 2.0, step = 0.05, default = 1.0
+        ),
+        "lora2_on" to DynamicParamControl.BoolField(default = false),
+        "lora2_strength" to DynamicParamControl.NumberField(
+            isInteger = false, min = 0.0, max = 2.0, step = 0.05, default = 1.0
+        ),
+        "lora3_on" to DynamicParamControl.BoolField(default = false),
+        "lora3_strength" to DynamicParamControl.NumberField(
+            isInteger = false, min = 0.0, max = 2.0, step = 0.05, default = 0.75
+        )
+    )
+
     fun resolve(ref: DynamicParamRef, source: DynamicParamDefinitionSource): DynamicParam {
         val definition = source.inputDefinitionOf(ref.classType, ref.inputName)
         val control = controlFor(ref, definition, source)
@@ -92,6 +123,10 @@ object DynamicParamTypeResolver {
         FIXED_COMBO_OPTIONS[ref.placeholder]?.let { options ->
             return DynamicParamControl.ComboField(options = options, default = null)
         }
+
+        // App 端固定控件次之（见 FIXED_CONTROLS）：连接类型下的占位符查不到 widget 定义，
+        // 不登记就会退化成文本框；命中即无视服务器定义
+        FIXED_CONTROLS[ref.placeholder]?.let { return it }
 
         // 定义查不到 → 退化为单行文本框，不猜类型（设计约束 2）
         if (definition == null) {
