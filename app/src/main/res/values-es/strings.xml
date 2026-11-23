@@ -674,6 +674,8 @@
     <string name="update_error_verify_missing">La lista de actualizacion no contiene una suma SHA-256 valida. Actualizacion rechazada.</string>
     <string name="update_error_redirect">La descarga se redirigio a un host no confiable (%1$s). Actualizacion cancelada.</string>
     <string name="update_error_install_invalid">El nombre del paquete descargado no coincide con esta app. Instalacion bloqueada.</string>
+    <!-- v4.20.x: almacen de actualizaciones no disponible (distinto de "almacenamiento lleno") -->
+    <string name="update_error_storage_unavailable">El almacen de actualizaciones no esta disponible. Libera espacio o reinicia el dispositivo y vuelve a comprobar las actualizaciones.</string>
     <string name="update_action_retry">Reintentar</string>
     <string name="update_manual_check_failed">Fallo la comprobacion: %1$s</string>
     <string name="update_already_latest">Ya tienes la ultima version.</string>
@@ -721,4 +723,36 @@
     <string name="notify_generation_action_cancel">Cancelar</string>
     <string name="label_generation_notifications">Notificaciones de generación</string>
     <string name="desc_generation_notifications">Muestra el progreso en la barra de notificaciones durante la generación y avisa al completar o fallar</string>
+    <!-- v4.18.x 后台省流量：后台保持连接开关（默认关） -->
+    <string name="label_background_keep_connected">Mantener conexión en segundo plano</string>
+    <string name="desc_background_keep_connected">Permanece conectado para recibir resultados al instante con la app minimizada o en ventana flotante. Desactivado (recomendado) ahorra datos: en redes móviles se cierra la conexión y los resultados llegan por lotes. Con Wi-Fi la conexión siempre se mantiene. Al activarlo, se consumen datos móviles de forma continua.</string>
+    <!-- Exportación Markdown de la información del modelo (plantilla compartida: ModelIntroMarkdown) -->
+    <string name="model_intro_export_md">Exportar Markdown</string>
+    <string name="model_intro_export_failed">No se pudo exportar la información del modelo</string>
+    <!-- Capa de usuario: desinstalar / selección múltiple / importar / restaurar -->
+    <string name="model_intro_menu_more">Más acciones</string>
+    <string name="model_intro_batch_manage">Selección múltiple</string>
+    <string name="model_intro_import">Importar información</string>
+    <string name="model_intro_hidden_menu">Desinstalados (%1$d)</string>
+    <string name="model_intro_uninstall_title">¿Desinstalar esta entrada?</string>
+    <string name="model_intro_uninstall_message">«%1$s» solo se ocultará en este dispositivo. La entrada integrada no se elimina y se puede restaurar en cualquier momento.</string>
+    <string name="model_intro_uninstall_confirm">Desinstalar</string>
+    <string name="model_intro_uninstall_done">Entrada desinstalada</string>
+    <string name="model_intro_restore">Restaurar</string>
+    <string name="model_intro_restore_done">Entrada restaurada</string>
+    <string name="model_intro_op_failed">La operación falló, inténtalo de nuevo</string>
+    <string name="model_intro_select_count">%1$d seleccionados</string>
+    <string name="model_intro_select_none">Selecciona primero alguna entrada</string>
+    <string name="model_intro_batch_title">Desinstalar seleccionados</string>
+    <string name="model_intro_batch_message">¿Desinstalar las %1$d entradas seleccionadas? Solo se ocultarán en este dispositivo y se pueden restaurar en cualquier momento.</string>
+    <string name="model_intro_batch_done">%1$d entradas desinstaladas</string>
+    <string name="model_intro_hidden_title">Entradas desinstaladas</string>
+    <string name="model_intro_hidden_empty">No hay entradas desinstaladas</string>
+    <string name="model_intro_import_success">%1$d entradas importadas</string>
+    <string name="model_intro_import_error_read">No se pudo leer el archivo, inténtalo de nuevo</string>
+    <string name="model_intro_import_error_unsupported">Tipo de archivo no compatible (solo .json o .md)</string>
+    <string name="model_intro_import_error_json">JSON no válido: se espera una tabla de información de modelos (models) o un objeto «nombre de archivo → entrada»</string>
+    <string name="model_intro_import_error_empty">El archivo no contiene entradas importables</string>
+    <string name="model_intro_import_error_md">No se encontró información del modelo en este Markdown: requiere un título «# nombre» y líneas de metadatos como «名字：…»</string>
+    <string name="model_intro_import_error_save">No se pudieron guardar las entradas importadas, inténtalo de nuevo</string>
 </resources>

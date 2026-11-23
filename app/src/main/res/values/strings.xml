@@ -801,6 +801,35 @@
     <!-- Model intro detail page (v4.17): full 20-section layout, entered from the intro sheet -->
     <string name="model_intro_detail_title">Model details</string>
     <string name="model_intro_open_detail">View full details</string>
+    <!-- Markdown export (single template shared with in-app rendering, see ModelIntroMarkdown) -->
+    <string name="model_intro_export_md">Export Markdown</string>
+    <string name="model_intro_export_failed">Could not export this model info</string>
+    <!-- User overlay: uninstall / batch / import / restore (see ModelIntroViewModel) -->
+    <string name="model_intro_menu_more">More actions</string>
+    <string name="model_intro_batch_manage">Select multiple</string>
+    <string name="model_intro_import">Import</string>
+    <string name="model_intro_hidden_menu">Uninstalled (%1$d)</string>
+    <string name="model_intro_uninstall_title">Uninstall this entry?</string>
+    <string name="model_intro_uninstall_message">“%1$s” will be hidden on this device only. The built-in entry is not deleted and can be restored at any time.</string>
+    <string name="model_intro_uninstall_confirm">Uninstall</string>
+    <string name="model_intro_uninstall_done">Entry uninstalled</string>
+    <string name="model_intro_restore">Restore</string>
+    <string name="model_intro_restore_done">Entry restored</string>
+    <string name="model_intro_op_failed">Operation failed, please try again</string>
+    <string name="model_intro_select_count">%1$d selected</string>
+    <string name="model_intro_select_none">Select at least one entry first</string>
+    <string name="model_intro_batch_title">Uninstall selected</string>
+    <string name="model_intro_batch_message">Uninstall %1$d selected entries? They are only hidden on this device and can be restored at any time.</string>
+    <string name="model_intro_batch_done">%1$d entries uninstalled</string>
+    <string name="model_intro_hidden_title">Uninstalled entries</string>
+    <string name="model_intro_hidden_empty">No uninstalled entries</string>
+    <string name="model_intro_import_success">%1$d entries imported</string>
+    <string name="model_intro_import_error_read">Could not read the file, please try again</string>
+    <string name="model_intro_import_error_unsupported">Unsupported file type (only .json or .md)</string>
+    <string name="model_intro_import_error_json">Invalid JSON: expected a model info table (models) or a “filename → entry” object</string>
+    <string name="model_intro_import_error_empty">No entries found in this file</string>
+    <string name="model_intro_import_error_md">No model info found in this Markdown: it needs a “# name” title and meta lines such as “名字：…”</string>
+    <string name="model_intro_import_error_save">Could not save the imported entries, please try again</string>
     <string name="model_intro_style_tags">Style</string>
     <string name="model_intro_lora_weight">LoRA weight</string>
     <string name="model_intro_lora_weight_range">%1$s – %2$s</string>
@@ -988,6 +1017,8 @@
     <string name="update_error_install_missing">The update package is missing or unreadable. Check for updates to download it again.</string>
     <string name="update_error_install_unavailable">No system installer is available on this device. Installation cannot start.</string>
     <string name="update_error_disk">Not enough storage (free %1$s, need about %2$s).</string>
+    <!-- v4.20.x 派工单：存储目录不可用/写探针失败（与「磁盘真满」分开的语义） -->
+    <string name="update_error_storage_unavailable">The update storage folder is unavailable. Free up space or restart the device, then check for updates again.</string>
     <string name="update_error_retry_exhausted">Failed after %1$d retries. Check the network and retry manually.</string>
     <string name="update_error_unknown">Download interrupted. Resumable retry supported.</string>
     <string name="update_error_unexpected">Download error: %1$s</string>

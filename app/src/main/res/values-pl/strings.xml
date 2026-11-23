@@ -674,6 +674,8 @@
     <string name="update_error_verify_missing">Lista aktualizacji nie zawiera prawidlowego skrotu SHA-256. Aktualizacja odrzucona.</string>
     <string name="update_error_redirect">Pobieranie przekierowano do niezaufanego hosta (%1$s). Aktualizacja przerwana.</string>
     <string name="update_error_install_invalid">Nazwa pobranego pakietu nie pasuje do tej aplikacji. Instalacja zablokowana.</string>
+    <!-- v4.20.x: katalog przechowywania niedostepny (inny komunikat niz "pelnia dysku") -->
+    <string name="update_error_storage_unavailable">Katalog przechowywania aktualizacji jest niedostepny. Zwolnij miejsce lub uruchom urzadzenie ponownie, a nastepnie sprawdz aktualizacje.</string>
     <string name="update_action_retry">Ponow</string>
     <string name="update_manual_check_failed">Sprawdzanie nie powiodlo sie: %1$s</string>
     <string name="update_already_latest">Mas juz najnowsza wersje.</string>
@@ -721,4 +723,36 @@
     <string name="notify_generation_action_cancel">Anuluj</string>
     <string name="label_generation_notifications">Powiadomienia o generowaniu</string>
     <string name="desc_generation_notifications">Pokazuje postęp na pasku powiadomień podczas generowania i informuje o zakończeniu lub niepowodzeniu</string>
+    <!-- v4.18.x 后台省流量：后台保持连接开关（默认关） -->
+    <string name="label_background_keep_connected">Utrzymuj połączenie w tle</string>
+    <string name="desc_background_keep_connected">Pozostaje połączony, aby natychmiast otrzymywać wyniki przy zminimalizowanej aplikacji lub w oknie pływającym. Wyłączone (zalecane) oszczędza dane: w sieciach komórkowych połączenie jest zamykane, a wyniki przychodzą partiami. Przy Wi-Fi połączenie jest zawsze utrzymywane. Włączenie powoduje ciągłe zużycie danych komórkowych.</string>
+    <!-- Eksport informacji o modelu do Markdown (wspólny szablon: ModelIntroMarkdown) -->
+    <string name="model_intro_export_md">Eksportuj Markdown</string>
+    <string name="model_intro_export_failed">Nie udało się wyeksportować informacji o modelu</string>
+    <!-- Warstwa użytkownika: odinstaluj / zaznaczanie wielu / importuj / przywróć -->
+    <string name="model_intro_menu_more">Więcej działań</string>
+    <string name="model_intro_batch_manage">Zaznaczanie wielu</string>
+    <string name="model_intro_import">Importuj informacje</string>
+    <string name="model_intro_hidden_menu">Odinstalowane (%1$d)</string>
+    <string name="model_intro_uninstall_title">Odinstalować ten wpis?</string>
+    <string name="model_intro_uninstall_message">„%1$s” zostanie ukryty tylko na tym urządzeniu. Wbudowany wpis nie jest usuwany i można go w każdej chwili przywrócić.</string>
+    <string name="model_intro_uninstall_confirm">Odinstaluj</string>
+    <string name="model_intro_uninstall_done">Wpis odinstalowany</string>
+    <string name="model_intro_restore">Przywróć</string>
+    <string name="model_intro_restore_done">Wpis przywrócony</string>
+    <string name="model_intro_op_failed">Operacja nie powiodła się, spróbuj ponownie</string>
+    <string name="model_intro_select_count">Wybrano %1$d</string>
+    <string name="model_intro_select_none">Najpierw zaznacz wpisy</string>
+    <string name="model_intro_batch_title">Odinstaluj zaznaczone</string>
+    <string name="model_intro_batch_message">Odinstalować %1$d zaznaczonych wpisów? Zostaną ukryte tylko na tym urządzeniu i można je w każdej chwili przywrócić.</string>
+    <string name="model_intro_batch_done">Odinstalowano %1$d wpisów</string>
+    <string name="model_intro_hidden_title">Odinstalowane wpisy</string>
+    <string name="model_intro_hidden_empty">Brak odinstalowanych wpisów</string>
+    <string name="model_intro_import_success">Zaimportowano %1$d wpisów</string>
+    <string name="model_intro_import_error_read">Nie udało się odczytać pliku, spróbuj ponownie</string>
+    <string name="model_intro_import_error_unsupported">Nieobsługiwany typ pliku (tylko .json lub .md)</string>
+    <string name="model_intro_import_error_json">Nieprawidłowy JSON: oczekiwano tabeli informacji o modelach (models) lub obiektu „nazwa pliku → wpis”</string>
+    <string name="model_intro_import_error_empty">Brak wpisów do zaimportowania w tym pliku</string>
+    <string name="model_intro_import_error_md">Nie znaleziono informacji o modelu w tym Markdown: wymagany jest tytuł „# nazwa” i wiersze metadanych, np. „名字：…”</string>
+    <string name="model_intro_import_error_save">Nie udało się zapisać zaimportowanych wpisów, spróbuj ponownie</string>
 </resources>

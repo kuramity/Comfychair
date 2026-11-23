@@ -674,6 +674,8 @@
     <string name="update_error_verify_missing">Le manifeste de mise a jour ne contient pas de somme SHA-256 valide. Mise a jour refusee.</string>
     <string name="update_error_redirect">Le telechargement a ete redirige vers un hote non approuve (%1$s). Mise a jour interrompue.</string>
     <string name="update_error_install_invalid">Le nom du paquet telecharge ne correspond pas a cette application. Installation bloquee.</string>
+    <!-- v4.20.x : dossier de stockage indisponible (distinct de « stockage plein ») -->
+    <string name="update_error_storage_unavailable">Le dossier de stockage des mises a jour est indisponible. Supprimez des fichiers inutiles ou redemarrez l appareil, puis relancez la verification des mises a jour.</string>
     <string name="update_action_retry">Reessayer</string>
     <string name="update_manual_check_failed">Echec de la verification : %1$s</string>
     <string name="update_already_latest">Deja la derniere version.</string>
@@ -721,4 +723,36 @@
     <string name="notify_generation_action_cancel">Annuler</string>
     <string name="label_generation_notifications">Notifications de génération</string>
     <string name="desc_generation_notifications">Affiche la progression dans la barre de notifications pendant la génération et signale la fin ou l\'échec</string>
+    <!-- v4.18.x 后台省流量：后台保持连接开关（默认关） -->
+    <string name="label_background_keep_connected">Garder la connexion en arrière-plan</string>
+    <string name="desc_background_keep_connected">Reste connecté pour recevoir les résultats instantanément, application réduite ou en fenêtre flottante. Désactivé (recommandé) économise les données : sur les réseaux mobiles la connexion est fermée et les résultats arrivent par lots. En Wi-Fi la connexion est toujours maintenue. L\'activer consomme en continu des données mobiles.</string>
+    <!-- Export Markdown de la fiche modèle (modèle partagé : ModelIntroMarkdown) -->
+    <string name="model_intro_export_md">Exporter en Markdown</string>
+    <string name="model_intro_export_failed">Impossible d\'exporter les informations du modèle</string>
+    <!-- Couche utilisateur : désinstaller / sélection multiple / importer / restaurer -->
+    <string name="model_intro_menu_more">Plus d\'actions</string>
+    <string name="model_intro_batch_manage">Sélection multiple</string>
+    <string name="model_intro_import">Importer des infos</string>
+    <string name="model_intro_hidden_menu">Désinstallés (%1$d)</string>
+    <string name="model_intro_uninstall_title">Désinstaller cette fiche ?</string>
+    <string name="model_intro_uninstall_message">« %1$s » ne sera masqué que sur cet appareil. La fiche intégrée n\'est pas supprimée et peut être restaurée à tout moment.</string>
+    <string name="model_intro_uninstall_confirm">Désinstaller</string>
+    <string name="model_intro_uninstall_done">Fiche désinstallée</string>
+    <string name="model_intro_restore">Restaurer</string>
+    <string name="model_intro_restore_done">Fiche restaurée</string>
+    <string name="model_intro_op_failed">Échec de l\'opération, réessayez</string>
+    <string name="model_intro_select_count">%1$d sélectionnés</string>
+    <string name="model_intro_select_none">Sélectionnez d\'abord des fiches</string>
+    <string name="model_intro_batch_title">Désinstaller la sélection</string>
+    <string name="model_intro_batch_message">Désinstaller les %1$d fiches sélectionnées ? Elles ne seront masquées que sur cet appareil et peuvent être restaurées à tout moment.</string>
+    <string name="model_intro_batch_done">%1$d fiches désinstallées</string>
+    <string name="model_intro_hidden_title">Fiches désinstallées</string>
+    <string name="model_intro_hidden_empty">Aucune fiche désinstallée</string>
+    <string name="model_intro_import_success">%1$d fiches importées</string>
+    <string name="model_intro_import_error_read">Impossible de lire le fichier, réessayez</string>
+    <string name="model_intro_import_error_unsupported">Type de fichier non pris en charge (uniquement .json ou .md)</string>
+    <string name="model_intro_import_error_json">JSON invalide : attendez une table d\'infos modèles (models) ou un objet « nom de fichier → fiche »</string>
+    <string name="model_intro_import_error_empty">Aucune fiche importable dans ce fichier</string>
+    <string name="model_intro_import_error_md">Aucune info de modèle dans ce Markdown : il faut un titre « # nom » et des lignes de métadonnées comme « 名字：… »</string>
+    <string name="model_intro_import_error_save">Impossible d\'enregistrer les fiches importées, réessayez</string>
 </resources>

@@ -818,6 +818,35 @@
     <!-- 模型介绍详情页（v4.17）：抽屉「查看完整详情」进入，20 个候选区块完整版 -->
     <string name="model_intro_detail_title">模型详情</string>
     <string name="model_intro_open_detail">查看完整详情</string>
+    <!-- Markdown 导出（界面渲染与导出共用 ModelIntroMarkdown 模板） -->
+    <string name="model_intro_export_md">导出 Markdown</string>
+    <string name="model_intro_export_failed">导出失败，请重试</string>
+    <!-- 用户覆盖层：卸载 / 批量 / 导入 / 恢复（见 ModelIntroViewModel） -->
+    <string name="model_intro_menu_more">更多操作</string>
+    <string name="model_intro_batch_manage">批量管理</string>
+    <string name="model_intro_import">导入介绍</string>
+    <string name="model_intro_hidden_menu">已卸载（%1$d）</string>
+    <string name="model_intro_uninstall_title">卸载此条介绍？</string>
+    <string name="model_intro_uninstall_message">「%1$s」将只在本机隐藏，内置介绍不会被删除，可随时在「已卸载」里恢复。</string>
+    <string name="model_intro_uninstall_confirm">卸载</string>
+    <string name="model_intro_uninstall_done">已卸载该条介绍</string>
+    <string name="model_intro_restore">恢复</string>
+    <string name="model_intro_restore_done">已恢复该条介绍</string>
+    <string name="model_intro_op_failed">操作失败，请重试</string>
+    <string name="model_intro_select_count">已选 %1$d 条</string>
+    <string name="model_intro_select_none">请先勾选要卸载的条目</string>
+    <string name="model_intro_batch_title">批量卸载</string>
+    <string name="model_intro_batch_message">将卸载选中的 %1$d 条介绍（只在本机隐藏，可随时恢复）。</string>
+    <string name="model_intro_batch_done">已卸载 %1$d 条介绍</string>
+    <string name="model_intro_hidden_title">已卸载的介绍</string>
+    <string name="model_intro_hidden_empty">没有已卸载的介绍</string>
+    <string name="model_intro_import_success">已导入 %1$d 条介绍</string>
+    <string name="model_intro_import_error_read">文件读取失败，请重试</string>
+    <string name="model_intro_import_error_unsupported">不支持的文件类型（只接受 .json 或 .md）</string>
+    <string name="model_intro_import_error_json">JSON 格式不正确：需要模型介绍表（models）或「文件名 → 条目」对象</string>
+    <string name="model_intro_import_error_empty">文件里没有可导入的介绍条目</string>
+    <string name="model_intro_import_error_md">Markdown 里没找到介绍内容：需要「# 模型名」标题与元信息行（如「名字：…」）</string>
+    <string name="model_intro_import_error_save">导入内容保存失败，请重试</string>
     <string name="model_intro_style_tags">风格</string>
     <string name="model_intro_lora_weight">LoRA 权重</string>
     <string name="model_intro_lora_weight_range">%1$s – %2$s</string>
@@ -902,6 +931,8 @@
     <string name="update_error_install_missing">安装包不存在或无法读取，请点「检查更新」重新下载。</string>
     <string name="update_error_install_unavailable">本机没有可用的系统安装器，无法启动安装。</string>
     <string name="update_error_disk">磁盘空间不足（剩余 %1$s，需要约 %2$s）。</string>
+    <!-- v4.20.x 派工单：存储目录不可用/写探针失败（与「磁盘真满」分开的语义） -->
+    <string name="update_error_storage_unavailable">更新存储目录不可用，请清理存储空间或重启手机后，再点「检查更新」重试。</string>
     <string name="update_error_retry_exhausted">已重试 %1$d 次仍失败，请检查网络后手动重试。</string>
     <string name="update_error_unknown">下载中断，可重试续传。</string>
     <string name="update_error_unexpected">下载出错：%1$s</string>
