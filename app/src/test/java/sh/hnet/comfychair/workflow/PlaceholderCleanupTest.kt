@@ -10,7 +10,7 @@ import sh.hnet.comfychair.WorkflowManager
 /**
  * 钉住 [WorkflowManager.clearStaleAndUnmappedPlaceholders] 的 Case 1 判定粒度：
  *
- * 生成期是**全局字符串替换**，同一占位符合法出现在多个节点上（预置流 `prebuilt_30` 里
+ * 生成期是**全局字符串替换**，同一占位符合法出现在多个节点上（如某些工作流里
  * `{{seed}}` 6 处、`{{width}}` 5 处、`{{positive_prompt}}` 5 处）。保存工作流时只能删
  * 「塞进了不相干输入」的那一项，不能因为节点不是映射目标就整键删掉——否则用户保存一次，
  * 其余节点的占位符就永久丢失，之后提交报 `required_input_missing`。
@@ -174,7 +174,7 @@ class PlaceholderCleanupTest {
         cleanup(nodes, mapOf("seed" to "A"))
 
         assertEquals(
-            "RandomNoise 的 noise_seed 是 seed 的别名（预置流 prebuilt_30 实际用法）",
+            "RandomNoise 的 noise_seed 是 seed 的别名（实际工作流用法）",
             "{{seed}}", inputsOf(nodes, "B").getString("noise_seed")
         )
     }
@@ -195,7 +195,7 @@ class PlaceholderCleanupTest {
         cleanup(nodes, mapOf("positive_prompt" to "A"))
 
         assertEquals("目标节点 A 保留", "{{positive_prompt}}", inputsOf(nodes, "A").getString("text"))
-        assertEquals("B 的 text 是合法共用（prebuilt_30 有 5 处）", "{{positive_prompt}}", inputsOf(nodes, "B").getString("text"))
+        assertEquals("B 的 text 是合法共用（实际流里有 5 处）", "{{positive_prompt}}", inputsOf(nodes, "B").getString("text"))
         assertEquals("C 的 prompt 同样是提示词字段", "{{positive_prompt}}", inputsOf(nodes, "C").getString("prompt"))
         assertFalse("D 的 model_name 与提示词语义不符，删除", inputsOf(nodes, "D").has("model_name"))
     }

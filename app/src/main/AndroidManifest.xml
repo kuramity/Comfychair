@@ -157,6 +157,17 @@
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
 
+        <!-- 生成任务级保活前台服务（P4 · 路线 A）。
+             foregroundServiceType=dataSync：与更新模块共用同一类型与权限声明，
+             但**服务实例独立**（更新走 WorkManager 的 SystemForegroundService，
+             这里是本应用自己的 Service），两套互不影响。
+             exported=false：只由本应用显式 startForegroundService。
+             服务仅在「WiFi + 有生成任务」时存在，任务结束立即 stopSelf，不是常驻。 -->
+        <service
+            android:name=".notify.GenerationKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- 生成进度通知上「取消」按钮的接收器。
              exported=false：仅本 App 的 PendingIntent 能触发（通知动作广播由系统派发，
              带 origin 校验）。不持有任何状态，转发给 GenerationNotifier.requestCancel。 -->

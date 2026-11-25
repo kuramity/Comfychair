@@ -1,5 +1,8 @@
 package sh.hnet.comfychair.ui.components
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,8 +14,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -22,16 +28,15 @@ import sh.hnet.comfychair.R
 import sh.hnet.comfychair.connection.ConnectionFailure
 
 /**
- * Alert dialog shown when WebSocket connection fails after max retry attempts.
+ * Alert dialog shown for connection failures that need an explicit user decision
+ * (currently only authentication failures).
  *
- * Shows different options based on failure type:
- * - Network failure: Reconnect / Return to Login
- * - Auth failure: Return to Login only (no point retrying with invalid credentials)
- * - Stall failure: Dismiss only (informative)
- *
- * 这里**不再提供"进入离线"入口**：按已确认的决策 1，连不上服务器时由
- * `ConnectionManager` 自动切到离线态（有缓存时），不再让用户选；没有缓存时进离线
- * 也没有内容可看，按钮只会误导。用户若想主动离线，设置页的「强制离线」开关是明确入口。
+ * P3（弱网不再把人困在弹窗里）：
+ * - 对话框**任何时刻都可以关闭**（返回键 / 点外部 / 「稍后再试」）；
+ * - 点「重新连接」后即使一直转圈，`返回登录` 与 `稍后再试` 仍然可点，
+ *   正在进行的重连不会被取消，只是不再挡着界面；
+ * - 网络中断 / 传输停滞已改走顶部非阻塞横幅（见 `ConnectionStatusBanner`），
+ *   不会再走到这里。
  *
  * The Reconnect button shows a loading state with "Reconnecting..." while attempting.
  * Buttons are stacked vertically with thumb-friendly ordering (primary action at bottom).
@@ -48,7 +53,8 @@ fun ConnectionAlertDialog(
     val isStallFailure = failureType == ConnectionFailure.STALLED
 
     AlertDialog(
-        onDismissRequest = { if (!isReconnecting) onDismiss() },
+        // 永远允许关闭：被"稍后再试"关掉后，后台重连/退避不受影响。
+        onDismissRequest = onDismiss,
         title = {
             Text(
                 text = stringResource(
@@ -94,16 +100,24 @@ fun ConnectionAlertDialog(
                         horizontalAlignment = Alignment.End,
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        // Secondary: Return to Login (outlined button, top)
+                        // 明确出口①：先关掉弹窗，继续用当前界面（后台重连不受影响）
+                        TextButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(stringResource(R.string.action_try_later))
+                        }
+
+                        // 明确出口②：返回登录页
                         OutlinedButton(
                             onClick = onReturnToLogin,
-                            enabled = !isReconnecting,
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(stringResource(R.string.action_return_to_login))
                         }
 
                         // Primary: Reconnect (filled button, bottom - easiest thumb reach)
+                        // 仅本按钮在重连期间禁用；其余出口始终可点，杜绝"转圈后被卡死"。
                         Button(
                             onClick = onReconnect,
                             enabled = !isReconnecting,
@@ -125,13 +139,63 @@ fun ConnectionAlertDialog(
             }
         },
         confirmButton = {
-            // For auth failure, show single button
+            // For auth failure, show single button + explicit "稍后再试" exit
             if (isAuthFailure) {
-                Button(onClick = onReturnToLogin) {
-                    Text(stringResource(R.string.action_return_to_login))
+                Column(horizontalAlignment = Alignment.End) {
+                    TextButton(onClick = onDismiss) {
+                        Text(stringResource(R.string.action_try_later))
+                    }
+                    Button(onClick = onReturnToLogin) {
+                        Text(stringResource(R.string.action_return_to_login))
+                    }
                 }
             }
             // For network/stall failure, buttons are in the text content above
         }
     )
+}
+
+/**
+ * 顶部非阻塞连接横幅（P3）。
+ *
+ * 弱网下"连接中断"不该用模态框拦人：这里只占一条细边，界面与数据完全保留，
+ * 重连成功后随 [visible] 变 false 自动消失（调用方用 WebSocket 状态驱动）。
+ */
+@Composable
+fun ConnectionStatusBanner(
+    visible: Boolean,
+    text: String,
+    modifier: Modifier = Modifier
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(),
+        exit = fadeOut(),
+        modifier = modifier
+    ) {
+        Surface(
+            color = MaterialTheme.colorScheme.secondaryContainer,
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+        }
+    }
 }

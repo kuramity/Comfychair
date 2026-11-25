@@ -102,10 +102,22 @@ class GenerationNotifierPolicyTest {
 
     @Test
     fun `无进度数据期间按时间窗节流`() {
-        // max=0 → percent 占位 -1：两次都是 -1 视为"没变化"，不重复发
+        // max=0 → percent 占位 -1：短窗口内不重复发；但每 60 秒要刷新一次（P4）
         assertFalse(
             GenerationNotifier.shouldEmitProgress(
                 lastEmitAtMs = 5_000L, nowMs = 6_500L, minIntervalMs = 1_000L,
+                lastPercent = -1, newPercent = -1,
+            )
+        )
+        assertFalse(
+            GenerationNotifier.shouldEmitProgress(
+                lastEmitAtMs = 5_000L, nowMs = 64_000L, minIntervalMs = 1_000L,
+                lastPercent = -1, newPercent = -1,
+            )
+        )
+        assertTrue(
+            GenerationNotifier.shouldEmitProgress(
+                lastEmitAtMs = 5_000L, nowMs = 66_000L, minIntervalMs = 1_000L,
                 lastPercent = -1, newPercent = -1,
             )
         )

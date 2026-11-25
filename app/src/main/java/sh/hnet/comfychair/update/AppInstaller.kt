@@ -23,7 +23,8 @@ import java.io.File
  *   设置页让用户勾选（引导而非静默安装）。
  * - **禁止静默安装**：全程只用系统安装器 UI，不碰任何无障碍/反射安装通道。
  * - 文件通过 [FileProvider]（authorities 与项目既有的 image 分享共用，
- *   file_paths.xml 里补 external-files-path 的 update 子目录）。
+ *   file_paths.xml 里补 external-files-path 的 update 子目录；v4.20.x 起回退目录
+ *   filesDir/update/ 同样有 files-path 声明）。
  *
  * v4.16.11（P0-7）：**装前校验包名**。SHA-256 只保证"下载的文件没被中间人换掉"，
  * 挡不住"有人直接把任意 APK 放进 update/update.apk 再触发安装"这条旁路

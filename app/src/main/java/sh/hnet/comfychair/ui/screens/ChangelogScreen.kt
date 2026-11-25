@@ -33,7 +33,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -41,6 +46,7 @@ import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.update.ChangelogEntry
 import sh.hnet.comfychair.update.ChangelogParser
+import sh.hnet.comfychair.update.InlineStyle
 import sh.hnet.comfychair.ui.util.withStableKeys
 
 /**
@@ -167,10 +173,16 @@ private fun ChangelogCard(entry: ChangelogEntry, isCurrent: Boolean) {
             if (entry.items.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 entry.items.forEach { item ->
+                    // level 2 = 一级条目下的详细说明（CHANGELOG 里是「两个空格 + ·」）：
+                    // 缩进 + 小一号字，否则整段会被当一级条目平铺，层次全糊在一起
+                    val isSub = item.level >= 2
                     Text(
-                        text = "• $item",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        text = inlineAnnotated((if (isSub) "· " else "• ") + item.text),
+                        style = if (isSub) MaterialTheme.typography.bodySmall
+                        else MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = if (isSub) Modifier.padding(start = 16.dp, top = 2.dp)
+                        else Modifier.padding(top = 4.dp)
                     )
                 }
             }
@@ -180,3 +192,24 @@ private fun ChangelogCard(entry: ChangelogEntry, isCurrent: Boolean) {
 
 /** 内置日志文件名（assets 根目录）。 */
 private const val CHANGELOG_ASSET = "CHANGELOG.md"
+
+/**
+ * 把一行正文里的 `**粗体**` 与 `` `代码` `` 转成 [AnnotatedString]。
+ *
+ * 切分逻辑在 [ChangelogParser.parseInline]（纯函数，有 JVM 单测）；
+ * 这里只负责把片段映射成 Compose 的 SpanStyle。
+ *
+ * 真机现状（2026-11-26）：CHANGELOG 正文里大量 `**粗体**` 与 `` `标识符` ``，
+ * 旧实现整行纯文本绘制，用户看到满屏星号和反引号。
+ */
+private fun inlineAnnotated(text: String): AnnotatedString = buildAnnotatedString {
+    ChangelogParser.parseInline(text).forEach { segment ->
+        when (segment.style) {
+            InlineStyle.Normal -> append(segment.text)
+            InlineStyle.Bold ->
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(segment.text) }
+            InlineStyle.Code ->
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(segment.text) }
+        }
+    }
+}

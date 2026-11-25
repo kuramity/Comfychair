@@ -79,8 +79,10 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -105,6 +107,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -123,12 +128,12 @@ import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.storage.GalleryTrashEntry
 import sh.hnet.comfychair.ui.components.AppMenuDropdown
 import sh.hnet.comfychair.ui.components.ViewerRect
-import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
 import sh.hnet.comfychair.cache.ActiveView
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.ThreeDResultHolder
+import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
 import sh.hnet.comfychair.ui.components.shared.ThreeDViewerSheet
 import sh.hnet.comfychair.connection.rememberIsOffline
 import sh.hnet.comfychair.ui.components.rememberLazyBitmap
@@ -347,6 +352,11 @@ fun GalleryScreen(
                         if (s.removedWithServer > 0) {
                             add(context.getString(R.string.msg_trash_purged_server, s.removedWithServer))
                         }
+                        // 404 收敛的子集：文件在服务器上已不存在（多半是电脑端删的），
+                        // 单独说明，免得用户以为手机端动过服务器上的其它文件
+                        if (s.alreadyGone > 0) {
+                            add(context.getString(R.string.msg_trash_purged_already_gone, s.alreadyGone))
+                        }
                         if (s.removedLocalOnly > 0) {
                             add(
                                 context.getString(
@@ -411,6 +421,22 @@ fun GalleryScreen(
         // Update priorities to protect items around clicked index
         val allKeys = uiState.items.map { it.toCacheKey() }
         MediaCache.updateNavigationPriorities(safeIndex, allKeys)
+
+        // P2-B 配套：网格预取已经只暖缩略图，原图只在"真的要点开全屏"时才需要。
+        // 点击到查看器真正显示之间还有 PixelCopy 截图 + 挖空 + startActivity 的空档，
+        // 这里把被点开这张的原图排进预取队列（命中则由 worker 直接跳过）：
+        // 查看器首帧照旧命中原图缓存，"点图进全屏的速度"不因为 B 项退步。
+        uiState.items.getOrNull(safeIndex)?.let { item ->
+            MediaCache.prefetchOriginal(
+                MediaCache.PrefetchItem(
+                    key = allKeys[safeIndex],
+                    isVideo = item.isVideo,
+                    subfolder = item.subfolder,
+                    type = item.type,
+                    sourceMissing = item.sourceMissing
+                )
+            )
+        }
 
         val viewerItems = galleryItemsToViewerItems(uiState.items)
         val intent = MediaViewerActivity.createGalleryIntent(
@@ -557,22 +583,39 @@ fun GalleryScreen(
     // Track scroll position and update cache priorities with debounce
     // Only update when Gallery is the active view (not when MediaViewer is animating closed)
     // columns 进依赖：捏合换列后可见项数量与优先级区间都会变，必须重新上报
-    LaunchedEffect(
-        gridState.firstVisibleItemIndex,
-        gridState.layoutInfo.visibleItemsInfo.size,
-        columns
-    ) {
-        if (prefetchItems.isNotEmpty() && MediaCache.isActiveView(ActiveView.GALLERY)) {
-            // Debounce scroll updates to avoid excessive calls during fast scrolling
-            kotlinx.coroutines.delay(100)
-            MediaCache.updateGalleryPosition(
-                firstVisibleIndex = gridState.firstVisibleItemIndex,
-                visibleItemCount = gridState.layoutInfo.visibleItemsInfo.size,
-                allItems = prefetchItems,
-                // 预取优先级要按真实列数算（一行几列直接决定"附近几张"）
-                columnsInGrid = columns
-            )
+    //
+    // P2-D：原来把 `gridState.firstVisibleItemIndex` / `layoutInfo.visibleItemsInfo.size`
+    // 写在 LaunchedEffect 的 key 位置 —— 这两次读取发生在 **composition 阶段**，
+    // 每滚过一行就换一次 key：先取消旧协程、再整页重组一遍（网格 content lambda
+    // 与每个可见项的 key 计算都跟着重跑）。改为 snapshotFlow：状态只在协程里读，
+    // 帧内多次变化合并成一次发射；distinctUntilChanged 去掉同值的重复发射；
+    // collectLatest 用一个 100ms 的可取消 delay 做去抖（新值到达即取消旧的等待，
+    // 效果等同 debounce，且不需要 @FlowPreview 的 debounce）。
+    // 依赖仍保留 columns 与 prefetchItems：换列后列宽/可见数变了、条目列表变了
+    // （刷新/删除）都必须重新上报一次；snapshotFlow 会立刻发射当前值，首帧不漏报。
+    LaunchedEffect(columns, prefetchItems) {
+        snapshotFlow {
+            gridState.firstVisibleItemIndex to gridState.layoutInfo.visibleItemsInfo.size
         }
+            .distinctUntilChanged()
+            .collectLatest { (firstVisibleIndex, visibleItemCount) ->
+                if (prefetchItems.isEmpty() || !MediaCache.isActiveView(ActiveView.GALLERY)) {
+                    return@collectLatest
+                }
+                // 去抖：快速滑动期间不重排预取队列，停手 100ms 才按最终位置算一次
+                delay(100)
+                // P2-B：优先级重排与预取都是 LRU/队列/文件存在性判断，
+                // 不该压在主线程上（磁盘优先模式下 isCached 要做多次文件 stat）
+                withContext(Dispatchers.Default) {
+                    MediaCache.updateGalleryPosition(
+                        firstVisibleIndex = firstVisibleIndex,
+                        visibleItemCount = visibleItemCount,
+                        allItems = prefetchItems,
+                        // 预取优先级要按真实列数算（一行几列直接决定"附近几张"）
+                        columnsInGrid = columns
+                    )
+                }
+            }
     }
 
     // Prefetch when items become available or change (e.g., after manual refresh)
@@ -603,6 +646,29 @@ fun GalleryScreen(
             MediaCache.initialPrefetch(initialItems)
         }
     }
+
+    // ============================================================
+    // N4-R：长按滑选（线性连续区间）
+    // ============================================================
+    // 手势本体（长按阈值、精确/最近命中、区间、边缘滚动）全在 GalleryDragSelect.kt 的
+    // rememberGalleryDragSelectModifier 里。这里只提供三样数据出口：
+    //   · 条目数（区间边界）；
+    //   · index → ViewModel 选择键（与 _selectedItems 同口径，走 GalleryViewModel.getItemKey）；
+    //   · 当前选中集合（手势开始时被快照成 baseline）+ 整体设置集合（applyDragSelection）。
+    //
+    // 用 rememberUpdatedState 取最新值：手势块的 pointerInput key 恒为 Unit、只创建一次，
+    // 闭包必须读稳定 State，否则会一直用首帧的旧列表 / 旧选中集。
+    val latestGalleryItems = rememberUpdatedState(uiState.items)
+    val latestSelectedKeys = rememberUpdatedState(uiState.selectedItems)
+    val galleryDragSelectModifier = rememberGalleryDragSelectModifier(
+        gridState = gridState,
+        itemCount = { latestGalleryItems.value.size },
+        itemKeyAt = { index ->
+            latestGalleryItems.value.getOrNull(index)?.let { galleryViewModel.getItemKey(it) }
+        },
+        selectedKeys = { latestSelectedKeys.value },
+        applySelection = { keys -> galleryViewModel.applyDragSelection(keys) }
+    )
 
     Column(modifier = modifier.fillMaxSize()) {
         TopAppBar(
@@ -725,8 +791,35 @@ fun GalleryScreen(
             modifier = Modifier.fillMaxSize()
         ) {
             // Always use LazyVerticalGrid for consistent nested scroll behavior with pull-to-refresh
+            //
+            // A1（2026-11-25，回退 P2-A）：网格重新包回 NoOverscrollContainer。
+            //
+            // 为什么回退：P2-A 去掉这层后恢复了 Android 12+ 的 stretch 拉伸，用户随后反馈
+            // 「图库滑动老是回弹、很僵硬」——时间线与 P2-A 上线的 v4.22.1 完全吻合。触发条件
+            // 很具体：网格滚不满一屏时（捏合到 4 列 + 条目少，列表高度 < 可视高度），任何一次
+            // 上滑都只会拉伸再弹回，观感就是「一滑就弹、弹完吸回来」。
+            //
+            // 回退点：删掉 NoOverscrollContainer 这一层（含其闭合括号）即可恢复 P2-A 行为；
+            // 单测断言同步在 GalleryGridPerformanceWiringTest 的 A 用例里。
+            //
+            // 缩进说明：内部 LazyVerticalGrid 整块（约 180 行）的原始缩进刻意保持不变，
+            // 以把本次 diff 压到最小；层级以括号为准，阅读时注意多了一层容器。
+            //
+            // —— 以下 P2-A 段落为历史记录，保留备查（当时的要求是恢复默认拉伸）——
+            // P2-A：网格外层原先裹着 NoOverscrollContainer（LocalOverscrollFactory = null）。
+            // 那个容器在字节码层面是「不创建任何 overscroll 效果」，所以用户要的"拉伸感"
+            // 不是弱，是零。它自己的类注释写明的引入动机只有一条：规避长列表上 stretch
+            // 动画造成的卡顿（Google Issue #233515751）；全仓没有「下拉刷新与 overscroll
+            // 打架」的 bug 记录，且 PTR 本身不碰 overscroll factory（1.5.0-alpha11 的
+            // PullToRefreshKt / PullToRefreshModifierNode 字节码里没有任何
+            // LocalOverscrollFactory 引用，它只作为 NestedScrollConnection 消费位移）。
+            // 因此这里按要求移除外层包裹，恢复 Material3 / Android 12+ 的默认 stretch。
+            // 两者在同一手势上的实际表现（顶部下拉时 PTR 指示器 vs stretch）必须真机确认，
+            // 见执行报告-P2.md 的验收记录。
+            // （P2-A 写的那个回退点已执行，见上方 A1 说明。）
+            // 注：该容器文件未删除，日志/节点浏览/提示词库/设置/工作流这 5 个文件里还有 8 处调用。
             NoOverscrollContainer(modifier = Modifier.fillMaxSize()) {
-                LazyVerticalGrid(
+            LazyVerticalGrid(
                     // 列数由捏合手势决定（2/3/4，C1）；开关关闭时恒为 2
                     columns = GridCells.Fixed(columns),
                     state = gridState,
@@ -778,11 +871,23 @@ fun GalleryScreen(
                                 Modifier
                             }
                         )
+                        // N4-R：长按滑选（线性连续区间）。与捏合检测同为 Initial 通道的自定义手势：
+                        // 长按达成前不消费任何事件（滚动/单击/下拉刷新照旧），达成后接管 ——
+                        // 起点格与当前手指所在格之间的整段全部选中（跨行时中间整行全选），
+                        // 拖回则区间缩短。格子自身的 onLongPress 已移除：两处都留会在同一个
+                        // 500ms 阈值上各触发一次（选中/取消互相抵消，看起来像没选中）。
+                        .then(galleryDragSelectModifier)
                 ) {
                 if (uiState.isLoading && uiState.items.isEmpty()) {
                     // Loading state - show as full-span item
                     // 全宽占位项跟随列数（maxLineSpan = 当前一行几列），否则 3/4 列时会错位
-                    item(span = { GridItemSpan(maxLineSpan) }) {
+                    // P2-E：补 contentType + 稳定 key —— 否则它和卡片共用同一个复用池，
+                    // 首屏从"转圈"切到"卡片"时要整槽重建一次内容
+                    item(
+                        span = { GridItemSpan(maxLineSpan) },
+                        key = GALLERY_STATE_LOADING_KEY,
+                        contentType = GALLERY_GRID_STATE_CONTENT_TYPE
+                    ) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -794,7 +899,11 @@ fun GalleryScreen(
                     }
                 } else if (uiState.items.isEmpty()) {
                     // Empty state - show as full-span item
-                    item(span = { GridItemSpan(maxLineSpan) }) {
+                    item(
+                        span = { GridItemSpan(maxLineSpan) },
+                        key = GALLERY_STATE_EMPTY_KEY,
+                        contentType = GALLERY_GRID_STATE_CONTENT_TYPE
+                    ) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -821,7 +930,13 @@ fun GalleryScreen(
                     // key 必须与去重口径（GalleryRepository 的 distinctBy）完全一致：
                     // 用 "_" 拼会让 (a, b_c) 与 (a_b, c) 撞成同一个 key，
                     // LazyGrid 撞 key 会抛 IllegalArgumentException = 闪退。
-                    itemsIndexed(uiState.items, key = { _, item -> GalleryMetadataCache.itemIdentityKey(item.promptId, item.filename) }) { index, item ->
+                    itemsIndexed(
+                        uiState.items,
+                        key = { _, item -> GalleryMetadataCache.itemIdentityKey(item.promptId, item.filename) },
+                        // P2-E：卡片/页脚/占位项分池复用。缺 contentType 时三者共用同一个
+                        // 复用槽，滑到页脚会把卡片槽整槽换成按钮再换回来（多两次内容替换）
+                        contentType = { _, _ -> GALLERY_GRID_CARD_CONTENT_TYPE }
+                    ) { index, item ->
                         GalleryItemCard(
                             item = item,
                             isSelected = galleryViewModel.isItemSelected(item),
@@ -840,15 +955,53 @@ fun GalleryScreen(
                                     // Normal mode, tap opens MediaViewer
                                     launchMediaViewer(index)
                                 }
-                            },
-                            onLongPress = {
-                                // Long press enters selection mode and selects this item
-                                galleryViewModel.toggleSelection(item)
                             }
+                            // N4-R：长按不再挂在格子上。长按入口统一由网格容器的
+                            // detectDragSelectAfterLongPress 处理（进入选择模式 + 选中落点所在格
+                            // + 继续拖动按「线性区间」整段选中）。两处并存会在同一阈值上
+                            // 各触发一次，选中与取消互相抵消。
                         )
                     }
+
+                    // ============================================================
+                    // 「加载更早」分页入口（config-audit-report 事项2）
+                    // ============================================================
+                    //
+                    // 选**底部按钮**而不是"滚到底自动加载"，两条理由：
+                    // - 对既有滚动链路零侵入：本页已挂着三处按 gridState 驱动的
+                    //   LaunchedEffect（预取优先级、捏合换列锚定、查看器回位），自动加载
+                    //   要再插一处并和它们互相让位；按钮只是网格尾部一个全宽 item，
+                    //   PullToRefreshBox 的下拉刷新与滚动恢复行为原样不动。
+                    // - 自动加载有一个按钮天然没有的重触发环：整页净新增为 0（条目都被
+                    //   墓碑滤掉/索引已包含）时列表高度不变、"仍在底部"会连发请求，
+                    //   需要额外的防抖闸；按钮只在用户明确点击时发一笔。
+                    if (uiState.canLoadOlder || uiState.isLoadingOlder) {
+                        item(
+                            span = { GridItemSpan(maxLineSpan) },
+                            key = GALLERY_LOAD_OLDER_FOOTER_KEY,
+                            contentType = GALLERY_GRID_FOOTER_CONTENT_TYPE
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 12.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (uiState.isLoadingOlder) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(28.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    TextButton(onClick = { galleryViewModel.loadOlder() }) {
+                                        Text(stringResource(R.string.button_gallery_load_older))
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                }
+            }
             }
         }
     }
@@ -1205,8 +1358,7 @@ private fun GalleryItemCard(
     isSelected: Boolean,
     selectionMode: Boolean = false,
     isOffline: Boolean = false,
-    onTap: () -> Unit,
-    onLongPress: () -> Unit
+    onTap: () -> Unit
 ) {
     // Create cache key directly from item's stable properties
     val cacheKey = item.toCacheKey()
@@ -1256,6 +1408,10 @@ private fun GalleryItemCard(
             // key 用 failedPlaceholder：状态翻转时重启手势检测，避免闭包读到旧值。
             // 第三态（sourceMissing）且本机无缓存时不在这里重试：点开查看器，
             // 由查看器明确显示「原图已被删除，且本机无缓存」（重试入口也在那）。
+            //
+            // N4-R：这里只剩 tap。长按（进入选择模式 + 线性区间滑选）改由网格容器的
+            // GalleryDragSelect 统一处理；容器在长按达成后会消费抬手事件，
+            // 所以「长按后松手」不会掉回这里变成一次 tap（instrumented 用例已覆盖）。
             .pointerInput(failedPlaceholder, item.sourceMissing) {
                 detectTapGestures(
                     onTap = {
@@ -1264,8 +1420,7 @@ private fun GalleryItemCard(
                         } else {
                             onTap()
                         }
-                    },
-                    onLongPress = { onLongPress() }
+                    }
                 )
             }
     ) {
@@ -1423,6 +1578,32 @@ private fun GalleryItemCard(
 
 /** 图库网格四周内边距（dp）。格子矩形换算与 LazyVerticalGrid 的 contentPadding 必须同值——一处来源 */
 internal const val GALLERY_GRID_CONTENT_PADDING_DP = 8f
+
+/**
+ * 「加载更早」页脚 item 的稳定 key。
+ * 与条目 key（NUL 二元组）不可能相撞：这个常量不含 NUL，且全网格只有这一个页脚。
+ */
+internal const val GALLERY_LOAD_OLDER_FOOTER_KEY = "gallery_load_older_footer"
+
+/**
+ * 网格 item 的 contentType（P2-E）。
+ *
+ * `LazyVerticalGrid` 的复用池按 contentType 分区：卡片（每格一张位图 + 角标）、
+ * 页脚（一个按钮）、状态占位（转圈/空态插图）三种内容毫不相干，共用同一槽位时
+ * 滑到页脚会把卡片槽整槽拆掉重建。分区之后三者各自复用，滚动期少两次内容替换。
+ */
+internal const val GALLERY_GRID_CARD_CONTENT_TYPE = "gallery_card"
+internal const val GALLERY_GRID_FOOTER_CONTENT_TYPE = "gallery_footer"
+internal const val GALLERY_GRID_STATE_CONTENT_TYPE = "gallery_state"
+
+/**
+ * 状态占位 item 的稳定 key（P2-E）。
+ *
+ * 修复前 loading / empty 两个全宽占位项没有 key：网格在"转圈 → 空态 → 有图"之间切换时，
+ * 同一个槽位换了身份却没有 key 可对齐，只能整槽丢弃重建。
+ */
+internal const val GALLERY_STATE_LOADING_KEY = "gallery_state_loading"
+internal const val GALLERY_STATE_EMPTY_KEY = "gallery_state_empty"
 
 /**
  * 首屏预取的窗口大小（从首个可见项往后取这么多项）。

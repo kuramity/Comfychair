@@ -15,7 +15,10 @@ import sh.hnet.comfychair.model.ModelIntro
  */
 class ModelSubtitleTest {
 
-    /** 三字段全有的基准条目 */
+    /**
+     * 三字段全有的基准条目。
+     * author 特意保留：用来钉住「作者有值也不进副标题」这条规则（用户要求）。
+     */
     private fun fullIntro(missing: Boolean = false) = ModelIntro(
         file = "model.safetensors",
         base = "SD 1.5",
@@ -31,15 +34,16 @@ class ModelSubtitleTest {
     }
 
     @Test
-    fun `三字段全有_按底模类型作者顺序拼接`() {
-        assertEquals("SD 1.5 · LoRA · 作者 张三", modelSubtitle(fullIntro()))
+    fun `三字段全有_只拼底模类型_作者不进副标题`() {
+        // 用户要求：作者名不出现在界面上，副标题只有底模 · 类型
+        assertEquals("SD 1.5 · LoRA", modelSubtitle(fullIntro()))
     }
 
     @Test
     fun `部分字段有_只拼有值的部分`() {
         val intro = ModelIntro(file = "m.safetensors", base = "Anima", author = "李四")
-        // type 缺失时中间跳过，不留空段
-        assertEquals("Anima · 作者 李四", modelSubtitle(intro))
+        // type 缺失时跳过不留空段；author 有值也不参与拼接
+        assertEquals("Anima", modelSubtitle(intro))
     }
 
     @Test
@@ -69,6 +73,6 @@ class ModelSubtitleTest {
     @Test
     fun `有字段且missing带badge_拼接后追加badge`() {
         // 有实质字段时 missing 徽标追在末尾，字段信息与移除状态同时可见
-        assertEquals("SD 1.5 · LoRA · 作者 张三 · (文件已移除)", modelSubtitle(fullIntro(missing = true), "(文件已移除)"))
+        assertEquals("SD 1.5 · LoRA · (文件已移除)", modelSubtitle(fullIntro(missing = true), "(文件已移除)"))
     }
 }

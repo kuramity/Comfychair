@@ -11,9 +11,11 @@ package sh.hnet.comfychair.repository
  *
  * **破坏性硬约束在代码上的落点**（违反任一条即验收不通过）：
  * 1. 服务器删除只走 `DELETE /browser/files`，请求体只带 (filename, folder_path,
- *    folder_type) 三元组，folder_type 被 [toBrowserFolderType] 白名单锁死在
- *    outputs/temp/input 三个根 —— 客户端拼不出、也发不出绝对路径；
- *    [isLocatorSafe] 再把含路径分隔符 / `..` 的定位符挡在请求之前。
+ *    folder_type) 三元组：folder_type 由 [toBrowserFolderType] 解析，**发出值恒在**
+ *    outputs/temp/input 三个根内（未知 type 兜底 outputs 并置告警标记，原值永不透传）；
+ *    子目录先经 [normalizeFolderPath] 把 Windows 反斜杠统一成正斜杠，再由
+ *    [isLocatorSafe] 把含 `..`、绝对前缀（含归一化后的盘符形态）、反斜杠残值的
+ *    定位符挡在请求之前 —— 客户端拼不出、也发不出绝对路径。
  * 2. 探测失败（[ServerDeleteCapability.UNKNOWN]）绝不折算成"支持"；
  *    删除请求失败（[ServerDeleteAttempt.RETRYABLE]）绝不折算成"已删除"——
  *    调用方据返回值保留条目并标记待重试，最终状态只认服务器响应。
@@ -80,27 +82,53 @@ fun classifyDeleteAttempt(httpCode: Int?, networkFailed: Boolean): ServerDeleteA
     else -> ServerDeleteAttempt.RETRYABLE
 }
 
+/** folder_type 解析结果：[value] 恒为白名单值，[fellBackToOutputs] 提示调用方记日志。 */
+data class BrowserFolderTypeResolution(
+    /** 实际发给接口的 folder_type：只会是 outputs / temp / input 三者之一 */
+    val value: String,
+    /** 原始 type 为 null / 空白 / 白名单之外，已兜底到 outputs 根 —— 调用方须记告警并带原值 */
+    val fellBackToOutputs: Boolean
+)
+
 /**
- * ComfyUI 历史里的 type → 插件接口的 folder_type（白名单映射）。
+ * ComfyUI 历史里的 type → 插件接口的 folder_type（白名单映射 + 显式兜底）。
  *
  * 接口只认三个根（folder_type ∈ outputs/input/temp，服务端 get_parent_path 解析），
- * 白名单之外的值一律返回 null —— 调用方必须把该条目标为"无法定位"，**不得**
- * 把原值透传出去（那等于把任意字符串送进服务端的路径拼接）。
- * type 为空按 ComfyUI 默认的 output 处理（个别节点 /history 里缺这个字段）。
+ * 本函数的**发出值**恒在这三根之内 —— 原值任何情况下都不透传（那等于把任意字符串
+ * 送进服务端的路径拼接）。
+ * null / 空白 / 白名单外的值兜底按 "outputs" 处理：图库只展示 outputs 目录的产出，
+ * 这是最合理的默认；兜底不静默 —— [BrowserFolderTypeResolution.fellBackToOutputs]
+ * 为 true，调用方据此带原始值记调试日志。
  */
-fun toBrowserFolderType(type: String): String? = when (type.trim().lowercase()) {
-    "output", "outputs", "" -> "outputs"
-    "temp" -> "temp"
-    "input" -> "input"
-    else -> null
-}
+fun toBrowserFolderType(type: String?): BrowserFolderTypeResolution =
+    when (type?.trim()?.lowercase()) {
+        "output", "outputs" -> BrowserFolderTypeResolution("outputs", fellBackToOutputs = false)
+        "temp" -> BrowserFolderTypeResolution("temp", fellBackToOutputs = false)
+        "input" -> BrowserFolderTypeResolution("input", fellBackToOutputs = false)
+        else -> BrowserFolderTypeResolution("outputs", fellBackToOutputs = true)
+    }
+
+/**
+ * folder_path 归一化：Windows 下的 ComfyUI 会在 /history 里返回反斜杠子目录
+ * （`anima\hires`），原值会被 [isLocatorSafe] 判非法、删除请求永远发不出去。
+ * 校验与发送**同一个归一化值**（调用侧唯一入口），杜绝"校验过却发原值"的分裂。
+ *
+ * 只做分隔符统一，不做任何安全裁决：`..` 段、绝对前缀归一化后依旧由
+ * [isLocatorSafe] 拦截（含反斜杠形态的 Windows 绝对路径 —— 归一化出的盘符段
+ * `C:` 同样被拒）。
+ */
+fun normalizeFolderPath(folderPath: String): String = folderPath.replace('\\', '/')
 
 /**
  * 定位符守卫：filename / folder_path 必须是纯名字，不得携带任何路径语义。
  *
  * filename 允许子目录吗？不允许 —— 插件语义是 path.join(root, folder_path, filename)，
  * filename 里塞 `../` 或绝对路径就把"只能删输出目录"的边界打穿。folder_path 允许
- * 正常的多级子目录，但同样拒绝 `..` 段与绝对前缀。空 filename 直接拒。
+ * 正常的多级子目录，但同样拒绝 `..` 段与绝对前缀 —— 包括 [normalizeFolderPath]
+ * 之后呈现 `C:/x` 形态的 Windows 绝对路径（盘符段视同绝对前缀）。空 filename 直接拒。
+ *
+ * **本函数是最后一道安全闸，只收紧不放宽**：上游归一化解决的是分隔符形态问题，
+ * 任何穿越/绝对语义到这里仍然一律 false。
  */
 fun isLocatorSafe(filename: String, folderPath: String): Boolean {
     if (filename.isBlank()) return false
@@ -109,8 +137,11 @@ fun isLocatorSafe(filename: String, folderPath: String): Boolean {
     if (folderPath.isBlank()) return true
     if (folderPath.startsWith("/")) return false
     if (folderPath.contains("\\")) return false
-    // 按 / 拆段：任何一段是 .. 或以 . 开头的可疑段都拒（正常输出目录没有这种段）
-    return folderPath.split('/').all { it != ".." }
+    val segments = folderPath.split('/')
+    // "C:\Windows" 归一化成 "C:/Windows"：首段是盘符（单字母+冒号）即绝对路径，拒
+    if (segments.any { it.matches(Regex("[A-Za-z]:")) }) return false
+    // 任何一段是 .. 都拒（正常输出目录没有这种段）
+    return segments.all { it != ".." }
 }
 
 /** 回收站条目"彻底删除"单条目的路由决策。 */

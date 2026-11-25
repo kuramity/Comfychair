@@ -1,5 +1,8 @@
 package sh.hnet.comfychair.ui.navigation
 
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
@@ -21,6 +24,10 @@ import sh.hnet.comfychair.taglibrary.state.TagLibraryViewModel
 import sh.hnet.comfychair.taglibrary.ui.TagDetailScreen
 import sh.hnet.comfychair.taglibrary.ui.TagLibraryScreen
 import sh.hnet.comfychair.ui.components.MainNavigationBar
+import sh.hnet.comfychair.ui.screens.ModelIntroDetailScreen
+import sh.hnet.comfychair.ui.screens.ModelIntroEditorScreen
+import sh.hnet.comfychair.ui.screens.ModelIntroHiddenScreen
+import sh.hnet.comfychair.ui.screens.ModelIntroScreen
 import sh.hnet.comfychair.ui.screens.TextToImageScreen
 import sh.hnet.comfychair.ui.screens.ImageToImageScreen
 import sh.hnet.comfychair.ui.screens.TextToVideoScreen
@@ -152,6 +159,63 @@ fun MainNavHost(
                         tagLibraryViewModel.addTag(PromptBridge.Channel.NEGATIVE, it)
                     }
                 )
+            }
+
+            // ---------- 模型介绍（与生成页共用主容器导航图） ----------
+            composable(MainRoute.ModelIntro.route) {
+                ModelIntroScreen(
+                    onBack = { navController.popBackStack() },
+                    onOpenDetail = { intro ->
+                        navController.navigate(MainRoute.ModelIntroDetail.createRoute(intro.file))
+                    },
+                    onOpenHidden = {
+                        navController.navigate(MainRoute.ModelIntroHidden.route) {
+                            launchSingleTop = true
+                        }
+                    },
+                    onOpenEditor = {
+                        // 顶栏「＋」= 新建模式（不带 file 参数）
+                        navController.navigate(MainRoute.ModelIntroEditor.ROUTE_NEW)
+                    },
+                    onEditEntry = { intro ->
+                        navController.navigate(MainRoute.ModelIntroEditor.createRoute(intro.file))
+                    }
+                )
+            }
+
+            // 已卸载的介绍（v4.21 二级页面）：逐条恢复（只去掉覆盖层里的隐藏标记）
+            composable(MainRoute.ModelIntroHidden.route) {
+                ModelIntroHiddenScreen(onBack = { navController.popBackStack() })
+            }
+
+            // 模型介绍详情页（v4.17 二级页面）：转场只做淡入淡出（200/150ms），不做 slide
+            composable(
+                MainRoute.ModelIntroDetail.route,
+                enterTransition = { fadeIn(tween(200)) },
+                exitTransition = { fadeOut(tween(150)) },
+                popEnterTransition = { fadeIn(tween(200)) },
+                popExitTransition = { fadeOut(tween(150)) },
+            ) { backStackEntry ->
+                val file = backStackEntry.arguments
+                    ?.getString(MainRoute.ModelIntroDetail.ARG_FILE).orEmpty()
+                ModelIntroDetailScreen(file = file, onBack = { navController.popBackStack() })
+            }
+
+            // 介绍文档编辑器（v4.21）：file 缺省 = 新建（先选模板），有值 = 编辑该条目。
+            // 转场与详情页同一套淡入淡出（编辑器同样是详情页级别的二级页面）。
+            composable(
+                MainRoute.ModelIntroEditor.route,
+                arguments = listOf(
+                    navArgument(MainRoute.ModelIntroEditor.ARG_FILE) { defaultValue = "" },
+                ),
+                enterTransition = { fadeIn(tween(200)) },
+                exitTransition = { fadeOut(tween(150)) },
+                popEnterTransition = { fadeIn(tween(200)) },
+                popExitTransition = { fadeOut(tween(150)) },
+            ) { backStackEntry ->
+                val file = backStackEntry.arguments?.getString(MainRoute.ModelIntroEditor.ARG_FILE)
+                    ?.takeIf { it.isNotBlank() }
+                ModelIntroEditorScreen(file = file, onBack = { navController.popBackStack() })
             }
         }
     }

@@ -6,8 +6,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material3.FloatingActionButton
@@ -17,12 +19,16 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import sh.hnet.comfychair.cache.MediaCache
+import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.connection.WebSocketState
 import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.ui.components.ConnectionAlertDialog
+import sh.hnet.comfychair.ui.components.ConnectionStatusBanner
 import sh.hnet.comfychair.ui.components.shared.ProvideFilamentEngine
 import sh.hnet.comfychair.ui.screens.GalleryScreen
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme
@@ -65,32 +71,49 @@ class GalleryContainerActivity : ComponentActivity() {
                 // Observe connection alert state from ConnectionManager (single source of truth)
                 val connectionAlertState by ConnectionManager.connectionAlertState.collectAsStateWithLifecycle()
                 val isReconnecting by ConnectionManager.isReconnecting.collectAsStateWithLifecycle()
+                val connectionNotice by ConnectionManager.connectionNotice.collectAsStateWithLifecycle()
+                val webSocketState by ConnectionManager.webSocketState.collectAsStateWithLifecycle()
+                // P3：图库断线不弹模态、不切页；顶部细横幅提示，重连成功后自动消失
+                val failedState = webSocketState as? WebSocketState.Failed
+                val connectionBannerVisible = webSocketState is WebSocketState.Reconnecting ||
+                    (failedState != null && failedState.failureType != ConnectionFailure.AUTHENTICATION) ||
+                    connectionNotice != null
 
                 Surface(modifier = Modifier.fillMaxSize()) {
                     // 共享 Filament Engine（v4.5.0）：图库的 3D 条目查看器与主页面
                     // 各自是独立 Activity，所以这里也要单独提供一份 —— 同一 Activity 内
                     // 的"3D 角标点开 + 全屏 Dialog"才能共用一个引擎。
                     ProvideFilamentEngine {
-                        Scaffold(
-                            floatingActionButton = {
-                                FloatingActionButton(
-                                    onClick = { finish() },
-                                    containerColor = MaterialTheme.colorScheme.secondaryContainer
-                                ) {
-                                    Icon(
-                                        Icons.Default.AutoAwesome,
-                                        contentDescription = stringResource(R.string.menu_generation),
-                                        tint = MaterialTheme.colorScheme.onSecondaryContainer
-                                    )
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            Scaffold(
+                                floatingActionButton = {
+                                    FloatingActionButton(
+                                        onClick = { finish() },
+                                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                                    ) {
+                                        Icon(
+                                            Icons.Default.AutoAwesome,
+                                            contentDescription = stringResource(R.string.menu_generation),
+                                            tint = MaterialTheme.colorScheme.onSecondaryContainer
+                                        )
+                                    }
                                 }
+                            ) { paddingValues ->
+                                GalleryScreen(
+                                    generationViewModel = generationViewModel,
+                                    galleryViewModel = galleryViewModel,
+                                    onNavigateToSettings = { openSettings() },
+                                    onLogout = { logout() },
+                                    modifier = Modifier.padding(paddingValues)
+                                )
                             }
-                        ) { paddingValues ->
-                            GalleryScreen(
-                                generationViewModel = generationViewModel,
-                                galleryViewModel = galleryViewModel,
-                                onNavigateToSettings = { openSettings() },
-                                onLogout = { logout() },
-                                modifier = Modifier.padding(paddingValues)
+
+                            ConnectionStatusBanner(
+                                visible = connectionBannerVisible,
+                                text = stringResource(R.string.msg_connection_interrupted),
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .statusBarsPadding()
                             )
                         }
                     }

@@ -2,7 +2,7 @@
 
 An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 
-**Current version**: v4.20.0（二次开发版 / Community Edition）
+**Current version**: v4.22.5（二次开发版 / Community Edition）
 
 > **This project is a fork of [ComfyChair](https://github.com/legal-hkr/comfychair),
 > originally developed by Legal HKr, licensed under GPL-3.0.
@@ -30,19 +30,23 @@ A streamlined mobile interface for ComfyUI servers — generate and manage AI im
 
 <img src="metadata/en-US/images/phoneScreenshots/1.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/2.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/3.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/4.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/5.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/6.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/7.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/8.png" width="200"/>
 
-## Recent changes (v4.19.5 → v4.20.0)
+## Recent changes (v4.20.0 → v4.22.5)
 
 **Added**
 
-- Generation progress notification: persistent progress bar + completion banner, tap to return
-- Disconnect reconciliation: reconnect now classifies interrupted jobs into four terminal states (no more silent progress-bar disappearance)
-- Model intro detail page: tap an entry to open a full-screen detail view
-- LiteGraph converter supports rgthree `GetNode`/`SetNode` variables (auto-resolved on import)
+- Model intro editor: manage entries in-app (edit, hide, uninstall, export), with Markdown author text
+- Gallery: load earlier history incrementally; drag-select across the grid
+- Full-screen paging rework: direction-based page turn with reliable fling displacement
+- Update download reports remaining disk space correctly
+- Generation keep-alive service and progress notifications
 
 **Fixed**
 
-- Interrupted jobs during disconnect no longer vanish silently — failure is reported and cleaned up
-- Converter failure cases now show explicit Chinese warnings instead of a generic error
+- Full-screen paging no longer bounces back before the halfway point (fling displacement was never accumulated)
+- Gallery overscroll and paging rebound reverted to the upstream default behaviour
+- Trash deletion failures reported instead of silently succeeding
+- Changelog screen: secondary descriptions and Markdown formatting now render correctly
+- Tag database: deferred close counter prevents use-after-close during in-flight queries
 
 Full history: [CHANGELOG](app/src/main/assets/CHANGELOG.md).
 
@@ -315,7 +319,7 @@ To connect to your ComfyUI server, you'll need:
 - **Architecture**: MVVM with ViewModels and StateFlow
 - **Navigation**: Jetpack Compose Navigation
 - **Build system**: Gradle with Kotlin DSL
-- **Testing**: 1942 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
+- **Testing**: 2200 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
 
 ## Contributing
 

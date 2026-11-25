@@ -59,6 +59,22 @@ data class CommunityPrompt(
 )
 
 /**
+ * 用户自定义字段（介绍库里「可改名的键值对行」，一行一个）。
+ *
+ * 内置 169 条数据里**不存在**这个字段（`assets/model_intros.json` 只读、不动一个字节），
+ * 它只出现在用户编辑过的条目里（覆盖层 `entry.customFields`）。
+ *
+ * 两个字段都是纯文本：`label` 是用户自己写的字段名（界面允许改），`value` 是值。
+ * 空壳项（label 或 value 空白）**不允许落盘**——解析与序列化两侧都会跳过，
+ * 否则页面上会出现「：」（没名字的空白行）。键值顺序按列表顺序保留（用户自己排的序），
+ * 与 [ModelIntro.params] 那种按预设表重排的键值对是两回事，不要拿 `strMap` 读它。
+ */
+data class CustomField(
+    val label: String,
+    val value: String,
+)
+
+/**
  * 单个模型的介绍条目。
  *
  * 所有面向用户的文本（summary / params / companions）都是**预生成好的中文**——
@@ -149,6 +165,13 @@ data class ModelIntro(
      * 数据本身就薄。界面据此显示占位说明，不渲染只有套话的完整介绍区。
      */
     val introMissing: Boolean = false,
+    /**
+     * 用户自定义字段（可增可删、字段名可改；见 [CustomField]）。
+     *
+     * **默认空列表，且必须放在最后一个参数**：既有构造点与内置数据都没有这个字段，
+     * 老条目的行为一个字节都不变。只有用户编辑过、写进覆盖层的条目才可能非空。
+     */
+    val customFields: List<CustomField> = emptyList(),
 ) {
     /**
      * 这条介绍值不值得给用户一个「查看」入口。
@@ -222,6 +245,27 @@ object ModelIntroTable {
     @Volatile
     private var tableGeneratedAt: String? = null
 
+    /**
+     * 未叠加用户覆盖层的原始索引（**合并发生在读取时**：内置库 / 服务器热更新落盘后
+     * 都先装到这里，再由 [rebuildView] 叠加 [overrides]）。
+     *
+     * 键与 [byFile] 同构（小写文件名 + 小写 rel），[rebuildView] 从它重算视图。
+     */
+    @Volatile
+    private var baseByFile: Map<String, ModelIntro> = emptyMap()
+
+    /** 未叠加覆盖层的 [byRel]（顶层 `by_rel` 反查索引）。 */
+    @Volatile
+    private var baseByRel: Map<String, ModelIntro> = emptyMap()
+
+    /** 当前生效的用户覆盖层（键已归一为小写文件名，见 [ModelIntroOverrides.normalizeKey]）。 */
+    @Volatile
+    private var overrides: Map<String, OverrideEntry> = emptyMap()
+
+    /** 覆盖层落盘位置（首次 [ensureLoaded] 时绑定；未绑定时不接受写操作，见 [hide]）。 */
+    @Volatile
+    private var overridesFile: java.io.File? = null
+
     /** 表是否已装好（供界面区分「还没加载」与「确实没收录」）。 */
     val isLoaded: Boolean
         get() = byFile.isNotEmpty()
@@ -238,8 +282,12 @@ object ModelIntroTable {
      * 懒加载：优先用服务器同步下来的那份（filesDir），没有才退回 APK 内置的一份。
      *
      * 失败时保持空表——介绍只是锦上添花，绝不能因为它让模型选择不可用。
+     *
+     * **先绑定用户覆盖层再装表**：[install] 会在装载后立刻叠加覆盖层，顺序反了会先闪一下
+     * 「已卸载的条目又出现」。绑定是幂等的，已加载过表也会走到（保证写操作有落盘目标）。
      */
     fun ensureLoaded(context: Context) {
+        bindOverrides(ModelIntroOverrides.fileIn(context))
         if (isLoaded) return
         synchronized(this) {
             if (isLoaded) return
@@ -341,14 +389,267 @@ object ModelIntroTable {
         .distinctBy { it.file.lowercase() }
         .sortedWith(compareBy({ it.folder }, { it.file.lowercase() }))
 
-    /** 清空（测试与登出时用）。 */
+    // ---------------- 用户覆盖层（卸载 / 恢复） ----------------
+
+    /**
+     * 本地「卸载」一个条目：只在覆盖层里记 `hidden = true`，**不删内置库/缓存里的任何字节**。
+     *
+     * 覆盖层里带 `entry` 的记录（旧版「导入介绍」写入的，导入功能已下线但文件里的记录还要读得回）
+     * 保留它的内容，恢复后看到的仍是那一版。
+     *
+     * @param file 文件名（大小写不敏感、带路径也认，见 [ModelIntroOverrides.normalizeKey]）
+     * @return true = 已落盘并生效；false = 未绑定覆盖层文件或写入失败（内存视图保持原样）
+     */
+    fun hide(file: String): Boolean = updateOverrides { current ->
+        val key = resolveOverrideKey(current, file)
+        if (key.isEmpty()) return@updateOverrides null
+        val existing = current[key]
+        current + (key to (existing?.copy(hidden = true) ?: OverrideEntry(hidden = true)))
+    }
+
+    /**
+     * 恢复一个被本地「卸载」的条目：去掉 `hidden` 标记。
+     *
+     * 覆盖层里没有该条目、或本来就没隐藏时是**无副作用的成功**（幂等）。
+     * 有条目内容（`entry`）的保留内容，只把隐藏标记清掉；没有内容的整条记录删除
+     * （覆盖层文件保持干净）。
+     */
+    fun restore(file: String): Boolean = updateOverrides { current ->
+        val key = resolveOverrideKey(current, file)
+        if (key.isEmpty()) return@updateOverrides null
+        val existing = current[key] ?: return@updateOverrides current
+        if (!existing.hidden) return@updateOverrides current
+        val next = if (existing.entry != null) existing.copy(hidden = false) else null
+        if (next == null) current - key else current + (key to next)
+    }
+
+    /**
+     * 当前被本地「卸载」的文件名（归一后的小写文件名，已排序）。
+     *
+     * 返回值可直接回传给 [restore]；界面要显示原文件名时用 [lookup] 之外的数据源
+     * （被隐藏的条目已经不在视图里，见 [all]）。
+     */
+    fun hiddenFiles(): List<String> = overrides
+        .filterValues { it.hidden }
+        .keys
+        .sorted()
+
+    /**
+     * 查询一个**已卸载**条目的展示数据（「已卸载」列表用；被隐藏的条目不在 [all]/[lookup] 里）。
+     *
+     * 优先取覆盖层里的 `entry`（旧版导入写入的那版），否则回退**未叠加覆盖层**的内置/缓存条目；
+     * 两处都没有（例如先 hide 后数据被删）返回 null，界面显示归一化后的文件名即可。
+     */
+    fun hiddenIntro(file: String): ModelIntro? {
+        val key = ModelIntroOverrides.normalizeKey(file)
+        if (key.isEmpty()) return null
+        overrides[key]?.entry?.let { return it }
+        baseByFile[key]?.let { return it }
+        return baseByFile.values.firstOrNull {
+            ModelIntroOverrides.normalizeKey(it.file) == key
+        }
+    }
+
+    // ---------------- 用户编辑写入口（编辑 / 新建 / 删除自建条目，v4.21） ----------------
+
+    /**
+     * 把一条完整条目写进覆盖层（编辑器「保存」的唯一入口）。
+     *
+     * 两种情形走同一条路径——覆盖层里的 `entry` 记录本来就同时支持它们：
+     * - 内置库里**有**这个文件名 → 读取时**整条替换**那条（内置库与热更新缓存一个字节都不改，
+     *   用户改的只是压在上面的覆盖层，数据再更新也只是替换对象换了）；
+     * - 内置库里**没有** → 追加为「自建条目」。
+     *
+     * [ModelIntro.customFields] 随整条一起落盘，`entry` 里带的其他字段同样保留
+     * （编辑器提交的就是完整条目，不做字段级合并）。
+     *
+     * **已卸载（`hidden = true`）的记录只换内容、不清隐藏标记**：保存一份编辑不该把
+     * 用户亲手卸载掉的条目悄悄放回列表（要显示必须显式 [restore]，与 [hide] 保留 `entry`
+     * 的语义对称）。
+     *
+     * **空白字段当场剔除**（`label` 或 `value` 为空白的整行丢弃）：落盘侧本来就会跳过它们
+     * （[introToJson]），内存里若还留着，会出现「本次会话看得到空行、重启后消失」的不一致。
+     * 界面编辑框里的草稿行由界面自己维护，不靠这里存。
+     *
+     * @return true = 已原子落盘并生效；false = `file` 为空 / 未绑定覆盖层文件 / 写入失败
+     *         （三种情况内存视图都保持原样，界面不会显示一个磁盘上不存在的效果）
+     */
+    fun upsertEntry(intro: ModelIntro): Boolean = updateOverrides { current ->
+        val key = resolveOverrideKey(current, intro.file)
+        if (key.isEmpty()) return@updateOverrides null
+        val stored = intro.copy(
+            customFields = intro.customFields.filter { it.label.isNotBlank() && it.value.isNotBlank() },
+        )
+        val existing = current[key]
+        val next = if (existing != null) existing.copy(entry = stored) else OverrideEntry(entry = stored)
+        current + (key to next)
+    }
+
+    /**
+     * 删除一条**覆盖层自建**的条目（编辑器里「自建条目」才有删除按钮，见 [isCustomEntry]）。
+     *
+     * 内置库里的条目**不接受删除**——数据文件随 APK 更新、也会被服务器热更新整份替换，
+     * 真删了下次更新又回来；用户要它消失只能 [hide]（本地卸载）。所以这里只做四层拒绝：
+     * 入参为空、覆盖层里没记录、内置库里有这个文件名、记录里没有 `entry`（那只是一条
+     * 卸载标记，取消隐藏请用 [restore]）。
+     *
+     * 删除会把整条记录（含 `hidden` 标记与 `customFields`）从覆盖层里摘掉。
+     *
+     * @return true = 已落盘并生效；false = 被拒绝或写入失败（内存视图保持原样）
+     */
+    fun deleteCustomEntry(file: String): Boolean = updateOverrides { current ->
+        val normalized = ModelIntroOverrides.normalizeKey(file)
+        if (normalized.isEmpty()) return@updateOverrides null
+        val key = resolveOverrideKey(current, file)
+        val existing = current[key] ?: return@updateOverrides null
+        if (existing.entry == null) return@updateOverrides null
+        // 内置库里存在 → 内置条目，只能 hide；记录里 entry.file 的归一键也算（旧版导入键可能带路径）
+        val entryKey = ModelIntroOverrides.normalizeKey(existing.entry.file)
+        if (isBuiltInKey(normalized) || (entryKey.isNotEmpty() && isBuiltInKey(entryKey))) {
+            return@updateOverrides null
+        }
+        current - key
+    }
+
+    /**
+     * 这条文件名是不是**覆盖层自建**条目（界面据此决定给不给「删除」按钮）。
+     *
+     * 判据与 [deleteCustomEntry] 的接受条件完全一致：覆盖层里有记录、记录带 `entry`、
+     * 且内置库/热更新缓存里没有同文件名的条目。表还没装载时返回 false（无从判断内置库）。
+     */
+    fun isCustomEntry(file: String): Boolean {
+        val normalized = ModelIntroOverrides.normalizeKey(file)
+        if (normalized.isEmpty()) return false
+        val existing = overrides[normalized] ?: return false
+        if (existing.entry == null) return false
+        return !isBuiltInKey(normalized)
+    }
+
+    /** 内置库（未叠加覆盖层的那份：APK 内置或服务器热更新缓存）里是否存在该归一键。 */
+    private fun isBuiltInKey(key: String): Boolean {
+        if (key.isEmpty()) return false
+        if (baseByFile[key] != null) return true
+        return baseByFile.values.any { ModelIntroOverrides.normalizeKey(it.file) == key }
+    }
+
+    /** 清空（测试与登出时用）。覆盖层文件**不删**：下次 [ensureLoaded] 会重新读回来。 */
     fun clear() {
         synchronized(this) {
             byFile = emptyMap()
             byRel = emptyMap()
+            baseByFile = emptyMap()
+            baseByRel = emptyMap()
+            overrides = emptyMap()
+            overridesFile = null
             tableVersion = 0
             tableGeneratedAt = null
         }
+    }
+
+    // ---------------- 覆盖层的写路径 ----------------
+
+    /**
+     * 绑定覆盖层文件并读进内存（幂等；同一路径只读一次）。
+     *
+     * 绑定后会立刻重算视图（表已装好时），所以「先装表后绑覆盖层」也不会漏掉卸载记录。
+     */
+    private fun bindOverrides(file: java.io.File) {
+        if (overridesFile == file) return
+        synchronized(this) {
+            if (overridesFile == file) return
+            overrides = ModelIntroOverrides.load(file)
+            overridesFile = file
+            rebuildView()
+        }
+    }
+
+    /**
+     * 覆盖层「读-改-写」的唯一入口：变换 → 原子落盘 → **落盘成功才**换内存并重算视图。
+     *
+     * 落盘失败时内存视图保持原样——否则界面显示「已卸载」而磁盘没有记录，
+     * 重启后条目又冒出来，用户会以为卸载坏了。
+     *
+     * @param transform 返回 null 表示入参无效、什么都不做（返回 false）
+     * @return true = 无变化或已落盘生效；false = 未绑定文件 / 入参无效 / 写入失败
+     */
+    private fun updateOverrides(
+        transform: (Map<String, OverrideEntry>) -> Map<String, OverrideEntry>?,
+    ): Boolean = synchronized(this) {
+        val file = overridesFile
+        if (file == null) {
+            logW("覆盖层未绑定 filesDir（ensureLoaded 未调用），拒绝写入：${ModelIntroOverrides.FILE_NAME}")
+            return@synchronized false
+        }
+        val next = transform(overrides) ?: return@synchronized false
+        if (next == overrides) return@synchronized true
+        if (!ModelIntroOverrides.save(file, next)) {
+            logW("覆盖层写入失败（磁盘保持原样，内存视图不变）: ${file.name}")
+            return@synchronized false
+        }
+        overrides = next
+        rebuildView()
+        true
+    }
+
+    /**
+     * 找到某个文件名在覆盖层里对应的键。
+     *
+     * 先按归一后的字面键找；找不到再看有没有记录的 `entry.file` 归一后相同
+     * （旧版导入写入时键取的是条目自身的 file，可能与调用方传的名字不同大小写/带路径）。
+     */
+    private fun resolveOverrideKey(current: Map<String, OverrideEntry>, file: String): String {
+        val key = ModelIntroOverrides.normalizeKey(file)
+        if (key.isEmpty() || current.containsKey(key)) return key
+        return current.entries
+            .firstOrNull { ModelIntroOverrides.normalizeKey(it.value.entry?.file ?: "") == key }
+            ?.key
+            ?: key
+    }
+
+    /**
+     * 用 [baseByFile] + [overrides] 重算两套查询索引（合并**发生在读取时**）。
+     *
+     * 内置表更新、服务器热更新装载、覆盖层增删都会走这里——所以覆盖层永远压在最新数据上，
+     * 数据文件怎么换都不会把它冲掉。
+     */
+    private fun rebuildView() {
+        val baseEntries = baseByFile.values.distinctBy { it.file.lowercase() }
+        if (baseEntries.isEmpty()) {
+            byFile = emptyMap()
+            byRel = emptyMap()
+            return
+        }
+        val applied = ModelIntroOverrides.applyOverrides(baseEntries, overrides)
+
+        val viewByFile = HashMap<String, ModelIntro>(applied.size * 2)
+        for (intro in applied) {
+            viewByFile[intro.file.lowercase()] = intro
+            intro.rel?.takeIf { it.isNotBlank() }?.let { viewByFile[it.lowercase()] = intro }
+        }
+
+        // by_rel 以原始映射为准，把每个指针解析到合并后的那一条；被卸载的条目整条不出现
+        val viewByRel = HashMap<String, ModelIntro>(baseByRel.size + applied.size)
+        for ((rel, baseIntro) in baseByRel) {
+            val key = ModelIntroOverrides.normalizeKey(baseIntro.file)
+            val merged = ModelIntroOverrides.applyTo(baseIntro, overrides[key]) ?: continue
+            viewByRel[rel] = merged
+        }
+        // 覆盖层带来的新 rel（旧版导入新增的条目 / 换了 rel 的条目）：内置 by_rel 里没有，补上
+        if (overrides.isNotEmpty()) {
+            for (intro in applied) {
+                val rel = intro.rel?.takeIf { it.isNotBlank() }?.lowercase() ?: continue
+                if (rel !in viewByRel) viewByRel[rel] = intro
+            }
+        }
+
+        byFile = viewByFile
+        byRel = viewByRel
+    }
+
+    /** 测试专用：绑定一个覆盖层文件（等价于 ensureLoaded 里的绑定步骤，不碰 Context）。 */
+    internal fun bindOverridesForTest(file: java.io.File) {
+        synchronized(this) { overridesFile = null }
+        bindOverrides(file)
     }
 
     // ---------------- 解析 ----------------
@@ -385,17 +686,25 @@ object ModelIntroTable {
         }
         if (parsed == null) {
             if (force) {
-                byFile = emptyMap()
-                byRel = emptyMap()
-                tableVersion = 0
-                tableGeneratedAt = null
+                synchronized(this) {
+                    baseByFile = emptyMap()
+                    baseByRel = emptyMap()
+                    byFile = emptyMap()
+                    byRel = emptyMap()
+                    tableVersion = 0
+                    tableGeneratedAt = null
+                }
             }
             return false
         }
-        byFile = parsed.byFile
-        byRel = parsed.byRel
-        tableVersion = parsed.version
-        tableGeneratedAt = parsed.generatedAt
+        synchronized(this) {
+            baseByFile = parsed.byFile
+            baseByRel = parsed.byRel
+            tableVersion = parsed.version
+            tableGeneratedAt = parsed.generatedAt
+            // 合并发生在读取时：内置更新 / 服务器热更新都只换 base，覆盖层永远压在上面
+            rebuildView()
+        }
         return true
     }
 
@@ -420,47 +729,7 @@ object ModelIntroTable {
         while (keys.hasNext()) {
             val key = keys.next()
             val o = models.optJSONObject(key) ?: continue
-            val intro = ModelIntro(
-                file = o.strOrNull("file") ?: key,
-                rel = o.strOrNull("rel"),
-                kind = o.strOrNull("kind"),
-                name = o.strOrNull("name"),
-                type = o.strOrNull("type"),
-                base = o.strOrNull("base"),
-                author = o.strOrNull("author"),
-                version = o.strOrNull("version"),
-                summary = o.strOrNull("summary"),
-                effect = o.strOrNull("effect"),
-                params = o.strMap("params"),
-                authorParams = o.strMap("author_params"),
-                companions = o.strOrNull("companions"),
-                tags = o.strList("tags"),
-                usedIn = o.strList("used_in"),
-                url = o.strOrNull("url"),
-                introOriginal = o.strOrNull("intro_original"),
-                source = o.strOrNull("source"),
-                // 数据侧 2026-11-15 起改用 removed（missing 是旧键名，兼容读一轮）
-                missing = o.lenientBoolean("removed") || o.lenientBoolean("missing"),
-                loraWeight = o.loraWeightOrNull("loraWeight"),
-                localPositioning = o.strOrNull("local_positioning"),
-                communityParams = o.communityParams("communityParams"),
-                communitySamples = o.optJSONObject("communitySamples")?.let {
-                    CommunitySamples(
-                        total = it.optInt("total", 0),
-                        withMeta = it.optInt("withMeta", 0),
-                        withParams = it.optInt("withParams", 0),
-                    )
-                },
-                communityPrompt = o.optJSONObject("communityPrompt")?.let {
-                    CommunityPrompt(
-                        positive = it.strOrNull("positive"),
-                        negative = it.strOrNull("negative"),
-                        likes = it.optInt("likes", 0),
-                    )
-                },
-                confidenceNote = o.strOrNull("confidenceNote"),
-                introMissing = o.lenientBoolean("introMissing"),
-            )
+            val intro = introFromJson(o, fallbackFile = key)
             out[key.lowercase()] = intro
             // 相对路径也建一份索引，供同名文件消歧
             intro.rel?.takeIf { it.isNotBlank() }?.let { out[it.lowercase()] = intro }
@@ -482,24 +751,162 @@ object ModelIntroTable {
     }
 
     /**
-     * 布尔字段的类型宽容读取。[org.json.JSONObject.optBoolean] 只认 JSON boolean，
-     * 遇到字符串 `"true"`、数字 `1` 一律返回默认值 false——数据链路是脚本生成的，
-     * 类型漂移不该让条目被静默当成"未删除"。
+     * 单个条目的 JSON → [ModelIntro]（内置表与用户覆盖层共用同一份字段映射）。
      *
-     * 兼容：布尔 `true`/`false`、字符串（忽略大小写与首尾空白，`"true"`/`"1"` 为真）、
-     * 数字 `1`；其余一律 false。不抛异常。
+     * 抽成 internal 而不是在 [ModelIntroOverrides] 里再写一遍：字段有 20 多个，两处映射
+     * 漂移就会出现「覆盖层条目丢字段」而不报错——覆盖层里的条目必须与内置条目一样完整。
+     *
+     * @param fallbackFile `file` 字段缺失/空白时的兜底（内置表是 models 的键，覆盖层是记录键）
      */
-    private fun JSONObject.lenientBoolean(key: String): Boolean {
-        if (!has(key) || isNull(key)) return false
-        return when (val v = opt(key)) {
-            is Boolean -> v
-            is Number -> v.toInt() == 1
-            is String -> when (v.trim().lowercase()) {
-                "true", "1" -> true
-                else -> false
-            }
-            else -> false
+    internal fun introFromJson(o: JSONObject, fallbackFile: String): ModelIntro = ModelIntro(
+        file = o.strOrNull("file") ?: fallbackFile,
+        rel = o.strOrNull("rel"),
+        kind = o.strOrNull("kind"),
+        name = o.strOrNull("name"),
+        type = o.strOrNull("type"),
+        base = o.strOrNull("base"),
+        author = o.strOrNull("author"),
+        version = o.strOrNull("version"),
+        summary = o.strOrNull("summary"),
+        effect = o.strOrNull("effect"),
+        params = o.strMap("params"),
+        authorParams = o.strMap("author_params"),
+        companions = o.strOrNull("companions"),
+        tags = o.strList("tags"),
+        usedIn = o.strList("used_in"),
+        url = o.strOrNull("url"),
+        introOriginal = o.strOrNull("intro_original"),
+        source = o.strOrNull("source"),
+        // 数据侧 2026-11-15 起改用 removed（missing 是旧键名，兼容读一轮）
+        missing = o.lenientBoolean("removed") || o.lenientBoolean("missing"),
+        loraWeight = o.loraWeightOrNull("loraWeight"),
+        localPositioning = o.strOrNull("local_positioning"),
+        communityParams = o.communityParams("communityParams"),
+        communitySamples = o.optJSONObject("communitySamples")?.let {
+            CommunitySamples(
+                total = it.optInt("total", 0),
+                withMeta = it.optInt("withMeta", 0),
+                withParams = it.optInt("withParams", 0),
+            )
+        },
+        communityPrompt = o.optJSONObject("communityPrompt")?.let {
+            CommunityPrompt(
+                positive = it.strOrNull("positive"),
+                negative = it.strOrNull("negative"),
+                likes = it.optInt("likes", 0),
+            )
+        },
+        confidenceNote = o.strOrNull("confidenceNote"),
+        introMissing = o.lenientBoolean("introMissing"),
+        customFields = o.customFieldsOf("customFields"),
+    )
+
+    /**
+     * [ModelIntro] → 单个条目的 JSON（覆盖层落盘用，[introFromJson] 的逆操作）。
+     *
+     * 只写有值的字段（空字符串 / 空集合 / false 不写），保持覆盖层文件可读；
+     * 字段名与内置数据文件的契约一致（`author_params` / `intro_original` / `removed` …），
+     * 于是同一套解析代码两边通用。
+     */
+    internal fun introToJson(intro: ModelIntro): JSONObject = JSONObject().apply {
+        put("file", intro.file)
+        intro.rel?.takeIf { it.isNotBlank() }?.let { put("rel", it) }
+        intro.kind?.takeIf { it.isNotBlank() }?.let { put("kind", it) }
+        intro.name?.takeIf { it.isNotBlank() }?.let { put("name", it) }
+        intro.type?.takeIf { it.isNotBlank() }?.let { put("type", it) }
+        intro.base?.takeIf { it.isNotBlank() }?.let { put("base", it) }
+        intro.author?.takeIf { it.isNotBlank() }?.let { put("author", it) }
+        intro.version?.takeIf { it.isNotBlank() }?.let { put("version", it) }
+        intro.summary?.takeIf { it.isNotBlank() }?.let { put("summary", it) }
+        intro.effect?.takeIf { it.isNotBlank() }?.let { put("effect", it) }
+        if (intro.params.isNotEmpty()) put("params", JSONObject(intro.params))
+        if (intro.authorParams.isNotEmpty()) put("author_params", JSONObject(intro.authorParams))
+        intro.companions?.takeIf { it.isNotBlank() }?.let { put("companions", it) }
+        if (intro.tags.isNotEmpty()) put("tags", JSONArray(intro.tags))
+        if (intro.usedIn.isNotEmpty()) put("used_in", JSONArray(intro.usedIn))
+        intro.url?.takeIf { it.isNotBlank() }?.let { put("url", it) }
+        intro.introOriginal?.takeIf { it.isNotBlank() }?.let { put("intro_original", it) }
+        intro.source?.takeIf { it.isNotBlank() }?.let { put("source", it) }
+        if (intro.missing) put("removed", true)
+        intro.loraWeight?.let { w ->
+            put("loraWeight", JSONObject().apply {
+                w.min?.let { put("min", it) }
+                w.max?.let { put("max", it) }
+                w.default?.let { put("default", it) }
+                w.source?.takeIf { it.isNotBlank() }?.let { put("source", it) }
+                w.quote?.takeIf { it.isNotBlank() }?.let { put("quote", it) }
+            })
         }
+        intro.localPositioning?.takeIf { it.isNotBlank() }?.let { put("local_positioning", it) }
+        if (intro.communityParams.isNotEmpty()) {
+            put("communityParams", JSONObject().apply {
+                for ((k, v) in intro.communityParams) {
+                    put(k, JSONObject().apply {
+                        put("value", v.value)
+                        put("count", v.count)
+                    })
+                }
+            })
+        }
+        intro.communitySamples?.let { s ->
+            put("communitySamples", JSONObject().apply {
+                put("total", s.total)
+                put("withMeta", s.withMeta)
+                put("withParams", s.withParams)
+            })
+        }
+        intro.communityPrompt?.let { p ->
+            put("communityPrompt", JSONObject().apply {
+                p.positive?.takeIf { it.isNotBlank() }?.let { put("positive", it) }
+                p.negative?.takeIf { it.isNotBlank() }?.let { put("negative", it) }
+                put("likes", p.likes)
+            })
+        }
+        intro.confidenceNote?.takeIf { it.isNotBlank() }?.let { put("confidenceNote", it) }
+        if (intro.introMissing) put("introMissing", true)
+        // 自定义字段：只写有意义（label 与 value 都非空白）的项，空列表整个键不写——
+        // 老版本写出的覆盖层文件与新版本读回来的字节内容必须完全一致（见 CustomField）
+        customFieldsToJson(intro.customFields)?.let { put("customFields", it) }
+    }
+
+    /**
+     * 自定义字段 → JSON 数组；**没有有意义项时返回 null**（调用方据此省略整个键）。
+     *
+     * 与 [customFieldsOf] 用同一套「空白即剔除」判定，两处各写一遍迟早会漂移出
+     * 「写进去读不回来」的往返差异。
+     */
+    private fun customFieldsToJson(fields: List<CustomField>): JSONArray? {
+        val meaningful = fields.filter { it.label.isNotBlank() && it.value.isNotBlank() }
+        if (meaningful.isEmpty()) return null
+        return JSONArray().apply {
+            for (f in meaningful) {
+                put(JSONObject().apply {
+                    put("label", f.label)
+                    put("value", f.value)
+                })
+            }
+        }
+    }
+
+    /**
+     * 自定义字段（`[{"label":"基座","value":"Qwen-Image-2.1"}, ...]`）。
+     *
+     * 容忍性（老数据兼容是硬要求）：缺键、`null`、空数组、不是数组（老版本不可能写，
+     * 但手工改坏的文件不能因此把整条目丢掉）一律返回空列表；数组里的元素不是对象、
+     * 或 label / value 任意为空白 → **跳过该项**，不渲染空行。
+     *
+     * 顺序按数组下标原样保留（用户自己排的序）。
+     */
+    private fun JSONObject.customFieldsOf(key: String): List<CustomField> {
+        val arr = optJSONArray(key) ?: return emptyList()
+        val out = ArrayList<CustomField>(arr.length())
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i) ?: continue
+            val label = item.strOrNull("label") ?: continue
+            val value = item.strOrNull("value") ?: continue
+            out += CustomField(label = label, value = value)
+        }
+        return out
     }
 
     private fun JSONObject.strOrNull(key: String): String? {
@@ -603,4 +1010,29 @@ object ModelIntroTable {
 
     /** 社区常用参数键的显示顺序（英文枚举键 → 界面按此序显示中文标签）。 */
     private val COMMUNITY_PARAM_ORDER = listOf("sampler", "cfg", "steps", "scheduler")
+}
+
+/**
+ * 布尔字段的类型宽容读取。[org.json.JSONObject.optBoolean] 只认 JSON boolean，
+ * 遇到字符串 `"true"`、数字 `1` 一律返回默认值 false——数据链路是脚本生成的，
+ * 类型漂移不该让条目被静默当成"未删除"（或让覆盖层的 `hidden` 被静默当成 false，
+ * 那样用户卸载的条目会在重启后复活）。
+ *
+ * 兼容：布尔 `true`/`false`、字符串（忽略大小写与首尾空白，`"true"`/`"1"` 为真）、
+ * 数字 `1`；其余一律 false。不抛异常。
+ *
+ * 放在文件顶层（internal）是为了让 [ModelIntroOverrides] 用同一份判定——
+ * 两处各写一遍迟早会在下次改宽容规则时漂移。
+ */
+internal fun JSONObject.lenientBoolean(key: String): Boolean {
+    if (!has(key) || isNull(key)) return false
+    return when (val v = opt(key)) {
+        is Boolean -> v
+        is Number -> v.toInt() == 1
+        is String -> when (v.trim().lowercase()) {
+            "true", "1" -> true
+            else -> false
+        }
+        else -> false
+    }
 }

@@ -227,10 +227,13 @@ class GalleryWriteResultWiringTest {
 
     @Test
     fun `图库网格 key 走 itemIdentityKey`() {
+        // P2-E 给 itemsIndexed 补了 contentType，调用从"一行写完"变成多参数多行，
+        // 所以这里钉住的是 key 表达式本身（口径不变：仍必须是 itemIdentityKey，
+        // 也就是 NUL 分隔；换成 "_" 拼接仍会让 (a, b_c) 与 (a_b, c) 撞键）。
         assertContains(
             source(galleryScreenPath),
-            "itemsIndexed(uiState.items, key = { _, item -> " +
-                "GalleryMetadataCache.itemIdentityKey(item.promptId, item.filename) })",
+            "key = { _, item -> " +
+                "GalleryMetadataCache.itemIdentityKey(item.promptId, item.filename) }",
             "LazyGrid key 必须与仓储去重口径同为 NUL 分隔（下划线撞键会抛 IllegalArgumentException）"
         )
     }

@@ -47,6 +47,8 @@
     <string name="error_upload_stalled">Upload stalled</string>
     <string name="action_reconnect">Reconnect</string>
     <string name="action_reconnecting">Reconnecting…</string>
+    <string name="action_try_later">Try Later</string>
+    <string name="msg_connection_interrupted">Connection interrupted. Retrying in the background…</string>
     <string name="msg_reconnect_failed">Unable to reconnect</string>
     <string name="action_return_to_login">Return to Login</string>
 
@@ -292,6 +294,8 @@
     <!-- Gallery selection mode strings -->
     <string name="gallery_selected_count">%d selected</string>
     <string name="button_gallery_select">Select items</string>
+    <!-- 图库「加载更早」分页按钮（实现见 GalleryRepository.loadOlderItems） -->
+    <string name="button_gallery_load_older">Load older</string>
     <string name="button_cancel_selection">Cancel selection</string>
     <string name="button_select_all">Select all</string>
     <string name="button_deselect_all">Deselect all</string>
@@ -792,22 +796,19 @@
     <string name="model_intro_used_in">Used in</string>
     <string name="model_intro_original">Author\'s original text</string>
     <string name="model_intro_path">Location</string>
-    <string name="model_intro_source">Source</string>
     <string name="model_intro_missing_badge">File removed</string>
     <string name="model_intro_missing_notice">⚠ Local file removed — this model was deleted from the model library, so recommended settings and companion models are no longer shown. The description below is kept only so you can tell what it used to be.</string>
     <string name="model_intro_kind">Category</string>
     <string name="model_intro_effect_archive">LoRA effect archive (%1$d)</string>
     <string name="model_intro_effect_archive_orphan_only">Only in the effect archive (no model info yet)</string>
-    <!-- Model intro detail page (v4.17): full 20-section layout, entered from the intro sheet -->
+    <!-- Model intro detail page (v4.17): full 20-section layout, entered straight from the intro list -->
     <string name="model_intro_detail_title">Model details</string>
-    <string name="model_intro_open_detail">View full details</string>
     <!-- Markdown export (single template shared with in-app rendering, see ModelIntroMarkdown) -->
     <string name="model_intro_export_md">Export Markdown</string>
     <string name="model_intro_export_failed">Could not export this model info</string>
-    <!-- User overlay: uninstall / batch / import / restore (see ModelIntroViewModel) -->
+    <!-- User overlay: uninstall / batch / restore (see ModelIntroViewModel) -->
     <string name="model_intro_menu_more">More actions</string>
     <string name="model_intro_batch_manage">Select multiple</string>
-    <string name="model_intro_import">Import</string>
     <string name="model_intro_hidden_menu">Uninstalled (%1$d)</string>
     <string name="model_intro_uninstall_title">Uninstall this entry?</string>
     <string name="model_intro_uninstall_message">“%1$s” will be hidden on this device only. The built-in entry is not deleted and can be restored at any time.</string>
@@ -823,13 +824,33 @@
     <string name="model_intro_batch_done">%1$d entries uninstalled</string>
     <string name="model_intro_hidden_title">Uninstalled entries</string>
     <string name="model_intro_hidden_empty">No uninstalled entries</string>
-    <string name="model_intro_import_success">%1$d entries imported</string>
-    <string name="model_intro_import_error_read">Could not read the file, please try again</string>
-    <string name="model_intro_import_error_unsupported">Unsupported file type (only .json or .md)</string>
-    <string name="model_intro_import_error_json">Invalid JSON: expected a model info table (models) or a “filename → entry” object</string>
-    <string name="model_intro_import_error_empty">No entries found in this file</string>
-    <string name="model_intro_import_error_md">No model info found in this Markdown: it needs a “# name” title and meta lines such as “名字：…”</string>
-    <string name="model_intro_import_error_save">Could not save the imported entries, please try again</string>
+    <!-- Intro document editor (v4.21): new / edit entries through the user overlay
+         (see ModelIntroEditorScreen; built-in data files are never touched) -->
+    <string name="model_intro_editor_entry">Add new introduction</string>
+    <string name="model_intro_edit_entry">Edit this entry</string>
+    <string name="model_intro_editor_title_new">New introduction</string>
+    <string name="model_intro_editor_title_edit">Edit introduction</string>
+    <string name="model_intro_editor_field_file">File name</string>
+    <string name="model_intro_editor_field_name">Name</string>
+    <string name="model_intro_editor_field_base">Base model</string>
+    <string name="model_intro_editor_field_version">Version</string>
+    <string name="model_intro_editor_field_kind">Type</string>
+    <string name="model_intro_editor_field_effect">Effect</string>
+    <string name="model_intro_custom_fields">Custom fields</string>
+    <string name="model_intro_editor_add_field">Add field</string>
+    <string name="model_intro_editor_remove_field">Remove this field</string>
+    <string name="model_intro_editor_label_hint">Field name</string>
+    <string name="model_intro_editor_value_hint">Value</string>
+    <string name="model_intro_editor_template_title">Pick a template to prefill the fields</string>
+    <string name="model_intro_editor_template_skip">Start blank</string>
+    <string name="model_intro_editor_save">Save</string>
+    <string name="model_intro_editor_saved">Saved</string>
+    <string name="model_intro_editor_file_required">File name is required</string>
+    <string name="model_intro_editor_builtin_override">This entry exists in the built-in library. Saving will replace it with your version as a whole; the built-in content can be restored any time.</string>
+    <string name="model_intro_editor_delete">Delete</string>
+    <string name="model_intro_editor_delete_title">Delete this custom entry?</string>
+    <string name="model_intro_editor_delete_message">“%1$s” was created on this device. Deleting removes it for good; the built-in library is not affected.</string>
+    <string name="model_intro_editor_deleted">Entry deleted</string>
     <string name="model_intro_style_tags">Style</string>
     <string name="model_intro_lora_weight">LoRA weight</string>
     <string name="model_intro_lora_weight_range">%1$s – %2$s</string>
@@ -848,6 +869,7 @@
     <string name="model_intro_confidence_note">Confidence note</string>
     <string name="model_intro_intro_missing">No full intro for this model — only basic info is available.</string>
     <string name="model_intro_copy_params">Copy recommended params</string>
+    <string name="model_intro_copy_all">Copy all</string>
     <string name="model_intro_copied">Copied</string>
     <string name="model_intro_source_from">Source %1$s</string>
     <string name="model_list_loading">Loading model list…</string>
@@ -949,9 +971,8 @@
     <string name="node_params_max_only">max %1$s</string>
     <string name="node_params_step">step %1$s</string>
     <string name="node_params_out_of_range">Out of the allowed range — this will be clamped to %1$s when you submit</string>
-    <!-- App-side fixed COMBO option (DynamicParamTypeResolver.FIXED_COMBO_OPTIONS): the MOSS
-         five-mode integrated flow (prebuilt_30). Values are submitted as identifiers; these
-         are display labels only -->
+    <!-- App-side fixed COMBO option (DynamicParamTypeResolver.FIXED_COMBO_OPTIONS). Values are
+         submitted as identifiers; these are display labels only -->
     <string name="dynamic_param_mode_label">Generation mode</string>
     <!-- 动态参数标签 -->
     <string name="dynamic_param_steps2_label">Second pass steps</string>
@@ -1047,6 +1068,8 @@
     <string name="notify_generation_progress_running">Generating…</string>
     <string name="notify_generation_completed_title">Generation complete</string>
     <string name="notify_generation_failed_title">Generation failed</string>
+    <string name="notify_generation_pending_title">Result pending confirmation</string>
+    <string name="notify_generation_pending_text">Open the app to check the latest status</string>
     <string name="notify_generation_action_cancel">Cancel</string>
     <string name="label_generation_notifications">Generation notifications</string>
     <string name="desc_generation_notifications">Show progress in the notification shade while generating, and alert on completion or failure</string>
@@ -1094,6 +1117,7 @@
     <string name="msg_trash_restored">Restored</string>
     <string name="msg_trash_restore_failed">Restore failed (entry no longer in trash)</string>
     <string name="msg_trash_purged_server">%1$d deleted on server and device</string>
+    <string name="msg_trash_purged_already_gone">of which %1$d were already gone on the server (possibly deleted on the computer)</string>
     <string name="msg_trash_purged_local_only">%1$d: server has no delete interface, only local records removed (server files kept)</string>
     <string name="msg_trash_purge_pending">%1$d failed to delete on server, kept in trash for retry</string>
     <string name="msg_trash_kept_other_server">%1$d belong to other servers, kept in trash</string>

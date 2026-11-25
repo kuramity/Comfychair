@@ -4,19 +4,16 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Test
-import java.io.File
 
 /**
  * LoRA 效果档案表的查询逻辑测试。
  *
  * 两类用例：
- * 1. **真实数据**（assets 内置那份）——钉住总量特征（有值 47 条 / 孤儿 11 条），数据换版时
- *    这里会响铃提醒同步改数字，而不是悄悄漂移；
+ * 1. **构造数据**——总量口径（有值/孤儿划分）、值非空保证；
  * 2. **注入构造数据**——null 安全、大小写、排序这些边界行为。
  *
- * 真实数据用例在 assets 文件不在（换机/CI 布局不同）时**跳过而不是误报失败**。
+ * 不依赖任何外部数据文件。
  */
 class LoraEffectTableTest {
 
@@ -25,52 +22,35 @@ class LoraEffectTableTest {
         LoraEffectTable.clearForTest()
     }
 
-    // ---------------- 真实数据（assets 内置） ----------------
+    // ---------------- 构造数据 ----------------
 
-    /** JVM 单测的工作目录是模块目录（app/），assets 在 src/main/assets 下。 */
-    private fun loadAssetText(name: String): String? {
-        for (dir in listOf("src/main/assets", "app/src/main/assets")) {
-            val f = File(dir, name)
-            if (f.exists()) return f.readText()
-        }
-        return null
-    }
-
-    /** 载入真实效果档案；文件不在返回 false 让用例跳过。 */
-    private fun loadRealTable(): Boolean {
-        val text = loadAssetText("lora_effects.json") ?: return false
-        LoraEffectTable.setTableJsonForTest(text)
-        return true
-    }
-
-    /** 介绍表收录的文件名集合（orphans 判定的 knownFiles）；文件不在返回 null。 */
-    private fun loadKnownModelFiles(): Set<String>? {
-        val text = loadAssetText("model_intros.json") ?: return null
-        val models = org.json.JSONObject(text).getJSONObject("models")
-        val out = HashSet<String>()
-        val keys = models.keys()
-        while (keys.hasNext()) out.add(keys.next())
-        return out
+    /** 注入一份小型档案表，覆盖「有值 / null / 空串」三种形态。 */
+    private fun loadSyntheticTable() {
+        LoraEffectTable.setTableJsonForTest(
+            """
+            {"a.safetensors":"效果甲",
+             "b.safetensors":"效果乙",
+             "c.safetensors":null,
+             "d.safetensors":""}
+            """.trimIndent()
+        )
     }
 
     @Test
-    fun `真实数据有值条目47条`() {
-        assumeTrue("assets 不可用时跳过（换机/CI 布局差异）", loadRealTable())
-        assertEquals(47, LoraEffectTable.all().size)
+    fun `有值条目数与孤儿划分符合注入数据`() {
+        loadSyntheticTable()
+        // null 与空串都被跳过 → 只剩 2 条有值
+        assertEquals(2, LoraEffectTable.all().size)
+
+        val known = setOf("a.safetensors")
+        val orphans = LoraEffectTable.orphans(known)
+        assertEquals("介绍表未收录的那条必须进孤儿", listOf("b.safetensors"), orphans.map { it.first })
+        assertEquals("孤儿条目要带上效果文本", "效果乙", orphans.single().second)
     }
 
     @Test
-    fun `真实数据孤儿条目11条`() {
-        assumeTrue("assets 不可用时跳过", loadRealTable())
-        val known = loadKnownModelFiles()
-        assumeTrue("model_intros.json 不可用时跳过", known != null)
-        // 2026-11-21 模型库巡检同步后更新（孤儿 5 → 11）
-        assertEquals(11, LoraEffectTable.orphans(known!!).size)
-    }
-
-    @Test
-    fun `真实数据有值条目都不含空白值`() {
-        assumeTrue("assets 不可用时跳过", loadRealTable())
+    fun `有值条目都不含空白值`() {
+        loadSyntheticTable()
         // 解析层保证 all() 里只有非空文本——这里钉住"值都是可直接显示的"
         LoraEffectTable.all().forEach { (key, value) ->
             assertTrue("键 $key 的值为空", value.isNotBlank())

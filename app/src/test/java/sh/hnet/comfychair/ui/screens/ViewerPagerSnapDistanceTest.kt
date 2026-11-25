@@ -29,6 +29,14 @@ class ViewerPagerSnapDistanceTest {
             allowInertia = { allowInertia }
         )
 
+    /** v4.20.1：带手势位移注入的构造（快甩翻一页的"确有位移"证据走这条线） */
+    private fun snapDistanceWithFraction(pageCount: Int, allowInertia: Boolean, fraction: Float) =
+        ViewerPagerSnapDistance(
+            pageCountProvider = { pageCount },
+            allowInertia = { allowInertia },
+            offsetFractionProvider = { fraction }
+        )
+
     @Test
     fun `慢速松手保持逐张`() {
         val adapter = snapDistance(pageCount = 9)
@@ -260,5 +268,197 @@ class ViewerPagerSnapDistanceTest {
         // 功能关着：并排链路整体停用，不存在"队列模式"，同样不放
         assertEquals(false, pagerInertiaAllowed(threeLevelEnabled = false, sideBySideActive = true))
         assertEquals(false, pagerInertiaAllowed(threeLevelEnabled = false, sideBySideActive = false))
+    }
+
+    /**
+     * v4.20.1 接线：快甩翻一页的判定必须在**归零之后**仍能看到真实甩速。
+     * 全屏态把速度按 0 喂给跨页上限（"只滑一张"），但快甩分支吃的是独立通道的
+     * 真实速度 —— 框架给的 suggestedTargetPage 已经 round 回原页（快甩小幅场景）
+     * 时，接线层注入"真实甩速 + 松手位移"仍要能翻到相邻一张。
+     */
+    @Test
+    fun `全屏态真实甩速仍能触发快甩翻一页`() {
+        val fullScreen = snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = 0.1f)
+        // 修复主场景：拖 0.1 页快甩 2500px/s，框架衰减终点 round 回原页（3）。
+        // 修复前：归零 + 终点在原页 → 吸附回 3（弹回原位）；现在翻到 4
+        assertEquals(
+            4,
+            fullScreen.calculateTargetPage(
+                startPage = 3,
+                suggestedTargetPage = 3,
+                velocity = 2500f,
+                pageSize = pitch,
+                pageSpacing = 0
+            )
+        )
+        // 反方向镜像：往上一张方向快甩 → 2
+        assertEquals(
+            2,
+            snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = -0.1f)
+                .calculateTargetPage(
+                    startPage = 3,
+                    suggestedTargetPage = 3,
+                    velocity = -2500f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
+    }
+
+    @Test
+    fun `全屏态大幅甩仍只挪一张`() {
+        // 归零口径不被新参数绕过：衰减终点 7 张外、甩速 12000 —— 仍只进一张
+        assertEquals(
+            6,
+            snapDistanceWithFraction(pageCount = 20, allowInertia = false, fraction = 0.2f)
+                .calculateTargetPage(
+                    startPage = 5,
+                    suggestedTargetPage = 12,
+                    velocity = 12000f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
+    }
+
+    @Test
+    fun `队列态大幅甩不被快甩分支砍成一张`() {
+        // 甩幅超过一页（衰减约 7 页）时快甩分支必须让位，既有 G2 多张惯性保留
+        assertEquals(
+            12,
+            snapDistanceWithFraction(pageCount = 20, allowInertia = true, fraction = 0.3f)
+                .calculateTargetPage(
+                    startPage = 5,
+                    suggestedTargetPage = 12,
+                    velocity = 12000f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
+    }
+
+    @Test
+    fun `v4_22_4 有滑动就翻_与速度无关`() {
+        // 用户规格 2026-11-26：「不管长短，别回弹，直接下、上一张」。
+        // 0.02 页（1080 屏上约 22px）刚好达到 2% 门槛 → 翻下一页
+        assertEquals(
+            4,
+            snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = 0.02f)
+                .calculateTargetPage(startPage = 3, suggestedTargetPage = 3, velocity = 2500f, pageSize = pitch, pageSpacing = 0)
+        )
+        // 极慢（50px/s）也一样翻 —— 旧规格这里会回原页
+        assertEquals(
+            4,
+            snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = 0.05f)
+                .calculateTargetPage(startPage = 3, suggestedTargetPage = 3, velocity = 50f, pageSize = pitch, pageSpacing = 0)
+        )
+        // 低于 2% 门槛（轻点 / 手指抖动）→ 回原页
+        assertEquals(
+            3,
+            snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = 0.01f)
+                .calculateTargetPage(startPage = 3, suggestedTargetPage = 3, velocity = 2500f, pageSize = pitch, pageSpacing = 0)
+        )
+    }
+
+    @Test
+    fun `未注入位移时行为与旧版一致`() {
+        // 默认构造（offsetFractionProvider 缺省 { 0f }）：位移证据恒缺失，
+        // 快甩分支永不触发 —— 2500px/s、终点在原页 → 仍吸附回原页（旧行为）
+        assertEquals(
+            3,
+            snapDistance(pageCount = 9, allowInertia = false).calculateTargetPage(
+                startPage = 3,
+                suggestedTargetPage = 3,
+                velocity = 2500f,
+                pageSize = pitch,
+                pageSpacing = 0
+            )
+        )
+    }
+
+    /**
+     * v4.20.2 真机回归（iQOO Neo10 Pro+，pagePitch = 1080px）：全屏单图态不再要求
+     * "衰减 + 位移 ≤ 1 页"。3990 / 4085px/s 的快速小幅滑衰减 0.98~1.02 页，加位移
+     * 后恰好越过一页线，旧条件把本应翻页的手势挡成回弹；归零后跨页上限本就只有
+     * 一张，去掉该条件不会放大翻页幅度。
+     */
+    @Test
+    fun `全屏态快速小幅滑越过一页线仍翻页`() {
+        // 4085px/s + 0.061 页：旧逻辑 1.080 > 1 → 回弹；现在翻到相邻一张
+        assertEquals(
+            4,
+            snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = 0.061f)
+                .calculateTargetPage(
+                    startPage = 3,
+                    suggestedTargetPage = 3,
+                    velocity = 4085f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
+        // 3990px/s + 同向 0.076 页：同类样本（1.054 > 1），同样翻页
+        assertEquals(
+            4,
+            snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = 0.076f)
+                .calculateTargetPage(
+                    startPage = 3,
+                    suggestedTargetPage = 3,
+                    velocity = 3990f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
+    }
+
+    @Test
+    fun `全屏态 8478pxs 仍只翻一张`() {
+        // 规格保护：全屏单图不管甩多大力都只滑一张（衰减 3.619 页也不例外）
+        assertEquals(
+            5,
+            snapDistanceWithFraction(pageCount = 8, allowInertia = false, fraction = 0.18f)
+                .calculateTargetPage(
+                    startPage = 4,
+                    suggestedTargetPage = 4,
+                    velocity = 8478f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
+    }
+
+    @Test
+    fun `v4_22_4 全屏态只看位移方向_不要求与速度同号`() {
+        // 真机实证（iQOO，2026-11-26）：左滑时 pager 的 velocity 是正的（+3990）
+        // 而手指位移是负的（-0.076 页）—— 两者符号恒相反。
+        // 旧规格的 sign 一致性条件因此永不成立，这就是"没滑过一半就回弹"的根因之一。
+        // 新规格只看位移方向：leave = -0.076 → 翻上一张
+        assertEquals(
+            2,
+            snapDistanceWithFraction(pageCount = 9, allowInertia = false, fraction = -0.076f)
+                .calculateTargetPage(
+                    startPage = 3,
+                    suggestedTargetPage = 3,
+                    velocity = 3990f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
+    }
+
+    @Test
+    fun `并排预览态 8000pxs 不被快甩分支砍成一张`() {
+        // 回归保护：allowInertia = true（velocityPxPerSec 未归零）时"衰减 ≤ 1 页"
+        // 条件仍在，快甩分支让位，多页惯性 → 3 + 3
+        assertEquals(
+            6,
+            snapDistanceWithFraction(pageCount = 20, allowInertia = true, fraction = 0.1f)
+                .calculateTargetPage(
+                    startPage = 3,
+                    suggestedTargetPage = 8,
+                    velocity = 8000f,
+                    pageSize = pitch,
+                    pageSpacing = 0
+                )
+        )
     }
 }

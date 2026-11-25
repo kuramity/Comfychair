@@ -196,10 +196,10 @@ private fun samplerParamLabel(stageParam: SamplerStageRegistry.StageParam): Stri
         "pe_on" -> return stringResource(R.string.sampler_param_pe_on)
         "pe_model" -> return stringResource(R.string.sampler_param_pe_model)
         "pe_mmproj" -> return stringResource(R.string.sampler_param_pe_mmproj)
-        // MOSS 4K（prebuilt_33）的手部修复强度：`detail_denoise2` 会被 `detail_` 前缀 + 后缀
+        // 第二段采样的手部修复强度：`detail_denoise2` 会被 `detail_` 前缀 + 后缀
         // `denoise2` 误配进竖叉流的「分次补采」标签（「补采 2 去噪强度」），文案完全对不上。
-        // 完整占位符名 detail_denoise2 在 prebuilt_11 不存在，此处覆盖不影响竖叉流；
-        // 而同工作流的 detail_denoise（面部）与 prebuilt_11 同名、语义兼容（都是细节段去噪），
+        // 完整占位符名 detail_denoise2 在竖叉流里不存在，此处覆盖不影响该流；
+        // 而同工作流的 detail_denoise（面部）与竖叉流同名、语义兼容（都是细节段去噪），
         // 继续走通用「去噪强度」标签，不在本分支覆盖。
         "detail_denoise2" -> return stringResource(R.string.sampler_param_detail_denoise_hand)
     }
@@ -252,7 +252,7 @@ private fun samplerParamHint(stageParam: SamplerStageRegistry.StageParam): Strin
 }
 
 /**
- * App 端固定选项参数的中文标签（参数名级，如 moss_mode →「出图模式」）。
+ * App 端固定选项参数的中文标签（参数名级，如模式类占位符 →「出图模式」）。
  * 与逻辑层的固定选项表（DynamicParamTypeResolver.FIXED_COMBO_OPTIONS）配套；
  * 认不出的占位符返回 null，继续显示 `{{占位符}}` 原文。
  */
@@ -447,7 +447,7 @@ private fun RenderDynamicField(field: DynamicParamField, onValueChange: (String,
  * 被重排或被折进目录树都是错的。
  *
  * [displayOf] 只影响**显示**（选中框与菜单项），[onValueChange] 收到的仍是选项原值 ——
- * App 端固定选项（如 moss_mode）用它把标识符换成中文标签。
+ * App 端固定选项用它把标识符换成中文标签。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

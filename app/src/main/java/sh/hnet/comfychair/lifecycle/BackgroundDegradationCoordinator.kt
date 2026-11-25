@@ -6,10 +6,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy.NetworkClass
 import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy.WsPolicy
+import sh.hnet.comfychair.notify.GenerationKeepAliveService
 import sh.hnet.comfychair.queue.BackgroundQueuePollWorker
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.repository.GalleryRepository
@@ -60,6 +63,20 @@ object BackgroundDegradationCoordinator {
         scope.launch {
             NetworkClassMonitor.networkClass.collect { onNetworkChanged(it) }
         }
+        // P4：任务开始/结束本身也要触发重评 —— 否则「后台里任务跑完」不会切到省电档，
+        // 「后台里 WiFi 有任务」也拉不起保活服务（只能等下一次网络/可见性变化）。
+        scope.launch {
+            JobRegistry.queueState
+                .map { it.ownActiveJobCount > 0 }
+                .distinctUntilChanged()
+                .collect {
+                    if (degradationTimerExpired &&
+                        AppLifecycleMonitor.visibility.value.isDegraded
+                    ) {
+                        evaluate("任务状态变化")
+                    }
+                }
+        }
     }
 
     // ---------- 信号处理 ----------
@@ -88,6 +105,15 @@ object BackgroundDegradationCoordinator {
     }
 
     private fun onNetworkChanged(network: NetworkClass) {
+        // P4：仍在前台、切到 WiFi、且有任务在跑 —— 这是唯一还能合法启动前台服务的窗口，
+        // 先把保活服务预挂上（前台时它会撤掉自己的通知），避免「先切后台再切 WiFi」
+        // 时因 Android 12+ 后台启动限制而永远拉不起来。
+        if (network == NetworkClass.UNMETERED && !AppLifecycleMonitor.visibility.value.isDegraded) {
+            val queue = JobRegistry.queueState.value
+            if (queue.ownActiveJobCount > 0) {
+                appContext?.let { GenerationKeepAliveService.ensureRunning(it) }
+            }
+        }
         // 未过容忍期：定时器到点自动评估（保持原到期时刻，不重启）；
         // 已过容忍期的降级态下网络切换 → 立即重评（WiFi→蜂窝 断连；蜂窝→WiFi 恢复保连）
         if (degradationTimerExpired && AppLifecycleMonitor.visibility.value.isDegraded) {
@@ -129,11 +155,11 @@ object BackgroundDegradationCoordinator {
             "降级评估（$reason）：visibility=$visibility network=$network " +
                 "activeTask=$hasActiveTask keepConnected=$keepConnected -> $policy"
         )
-        apply(policy, network)
+        apply(policy, network, hasActiveTask)
     }
 
     /** 执行策略结果。幂等：重复评估出同一策略时，底层入口自身有挂起/取消的幂等守卫。 */
-    private fun apply(policy: WsPolicy, network: NetworkClass) {
+    private fun apply(policy: WsPolicy, network: NetworkClass, hasActiveTask: Boolean) {
         val context = appContext ?: return
         when (policy) {
             WsPolicy.KEEP_FULL_HEARTBEAT -> {
@@ -149,18 +175,29 @@ object BackgroundDegradationCoordinator {
                 ConnectionManager.clientOrNull
                     ?.updateWebSocketPingInterval(intervalMs / 1000)
                 ConnectionManager.resumeWebSocketFromSuspension()
+                // P4：WiFi + 有任务时拉起任务级前台服务保护进程（不在后台启动，
+                // 正常由任务开始时的 ViewModel 已启动；这里是 WiFi 切换/任务开始的补位）。
+                // 注意：KEEP_RELAXED 也可能来自「蜂窝 + 用户打开后台保连」，
+                // 那条路径不做保活（用户选的是省流量，不是常驻）。
+                if (hasActiveTask && network == NetworkClass.UNMETERED) {
+                    GenerationKeepAliveService.ensureRunning(context)
+                }
             }
 
             WsPolicy.DROP_AND_POLL -> {
-                // 断 WS 省流量，但任务在跑：15 分钟轮询 /queue 兜底 + 完成通知
+                // 断 WS 省流量，但任务在跑：15 分钟轮询 /queue 兜底 + 完成通知。
+                // 若此前在 WiFi 上已启动保活服务，这里**不**主动停：后台停止前台服务是
+                // 不可逆的（Android 12+ 不允许再在后台拉起），而任务还在跑，
+                // 让服务随任务结束自然退出更稳妥。
                 ConnectionManager.suspendWebSocketForBackground("蜂窝降级且有任务在跑，改周期轮询")
                 BackgroundQueuePollWorker.schedule(context)
             }
 
             WsPolicy.DROP_AND_IDLE -> {
-                // 断 WS，无任务在跑：静默，不排轮询
+                // 断 WS，无任务在跑：静默，不排轮询，也不保留保活服务
                 ConnectionManager.suspendWebSocketForBackground("蜂窝降级且无任务在跑")
                 BackgroundQueuePollWorker.cancel(context)
+                GenerationKeepAliveService.stop(context)
             }
         }
     }

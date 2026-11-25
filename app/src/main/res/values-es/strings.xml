@@ -51,6 +51,8 @@
     <string name="error_upload_stalled">Carga detenida</string>
     <string name="action_reconnect">Reconectar</string>
     <string name="action_reconnecting">Reconectando…</string>
+    <string name="action_try_later">Intentar más tarde</string>
+    <string name="msg_connection_interrupted">Conexión interrumpida. Reintentando en segundo plano…</string>
     <string name="msg_reconnect_failed">No se pudo reconectar</string>
     <string name="action_return_to_login">Volver al inicio</string>
 
@@ -729,10 +731,10 @@
     <!-- Exportación Markdown de la información del modelo (plantilla compartida: ModelIntroMarkdown) -->
     <string name="model_intro_export_md">Exportar Markdown</string>
     <string name="model_intro_export_failed">No se pudo exportar la información del modelo</string>
-    <!-- Capa de usuario: desinstalar / selección múltiple / importar / restaurar -->
+    <string name="model_intro_copy_all">Copiar todo</string>
+    <!-- Capa de usuario: desinstalar / selección múltiple / restaurar -->
     <string name="model_intro_menu_more">Más acciones</string>
     <string name="model_intro_batch_manage">Selección múltiple</string>
-    <string name="model_intro_import">Importar información</string>
     <string name="model_intro_hidden_menu">Desinstalados (%1$d)</string>
     <string name="model_intro_uninstall_title">¿Desinstalar esta entrada?</string>
     <string name="model_intro_uninstall_message">«%1$s» solo se ocultará en este dispositivo. La entrada integrada no se elimina y se puede restaurar en cualquier momento.</string>
@@ -748,11 +750,30 @@
     <string name="model_intro_batch_done">%1$d entradas desinstaladas</string>
     <string name="model_intro_hidden_title">Entradas desinstaladas</string>
     <string name="model_intro_hidden_empty">No hay entradas desinstaladas</string>
-    <string name="model_intro_import_success">%1$d entradas importadas</string>
-    <string name="model_intro_import_error_read">No se pudo leer el archivo, inténtalo de nuevo</string>
-    <string name="model_intro_import_error_unsupported">Tipo de archivo no compatible (solo .json o .md)</string>
-    <string name="model_intro_import_error_json">JSON no válido: se espera una tabla de información de modelos (models) o un objeto «nombre de archivo → entrada»</string>
-    <string name="model_intro_import_error_empty">El archivo no contiene entradas importables</string>
-    <string name="model_intro_import_error_md">No se encontró información del modelo en este Markdown: requiere un título «# nombre» y líneas de metadatos como «名字：…»</string>
-    <string name="model_intro_import_error_save">No se pudieron guardar las entradas importadas, inténtalo de nuevo</string>
+    <!-- Intro document editor (v4.21) -->
+    <string name="model_intro_editor_entry">Añadir entrada nueva</string>
+    <string name="model_intro_edit_entry">Editar esta entrada</string>
+    <string name="model_intro_editor_title_new">Entrada nueva</string>
+    <string name="model_intro_editor_title_edit">Editar entrada</string>
+    <string name="model_intro_editor_field_file">Nombre de archivo</string>
+    <string name="model_intro_editor_field_name">Nombre</string>
+    <string name="model_intro_editor_field_base">Modelo base</string>
+    <string name="model_intro_editor_field_version">Versión</string>
+    <string name="model_intro_editor_field_kind">Tipo</string>
+    <string name="model_intro_editor_field_effect">Efecto</string>
+    <string name="model_intro_custom_fields">Campos personalizados</string>
+    <string name="model_intro_editor_add_field">Añadir campo</string>
+    <string name="model_intro_editor_remove_field">Quitar este campo</string>
+    <string name="model_intro_editor_label_hint">Nombre del campo</string>
+    <string name="model_intro_editor_value_hint">Valor</string>
+    <string name="model_intro_editor_template_title">Elige una plantilla para rellenar los campos</string>
+    <string name="model_intro_editor_template_skip">Empezar en blanco</string>
+    <string name="model_intro_editor_save">Guardar</string>
+    <string name="model_intro_editor_saved">Guardado</string>
+    <string name="model_intro_editor_file_required">El nombre de archivo es obligatorio</string>
+    <string name="model_intro_editor_builtin_override">Esta entrada ya existe en la biblioteca integrada. Al guardar, tu versión la reemplazará por completo; puedes restaurar la integrada en cualquier momento.</string>
+    <string name="model_intro_editor_delete">Eliminar</string>
+    <string name="model_intro_editor_delete_title">¿Eliminar esta entrada propia?</string>
+    <string name="model_intro_editor_delete_message">«%1$s» se creó en este dispositivo. Si la eliminas, se perderá definitivamente; la biblioteca integrada no se ve afectada.</string>
+    <string name="model_intro_editor_deleted">Entrada eliminada</string>
 </resources>

@@ -76,21 +76,73 @@ class GalleryTrashLogicTest {
     }
 
     // ============================================================
-    // toBrowserFolderType：folder_type 白名单（硬约束 1 的核心）
+    // toBrowserFolderType：folder_type 白名单 + 兜底（硬约束 1 的核心）
     // ============================================================
 
     @Test
-    fun `folder_type 只认三个根，其它值一律 null`() {
-        assertEquals("outputs", toBrowserFolderType("output"))
-        assertEquals("outputs", toBrowserFolderType("outputs"))
-        assertEquals("outputs", toBrowserFolderType(""))     // 空按 ComfyUI 默认 output
-        assertEquals("outputs", toBrowserFolderType(" Output "))
-        assertEquals("temp", toBrowserFolderType("temp"))
-        assertEquals("input", toBrowserFolderType("input"))
-        // 白名单外：绝不透传给服务端的路径拼接
-        assertEquals(null, toBrowserFolderType("../input"))
-        assertEquals(null, toBrowserFolderType("models"))
-        assertEquals(null, toBrowserFolderType("C:"))
+    fun `folder_type 白名单值直接解析（fellBackToOutputs 为 false）`() {
+        val output = toBrowserFolderType("output")
+        assertEquals("outputs", output.value)
+        assertEquals(false, output.fellBackToOutputs)
+        assertEquals("outputs", toBrowserFolderType("outputs").value)
+        assertEquals("outputs", toBrowserFolderType(" Output ").value)
+        val temp = toBrowserFolderType("temp")
+        assertEquals("temp", temp.value)
+        assertEquals(false, temp.fellBackToOutputs)
+        val input = toBrowserFolderType("input")
+        assertEquals("input", input.value)
+        assertEquals(false, input.fellBackToOutputs)
+    }
+
+    @Test
+    fun `folder_type null 空白 未知值兜底 outputs 并置告警位（原值不透传）`() {
+        // type 缺失 / 不认识：发出值恒为 outputs（图库只展示 outputs 产出，最合理的默认），
+        // 任何情况下都不透传原值；告警位 true = 调用方须带原值记调试日志，兜底不静默
+        for (raw in listOf<String?>("   ", null, "", "../input", "models", "C:", "outputs2")) {
+            val resolved = toBrowserFolderType(raw)
+            assertEquals("outputs", resolved.value)
+            assertEquals(true, resolved.fellBackToOutputs)
+        }
+    }
+
+    // ============================================================
+    // normalizeFolderPath：Windows 反斜杠归一化（回收站"永远删不掉"真机回归）
+    // ============================================================
+
+    @Test
+    fun `反斜杠子目录归一化后通过守卫`() {
+        assertEquals("anima/hires", normalizeFolderPath("anima\\hires"))
+        assertEquals("a/b/c", normalizeFolderPath("a\\b/c"))  // 混合分隔符也统一
+        assertEquals("", normalizeFolderPath(""))
+        // 真机场景：Windows ComfyUI 返回 subfolder "anima\hires" —— 原值被拒、归一化值放行
+        assertEquals(false, isLocatorSafe("cal03c_00001_.png", "anima\\hires"))
+        assertEquals(true, isLocatorSafe("cal03c_00001_.png", normalizeFolderPath("anima\\hires")))
+    }
+
+    @Test
+    fun `归一化不放宽守卫 - 穿越与绝对路径归一化后仍被拒`() {
+        // 路径穿越的反斜杠形态：归一化后照样卡在 ".." 段
+        assertEquals(false, isLocatorSafe("a.png", normalizeFolderPath("batch\\..\\..\\models")))
+        // Unix 绝对路径（前导斜杠拒）
+        assertEquals(false, isLocatorSafe("a.png", normalizeFolderPath("/etc")))
+        assertEquals(false, isLocatorSafe("a.png", normalizeFolderPath("\\etc")))
+        // Windows 绝对路径："C:\Windows" 归一化成 "C:/Windows" —— 盘符段视同绝对前缀，照拒
+        // （若守卫不认盘符形态，归一化就会把绝对路径洗成"合法"，这道拒绝是归一化的前提）
+        assertEquals(false, isLocatorSafe("a.png", normalizeFolderPath("C:\\Windows")))
+        assertEquals(false, isLocatorSafe("a.png", normalizeFolderPath("c:/Windows")))
+        // UNC 形态 "\\server\share" → "//server/share"：前导斜杠拒
+        assertEquals(false, isLocatorSafe("a.png", normalizeFolderPath("\\\\server\\share")))
+    }
+
+    @Test
+    fun `归一化后 filename 仍非法时维持不发请求语义`() {
+        // filename 不是归一化对象：含任何分隔符 / 穿越形态一律拒 —— 调用方据此保留条目、
+        // 标记待重试、**不发**服务器删除请求（安全行为在归一化之后依旧成立）
+        assertEquals(false, isLocatorSafe("a\\b.png", normalizeFolderPath("anima\\hires")))
+        assertEquals(false, isLocatorSafe("a/b.png", normalizeFolderPath("anima\\hires")))
+        assertEquals(false, isLocatorSafe("sub/a.png", normalizeFolderPath("")))
+        assertEquals(false, isLocatorSafe("../a.png", normalizeFolderPath("anima\\hires")))
+        assertEquals(false, isLocatorSafe("", "any/where"))
     }
 
     // ============================================================

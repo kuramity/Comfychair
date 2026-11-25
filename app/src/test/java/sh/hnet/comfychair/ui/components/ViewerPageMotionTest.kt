@@ -2,6 +2,7 @@ package sh.hnet.comfychair.ui.components
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -185,6 +186,332 @@ class ViewerPageMotionTest {
     }
 
     // ============================================================
+    // 3b. 快甩翻一页（v4.20.1：快甩 + 小幅同向位移 → 翻相邻一张）
+    // ============================================================
+
+    @Test
+    fun `快甩小幅离开直接翻到相邻一张`() {
+        // 修复主场景：手指拖 0.1 页、甩速 2500px/s —— 衰减终点（约 0.43 页 + 0.1）
+        // 不过半，旧逻辑吸附回原页；现在甩速 + 同向位移双证据成立 → 翻下一张。
+        // 第 3 参（跨页上限口径）按全屏归零传 0，证明真实甩速单独生效（方案 A）
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = 0.1f
+            )
+        )
+        // 负方向严格镜像：往上一张方向快甩 → 翻 2
+        assertEquals(
+            2,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = -2500f, gestureLeavePages = -0.1f
+            )
+        )
+    }
+
+    @Test
+    fun `快甩但方向与位移相反不翻`() {
+        // 往回甩：拖了 0.1 页却朝原路甩回去 —— 方向证据不成立，走原有过半吸附
+        //（终点 0.4 页不过半 → 回原页，与修复前一致）
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.4f, 0f, pitch, 9,
+                flingVelocityPxPerSec = -2500f, gestureLeavePages = 0.1f
+            )
+        )
+    }
+
+    @Test
+    fun `慢速拖动过半仍翻一张`() {
+        // 原有行为不变：慢速（甩速 0）即使带着 0.6 页的拖动位移也不走快甩分支
+        //（速度门槛挡住），照旧按"过半才翻"吸附
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.6f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 0f, gestureLeavePages = 0.6f
+            )
+        )
+    }
+
+    @Test
+    fun `慢速位移不足回原页`() {
+        // v4.20.2：下限 0.05 → 0.03。0.02 页（1080px 页距 ≈ 22px）仍属"几乎没动"
+        // → 不算"甩"，吸附回原页（真机两次回弹是 0.017/0.022，与误触区分）
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.4f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = 0.02f
+            )
+        )
+    }
+
+    @Test
+    fun `全屏归零口径下大幅甩仍只挪一张`() {
+        // 跨页上限口径（velocityPxPerSec）按全屏归零：衰减终点 9 页外、甩速
+        // 20000px/s（衰减约 16 页，远超一页）—— v4.20.2 起全屏态不再看
+        // "衰减 ≤ 1 页"，快甩分支接手，但只翻相邻一张（start + 1），
+        // "不管甩多大力都只滑一张"不被突破
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 12f, 0f, pitch, 20,
+                flingVelocityPxPerSec = 20000f, gestureLeavePages = 0.2f
+            )
+        )
+    }
+
+    @Test
+    fun `单页时任何快甩都不越界`() {
+        // 快甩分支命中（全屏态不再检查衰减 ≤ 1 页）也要被页数夹住
+        assertEquals(
+            0,
+            ViewerPageMotion.snapTargetPage(
+                0, 5f, 0f, pitch, 1,
+                flingVelocityPxPerSec = 2000f, gestureLeavePages = 0.3f
+            )
+        )
+        // 极端速度同样走快甩分支，结果仍夹在 0
+        assertEquals(
+            0,
+            ViewerPageMotion.snapTargetPage(
+                0, 5f, 0f, pitch, 1,
+                flingVelocityPxPerSec = 9000f, gestureLeavePages = 0.3f
+            )
+        )
+    }
+
+    @Test
+    fun `首页往上一张方向甩钳在 0`() {
+        assertEquals(
+            0,
+            ViewerPageMotion.snapTargetPage(
+                0, 0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = -2500f, gestureLeavePages = -0.1f
+            )
+        )
+    }
+
+    @Test
+    fun `末页往下一张方向甩钳在末页`() {
+        assertEquals(
+            8,
+            ViewerPageMotion.snapTargetPage(
+                8, 8f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = 0.1f
+            )
+        )
+    }
+
+    @Test
+    fun `甩速与位移的门槛边缘`() {
+        // 甩速 1199：差 1px/s 不过门槛 → 回原页；1200：刚好触发
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 1199f, gestureLeavePages = 0.1f
+            )
+        )
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 1200f, gestureLeavePages = 0.1f
+            )
+        )
+        // 位移 0.029 页：不足 3%（v4.20.2 下限）→ 回原页；0.03 页：刚好触发
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = 0.029f
+            )
+        )
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = 0.03f
+            )
+        )
+    }
+
+    @Test
+    fun `离开量越上限或异常时不翻`() {
+        // 拖过半页（fraction 契约之外）：交还原有通道（终点就在原页 → 回原页）
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = 0.6f
+            )
+        )
+        // NaN / 无穷位移：证据无效，不翻
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = Float.NaN
+            )
+        )
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = Float.POSITIVE_INFINITY
+            )
+        )
+    }
+
+    @Test
+    fun `大幅甩动保留原有惯性跨页`() {
+        // 队列态口径（velocityPxPerSec 带真实速度）：12000px/s 衰减约 7 页，
+        // 快甩分支不得把它砍成一张 —— 终点 16 页外仍吸附到 3 + 7
+        assertEquals(
+            10,
+            ViewerPageMotion.snapTargetPage(
+                3, 19f, 12000f, pitch, 40,
+                flingVelocityPxPerSec = 12000f, gestureLeavePages = 0.3f
+            )
+        )
+    }
+
+    @Test
+    fun `不传新参数的旧调用行为不变`() {
+        // 新参数默认值（真实甩速 = velocityPxPerSec、位移 = 0）下位移证据恒缺失，
+        // 快甩分支对既有 5 参调用永不触发 —— 与 v4.20.1 之前逐字节一致
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(3, 3.0f, 2500f, pitch, 9)
+        )
+        assertEquals(
+            9,
+            ViewerPageMotion.snapTargetPage(3, 9f, 12000f, pitch, 12)
+        )
+    }
+
+    // ============================================================
+    // 3c. v4.20.2 真机回归（iQOO Neo10 Pro+，pagePitch = 1080px，8 张图）
+    //     全屏单图态口径：velocityPxPerSec = 0（跨页上限归零），
+    //     flingVelocityPxPerSec = 实测真实甩速，gestureLeavePages = 实测位移。
+    //     根因：decay 随速度超线性增长，3000~4300px/s 的快速小幅滑衰减 0.98~1.02 页，
+    //     加位移后恰好越过 1 页线，被旧条件挡成回弹（甩得越快越容易中招）。
+    // ============================================================
+
+    @Test
+    fun `真机 3990pxs 同向位移越过一页线仍翻页`() {
+        // 3990px/s 衰减 0.978 页 + 同向位移 0.076 = 1.054 > 1：旧条件挡成回弹。
+        // 全屏态去掉该条件（跨页上限已被归零钉在 1 张）→ 翻下一页。
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 3990f, gestureLeavePages = 0.076f
+            )
+        )
+    }
+
+    @Test
+    fun `真机 3990pxs 实测位移方向相反不翻`() {
+        // 实测原始数据是 flingVelocity=+3990、leave=-0.076（方向相反）。
+        // 方向一致是"朝甩动方向才翻"的防误翻证据，两个模式同口径保留 →
+        // 该次手势在现有规格下不可能翻页（是否应支持"反向蓄力甩"待用户确认）。
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 3990f, gestureLeavePages = -0.076f
+            )
+        )
+    }
+
+    @Test
+    fun `真机 4085pxs 衰减越过一页线仍翻页`() {
+        // 4085px/s 衰减 1.019 页 + 0.061 = 1.080：旧条件挡成回弹的第二个关键样本
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 4085f, gestureLeavePages = 0.061f
+            )
+        )
+    }
+
+    @Test
+    fun `真机 2621pxs 位移不足半页仍翻页`() {
+        // 实测已翻（0.471 页 + 0.122 = 0.593 ≤ 1，旧逻辑本来就过）——不许变差
+        assertEquals(
+            4,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2621f, gestureLeavePages = 0.122f
+            )
+        )
+    }
+
+    @Test
+    fun `真机 8478pxs 全屏态仍只翻一张`() {
+        // 规格保护：全屏单图不管甩多大力都只滑一张（衰减 3.619 页也不例外）
+        assertEquals(
+            5,
+            ViewerPageMotion.snapTargetPage(
+                4, 4.0f, 0f, pitch, 8,
+                flingVelocityPxPerSec = 8478f, gestureLeavePages = 0.18f
+            )
+        )
+    }
+
+    @Test
+    fun `真机低速与微小位移不翻页`() {
+        // 800px/s（真机数据最低档之外）：低于甩速门槛 → 不翻
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 800f, gestureLeavePages = 0.2f
+            )
+        )
+        // 5000px/s 但位移 0.02 页（≈22px）：低于 0.03 下限 → 防误触，不翻
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 5000f, gestureLeavePages = 0.02f
+            )
+        )
+    }
+
+    @Test
+    fun `并排预览态 8000pxs 保持跨多页惯性`() {
+        // 规格保护：队列态（velocityPxPerSec = 真实速度，未归零）保留全部原条件 ——
+        // 8000px/s 衰减 3.272 页 + 0.1 > 1 → 快甩分支让位，惯性页数 3 生效
+        assertEquals(
+            6,
+            ViewerPageMotion.snapTargetPage(
+                3, 8f, 8000f, pitch, 20,
+                flingVelocityPxPerSec = 8000f, gestureLeavePages = 0.1f
+            )
+        )
+    }
+
+    @Test
+    fun `真机方向不一致仍不翻`() {
+        // h：甩速正、位移负 —— 方向证据不成立（与 3990 实测行同类），走原有过半吸附
+        assertEquals(
+            3,
+            ViewerPageMotion.snapTargetPage(
+                3, 3.0f, 0f, pitch, 9,
+                flingVelocityPxPerSec = 2500f, gestureLeavePages = -0.1f
+            )
+        )
+    }
+
+    // ============================================================
     // 4. 拖动期间的位移口径（G3）
     // ============================================================
 
@@ -280,5 +607,41 @@ class ViewerPageMotionTest {
                 gestureActive = false, scrollInProgress = false, pagerFraction = 0.004f
             )
         )
+    }
+
+    // ---------------------------------------------- swipeTargetPage（v4.22.4）
+
+    /**
+     * 用户规格（2026-11-26 原话）：「手指只要有滑动的迹象，不管长短，别回弹，
+     * 直接下、上一张图片」。所以不看速度、不要求过半。
+     *
+     * 真机现状（iQOO Neo10 Pro+ / 1080px 页宽）：改前微滑 60px（5.5%）与慢拖 432px
+     * （40%）都停在原页；改后两者都翻相邻一张。
+     */
+    @Test
+    fun `swipeTargetPage 只要有滑动迹象就翻相邻一张`() {
+        assertEquals(1, ViewerPageMotion.swipeTargetPage(0, 0.055f, 6))
+        assertEquals(2, ViewerPageMotion.swipeTargetPage(1, 0.4f, 6))
+        assertEquals(0, ViewerPageMotion.swipeTargetPage(1, -0.06f, 6))
+        // 超过半页也只翻相邻一张（不放大跨页幅度）
+        assertEquals(1, ViewerPageMotion.swipeTargetPage(0, 0.9f, 6))
+    }
+
+    @Test
+    fun `swipeTargetPage 位移不足或异常时返回 null 交给原逻辑`() {
+        assertNull(ViewerPageMotion.swipeTargetPage(0, 0f, 6))
+        assertNull(ViewerPageMotion.swipeTargetPage(0, 0.019f, 6)) // 低于 2% 门槛
+        assertNull(ViewerPageMotion.swipeTargetPage(0, -0.019f, 6))
+        assertNull(ViewerPageMotion.swipeTargetPage(0, Float.NaN, 6))
+        assertNull(ViewerPageMotion.swipeTargetPage(0, Float.POSITIVE_INFINITY, 6))
+        assertNull(ViewerPageMotion.swipeTargetPage(0, 0.2f, 0)) // 没有页
+    }
+
+    @Test
+    fun `swipeTargetPage 两端不越界`() {
+        assertEquals(0, ViewerPageMotion.swipeTargetPage(0, -0.3f, 6))
+        assertEquals(5, ViewerPageMotion.swipeTargetPage(5, 0.3f, 6))
+        // 单页：两个方向都回到自己
+        assertEquals(0, ViewerPageMotion.swipeTargetPage(0, 0.3f, 1))
     }
 }

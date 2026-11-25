@@ -54,6 +54,44 @@ object TagDatabase {
     @Volatile
     private var database: SQLiteDatabase? = null
 
+    /**
+     * 方案 A 的关闭门：在途查询计数 + 延迟物理关闭。
+     *
+     * 物理关闭动作 [closeHandleNow] 只会在「确实没有在途引用」时被本门回调，
+     * 因此 close 不可能再把句柄从正在跑的游标底下抽走。
+     */
+    private val closeGate = DeferredCloseCounter { closeHandleNow() }
+
+    /**
+     * 物理关闭完成后的回调。由 [TagRepository] 注册，用来作废缓存的 searcher，
+     * 杜绝「持有已关闭句柄的 DAO 被写进单例」（诊断报告第三节的毒化场景）。
+     */
+    internal var onHandleClosed: (() -> Unit)? = null
+
+    /** 关闭是否已被请求、正在排空在途查询。`open` 与 searcher 赋值都要看这道门。 */
+    val isClosePending: Boolean get() = closeGate.isClosePending
+
+    /**
+     * 查询入口的引用计数。[TagDao] 的每一个 `rawQuery` 都必须按
+     * `if (acquire()) try { … } finally { release() }` 的形式配对使用。
+     *
+     * @return true = 句柄存活且无关闭请求，可以查；
+     *         false = 句柄已关闭 / 关闭正在排空，调用方必须放弃本次查询并返回空结果，
+     *                 **不得**触碰句柄，也**不得**调用 [release]
+     */
+    fun acquire(): Boolean {
+        // 先用 volatile 读挡掉「句柄已经没了」的情况：这是对陈旧 DAO（毒化单例）的
+        // 最后一道保险 —— 宁可返回空列表，也不让 rawQuery 去抛 IllegalStateException。
+        val db = database ?: return false
+        if (!db.isOpen) return false
+        return closeGate.acquire()
+    }
+
+    /** 查询出口。必须写在 finally 里，且只与 [acquire] 返回 true 的分支配对。 */
+    fun release() {
+        closeGate.release()
+    }
+
     /** 解压前需要的最小可用空间（字节）。纯函数，便于单测。 */
     internal fun requiredSpaceBytes(expectedBytes: Long = EXPECTED_DB_BYTES): Long =
         (expectedBytes * SPACE_HEADROOM_FACTOR).toLong()
@@ -71,6 +109,16 @@ object TagDatabase {
      */
     @Synchronized
     fun open(context: Context): Result<SQLiteDatabase> {
+        // 方案 A 的禁入门：关闭请求已发出、正在排空在途查询时，绝不能把**马上就要被关闭**
+        // 的句柄交出去 —— 上层会拿它建索引并把 searcher 写进单例，那个句柄随后就被物理
+        // 关闭，之后每次搜索必崩且 retry 救不回来（诊断报告第三节「毒化单例」）。
+        // 这里直接失败，让 retryInitialize 走正常的「初始化失败 → 再点重试」路径：
+        // 排空通常在毫秒级完成，第二次重试即可成功。
+        if (isClosePending) {
+            return Result.failure(
+                IllegalStateException("标签库正在关闭（在途查询尚未结束），请再点一次重试")
+            )
+        }
         database?.let { if (it.isOpen) return Result.success(it) }
 
         return try {
@@ -114,11 +162,41 @@ object TagDatabase {
         }
     }
 
-    /** 关闭数据库（应用退出或需要重新解压时调用）。 */
-    @Synchronized
+    /**
+     * 请求关闭数据库（应用退出或需要重新解压时调用）。
+     *
+     * 方案 A：这里**不再直接**关掉句柄。
+     * - 无在途查询（计数为 0）：立即物理关闭，与修复前行为一致；
+     * - 有在途查询：只置 `closeRequested`，由最后一个离开查询的 [release] 执行物理关闭。
+     *
+     * 非阻塞，因此可以在主线程调用（`TagLibraryViewModel.retryInitialize` 就是这条路）。
+     */
     fun close() {
-        database?.let { if (it.isOpen) it.close() }
-        database = null
+        closeGate.requestClose()
+    }
+
+    /**
+     * 真正的物理关闭。只由 [closeGate] 在「无在途引用」时回调，可能来自任意线程
+     * （哪个查询最后离开，就在哪个线程上执行）。
+     *
+     * 必须在计数锁之外调用：本方法要取 TagDatabase 自身的 monitor，而 [open] 是
+     * 「monitor → 计数锁」的顺序，反过来加锁会死锁。
+     */
+    private fun closeHandleNow() {
+        synchronized(this) {
+            database?.let { db ->
+                if (db.isOpen) {
+                    try {
+                        db.close()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "标签库关闭异常", e)
+                    }
+                }
+            }
+            database = null
+        }
+        // 句柄已失效：让上层把缓存的 DAO / Searcher 一起作废，别让陈旧句柄留在单例里
+        onHandleClosed?.invoke()
     }
 
     /** 数据库文件是否已解压完成。 */

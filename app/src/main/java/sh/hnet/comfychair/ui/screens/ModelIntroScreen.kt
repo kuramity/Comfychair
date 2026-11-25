@@ -1,8 +1,14 @@
 package sh.hnet.comfychair.ui.screens
 
+import android.widget.Toast
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,16 +24,24 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -35,13 +49,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import sh.hnet.comfychair.R
@@ -49,8 +68,8 @@ import sh.hnet.comfychair.model.LoraEffectTable
 import sh.hnet.comfychair.model.ModelIntro
 import sh.hnet.comfychair.model.ModelIntroTable
 import sh.hnet.comfychair.storage.AppSettings
-import sh.hnet.comfychair.ui.components.shared.ModelIntroSheet
 import sh.hnet.comfychair.ui.components.shared.modelSubtitle
+import sh.hnet.comfychair.viewmodel.ModelIntroViewModel
 
 /** 列表里的一行：目录节点 / 模型条目 / 档案孤儿条目（新旧行模型并存，见各 KDoc）。 */
 internal sealed interface IntroRow {
@@ -96,7 +115,7 @@ internal sealed interface IntroRow {
     }
 
     /**
-     * 档案孤儿条目（效果档案收录、介绍表里没有的）：点不开详情抽屉，就地展开/收起
+     * 档案孤儿条目（效果档案收录、介绍表里没有的）：点不开详情页，就地展开/收起
      * 显示效果全文，并标「仅效果档案收录」（复用现有孤儿标记键）。
      */
     data class Orphan(val fileName: String, val effect: String, val depth: Int) : IntroRow {
@@ -112,14 +131,36 @@ internal sealed interface IntroRow {
  * 点目录展开、再点收起。
  *
  * 数据来自随包内置 / 服务器更新的介绍表（[ModelIntroTable]），离线也能看。
+ *
+ * v4.21 起接上**用户覆盖层**（见 [ModelIntroViewModel]）：顶栏菜单里能批量管理、
+ * 查看并恢复已卸载条目；长按条目可卸载（只在本机隐藏）。点条目**直接进详情页**
+ * （[ModelIntroDetailScreen]，20 区块完整版）。
+ *
+ * @param onOpenDetail 点条目时进入详情页（v4.21 前是先在底部抽屉里预览，抽屉已下线）
+ * @param onOpenHidden 「已卸载（N）」的列表页入口（新路由，见 MainRoute.ModelIntroHidden）
+ * @param onOpenEditor 顶栏「＋」进入编辑器**新建模式**（无 file 参数，先选模板；
+ *        见 MainRoute.ModelIntroEditor）
+ * @param onEditEntry 长按菜单「编辑这条」进入编辑器**编辑模式**（带该条目的 file）
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}) {
+fun ModelIntroScreen(
+    onBack: () -> Unit,
+    onOpenDetail: (ModelIntro) -> Unit = {},
+    onOpenHidden: () -> Unit = {},
+    onOpenEditor: () -> Unit = {},
+    onEditEntry: (ModelIntro) -> Unit = {},
+    viewModel: ModelIntroViewModel = viewModel(),
+) {
     val context = LocalContext.current
-    var entries by remember { mutableStateOf<List<ModelIntro>>(emptyList()) }
-    var expanded by remember { mutableStateOf(emptySet<String>()) }
-    var detail by remember { mutableStateOf<ModelIntro?>(null) }
+    val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val entries = state.entries
+    var expanded by rememberSaveable(
+        stateSaver = listSaver<Set<String>, String>(
+            save = { it.toList() },
+            restore = { it.toSet() }
+        )
+    ) { mutableStateOf(emptySet<String>()) }
 
     // Q4（v4.16.6）合并形态开关（安全阀，组合时读一次）：开 = 三层树 + 档案只留孤儿；
     // 关 = 完整回到 v4.16.5 旧形态（独立档案分区 47 条 + 按路径展开的旧树）
@@ -127,31 +168,48 @@ fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}
 
     // 「LoRA 效果档案」分区：孤儿条目（介绍表里没有的）在前，其余条目在后。
     // Q4-1（v4.16.6）：合并去重只在**内存展示层**完成——splitArchiveKeys 划分
-    // 「已合并 42 / 孤儿 5」，数据文件（assets / filesDir 副本）一个字节都不改。
-    var archiveExpanded by remember { mutableStateOf(false) }
-    var orphanOpenKeys by remember { mutableStateOf(emptySet<String>()) }
-    var archiveOrphans by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
-    var archiveJoined by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+    // 「已合并 / 孤儿」，数据文件（assets / filesDir 副本）一个字节都不改。
+    var archiveExpanded by rememberSaveable { mutableStateOf(false) }
+    var orphanOpenKeys by rememberSaveable(
+        stateSaver = listSaver<Set<String>, String>(
+            save = { it.toList() },
+            restore = { it.toSet() }
+        )
+    ) { mutableStateOf(emptySet<String>()) }
+    var effects by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+
+    // ---- 覆盖层交互状态 ----
+    var menuExpanded by remember { mutableStateOf(false) }
+    var pendingUninstall by remember { mutableStateOf<ModelIntro?>(null) }
+    var showBatchConfirm by remember { mutableStateOf(false) }
+
+    // 介绍表（含覆盖层合并结果 + 已卸载名单）由 ViewModel 在 IO 线程装载；
+    // 卸载/恢复之后 ViewModel 自己会再刷一次，界面只读状态。
+    LaunchedEffect(Unit) { viewModel.load(context) }
+
+    // Toast 收集（文案 id + 格式参数由 ViewModel 给出，见 ModelIntroToastHost）
+    ModelIntroToastHost(viewModel)
 
     LaunchedEffect(Unit) {
-        // P2-17：模型介绍表是 513KB 的 JSON，读取 + 解析原先在主线程同步执行，
-        // 进页面时会卡住首帧。整段装载（含效果档案）放到 IO 线程，只回主线程写状态。
-        val loaded = withContext(Dispatchers.IO) {
-            ModelIntroTable.ensureLoaded(context)
-            val introList = ModelIntroTable.all()
-            // 效果档案在介绍表之后装载：orphans 的判定要先拿到介绍表收录的文件名集合
+        // P2-17：效果档案同样是读盘 + 解析，放 IO 线程
+        effects = withContext(Dispatchers.IO) {
             LoraEffectTable.ensureLoaded(context)
-            introList to LoraEffectTable.all()
-        }
-        entries = loaded.first
-        val effects = loaded.second
-        if (effects.isNotEmpty()) {
-            val known = entries.map { it.file.lowercase() }.toSet()
-            val (joined, orphans) = splitArchiveKeys(effects.keys.toList().sorted(), known)
-            archiveOrphans = orphans.map { it to effects.getValue(it) }
-            archiveJoined = joined.map { it to effects.getValue(it) }
+            LoraEffectTable.all()
         }
     }
+
+    // 档案去重划分：介绍表条目集变化（卸载/恢复）时要跟着重算
+    val archiveSplit = remember(entries, effects) {
+        if (effects.isEmpty() || entries.isEmpty()) {
+            emptyList<Pair<String, String>>() to emptyList<Pair<String, String>>()
+        } else {
+            val known = entries.map { it.file.lowercase() }.toSet()
+            val (joined, orphans) = splitArchiveKeys(effects.keys.toList().sorted(), known)
+            joined.map { it to effects.getValue(it) } to orphans.map { it to effects.getValue(it) }
+        }
+    }
+    val archiveJoined = archiveSplit.first
+    val archiveOrphans = archiveSplit.second
 
     // 三层树中间结构（Q4-3：类别 → 分组 → 条目），条目集不变时只算一次
     val categories = remember(entries) { buildCategories(entries) }
@@ -172,26 +230,108 @@ fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}
             TopAppBar(
                 title = {
                     Column {
-                        Text(stringResource(R.string.model_intro_screen_title))
                         Text(
-                            text = stringResource(R.string.model_intro_screen_count, entries.size),
+                            text = if (state.selectMode) {
+                                stringResource(R.string.model_intro_batch_manage)
+                            } else {
+                                stringResource(R.string.model_intro_screen_title)
+                            }
+                        )
+                        Text(
+                            text = if (state.selectMode) {
+                                stringResource(R.string.model_intro_select_count, state.selected.size)
+                            } else {
+                                stringResource(R.string.model_intro_screen_count, entries.size)
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = stringResource(R.string.button_back)
-                        )
+                    if (state.selectMode) {
+                        IconButton(onClick = { viewModel.exitSelectMode() }) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = stringResource(R.string.action_cancel)
+                            )
+                        }
+                    } else {
+                        IconButton(onClick = onBack) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = stringResource(R.string.button_back)
+                            )
+                        }
+                    }
+                },
+                actions = {
+                    if (state.selectMode) {
+                        TextButton(
+                            onClick = {
+                                if (state.selected.isEmpty()) {
+                                    Toast.makeText(
+                                        context,
+                                        context.getString(R.string.model_intro_select_none),
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    showBatchConfirm = true
+                                }
+                            }
+                        ) {
+                            Text(stringResource(R.string.model_intro_batch_title))
+                        }
+                    } else {
+                        // 新建介绍入口：放在「⋮」左边（MoreVert 是溢出菜单，语义上永远最右）。
+                        // 顶栏按钮固定进「新建」模式，编辑既有条目走长按菜单（任务书拍板）。
+                        IconButton(onClick = onOpenEditor) {
+                            Icon(
+                                imageVector = Icons.Default.Add,
+                                contentDescription = stringResource(R.string.model_intro_editor_entry)
+                            )
+                        }
+                        Box {
+                            IconButton(onClick = { menuExpanded = true }) {
+                                Icon(
+                                    imageVector = Icons.Default.MoreVert,
+                                    contentDescription = stringResource(R.string.model_intro_menu_more)
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = menuExpanded,
+                                onDismissRequest = { menuExpanded = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.model_intro_batch_manage)) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        viewModel.enterSelectMode()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            stringResource(
+                                                R.string.model_intro_hidden_menu,
+                                                state.hidden.size
+                                            )
+                                        )
+                                    },
+                                    onClick = {
+                                        menuExpanded = false
+                                        onOpenHidden()
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
             )
         }
     ) { padding ->
-        if (entries.isEmpty()) {
+        // loading 期间不显示「暂无介绍」（否则冷启动会闪一下空态）
+        if (entries.isEmpty() && !state.loading) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -207,6 +347,7 @@ fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}
             }
             return@Scaffold
         }
+        if (entries.isEmpty()) return@Scaffold
 
         // 旧档案分区只在回退态渲染（合并态的孤儿已在三层树顶的档案节点下）
         val archiveItems = if (archiveExpanded) archiveOrphans + archiveJoined else emptyList()
@@ -240,7 +381,7 @@ fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}
                                 orphanOpenKeys + fileName
                             }
                         },
-                        onOpenDetail = { intro -> detail = intro }
+                        onOpenDetail = onOpenDetail
                     )
                 }
             }
@@ -255,9 +396,26 @@ fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}
                         }
                     )
 
-                    is IntroRow.Model -> ModelRow(intro = row.intro, depth = row.depth) {
-                        detail = row.intro
-                    }
+                    is IntroRow.Model -> ModelRow(
+                        intro = row.intro,
+                        depth = row.depth,
+                        selectionMode = state.selectMode,
+                        isSelected = row.intro.file in state.selected,
+                        onClick = {
+                            if (state.selectMode) {
+                                viewModel.toggleSelected(row.intro.file)
+                            } else {
+                                onOpenDetail(row.intro)
+                            }
+                        },
+                        onLongClick = {
+                            if (state.selectMode) {
+                                viewModel.toggleSelected(row.intro.file)
+                            } else {
+                                pendingUninstall = row.intro
+                            }
+                        },
+                    )
 
                     // ---- 合并态（v4.16.6 三层树）----
                     is IntroRow.Node -> NodeRow(
@@ -272,9 +430,26 @@ fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}
                         }
                     )
 
-                    is IntroRow.Entry -> EntryRow(intro = row.intro, depth = row.depth) {
-                        detail = row.intro
-                    }
+                    is IntroRow.Entry -> EntryRow(
+                        intro = row.intro,
+                        depth = row.depth,
+                        selectionMode = state.selectMode,
+                        isSelected = row.intro.file in state.selected,
+                        onClick = {
+                            if (state.selectMode) {
+                                viewModel.toggleSelected(row.intro.file)
+                            } else {
+                                onOpenDetail(row.intro)
+                            }
+                        },
+                        onLongClick = {
+                            if (state.selectMode) {
+                                viewModel.toggleSelected(row.intro.file)
+                            } else {
+                                pendingUninstall = row.intro
+                            }
+                        },
+                    )
 
                     is IntroRow.Orphan -> OrphanRow(
                         fileName = row.fileName,
@@ -294,14 +469,70 @@ fun ModelIntroScreen(onBack: () -> Unit, onOpenDetail: (ModelIntro) -> Unit = {}
         }
     }
 
-    detail?.let { intro ->
-        ModelIntroSheet(
-            intro = intro,
-            onDismiss = { detail = null },
-            // v4.17：抽屉是快速预览，「查看完整详情」进二级页面（20 区块完整版）
-            onOpenDetail = {
-                detail = null
-                onOpenDetail(intro)
+    // ---- 长按操作（卸载 / 编辑，均为二次确认后执行）----
+    pendingUninstall?.let { intro ->
+        AlertDialog(
+            onDismissRequest = { pendingUninstall = null },
+            title = { Text(stringResource(R.string.model_intro_uninstall_title)) },
+            text = {
+                Text(
+                    stringResource(
+                        R.string.model_intro_uninstall_message,
+                        intro.name?.takeIf { it.isNotBlank() } ?: intro.file
+                    )
+                )
+            },
+            confirmButton = {
+                // 「编辑这条」与「卸载」并列（任务书 3）：编辑进编辑器（覆盖层整条覆盖，
+                // 内置库一个字节不改），卸载只是本地隐藏——两条路径互不掺和。
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(onClick = {
+                        pendingUninstall = null
+                        onEditEntry(intro)
+                    }) {
+                        Text(stringResource(R.string.model_intro_edit_entry))
+                    }
+                    TextButton(onClick = {
+                        pendingUninstall = null
+                        viewModel.hide(context, intro.file)
+                    }) {
+                        Text(
+                            text = stringResource(R.string.model_intro_uninstall_confirm),
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingUninstall = null }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            }
+        )
+    }
+
+    // ---- 批量卸载确认 ----
+    if (showBatchConfirm) {
+        val count = state.selected.size
+        AlertDialog(
+            onDismissRequest = { showBatchConfirm = false },
+            title = { Text(stringResource(R.string.model_intro_batch_title)) },
+            text = { Text(stringResource(R.string.model_intro_batch_message, count)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBatchConfirm = false
+                    viewModel.hideMany(context, state.selected)
+                }) {
+                    Text(
+                        text = stringResource(R.string.model_intro_uninstall_confirm),
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatchConfirm = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
             }
         )
     }
@@ -373,8 +604,13 @@ internal const val ARCHIVE_NODE_KEY = "k:__archive"
 /** kind 为空时的兜底桶名（数据侧 kind 是代码内硬编码中文枚举，兜底名随此惯例）。 */
 internal const val FALLBACK_KIND = "未分类"
 
-/** 类别展示顺序（数据侧 8 类）；不在表内的未知 kind 排在最后、「未分类」兜底桶殿后。 */
-private val KIND_ORDER = listOf(
+/**
+ * 类别展示顺序（数据侧 8 类）；不在表内的未知 kind 排在最后、「未分类」兜底桶殿后。
+ *
+ * internal：编辑器「类型」下拉用同一份枚举（任务书：下拉选 8 类）——两处各写一遍，
+ * 数据侧扩类时必漂移。
+ */
+internal val KIND_ORDER = listOf(
     "背景去除", "大模型", "图像编码器", "扩散模型", "LoRA", "放大模型", "VAE", "几何估计"
 )
 
@@ -383,7 +619,7 @@ private val KIND_ORDER = listOf(
  *
  * 档案条目键（小写 basename）与介绍表收录文件名集合天然同口径，无需归一化：
  * - 键在集合里 → **已合并**（介绍表条目自带同样的 effect，档案区不再重复列出，
- *   用户在树里点对应模型看详情抽屉）；
+ *   用户在树里点对应模型看详情页）；
  * - 键不在集合里 → **孤儿**（介绍表还没收录这条模型），档案节点下保留展示。
  *
  * 输入顺序即输出顺序（调用方传排序后的键，输出保持字典序稳定）。
@@ -530,7 +766,7 @@ private fun ArchiveHeaderRow(expanded: Boolean, count: Int, onToggle: () -> Unit
 }
 
 /**
- * 效果档案的一条：能按文件名 join 到介绍表的条目点击打开详情抽屉；
+ * 效果档案的一条：能按文件名 join 到介绍表的条目点击进详情页；
  * join 不到的（档案里先记了效果、模型还没进全量溯源的孤儿条目）就地展开/收起
  * 显示效果全文，不新开路由。
  */
@@ -617,39 +853,78 @@ private fun FolderRow(row: IntroRow.Folder, isExpanded: Boolean, onToggle: () ->
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ModelRow(intro: ModelIntro, depth: Int, onClick: () -> Unit) {
+private fun ModelRow(
+    intro: ModelIntro,
+    depth: Int,
+    selectionMode: Boolean,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     // 统一走 shared 的 modelSubtitle：它额外带两段兜底——没有结构化字段时用作者推荐 tag，
     // 以及「文件已移除」标记。原先本页自己拼 base·type·作者，模型文件被清理后这行就是空白，
     // 用户完全看不出这个条目已经失效。
     val subtitle = modelSubtitle(intro, stringResource(R.string.model_intro_missing_badge))
-    Column(
+    // U1-A：自绘「按下即完整高亮」的底色，替掉 M3 ripple。
+    // ripple 有扩散 + 淡出的前摇（约 300–500ms），而 onClick 抬手就导航、列表随即被销毁，
+    // 用户看到的是「白色高亮刚晕开一半画面就跳走了」。这里按下第一帧整行就是完整底色，
+    // 松开立即恢复，不存在播到一半被打断的观感。长按（卸载确认框）同样会亮，这是对的。
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    // 与分组标题（GROUP_TITLE_SHAPE 6dp）同一套视觉语言；行本身无圆角，圆角只作用于底色
+    val rowShape = RoundedCornerShape(8.dp)
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(start = 12.dp + (depth * 16).dp, end = 16.dp, top = 8.dp, bottom = 8.dp)
+            // 底色画在整行（含缩进区），「完整高亮」才是 U1-A 要的观感
+            .background(
+                color = if (pressed) {
+                    MaterialTheme.colorScheme.surfaceContainerHighest
+                } else {
+                    Color.Transparent
+                },
+                shape = rowShape
+            )
+            // 长按 = 卸载此条介绍（批量管理模式下退化为勾选，不弹卸载框）
+            .combinedClickable(
+                interactionSource = interactionSource,
+                // 关掉 ripple：不关的话它会在自绘底色上再晕一层，看起来更脏
+                indication = null,
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
+            .padding(start = 12.dp + (depth * 16).dp, end = 16.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(
-            text = intro.name ?: intro.file,
-            style = MaterialTheme.typography.bodyMedium,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            text = intro.file,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        if (!subtitle.isNullOrEmpty()) {
+        if (selectionMode) {
+            Checkbox(checked = isSelected, onCheckedChange = null)
+            Spacer(Modifier.width(4.dp))
+        }
+        Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = subtitle,
+                text = intro.name ?: intro.file,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = intro.file,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+            if (!subtitle.isNullOrEmpty()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
@@ -724,50 +999,86 @@ private fun NodeRow(node: IntroRow.Node, isExpanded: Boolean, onToggle: () -> Un
 /**
  * 三层树的模型条目行：名称（bodyMedium，Q4-4 统一 maxLines=1 + ellipsis，尾部截断）+
  * 文件名（labelSmall）+ 副标题/状态标记（[modelSubtitle] 带「文件已移除」等标记）。
- * 点击打开详情抽屉——42 条已合并的档案条目就在这里看到效果（抽屉优先读条目 effect）。
+ * 点击进详情页——42 条已合并的档案条目就在详情页里看到效果（详情页优先读条目 effect）。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun EntryRow(intro: ModelIntro, depth: Int, onClick: () -> Unit) {
+private fun EntryRow(
+    intro: ModelIntro,
+    depth: Int,
+    selectionMode: Boolean,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     // 统一走 shared 的 modelSubtitle（与旧 ModelRow 同一兜底链：结构化字段 → 推荐 tag → 移除标记）
     val subtitle = modelSubtitle(intro, stringResource(R.string.model_intro_missing_badge))
-    Column(
+    // U1-A：与 ModelRow 同一套「按下即完整高亮」的自绘底色（三棵树的条目行手感必须一致，
+    // 否则合并态与回退态点起来是两种感觉）。按下第一帧即完整高亮，松开立即恢复，随后照常导航
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val rowShape = RoundedCornerShape(8.dp)
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            // 底色画在整行（含缩进区），条目层与分组标题的底色语言统一
+            .background(
+                color = if (pressed) {
+                    MaterialTheme.colorScheme.surfaceContainerHighest
+                } else {
+                    Color.Transparent
+                },
+                shape = rowShape
+            )
+            // 长按 = 卸载此条介绍（批量管理模式下退化为勾选，不弹卸载框）
+            .combinedClickable(
+                interactionSource = interactionSource,
+                // 关掉 ripple，否则它会在自绘底色上再晕一层
+                indication = null,
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
             .padding(
                 start = 12.dp + (depth * 16).dp,
                 end = 16.dp,
                 top = INTRO_ROW_SPACING,
                 bottom = INTRO_ROW_SPACING
-            )
+            ),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(
-            text = intro.name ?: intro.file,
-            style = MaterialTheme.typography.bodyMedium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            text = intro.file,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        if (!subtitle.isNullOrEmpty()) {
+        if (selectionMode) {
+            Checkbox(checked = isSelected, onCheckedChange = null)
+            Spacer(Modifier.width(4.dp))
+        }
+        Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = subtitle,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                text = intro.name ?: intro.file,
+                style = MaterialTheme.typography.bodyMedium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+            Text(
+                text = intro.file,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (!subtitle.isNullOrEmpty()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
 
 /**
- * 档案孤儿条目行（合并态档案节点下，共 5 条）：介绍表里没有这条模型，点不开详情抽屉，
+ * 档案孤儿条目行（合并态档案节点下，共 5 条）：介绍表里没有这条模型，点不开详情页，
  * 就地展开/收起显示效果全文；名称行下标「仅效果档案收录」（复用现有孤儿标记键），
  * 即"未收录到目录树"的明确标注。
  */

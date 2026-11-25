@@ -3,6 +3,7 @@ package sh.hnet.comfychair.ui.components
 import android.graphics.Bitmap
 import android.util.Log
 import sh.hnet.comfychair.BuildConfig
+import sh.hnet.comfychair.util.DebugLogger
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.VectorConverter
@@ -54,6 +55,12 @@ private const val REVEAL_MASK_TRANSITION_MS = 120
 
 /** 飞回动画时长（ms，E4）：落在派工单给的 200~260 区间内，与吸附/收尾动画观感一致 */
 private const val FLY_BACK_DURATION_MS = 240
+
+/**
+ * GESTURE_PROBE 翻页手势诊断日志的 TAG（临时埋点，真机采集甩速数据用）。
+ * 走 DebugLogger 内存缓冲（设置里可导出），消息统一带 GESTURE_PROBE 前缀方便 grep。
+ */
+private const val GESTURE_PROBE_TAG = "ImageViewer"
 
 /**
  * Image viewer with constrained pinch-to-zoom and pan.
@@ -1046,6 +1053,17 @@ fun ImageViewer(
                                 }
                             }
                         } while (event.changes.any { it.pressed })
+
+                        // GESTURE_PROBE（临时诊断，真机甩速采集）：手势结束快照，每手势恰好一条。
+                        // 放在 do-while 之后而不是方向锁定帧——快速小幅滑动可能整段手势都
+                        // UNDECIDED（没到方向锁定阈值就抬手），锁定帧不一定打得到；这里拿到的
+                        // lockedDirection 是本手势最终值，配合 MediaViewerScreen 里
+                        // calculateTargetPage 的松手速度可对出"第一次快速小幅滑动"的完整证据链
+                        DebugLogger.d(
+                            GESTURE_PROBE_TAG,
+                            "GESTURE_PROBE drag: locked=$lockedDirection " +
+                                "totalDx=$accumulatedDx totalDy=$accumulatedDy scale=$scale"
+                        )
 
                         // 脱离拖动松手：位移或向下甩速达标 → 退出查看器（走统一出口）；
                         // 否则弹簧回位。已经发起退出（exitCommitted）时不再触发。

@@ -10,6 +10,7 @@ import java.io.File
  *
  * 这两条靠「配置对不对」生效，普通单测覆盖不到运行时，所以用源码/资源文本断言钉住：
  * - file_paths.xml 不得再有 `path="."`（整个 cacheDir/filesDir 当可共享根）；
+ *   files-path 仅允许 v4.20.x 更新目录回退用的 update/ 专用子目录（白名单见用例内注释）；
  * - 全部 FileProvider URI 只能从两个专用目录产出（分享载荷 share/、更新包 update/）；
  * - 分享载荷只写 cacheDir/share/（ShareFileStore）；
  * - 明文闸门必须接在 ComfyUIClient 的统一 client 构造上；
@@ -40,7 +41,14 @@ class SecurityConfigWiringTest {
             "file_paths.xml 不得再出现 path=\".\"（整个目录当可共享根）",
             xml.contains("path=\".\"")
         )
-        assertFalse("file_paths.xml 不得再声明 files-path 根", xml.contains("<files-path"))
+        // v4.20.x 更新目录内部回退（filesDir/update/）：安装链路必须能给回退目录发
+        // content URI。files-path 从「一律禁止」收紧为「白名单：仅 update/ 专用子目录」
+        // ——任何其它 files-path（新子目录、通配、缺 path 属性）仍然判违规。
+        val filesPaths = Regex("<files-path\\b[^>]*>").findAll(xml).map { it.value }.toList()
+        assertTrue(
+            "files-path 只允许声明 update/ 一个专用子目录，实际：$filesPaths",
+            filesPaths.all { it.contains("path=\"update/\"") }
+        )
         assertTrue(
             "分享载荷目录 cacheDir/share/ 必须声明",
             xml.contains("<cache-path name=\"share\" path=\"share/\"")

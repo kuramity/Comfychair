@@ -60,8 +60,8 @@ android {
         // versionCode 与版本名**解耦**：每次发版 +1，只保证单调递增（Android 的硬性要求）。
         // ⚠️ 发版前务必同时改这两行：只 cp 改文件名不改这里，会得到一个 versionCode
         //    与上一版完全相同的包（装不上也分不清，v0.9.33 踩过）。
-        versionCode = 148
-        versionName = "v4.20.0"
+        versionCode = 157
+        versionName = "v4.22.5"
 
         // 更新清单地址注入 BuildConfig（空字符串 = 未配置更新源）
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"$updateManifestUrl\"")
@@ -123,6 +123,21 @@ if (!releaseKeyReady) {
             }
         }
     }
+}
+
+// P0（2026-11-23 全量单测实测）：ProcessJavaResTask 的空目录竞态会让单测任务整体失败。
+// ProcessJavaResTask 继承 Sync/AbstractCopyTask，默认 includeEmptyDirs = true：它会把源树里的
+// 每个目录都在输出目录重建一遍并 chmod。Kotlin 插件把 build/tmp/kotlin-classes/debugUnitTest
+// （内含 sh/** 编译输出）注册为 java resources 源根，于是 java_res/.../out/ 下会生成一棵只有目录、
+// 没有 .class 的空骨架。Gradle 9.4.1 在 Windows 上没有原生 POSIX 文件模式
+// （GenericFileSystem.getUnixMode → FallbackStat），一旦某个目录在「枚举完目录树、再去取模式」
+// 的间隙里短暂不可见（Kotlin daemon 补写增量缓存 / 并发构建互相清理 build/），就抛
+// "Could not get file mode for ...\kotlin-classes\debugUnitTest\sh"，整个
+// :app:processDebugUnitTestJavaRes 失败、全量单测直接中断（2026-11-23 第 2 次复现）。
+// Java resources 本身无空目录语义（.class 早已被过滤掉），关闭空目录复制既不丢任何真实资源文件，
+// 也不再 stat 那些易变的编译输出目录。
+tasks.matching { it.name.startsWith("process") && it.name.endsWith("JavaRes") }.configureEach {
+    (this as? org.gradle.api.tasks.AbstractCopyTask)?.includeEmptyDirs = false
 }
 
 // Disable baseline profile generation for F-Droid reproducible builds

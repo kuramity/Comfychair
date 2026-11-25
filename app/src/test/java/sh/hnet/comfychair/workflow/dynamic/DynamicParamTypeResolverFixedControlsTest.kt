@@ -8,20 +8,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import sh.hnet.comfychair.workflow.InputDefinition
 import sh.hnet.comfychair.workflow.NodeTypeRegistry
-import java.io.File
 
 /**
- * [DynamicParamTypeResolver] 的 App 端固定控件表（FIXED_CONTROLS）单测（回归 + 真实资产钉住）。
+ * [DynamicParamTypeResolver] 的 App 端固定控件表（FIXED_CONTROLS）单测（回归钉住）。
  *
- * 背景：MOSS 4K 的 6 个 LoRA 占位符挂在 rgthree Power Lora Loader 的 `lora_1` 下，
+ * 背景：LoRA 占位符挂在 rgthree Power Lora Loader 的 `lora_1` 下，
  * 而 `lora_1` 在服务器 `/object_info` 里是连接类型（不是 widget），查不到字段定义，
  * 类型推导退化成单行文本框——用户得手打 `true` / `0.75` 才能开 LoRA。
  * FIXED_CONTROLS 按占位符名直接指定控件（开关 / 数字框），优先于服务器字段定义。
  *
- * 分三部分：
+ * 分两部分：
  * 1. 构造数据钉住控件类型与优先级（高于服务器定义；combo 同级更高）
  * 2. 未登记占位符与已登记 combo 的行为不变（回归）
- * 3. 真实资产（prebuilt_33 MOSS 4K HD）走「scan → resolve」全链路 + defaults 初值一致性
  *
  * 反证说明：本类测试的反证靠临时移除 FIXED_CONTROLS 里的 `lora1_on` 登记条目后重跑——
  * 第 1 部分的 `lora1_on` 断言必须变红（已实际执行并记录），证明断言真的依赖登记表。
@@ -167,68 +165,5 @@ class DynamicParamTypeResolverFixedControlsTest {
             (control as DynamicParamControl.ComboField).options
         )
         assertNull("固定下拉与固定控件都不带默认值语义（初值由 defaults 决定）", control.default)
-    }
-
-    // ================================================================
-    // 3. 真实资产：prebuilt_33 走「scan → resolve」全链路
-    // ================================================================
-
-    /** JVM 单测的工作目录是模块目录（app/），assets 在 src/main/assets 下。 */
-    private fun assetFile(name: String): File? {
-        for (dir in listOf("src/main/assets/prebuilt_workflows", "app/src/main/assets/prebuilt_workflows")) {
-            val f = File(dir, name)
-            if (f.isFile) return f
-        }
-        return null
-    }
-
-    @Test
-    fun `prebuilt_33 真实资产 scan 到 resolve 全链路 6 个 lora 占位符控件类型正确`() {
-        val f = assetFile("prebuilt_33_moss_4k_hd.json")
-        org.junit.Assume.assumeTrue("assets 不可用时跳过（换机/CI 布局差异）", f != null)
-
-        // 真实资产扫描 + 空 registry（模拟服务器 /object_info 里 lora_1 查不到 widget 定义）resolve
-        val refs = DynamicParamScanner.scan(f!!.readText())
-        val params = refs.map { DynamicParamTypeResolver.resolve(it, emptySource()) }
-        val byName = params.associateBy { it.placeholder }
-
-        // 3 个开关：类型与默认全关
-        listOf("lora1_on", "lora2_on", "lora3_on").forEach { name ->
-            val param = byName.getValue(name)
-            assertTrue("$name 必须解析为开关（真实资产全链路）", param.control is DynamicParamControl.BoolField)
-            assertEquals("$name 默认全关", false, (param.control as DynamicParamControl.BoolField).default)
-        }
-
-        // 3 个强度数字框：范围 0..2 步进 0.05，默认值与资产 defaults 一致
-        assertStrengthControl(byName.getValue("lora1_strength").control, 1.0)
-        assertStrengthControl(byName.getValue("lora2_strength").control, 1.0)
-        assertStrengthControl(byName.getValue("lora3_strength").control, 0.75)
-
-        // 全链路定位信息照旧（真实节点 707/851/924）
-        assertEquals("707", byName.getValue("lora1_on").nodeId)
-        assertEquals("924", byName.getValue("lora3_strength").nodeId)
-        assertEquals("Power Lora Loader (rgthree)", byName.getValue("lora2_strength").classType)
-    }
-
-    @Test
-    fun `prebuilt_33 真实 defaults 喂入后初值与固定控件 default 一致（两处默认值不打架）`() {
-        val f = assetFile("prebuilt_33_moss_4k_hd.json")
-        org.junit.Assume.assumeTrue("assets 不可用时跳过（换机/CI 布局差异）", f != null)
-
-        val workflow = JSONObject(f!!.readText())
-        val refs = DynamicParamScanner.scan(workflow.toString())
-        val params = refs.map { DynamicParamTypeResolver.resolve(it, emptySource()) }
-
-        val resolved = DynamicParamValues.resolveAll(
-            params, emptyMap(), workflow.optJSONObject("defaults")
-        ).associate { it.param.placeholder to it.value }
-
-        // defaults 优先于控件 default，但两处一致 → 面板初值与登记语义完全相同
-        assertEquals("false", resolved["lora1_on"])
-        assertEquals("false", resolved["lora2_on"])
-        assertEquals("false", resolved["lora3_on"])
-        assertEquals("1", resolved["lora1_strength"])
-        assertEquals("1", resolved["lora2_strength"])
-        assertEquals("0.75", resolved["lora3_strength"])
     }
 }

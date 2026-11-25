@@ -31,9 +31,9 @@ import sh.hnet.comfychair.storage.AppSettings
  * 重复。前后台由 [ComfyChairApp 的 ActivityLifecycleCallbacks][setAppInForeground]
  * 维护；进后台那一刻若有活跃生成，用最后一次快照补发一条；回前台即撤。
  *
- * **不做前台服务**（任务约束，省电优先）：手机端只是客户端，生成在服务器上跑，
- * 普通通知足够承载"锁屏可见进度"；App 进程被系统杀掉时通知停在最后一次快照，
- * 属于无前台服务的自然边界。
+ * **任务级前台服务（P4 起）**：[GenerationKeepAliveService] 在有生成任务且 WiFi 后台时
+ * 把这条进度通知提升为前台服务通知，目的只是让进程不被冻结 —— 服务随任务结束立即退出，
+ * **不是常驻通知**。没有任务时不存在该服务（用户明确要求）。
  *
  * **隐私约束**：只显示模式名（文生图等）+ 进度百分比 + 失败原因摘要。
  * 绝不显示提示词内容、绝不带图片缩略图 —— 通知栏在锁屏 / 公共场合可见。
@@ -68,11 +68,28 @@ object GenerationNotifier {
     /** 进度通知的最小更新间隔：ComfyUI 每步发一次 progress，直接透传太耗电 */
     private const val MIN_PROGRESS_INTERVAL_MS = 1000L
 
+    /**
+     * 没有百分比数据（max<=0）时的**保活刷新**间隔（P4）。
+     *
+     * 修复前：percent 恒为 null → 节流游标 lastPercent 恒为 -1 → 「百分比没变」
+     * 直接从第二次起永不更新，通知停在第一次的「生成中…」。用户看到的就是进度停滞。
+     * 现在无百分比状态按时间窗重发同一条静默通知（LOW 渠道、setOnlyAlertOnce），
+     * 让「还在跑」这件事在通知栏保持新鲜，代价是每分钟一次 notify（不联网、不唤醒网络）。
+     */
+    private const val INDETERMINATE_REFRESH_MS = 60_000L
+
     // ---------- 状态（全部 @Volatile：写侧在 ViewModel / 主线程，读侧在通知构建） ----------
 
-    /** App 是否在前台（[setAppInForeground] 由 Application 的生命周期回调维护） */
+    /**
+     * App 是否在前台（[setAppInForeground] 由 Application 的生命周期回调维护）。
+     *
+     * **默认 false（P4 修复）**：进程被 WorkManager 拉起时不会安装 Activity 生命周期，
+     * 原来的默认 true 会让 Worker 补发的完成通知走「前台」分支被直接撤销 ——
+     * 「完成提醒必达」在进程重启场景下永远不成立。正常前台路径里，监视器会在
+     * Activity ON_START 时把值改为 true，不依赖这个默认值。
+     */
     @Volatile
-    private var appInForeground: Boolean = true
+    private var appInForeground: Boolean = false
 
     /** 最后一次进度快照：进后台补发通知时用（null = 当前没有可展示的生成） */
     @Volatile
@@ -225,6 +242,34 @@ object GenerationNotifier {
         notify(context, notification)
     }
 
+    /**
+     * 完成状态在轮询重试上限内仍无法确认（P4）。
+     *
+     * **不谎报成功/失败**：只提示「结果待确认，打开 App 查看最新状态」。
+     * 走结果渠道（HIGH），因为这是用户需要采取动作的提醒，而不是过程进度。
+     */
+    fun onPendingConfirmation(context: Context, ownerId: String?) {
+        lastSnapshot = null
+        if (appInForeground || !canNotify(context)) {
+            // 前台时界面自己能展示状态；通知关闭时静默
+            return
+        }
+        ensureChannels(context)
+        val notification = NotificationCompat.Builder(context, RESULT_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_comfychair_foreground)
+            .setContentTitle(context.getString(R.string.notify_generation_pending_title))
+            .setContentText(
+                context.getString(titleResFor(ownerId)) + " · " +
+                    context.getString(R.string.notify_generation_pending_text)
+            )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setAutoCancel(true)
+            .setContentIntent(launchAppPendingIntent(context))
+            .build()
+        notify(context, notification)
+    }
+
     /** 用户主动取消 / 登出 / 状态复位：撤掉通知，清快照。 */
     fun cancel(context: Context) {
         lastSnapshot = null
@@ -292,8 +337,11 @@ object GenerationNotifier {
     }
 
     /**
-     * 进度通知节流：第一次必发；之后要求「百分比变化」且「距上次发出 ≥ 最小间隔」。
-     * max<=0 时 percent 为 -1（占位），期间按时间窗节流。
+     * 进度通知节流：第一次必发；之后要求「百分比变化」或「无百分比状态的时间窗刷新」。
+     * max<=0 时 percent 为 -1（占位）。
+     *
+     * P4 修复：-1 → -1 原来一律返回 false，于是无百分比的任务从第二次起永远不更新，
+     * 通知停在第一次的文案。现在 -1 状态每 [INDETERMINATE_REFRESH_MS] 重发一次。
      */
     internal fun shouldEmitProgress(
         lastEmitAtMs: Long,
@@ -303,7 +351,10 @@ object GenerationNotifier {
         newPercent: Int,
     ): Boolean {
         if (lastEmitAtMs == 0L) return true
-        if (newPercent == lastPercent) return false
+        if (newPercent == lastPercent) {
+            return newPercent < 0 &&
+                nowMs - lastEmitAtMs >= maxOf(minIntervalMs, INDETERMINATE_REFRESH_MS)
+        }
         return nowMs - lastEmitAtMs >= minIntervalMs
     }
 
@@ -322,10 +373,20 @@ object GenerationNotifier {
 
     private fun canNotify(context: Context): Boolean {
         // 设置开关（阶段 C）：用户关掉后不再发任何生成相关通知，并撤掉已挂的
-        if (!AppSettings.isGenerationNotificationsEnabled(context)) return false
+        if (!isNotificationSettingEnabled(context)) return false
         return ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
     }
+
+    /**
+     * 设置里的生成通知开关（P4：前台服务启动门槛用）。
+     *
+     * 与 [canNotify] 的区别：这里**不**检查运行时权限 —— 权限被拒时系统本就不展示
+     * 前台服务通知，但服务仍可保护进程；而设置里明确关闭时不应再挂任何生成通知，
+     * 也就不启动前台服务（回落到心跳 + 轮询）。
+     */
+    internal fun isNotificationSettingEnabled(context: Context): Boolean =
+        AppSettings.isGenerationNotificationsEnabled(context)
 
     private fun notify(context: Context, notification: Notification) {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -333,6 +394,27 @@ object GenerationNotifier {
     }
 
     private fun postProgressNotification(context: Context, snapshot: ProgressSnapshot) {
+        notify(context, buildProgressNotification(context, snapshot))
+    }
+
+    /**
+     * 构建进度通知本体（P4：前台服务复用同一通知 id / 渠道 / 文案）。
+     *
+     * @param percent null = 无百分比数据（indeterminate），显示「生成中…」
+     */
+    internal fun buildProgressNotification(
+        context: Context,
+        ownerId: String?,
+        percent: Int?,
+    ): Notification = buildProgressNotification(
+        context,
+        ProgressSnapshot(titleResId = titleResFor(ownerId), percent = percent)
+    )
+
+    private fun buildProgressNotification(
+        context: Context,
+        snapshot: ProgressSnapshot,
+    ): Notification {
         ensureChannels(context)
         val textRes = if (snapshot.percent != null) {
             R.string.notify_generation_progress_text
@@ -364,7 +446,7 @@ object GenerationNotifier {
         } else {
             builder.setProgress(0, 0, true)
         }
-        notify(context, builder.build())
+        return builder.build()
     }
 
     private fun launchAppPendingIntent(context: Context): PendingIntent {

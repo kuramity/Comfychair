@@ -1,6 +1,7 @@
 package sh.hnet.comfychair.queue
 
 import android.content.Context
+import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -84,6 +85,59 @@ data class SubmittedPrompt(
     val contentType: ContentType
 )
 
+/** P6：开关。关闭即回退到原有两条归属证据（不认领在途提交）。 */
+internal const val ENABLE_P6_PENDING_CLAIM = true
+
+/** P6：超过这个年龄的在途提交不再参与认领（提交到开始执行超过 2 分钟基本可判超时/丢失）。 */
+internal const val PENDING_CLAIM_MAX_AGE_MS = 120_000L
+
+/** P6：在途提交的保留上限（清理用）。超过 5 分钟无论是否认领都清掉。 */
+internal const val PENDING_RETENTION_MS = 300_000L
+
+/** P6：在途提交表最多保留多少条（防止长时间运行无限增长）。 */
+internal const val MAX_PENDING_SUBMISSIONS = 16
+
+/**
+ * P6：一次已发出但尚未拿到 promptId 的提交。
+ *
+ * 为什么这里没有 promptId：本问题的根因正是 promptId 只在成功响应体里返回，
+ * 而弱网下响应可能永远到不了 —— 所以只能先登记"我发过一次提交"这个意图，
+ * 等服务器的 `execution_start`（带 promptId）到达时再按提交顺序认领。
+ *
+ * @param token 本地自增序号（提交顺序，FIFO 认领用）
+ * @param enqueuedAtMs 发出提交的时刻（[SystemClock.elapsedRealtime]，仅用于超时判定）
+ * @param ownerId 归属页面（认领成功后登记任务用）
+ * @param contentType 产物类型（认领成功后登记任务用）
+ * @param label 仅用于日志/诊断（当前存 ownerId）
+ */
+internal data class PendingSubmission(
+    val token: Long,
+    val enqueuedAtMs: Long,
+    val ownerId: String,
+    val contentType: ContentType,
+    val label: String
+)
+
+/**
+ * P6：从**按提交顺序排列**的在途提交里挑出可认领的最早一条（纯函数，供 JVM 单测钉住）。
+ *
+ * 规则（执行书 §6.3）：
+ * - 只认最早的一条（FIFO，与 ComfyUI 队列顺序一致）；
+ * - 只认年龄在 `[0, maxAgeMs]` 内的；超窗口的由调用方清理，不在这里挑。
+ *
+ * @param pending 按提交顺序排列的在途提交
+ * @param nowMs 当前单调时刻
+ * @param maxAgeMs 认领窗口（默认 120 秒）
+ */
+internal fun pickPendingSubmission(
+    pending: List<PendingSubmission>,
+    nowMs: Long,
+    maxAgeMs: Long = PENDING_CLAIM_MAX_AGE_MS
+): PendingSubmission? = pending.firstOrNull { candidate ->
+    val age = nowMs - candidate.enqueuedAtMs
+    age in 0..maxAgeMs
+}
+
 /**
  * P1-1：`execution_start` 的归属判定（纯函数，供 JVM 单测钉住）。
  *
@@ -91,14 +145,24 @@ data class SubmittedPrompt(
  * 1. 注册表里已有这个 promptId（提交成功时 [JobRegistry.registerJob] 登记的）；
  * 2. 这个 promptId 是本机提交返回过的（[SubmittedPrompt] 记录在案）。
  *
- * 两条都不满足 = 外部客户端的任务。绝不能因为"本机恰好有在途提交"就认领：
+ * 两条都不满足 = 外部客户端的任务。绝不能仅凭"本机恰好有在途提交"就认领：
  * 那正是"外部客户端出的图跑到本机页面、本机进度条被外部任务推动"的根因。
+ *
+ * **P6 补充（第三条证据）**：弱网下 HTTP 响应会丢，promptId 永远拿不到，上述两条
+ * 都不可能有值。因此 `markExecuting` 在本函数两参都为空时，会再尝试
+ * [JobRegistry.beginSubmission] 登记的在途意图（FIFO、120 秒窗口、一次性消费）。
+ * 它之所以不会抢外部任务：
+ * - 本机连接使用的 client_id 与提交请求里的 client_id 一致，ComfyUI 的
+ *   `execution_start` 是**定向**发给提交方的（本机 ComfyUI 0.45.3
+ *   `execution.py:750` `broadcast=False`），外部设备的任务事件根本到不了这里；
+ * - 认领只发生在两条原有证据都为空时，且一次 `execution_start` 只消费一条意图。
  *
  * **覆盖边界（R2-L5）**：本机提交记录同样只在 [JobRegistry.registerJob] 里写入，
  * 所以"`execution_start` 早于 `registerJob` 到达"这个时序**不在**第 2 条的覆盖范围内
- *（那时注册表与本机提交记录都还没有这个 promptId，事件会被当成外部任务忽略）。
- * 该时序不会丢状态：[JobRegistry.markExecuting] 会先把 `executingPromptId` 记下来，
- * 随后 `registerJob` 的"已在执行则回填 owner/contentType"分支把归属补齐。
+ *（那时注册表与本机提交记录都还没有这个 promptId）。P6 之前该时序由
+ * [JobRegistry.markExecuting] 先记 `executingPromptId`、随后 `registerJob` 的
+ * "已在执行则回填 owner/contentType"分支补正；P6 之后，若在途意图还在，会在
+ * `markExecuting` 里直接认领并登记，最终状态一致。
  * 第 2 条真正覆盖的是：条目已被完成/取消/对账清掉之后，同一个 promptId 的事件被重放。
  *
  * @param eventPromptId 事件里带的 promptId
@@ -170,6 +234,15 @@ object JobRegistry {
      * 保证「登记一条任务」与「判定一条 execution_start 归属」看到同一份记录。
      */
     private val submittedPrompts = LinkedHashMap<String, SubmittedPrompt>()
+
+    // ── P6：在途提交（已发出、尚无 promptId）────────────────────────────────
+    // 所有读写都与 submittedPrompts 共用同一把锁（本对象的方法 @Synchronized），
+    // 保证「登记一条在途提交」与「execution_start 认领」看到同一份队列。
+    private val pendingSubmissions = ArrayDeque<PendingSubmission>()
+    private var nextSubmissionToken = 0L
+
+    /** 已被认领的 token → promptId（只保留最近若干条，用于提交回调判断"是否已被接管"）。 */
+    private val claimedSubmissions = LinkedHashMap<Long, String>()
 
     /**
      * 任务登记序号水位（P1-5）。
@@ -287,6 +360,153 @@ object JobRegistry {
     @Synchronized
     fun beginQueueSnapshot(): Long = registrationSeq.get()
 
+    // ============================================================
+    // P6：在途提交登记 / 对账 / 认领
+    // ============================================================
+
+    /**
+     * 提交**发出之前**登记一条在途意图（P6）。
+     *
+     * 只记录"我发过一次提交"，不含 promptId（本地此时还不知道）。
+     * 若之后 HTTP 响应丢失/超时，这条意图仍留在队列里，等 `execution_start` 到达时认领。
+     *
+     * @return 本次提交的 token（提交成功/失败时原样带回）
+     */
+    @Synchronized
+    fun beginSubmission(workflowName: String, ownerId: String, contentType: ContentType): Long {
+        val now = SystemClock.elapsedRealtime()
+        prunePendingLocked(now)
+        val token = ++nextSubmissionToken
+        pendingSubmissions.addLast(
+            PendingSubmission(
+                token = token,
+                enqueuedAtMs = now,
+                ownerId = ownerId,
+                contentType = contentType,
+                label = workflowName
+            )
+        )
+        // 防御性上限：正常情况（单飞闸门）至多一两条在途，这里是兜底
+        while (pendingSubmissions.size > MAX_PENDING_SUBMISSIONS) {
+            val dropped = pendingSubmissions.removeFirst()
+            DebugLogger.w(TAG, "P6：在途提交超过上限，丢弃最旧 token=${dropped.token}")
+        }
+        DebugLogger.d(TAG, "P6：登记在途提交 token=$token (owner=$ownerId, label=$workflowName)")
+        return token
+    }
+
+    /**
+     * 提交成功（拿到 promptId）→ 从在途表移除并登记任务（P6）。
+     *
+     * 如果这条 token 已经被 `execution_start` 提前认领（弱网下 WS 比 HTTP 快），
+     * 不再重复登记 —— 认领时已经 `registerJob` 过了。
+     */
+    @Synchronized
+    fun completeSubmission(token: Long, promptId: String, ownerId: String, contentType: ContentType) {
+        prunePendingLocked(SystemClock.elapsedRealtime())
+        val wasClaimed = claimedSubmissions[token] != null
+        removePendingLocked(token)
+        if (wasClaimed) {
+            DebugLogger.d(TAG, "P6：token=$token 已被 execution_start 提前认领，跳过重复登记")
+            return
+        }
+        registerJob(promptId, ownerId, contentType)
+    }
+
+    /**
+     * 提交失败，但**不能确定服务器是否已收下**（超时 / IO 中断 / 响应体解析失败）。
+     *
+     * 保留在途意图，等 `execution_start` 按 FIFO 认领；超过认领窗口或 5 分钟保留期后
+     * 会在下一次 begin/claim 时被清理。
+     */
+    @Synchronized
+    fun markSubmissionUnresolved(token: Long) {
+        val stillPending = pendingSubmissions.any { it.token == token }
+        if (stillPending) {
+            DebugLogger.w(TAG, "P6：提交结果未知，保留在途意图 token=$token（等待 execution_start 认领）")
+        } else {
+            DebugLogger.w(TAG, "P6：提交结果未知，但 token=$token 已不在在途表（可能已认领/清理）")
+        }
+    }
+
+    /** 明确失败（服务器拒绝 / 未连接 / 认证失败）：不会再执行，直接丢弃在途意图。 */
+    @Synchronized
+    fun abandonSubmission(token: Long) {
+        if (removePendingLocked(token)) {
+            DebugLogger.d(TAG, "P6：丢弃在途提交 token=$token（服务器未接收）")
+        }
+    }
+
+    /**
+     * 这条提交 token 是否已经被 `execution_start` 认领？返回认领到的 promptId。
+     *
+     * 提交回调（可能晚于 execution_start 数秒）用它判断"服务器其实已经收下并开始跑了"，
+     * 从而不再向用户报"提交超时"。
+     */
+    @Synchronized
+    fun findClaimedPromptId(token: Long): String? = claimedSubmissions[token]
+
+    /**
+     * 认领最早的一条在途提交（P6，执行书 §6.3）。
+     *
+     * 只在 `markExecuting` 里、且注册表与提交记录都查不到该 promptId 时调用。
+     * 认领即从队列移除，防止同一意图被重复认领；返回的对象带 owner/contentType，
+     * 调用方负责 [registerJob]。
+     */
+    @Synchronized
+    private fun claimOldestPendingLocked(promptId: String, nowMs: Long): PendingSubmission? {
+        prunePendingLocked(nowMs)
+        while (pendingSubmissions.isNotEmpty()) {
+            val candidate = pickPendingSubmission(pendingSubmissions.toList(), nowMs)
+            if (candidate == null) {
+                // 没有任何一条在认领窗口内：全部清理（不会再有机会被认领）
+                DebugLogger.w(TAG, "P6：在途提交均已超过认领窗口，放弃 ${pendingSubmissions.size} 条")
+                pendingSubmissions.clear()
+                return null
+            }
+            // 候选之前的条目必然更旧、已超出窗口，一并清掉
+            while (pendingSubmissions.isNotEmpty() && pendingSubmissions.first().token != candidate.token) {
+                val dropped = pendingSubmissions.removeFirst()
+                DebugLogger.w(TAG, "P6：清理过期的在途提交 token=${dropped.token}")
+            }
+            pendingSubmissions.removeFirst()
+            claimedSubmissions[candidate.token] = promptId
+            while (claimedSubmissions.size > MAX_PENDING_SUBMISSIONS) {
+                val oldest = claimedSubmissions.keys.firstOrNull() ?: break
+                claimedSubmissions.remove(oldest)
+            }
+            return candidate
+        }
+        return null
+    }
+
+    /** 清理超过保留期的在途提交与过旧的已认领记录（每次 begin/claim 顺带做）。 */
+    private fun prunePendingLocked(nowMs: Long) {
+        while (pendingSubmissions.isNotEmpty()) {
+            val oldest = pendingSubmissions.first()
+            if (nowMs - oldest.enqueuedAtMs <= PENDING_RETENTION_MS) break
+            pendingSubmissions.removeFirst()
+            DebugLogger.d(TAG, "P6：清理超过保留期的在途提交 token=${oldest.token}")
+        }
+        while (claimedSubmissions.size > MAX_PENDING_SUBMISSIONS) {
+            val oldest = claimedSubmissions.keys.firstOrNull() ?: break
+            claimedSubmissions.remove(oldest)
+        }
+    }
+
+    /** 按 token 移除一条在途提交。 */
+    private fun removePendingLocked(token: Long): Boolean {
+        var removed = false
+        val iterator = pendingSubmissions.iterator()
+        while (iterator.hasNext()) {
+            if (iterator.next().token == token) {
+                iterator.remove()
+                removed = true
+            }
+        }
+        return removed
+    }
+
     /**
      * Mark a job as executing when execution_start is received.
      * This updates the executingPromptId/ownerId for preview routing.
@@ -296,15 +516,36 @@ object JobRegistry {
     @Synchronized
     fun markExecuting(promptId: String) {
         val currentState = _queueState.value
-        val job = currentState.ownJobs[promptId]
+        var job = currentState.ownJobs[promptId]
+
+        // P6（第三条归属证据）：注册表和本机提交记录都查不到，但本地有"已发出、结果未知"的
+        // 在途提交 —— 弱网下 HTTP 响应丢了，`execution_start` 反而先到。按提交顺序认领最早的
+        // 一条，把任务登记回本机名下。
+        //
+        // 只在**两条原有证据都为空**时认领（submittedPrompts 命中说明 promptId 已确定是
+        // 本机的，直接走原逻辑，不消耗在途 token，避免事件重放误吃 token）。
+        if (job == null && submittedPrompts[promptId] == null && ENABLE_P6_PENDING_CLAIM) {
+            val claimed = claimOldestPendingLocked(promptId, SystemClock.elapsedRealtime())
+            if (claimed != null) {
+                val ageSec = (SystemClock.elapsedRealtime() - claimed.enqueuedAtMs) / 1000
+                DebugLogger.i(
+                    TAG,
+                    "P6 接管：promptId=${Obfuscator.promptId(promptId)} 认领 token=${claimed.token}（提交于 ${ageSec} 秒前，owner=${claimed.ownerId}）"
+                )
+                registerJob(promptId, claimed.ownerId, claimed.contentType)
+                job = _queueState.value.ownJobs[promptId]
+            }
+        }
 
         if (job != null) {
             DebugLogger.i(TAG, "Job executing: ${Obfuscator.promptId(promptId)} (owner: ${job.ownerId})")
 
+            // 重新取一次：认领路径刚在 registerJob 里写过 _queueState，不能用上面捕获的旧快照
+            val latestState = _queueState.value
             val updatedJob = job.copy(status = JobStatus.EXECUTING)
-            val newJobs = currentState.ownJobs + (promptId to updatedJob)
+            val newJobs = latestState.ownJobs + (promptId to updatedJob)
 
-            _queueState.value = currentState.copy(
+            _queueState.value = latestState.copy(
                 executingPromptId = promptId,
                 executingOwnerId = job.ownerId,
                 executingContentType = job.contentType,
@@ -313,7 +554,8 @@ object JobRegistry {
         } else {
             // Job from another client - just track execution state
             DebugLogger.d(TAG, "External job executing: ${Obfuscator.promptId(promptId)}")
-            _queueState.value = currentState.copy(
+            val latestState = _queueState.value
+            _queueState.value = latestState.copy(
                 executingPromptId = promptId,
                 executingOwnerId = null,
                 executingContentType = null
@@ -672,6 +914,8 @@ object JobRegistry {
         DebugLogger.i(TAG, "Clearing all job state")
         submittedPrompts.clear()
         jobRegistrationSeq.clear()
+        pendingSubmissions.clear()
+        claimedSubmissions.clear()
         _queueState.value = QueueState()
         // clear 也要落盘：否则 prefs 里留着旧任务，本会话若再无其它 persist 触发点，
         // 下次启动 restoreState 会把已清的任务恢复成幽灵任务。

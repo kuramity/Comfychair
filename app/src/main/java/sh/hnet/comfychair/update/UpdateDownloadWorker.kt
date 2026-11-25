@@ -2,6 +2,9 @@ package sh.hnet.comfychair.update
 
 import android.content.Context
 import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.StatFs
+import android.os.storage.StorageManager
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
@@ -23,6 +26,30 @@ import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
 /**
+ * update/ 目录解析结果（派工单第 1 层）。
+ *
+ * 存在的意义：把「路径查询失败」和「磁盘真的满」拆成两种语义。旧实现
+ * `File(getExternalFilesDir(null), "update")` 在外部目录返回 null 时会得到
+ * **相对路径** `update`，`mkdirs()` 静默失败，`usableSpace` 恒为 0 —— 用户看到
+ * 「剩余 0 B」，实际是路径根本不合法。
+ *
+ * @see UpdateDownloadWorker.resolveUpdateDir
+ */
+sealed interface UpdateDirResult {
+    /** 拿到了可用目录；[usedFallback]=true 表示外部私有目录不可用、回退到了应用内部目录 */
+    data class Ok(val dir: File, val usedFallback: Boolean) : UpdateDirResult
+
+    /** 外部与内部目录都不可用：调用方必须按「存储不可用」失败，绝不产出相对路径 */
+    data class Unavailable(val reason: String) : UpdateDirResult
+}
+
+/**
+ * 空间预检结论（派工单第 2 层）：UNKNOWN（查询失败）与 INSUFFICIENT（数值有效但不够）
+ * 是两种不同的语义，前者放行记 warning，后者才拦截。
+ */
+enum class SpaceOutcome { ENOUGH, INSUFFICIENT, UNKNOWN }
+
+/**
  * 更新 APK 下载引擎（v4.6.0）—— WorkManager CoroutineWorker，任务生命周期独立于 UI。
  *
  * 硬性约束的落地对照（编号见任务书 3.2 节）：
@@ -33,7 +60,8 @@ import java.util.concurrent.TimeUnit
  * - **13 节流**：进度经 [UpdateRepository.publishProgress] 统一节流（≥400ms 才向
  *   StateFlow 发射），读盘循环本身不触发任何 UI 更新。
  * - **14 流式读写**：64KB buffer 逐块搬运，无全量 ByteArray。
- * - **15 .part 约定**：`update.apk.part` 放在 getExternalFilesDir/update/；
+ * - **15 .part 约定**：`update.apk.part` 放在 getExternalFilesDir/update/（外部私有
+ *   目录不可用时回退 filesDir/update/，见 [resolveUpdateDir]）；
  *   SHA-256 通过后先删旧完整 APK 再原子重命名，磁盘上最多一份完整 APK。
  * - **17/18 后台完成**：Worker 不直接 startActivity；完成通知由 [UpdateNotifier] 发出，
  *   点击通知触发安装。
@@ -102,9 +130,143 @@ class UpdateDownloadWorker(
 
         private const val TAG = "UpdateDownloadWorker"
 
-        /** update/ 子目录（getExternalFilesDir 下，外部私有空间，卸载即清） */
-        fun updateDir(context: Context): File =
-            File(context.getExternalFilesDir(null), "update").apply { mkdirs() }
+        /** update/ 子目录名（外部私有空间与内部回退共用同一个名字，卸载即清） */
+        private const val UPDATE_DIR_NAME = "update"
+
+        /**
+         * update/ 目录（派工单第 1 层）：返回 [UpdateDirResult]，不再可能给出相对路径。
+         *
+         * 首选 `getExternalFilesDir(null)/update`（外部私有空间，卸载即清）；
+         * 该 API 可返回 null（无外部存储 / 存储被卸载），旧代码在此处构造出
+         * `File(null, "update")` → 相对路径 → usableSpace 恒 0 的「剩余 0 B」误报。
+         * 现在外部不可用就回退 `filesDir/update`，两者都失败由调用方按存储不可用处理。
+         */
+        fun updateDir(context: Context): UpdateDirResult =
+            resolveUpdateDir(context.getExternalFilesDir(null), context.filesDir)
+
+        /**
+         * 纯函数版目录解析（JVM 单测直接覆盖，不碰 Android 框架）。
+         *
+         * 判定口径：
+         * - `mkdirs()` 返回 false 时**必须再查 isDirectory** —— 目录已存在时 mkdirs 同样
+         *   返回 false，属正常情况；
+         * - 目录存在但不可写（`canWrite()` false）同样视为不可用 → 回退；
+         * - 结果一律经 `absoluteFile` 归一化 —— **绝不产出相对路径**。
+         */
+        fun resolveUpdateDir(externalFilesDir: File?, internalFilesDir: File): UpdateDirResult {
+            if (externalFilesDir != null) {
+                val external = File(externalFilesDir, UPDATE_DIR_NAME).absoluteFile
+                if (usableDirectory(external)) {
+                    return UpdateDirResult.Ok(external, usedFallback = false)
+                }
+            }
+            val internal = File(internalFilesDir, UPDATE_DIR_NAME).absoluteFile
+            if (usableDirectory(internal)) {
+                return UpdateDirResult.Ok(internal, usedFallback = true)
+            }
+            return UpdateDirResult.Unavailable(
+                "外部与内部 update 目录均不可用" +
+                    "（externalFilesDir=$externalFilesDir, internalCandidate=${internal.path}）"
+            )
+        }
+
+        /** 目录可用性判定：能建/已建 + 确实是目录 + 可写。任何异常按不可用处理。 */
+        private fun usableDirectory(dir: File): Boolean = try {
+            (dir.mkdirs() || dir.isDirectory) && dir.isDirectory && dir.canWrite()
+        } catch (_: Exception) {
+            false
+        }
+
+        /** 下载预检的空间余量门槛：可用空间必须 ≥ 还需下载的字节 + 32MB 才放行 */
+        private const val SPACE_MARGIN_BYTES = 32L * 1024 * 1024
+
+        /**
+         * 空间预检纯函数（派工单第 2 层）。
+         *
+         * 语义分层（旧 bug 的教训：`usable < needed + margin` 把「查询失败的 0」
+         * 当成了「真的满」）：
+         * - [usableBytes] 为 null → **UNKNOWN**：查询失败不等于空间不足，调用方放行记 warning；
+         * - 数值有效（**包括 0**，0 是真实测得的剩余量）→ 与 needed+margin 比较；
+         * - 边界 `usable == needed + margin` 判 ENOUGH。
+         *
+         * 注意与 [selectUsable] 的分工：**API 语义上不成立的 0**（getAllocatableBytes 返回 0）
+         * 已在 [selectUsable] 里转成 null（视为查询无效），不会走到这里；而 StatFs 实测的 0
+         * 是有效数值，会带着 0 走到这里判 INSUFFICIENT。两种 0 的语义必须分开。
+         */
+        fun decideSpaceOutcome(usableBytes: Long?, neededBytes: Long, marginBytes: Long): SpaceOutcome {
+            if (usableBytes == null) return SpaceOutcome.UNKNOWN
+            return if (usableBytes < neededBytes + marginBytes) {
+                SpaceOutcome.INSUFFICIENT
+            } else {
+                SpaceOutcome.ENOUGH
+            }
+        }
+
+        /**
+         * 三路查询的原始值（诊断日志用；null = 该路失败或系统版本不支持）。
+         * [usableBytes] 是按优先级选出的最终口径，可能为 null（未知）。
+         */
+        data class SpaceQuery(
+            val usableBytes: Long?,
+            val statFsBytes: Long?,
+            val allocatableBytes: Long?,
+        )
+
+        /**
+         * 从两路原始值里选出有效口径（纯函数，派工单第 2 层的「0 的语义」在这里落地）：
+         * 1. `StorageManager.getAllocatableBytes(UUID_DEFAULT)`（API 26+，考虑分配配额）
+         *    —— 返回 **0 视为无效**（该 API 在配额模型下不会以 0 表示「真的满了」），走回退；
+         * 2. 回退 `StatFs(dir.absolutePath).availableBytes` —— 非负即为有效（含 0）；
+         * 3. 两路都无效 → null（未知）。
+         */
+        internal fun selectUsable(allocatableBytes: Long?, statFsBytes: Long?): Long? =
+            allocatableBytes?.takeIf { it > 0L } ?: statFsBytes?.takeIf { it >= 0L }
+
+        /** [selectUsable] 的两路原始值查询（需要 Context，不在 JVM 单测里直接调） */
+        internal fun querySpaceDetail(context: Context, dir: File): SpaceQuery {
+            val statFsBytes = runCatching { StatFs(dir.absolutePath).availableBytes }.getOrNull()
+            val allocatableBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                runCatching {
+                    (context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager)
+                        ?.getAllocatableBytes(StorageManager.UUID_DEFAULT)
+                }.getOrNull()
+            } else {
+                null
+            }
+            return SpaceQuery(
+                usableBytes = selectUsable(allocatableBytes, statFsBytes),
+                statFsBytes = statFsBytes,
+                allocatableBytes = allocatableBytes,
+            )
+        }
+
+        /** 写探针文件名（下载开始前自检用，用完即删） */
+        private const val PROBE_FILE_NAME = ".write-probe.tmp"
+
+        /**
+         * 写探针（派工单第 4 层）：真实写 1KB → 读回校验 → 删除。
+         *
+         * 存在的意义：空间 API 报「够」不代表写进去真的成功（配额、fuse 异常、只读重挂载
+         * 都会骗过静态查询）。返回 null = 通过；非 null = 失败原因，由调用方转
+         * [DownloadPolicy.StorageUnavailableException]（不可重试分型）。
+         * 纯 java.io，JVM 单测直接覆盖（temp 目录通过 / 不存在目录失败 / 探针文件必被清）。
+         */
+        internal fun probeWritable(dir: File): String? {
+            val probe = File(dir, PROBE_FILE_NAME)
+            return try {
+                val payload = ByteArray(1024) { (it % 251).toByte() }
+                probe.writeBytes(payload)
+                if (!probe.readBytes().contentEquals(payload)) {
+                    "写探针读回校验不一致"
+                } else {
+                    null
+                }
+            } catch (e: Exception) {
+                "写探针 IO 失败: ${e.javaClass.simpleName} ${e.message}"
+            } finally {
+                runCatching { if (probe.exists()) probe.delete() }
+            }
+        }
 
         /**
          * 应用级共享 OkHttp 客户端（v4.7.1）。
@@ -171,10 +333,25 @@ class UpdateDownloadWorker(
             response
         }
 
-        fun partFile(context: Context): File = File(updateDir(context), PART_FILE_NAME)
-        fun finalFile(context: Context): File = File(updateDir(context), FINAL_FILE_NAME)
-        fun shaFile(context: Context): File = File(updateDir(context), SHA_FILE_NAME)
-        fun versionFile(context: Context): File = File(updateDir(context), VERSION_FILE_NAME)
+        /**
+         * update/ 下文件的定位（派工单第 1 层的调用点适配）。
+         *
+         * 目录解析成功 → 用解析结果；Unavailable → 仍给出**内部目录口径的绝对路径**
+         * （该目录此刻多半不存在，`exists()/isFile` 自然为 false、`delete()` 无害失败、
+         * 写操作抛 IOException 由外层 catch 分型），任何情况下不再出现相对路径，
+         * 也不再出现「路径无效却报 usableSpace=0」的假数值。
+         */
+        private fun updateFile(context: Context, name: String): File =
+            when (val result = updateDir(context)) {
+                is UpdateDirResult.Ok -> File(result.dir, name)
+                is UpdateDirResult.Unavailable ->
+                    File(File(context.filesDir, UPDATE_DIR_NAME), name)
+            }
+
+        fun partFile(context: Context): File = updateFile(context, PART_FILE_NAME)
+        fun finalFile(context: Context): File = updateFile(context, FINAL_FILE_NAME)
+        fun shaFile(context: Context): File = updateFile(context, SHA_FILE_NAME)
+        fun versionFile(context: Context): File = updateFile(context, VERSION_FILE_NAME)
 
         /**
          * 读取当前**已安装**的 versionCode（Int 口径的便捷入口）。
@@ -282,6 +459,53 @@ class UpdateDownloadWorker(
         UpdateNotifier.updateProgress(applicationContext, repository.state.value, versionName)
 
         try {
+            // 派工单第 1、4 层：下载开始前（part 已定位）做目录复检 + 1KB 写探针。
+            // 两者失败都抛 StorageUnavailableException → classifyFailure 判
+            // STORAGE_UNAVAILABLE（不可重试）→ failureMessage 走「存储不可用」横幅，
+            // 不会再以「剩余 0 B」的假数值面目出现（那是路径失效，不是磁盘满）。
+            val dirResult = updateDir(applicationContext)
+            when (dirResult) {
+                is UpdateDirResult.Unavailable ->
+                    throw DownloadPolicy.StorageUnavailableException(dirResult.reason)
+                is UpdateDirResult.Ok -> {
+                    if (dirResult.usedFallback) {
+                        // 第 4 层诊断：回退必须能区分「externalFilesDir 为 null」与「目录存在但不可写」，
+                        // 否则事后只有「回退了」这一条信息，无法定位是存储被卸载还是权限/配额问题。
+                        val externalRoot = applicationContext.getExternalFilesDir(null)
+                        val externalCandidate = externalRoot?.let {
+                            File(it, UPDATE_DIR_NAME).absoluteFile
+                        }
+                        val fallbackReason = when {
+                            externalRoot == null ->
+                                "externalFilesDir 为 null（无外部存储或存储被卸载）"
+                            externalCandidate == null ->
+                                "外部 update 目录路径无法构造"
+                            !externalCandidate.isDirectory ->
+                                "外部 update 目录不存在或不是目录（创建失败）"
+                            !externalCandidate.canWrite() ->
+                                "外部 update 目录存在但不可写"
+                            else ->
+                                "外部 update 目录未通过可用性判定"
+                        }
+                        DebugLogger.w(
+                            TAG,
+                            "外部私有目录不可用 → 回退内部目录 ${dirResult.dir.absolutePath}" +
+                                "（原因：$fallbackReason）"
+                        )
+                    }
+                    probeWritable(dirResult.dir)?.let { failure ->
+                        // 第 4 层诊断：探针失败必须能定位到具体路径与失败原因（配额/fuse/只读重挂载）
+                        DebugLogger.w(
+                            TAG,
+                            "写探针失败 path=${File(dirResult.dir, PROBE_FILE_NAME).absolutePath}: $failure"
+                        )
+                        throw DownloadPolicy.StorageUnavailableException(
+                            "dir=${dirResult.dir.absolutePath}: $failure"
+                        )
+                    }
+                }
+            }
+
             // .part 已达到已知总长（A-R1 Critical-2）：视为上次已下完但没来得及 rename，
             // 再发 `bytes=N-` 续传必然 416。直接跳过下载进 SHA 校验；
             // 校验不过按"残留 .part 与新版本不符"删掉全量重下一次（仍失败才判最终失败）。
@@ -486,12 +710,17 @@ class UpdateDownloadWorker(
             )
             DownloadPolicy.FailureKind.DISK_FULL -> {
                 val disk = e as? DownloadPolicy.DiskFullException
+                // INSUFFICIENT 才走到这里，数值是真实测得的剩余量（不再是伪造的 0）
                 ctx.getString(
                     R.string.update_error_disk,
                     UpdateFormat.formatBytes(disk?.usableBytes ?: 0L),
                     UpdateFormat.formatBytes(disk?.neededBytes ?: 0L)
                 )
             }
+            // 派工单第 3 层：目录不可用/探针失败说「存储不可用」，绝不显示剩余字节数
+            DownloadPolicy.FailureKind.STORAGE_UNAVAILABLE -> ctx.getString(
+                R.string.update_error_storage_unavailable
+            )
             // P0-7：重定向越界属于安全拒绝，必须给出明确原因而不是笼统的"未知错误"
             DownloadPolicy.FailureKind.INSECURE_REDIRECT -> ctx.getString(
                 R.string.update_error_redirect,
@@ -599,16 +828,34 @@ class UpdateDownloadWorker(
     ): Long {
         val body = response.body ?: throw IOException("响应体为空")
 
-        // 存储空间预检（硬性约束 17 的"存储空间不足检查"）：
-        // 剩余空间 < 还需要下载的量 + 32MB 余量 时直接失败，不要下到一半撑爆
+        // 存储空间预检（派工单第 2、4 层）：三路查询 + 语义分层。
+        // 旧实现 `part.usableSpace < needed + 32MB` 的问题：路径无效时 usableSpace
+        // 恒为 0，「查询失败」被当成「真的满了」，用户只看到「剩余 0 B」。
+        // 现在：INSUFFICIENT（数值有效且不够）才拦截并带真实数值；UNKNOWN（查询失败）
+        // 放行并记 warning——写不进去会由 [DownloadPolicy.StorageUnavailableException]
+        // 的探针/IO 分型兜底，不会再伪装成「磁盘只剩 0」。
         val needed = if (total > 0) total - resumeFrom else 0L
         if (needed > 0) {
-            val usable = part.usableSpace
-            // usable == 0 / 负值（分区不可用或已满）同样必须拦截：原先的区间写法
-            // 恰好把 0 排除在外，"剩余 0 可用"时会跳过预检直接下到一半撑爆
-            if (usable < needed + 32L * 1024 * 1024) {
-                // 抛 DiskFullException 让分型器归为不可恢复（重试解决不了磁盘满）
-                throw DownloadPolicy.DiskFullException(usable, needed)
+            val detail = querySpaceDetail(applicationContext, part)
+            val outcome = decideSpaceOutcome(detail.usableBytes, needed, SPACE_MARGIN_BYTES)
+            // 全量诊断（验收标准：出错时能看到 路径/externalDir 是否为 null/三路原始值/needed）
+            DebugLogger.i(
+                TAG,
+                "update storage: dir=${part.parentFile?.absolutePath} " +
+                    "externalDir=${applicationContext.getExternalFilesDir(null) == null} " +
+                    "usableSpace=${part.usableSpace} statFs=${detail.statFsBytes} " +
+                    "allocatable=${detail.allocatableBytes} needed=$needed outcome=$outcome"
+            )
+            when (outcome) {
+                SpaceOutcome.INSUFFICIENT ->
+                    // 只在数值有效且确实不够时抛 DiskFullException，必带真实剩余量
+                    throw DownloadPolicy.DiskFullException(detail.usableBytes ?: 0L, needed)
+                SpaceOutcome.UNKNOWN ->
+                    DebugLogger.w(
+                        TAG,
+                        "存储空间查询失败（allocatable=${detail.allocatableBytes} statFs=${detail.statFsBytes}），按放行策略继续"
+                    )
+                SpaceOutcome.ENOUGH -> Unit
             }
         }
 

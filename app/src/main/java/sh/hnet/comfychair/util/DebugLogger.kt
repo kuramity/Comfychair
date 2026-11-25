@@ -58,6 +58,12 @@ object DebugLogger {
     private var enabled = false
     private const val MAX_ENTRIES = 1000
 
+    /** 写入与裁剪共用同一把锁，避免 add 与 subList().clear() 之间发生竞态。 */
+    private val trimLock = Any()
+
+    /** 裁剪后保留的目标条数；留出余量，避免每次超限都裁剪。 */
+    private const val TRIM_TO = 800
+
     /**
      * 条目版本号，每次内容变化 +1（AtomicInteger：并发自增不丢号）。
      *
@@ -106,12 +112,15 @@ object DebugLogger {
             message = message
         )
 
-        entries.add(entry)
+        // 写入与裁剪必须处于同一临界区：CopyOnWriteArrayList 的 subList().clear()
+        // 会校验 modCount，若另一线程在两步之间 add，就会抛 ConcurrentModificationException。
+        synchronized(trimLock) {
+            entries.add(entry)
 
-        // Trim old entries if over limit：批量删到上限以下 —— CopyOnWriteArrayList 上
-        // subList().clear() 是一次数组复制，而逐条 removeAt(0) 每条都复制整个数组。
-        if (entries.size > MAX_ENTRIES) {
-            entries.subList(0, entries.size - MAX_ENTRIES).clear()
+            // 超限时批量删到 TRIM_TO，避免每一条新日志都触发一次数组复制。
+            if (entries.size > MAX_ENTRIES) {
+                entries.subList(0, entries.size - TRIM_TO).clear()
+            }
         }
 
         version.incrementAndGet()

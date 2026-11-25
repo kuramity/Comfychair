@@ -113,6 +113,17 @@ internal object PreviewFramePolicy {
 object ConnectionManager {
     private const val TAG = "Connection"
 
+    /** P2 观测日志：写入应用内缓冲，并在调试日志开启时同步到 logcat。 */
+    private fun logWsInfo(message: String) {
+        DebugLogger.i(TAG, message)
+        if (DebugLogger.isEnabled()) android.util.Log.i("ComfyChair", message)
+    }
+
+    private fun logWsError(message: String) {
+        DebugLogger.e(TAG, message)
+        if (DebugLogger.isEnabled()) android.util.Log.e("ComfyChair", message)
+    }
+
     /**
      * 应用层心跳间隔（发送 `{"type":"ping"}`）。
      *
@@ -127,6 +138,14 @@ object ConnectionManager {
     @Volatile
     private var keepaliveIntervalMs = KEEPALIVE_INTERVAL_MS
 
+    /** 当前 WebSocket 的建立时刻（elapsedRealtime）；P2 仅用于观测连接存活时长。 */
+    @Volatile
+    private var connectedAtElapsedMs = 0L
+
+    /** 当前连接已存活多久；从未建立或已经关闭时返回 0。 */
+    private fun connectedElapsedMs(): Long =
+        if (connectedAtElapsedMs > 0L) SystemClock.elapsedRealtime() - connectedAtElapsedMs else 0L
+
     /**
      * 后台降级是否已挂起 WS（与 [reconnectBlocked] 分开的独立标记）：
      * 只有降级挂起自己置的 reconnectBlocked 才允许在回前台时解除 ——
@@ -137,6 +156,9 @@ object ConnectionManager {
 
     /** 重连退避封顶：2s→4s→8s→16s→30s，之后保持 30s 一次，直到连上或被显式阻断。 */
     private const val MAX_RECONNECT_BACKOFF_MS = 30_000L
+
+    /** 传输停滞横幅的自动消失时长（P3）：不是断线，不能一直挂在顶部。 */
+    private const val NOTICE_AUTO_DISMISS_MS = 6_000L
 
     /**
      * WS 二进制预览的**字节上限**（P1-27）。
@@ -188,6 +210,15 @@ object ConnectionManager {
     // Connection alert dialog state - single source of truth
     private val _connectionAlertState = MutableStateFlow<ConnectionAlertState?>(null)
     val connectionAlertState: StateFlow<ConnectionAlertState?> = _connectionAlertState.asStateFlow()
+
+    /**
+     * 非阻塞连接提示（顶部细横幅），与 [connectionAlertState] 互斥使用。
+     *
+     * 背景（P3）：弱网下「切离线失败 → 模态框」会把用户困住，唯一出路是按返回，
+     * 而返回被解释成"回连接页"。现在网络类失败只写这里，界面保持当前数据并原位重连。
+     */
+    private val _connectionNotice = MutableStateFlow<ConnectionNotice?>(null)
+    val connectionNotice: StateFlow<ConnectionNotice?> = _connectionNotice.asStateFlow()
 
     // Connection check in progress (for "Connecting..." button state)
     private val _isConnecting = MutableStateFlow(false)
@@ -686,6 +717,8 @@ object ConnectionManager {
             protocol = protocol,
             clientId = _clientId!!
         )
+        // 新连接建立：上一次会话遗留的断线横幅不再成立
+        clearConnectionNotice()
         DebugLogger.i(TAG, "Connected successfully")
 
         // 回到在线：清掉强制离线标记、重置防抖动判定、停止离线探测
@@ -721,6 +754,7 @@ object ConnectionManager {
         _clientId = null
         _sessionExpired.value = false
         _connectionState.value = ConnectionState.Disconnected
+        clearConnectionNotice()
         DebugLogger.i(TAG, "Disconnected")
     }
 
@@ -782,18 +816,79 @@ object ConnectionManager {
     }
 
     /**
-     * Show the connection alert dialog.
-     * This is the single entry point for showing connection dialogs from anywhere in the app.
+     * 报告一次连接失败。
      *
-     * 弹窗只负责告知失败与提供「重连 / 回登录页」；进离线由自动切换负责，不再问用户
-     * （所以也不再需要按缓存是否存在决定按钮，`context` 仅为兼容调用方保留）。
+     * P3：这里是**唯一的弹窗分流入口**。只有认证失效需要用户立刻处理，才弹模态；
+     * 网络中断 / 传输停滞等「后台重试就能自己好」的失败一律降级为非阻塞横幅
+     * （[connectionNotice]）。这样图库浏览、生成中等待等场景不会被一个关不掉的
+     * 对话框挡住，用户也就不必靠按返回逃离（按返回会被当作"回连接页"）。
      *
      * @param context Context（保留以兼容调用方签名）
      * @param failureType The type of connection failure
      */
     fun showConnectionAlert(context: Context, failureType: ConnectionFailure) {
         DebugLogger.d(TAG, "showConnectionAlert: failureType=$failureType")
-        _connectionAlertState.value = ConnectionAlertState(failureType)
+        if (shouldBlockWithDialog(failureType)) {
+            _connectionAlertState.value = ConnectionAlertState(failureType)
+        } else {
+            showConnectionNotice(failureType)
+        }
+    }
+
+    /**
+     * 只有必须由用户处理、且无法在后台静默恢复的失败才值得模态拦截。
+     * 目前仅认证失效（凭据错误 / 会话过期）符合：不处理的话重试多少次都没用。
+     */
+    private fun shouldBlockWithDialog(failureType: ConnectionFailure): Boolean =
+        failureType == ConnectionFailure.AUTHENTICATION
+
+    /**
+     * 显示非阻塞连接提示（顶部横幅），并确保网络类失败仍在后台继续重连。
+     *
+     * 不切页面、不清数据：调用方界面保持原样，横幅在 [WebSocketState.Connected]
+     * 或进入离线态时自动清除。
+     */
+    fun showConnectionNotice(failureType: ConnectionFailure) {
+        DebugLogger.d(TAG, "showConnectionNotice: failureType=$failureType")
+        _connectionNotice.value = ConnectionNotice(failureType)
+        ensureBackgroundRetry(failureType)
+        // 传输停滞是"这一次请求卡住了"，不是连接断了：WebSocket 可能一直是 Connected，
+        // 没有 onOpen 来清横幅，所以给一个短时自动消失，避免顶部一直挂着提示。
+        if (failureType == ConnectionFailure.STALLED) {
+            scope.launch {
+                delay(NOTICE_AUTO_DISMISS_MS)
+                if (_connectionNotice.value?.failureType == ConnectionFailure.STALLED) {
+                    _connectionNotice.value = null
+                }
+            }
+        }
+    }
+
+    private fun clearConnectionNotice() {
+        if (_connectionNotice.value != null) {
+            _connectionNotice.value = null
+        }
+    }
+
+    /**
+     * 横幅承诺"正在自动重试"就必须真的有重试在跑。
+     *
+     * `ensureConnection` 等入口在失败时不会自己排重连，若只显示横幅不排重试，
+     * 用户会一直停在"正在重试"却永远等不到。已有重连 job / 正在重连时保持不动，
+     * 避免同一时刻叠两条退避链。
+     */
+    private fun ensureBackgroundRetry(failureType: ConnectionFailure) {
+        if (failureType != ConnectionFailure.NETWORK) return
+        if (isOffline || reconnectBlocked || _client == null) return
+        val ws = _webSocketState.value
+        if (ws is WebSocketState.Connected ||
+            ws is WebSocketState.Connecting ||
+            ws is WebSocketState.Reconnecting
+        ) {
+            return
+        }
+        if (pendingReconnectJob?.isActive == true) return
+        scheduleReconnect()
     }
 
     /**
@@ -1208,7 +1303,11 @@ object ConnectionManager {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 val applied = runIfCurrent {
-                    DebugLogger.i(TAG, "WebSocket connected")
+                    connectedAtElapsedMs = SystemClock.elapsedRealtime()
+                    logWsInfo(
+                        "[WS] connected generation=$generation elapsed=0.000s " +
+                            "appPing=${keepaliveIntervalMs / 1000}s (effective)"
+                    )
                     connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
                     reconnectAttempts = 0
                     reconnectBlocked = false
@@ -1219,6 +1318,11 @@ object ConnectionManager {
                     if (_connectionAlertState.value != null) {
                         DebugLogger.i(TAG, "WebSocket connected, clearing dialog")
                         _connectionAlertState.value = null
+                    }
+                    // P3：横幅同理 —— 重连成功后"连接中断"提示必须自动消失
+                    if (_connectionNotice.value != null) {
+                        DebugLogger.i(TAG, "WebSocket connected, clearing notice banner")
+                        _connectionNotice.value = null
                     }
                     _isReconnecting.value = false
                     _isConnecting.value = false
@@ -1250,7 +1354,12 @@ object ConnectionManager {
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 // NEW-2：判代次与整段状态机写入在同一个锁内完成，避免"通过检查后又被作废"
                 val applied = runIfCurrent {
-                    DebugLogger.e(TAG, "WebSocket connection failed: ${t::class.simpleName}")
+                    val elapsedMs = connectedElapsedMs()
+                    logWsError(
+                        "[WS] onFailure code=${response?.code ?: "none"} " +
+                            "reason=${t.message ?: t::class.simpleName} elapsed=${elapsedMs / 1000.0}s"
+                    )
+                    connectedAtElapsedMs = 0L
                     // 顺序很重要（条目 4.1）：先停心跳 → 再落终态或排重连。
                     // 若先排重连，scheduleReconnect 在离线/手动重连中/被阻断时会提前 return，
                     // 状态就永久停在 Connecting（界面一直显示"连接中"）。
@@ -1273,8 +1382,12 @@ object ConnectionManager {
                         // 模态告警，紧接着 scheduleReconnect 又把状态写成 Reconnecting，
                         // 一次瞬时失败就闪一下对话框（StateFlow 合并下时有时无）。
                         DebugLogger.d(TAG, "onFailure: 已排自动重连，跳过模态失败态")
+                    } else if (isOffline) {
+                        // 离线态本来就没有 WebSocket（由离线看门狗负责恢复探测），
+                        // 这里落 Failed 只会在界面闪一个"连接失败"，对用户毫无意义。
+                        DebugLogger.d(TAG, "onFailure: 离线态忽略 WebSocket 失败")
                     } else {
-                        // 排不上重连（离线 / 手动重连中 / 被阻断）：这才是需要用户知道的失败终态
+                        // 排不上重连（手动重连中 / 被阻断）：这才是需要用户知道的失败终态
                         DebugLogger.w(TAG, "onFailure: 自动重连被跳过，落失败终态")
                         _webSocketState.value = WebSocketRecoveryPolicy.afterFailure(
                             current = _webSocketState.value,
@@ -1289,7 +1402,12 @@ object ConnectionManager {
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 // NEW-2：同上，判代次 + 收尾 + 排重连整体在锁内
                 runIfCurrent {
-                    DebugLogger.i(TAG, "WebSocket closed (code: $code)")
+                    val elapsedMs = connectedElapsedMs()
+                    logWsInfo(
+                        "[WS] onClosed code=$code reason=${reason.ifBlank { "<empty>" }} " +
+                            "elapsed=${elapsedMs / 1000.0}s"
+                    )
+                    connectedAtElapsedMs = 0L
                     stopKeepalive()
                     connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
                     // 无论 code 是多少都先收尾为 Disconnected，再决定要不要重连（条目 4.1）
@@ -1323,7 +1441,7 @@ object ConnectionManager {
      * Close the active WebSocket connection.
      */
     fun closeWebSocket() {
-        DebugLogger.i(TAG, "Closing WebSocket connection")
+        logWsInfo("[WS] close reason=manual elapsed=${connectedElapsedMs() / 1000.0}s")
         closeWebSocketInternal()
     }
 
@@ -1357,6 +1475,7 @@ object ConnectionManager {
         // 又把状态写成 Failed 并排一次多余的重连
         invalidateWebSocketCallbacks()
         _client?.closeWebSocket()
+        connectedAtElapsedMs = 0L
         _webSocketState.value = WebSocketState.Disconnected
     }
 
@@ -1507,6 +1626,7 @@ object ConnectionManager {
      */
     private fun startKeepalive() {
         keepaliveJob?.cancel()
+        logWsInfo("[WS] ping interval = ${keepaliveIntervalMs / 1000}s (effective app-layer)")
         keepaliveJob = scope.launch {
             while (isActive && _webSocketState.value is WebSocketState.Connected) {
                 // 每轮读当前间隔（v4.18.x：降级放宽 / 回前台收紧，值由 updateKeepaliveInterval 维护）
@@ -1536,6 +1656,9 @@ object ConnectionManager {
     fun updateKeepaliveInterval(intervalMs: Long) {
         val previous = keepaliveIntervalMs
         keepaliveIntervalMs = intervalMs
+        logWsInfo(
+            "[WS] ping interval = ${intervalMs / 1000}s (effective app-layer, previous=${previous / 1000}s)"
+        )
         if (intervalMs < previous && keepaliveJob?.isActive == true) {
             startKeepalive()
         }
@@ -1556,7 +1679,7 @@ object ConnectionManager {
     fun suspendWebSocketForBackground(reason: String) {
         if (backgroundSuspended) return
         backgroundSuspended = true
-        DebugLogger.i(TAG, "后台降级：挂起 WebSocket（$reason）")
+        logWsInfo("[WS] suspend reason=$reason elapsed=${connectedElapsedMs() / 1000.0}s")
         reconnectBlocked = true
         pendingReconnectJob?.cancel()
         pendingReconnectJob = null
@@ -1580,7 +1703,7 @@ object ConnectionManager {
         if (connectionState.value !is ConnectionState.Connected) return
         val wsState = _webSocketState.value
         if (wsState is WebSocketState.Connected || wsState is WebSocketState.Connecting) return
-        DebugLogger.i(TAG, "解除降级挂起：恢复 WebSocket 连接")
+        logWsInfo("[WS] resume reason=background-suspension-cleared")
         openWebSocket()
     }
 
@@ -1624,6 +1747,7 @@ object ConnectionManager {
         // 指数退避：2s, 4s, 8s, 16s, 30s（封顶），之后保持 30s 一次，
         // 网络恢复后自动接上，不再于 12 秒后彻底放弃
         val delayMs = minOf(2000L shl minOf(reconnectAttempts - 1, 4), MAX_RECONNECT_BACKOFF_MS)
+        logWsInfo("[WS] reconnect attempt=$reconnectAttempts delay=${delayMs}ms")
         val sessionId = reconnectionSessionId  // Capture current session
 
         pendingReconnectJob = scope.launch {
@@ -2095,7 +2219,7 @@ object ConnectionManager {
             )
         }
 
-        return enterOfflineModeInternal(ctx, server?.id)
+        return enterOfflineModeInternal(ctx, server?.id, notifyOnFailure = false)
     }
 
     /**
@@ -2115,7 +2239,7 @@ object ConnectionManager {
 
         if (forced) {
             stopOfflineProbe()
-            val entered = enterOfflineModeInternal(ctx)
+            val entered = enterOfflineModeInternal(ctx, notifyOnFailure = false)
             if (!entered) {
                 // 没有可用缓存，强制离线无从生效：回滚持久化标志，避免"开关开着却仍是在线"
                 DebugLogger.w(TAG, "强制离线未生效：没有可用离线缓存")
@@ -2135,10 +2259,16 @@ object ConnectionManager {
      * 加载离线缓存 → 关闭 WebSocket / 取消重连 → 启动周期探测。
      *
      * @param serverId 目标服务器；null 时依次取当前服务器、已选服务器
+     * @param notifyOnFailure 切换失败时是否给用户非阻塞提示（仅自动切换传 true）。
+     *        用户主动点「离线 / 强制离线」失败由各自界面负责提示，不应留下全局横幅。
      * @return true 表示已进入离线态
      */
     @Synchronized
-    private fun enterOfflineModeInternal(context: Context?, serverId: String? = null): Boolean {
+    private fun enterOfflineModeInternal(
+        context: Context?,
+        serverId: String? = null,
+        notifyOnFailure: Boolean = true
+    ): Boolean {
         val ctx = (context ?: _applicationContext)?.applicationContext ?: run {
             DebugLogger.w(TAG, "enterOfflineMode: 缺少 Context，放弃切换")
             return false
@@ -2156,10 +2286,12 @@ object ConnectionManager {
         // 没有可用缓存不进离线：进去也是空白，应当明确报连接失败（用户确认的决策）
         if (!hasOfflineCache(ctx, targetServerId)) {
             DebugLogger.w(TAG, "enterOfflineMode: 该服务器无离线缓存，保持连接失败状态")
+            if (notifyOnFailure) onOfflineSwitchFailed()
             return false
         }
 
         if (!loadFromOfflineCache(ctx, targetServerId)) {
+            if (notifyOnFailure) onOfflineSwitchFailed()
             return false
         }
 
@@ -2169,6 +2301,13 @@ object ConnectionManager {
         reconnectBlocked = true  // 离线态由看门狗负责恢复探测，残留重连一律阻断
         closeWebSocketInternal()
         clearConnectionAlert()
+        if (notifyOnFailure) {
+            // 自动切离线（断网降级）：横幅继续提示"后台正在重试"，离线看门狗恢复在线后
+            // 由 connect() 清除；用户主动进离线则不显示任何"正在重连"字样。
+            _connectionNotice.value = ConnectionNotice(ConnectionFailure.NETWORK)
+        } else {
+            clearConnectionNotice()
+        }
 
         // 判定器同步到离线，并记下切换时刻（冷却起点）
         stabilityState = StabilityState(
@@ -2181,6 +2320,26 @@ object ConnectionManager {
 
         startOfflineProbeIfAllowed()
         return true
+    }
+
+    /**
+     * 「切离线失败」的兜底（P3，自动切换专用）。
+     *
+     * 没有离线缓存时进不去离线态，但**绝不能把用户困在失败终态**：
+     * 1. 判定器拉回 ONLINE —— 否则它仍记着 OFFLINE，下一次成功信号会被误判成
+     *    「离线恢复」而多触发一次 connect；
+     * 2. 只发非阻塞横幅，不弹模态 —— 当前界面的数据原样保留；
+     * 3. 若后台没有在途重连，补排一条退避重连，横幅上的"正在自动重试"才名副其实。
+     *
+     * 冷却时间沿用判定器已有的 lastSwitchAtMs，避免刚失败就立刻再切一次离线。
+     */
+    private fun onOfflineSwitchFailed() {
+        val lastSwitchAt = stabilityState.lastSwitchAtMs
+        stabilityState = StabilityState(
+            mode = StabilityMode.ONLINE,
+            lastSwitchAtMs = lastSwitchAt
+        )
+        showConnectionNotice(ConnectionFailure.NETWORK)
     }
 
     /**

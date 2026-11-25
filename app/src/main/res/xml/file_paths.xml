@@ -11,7 +11,9 @@
       （见 util/ShareFileStore.kt）；
     - 播放链路在应用进程内，使用 file://，不经过 FileProvider，因此不需要声明
       任何缓存/文件根；
-    - 内置更新模块的 APK（含 sha256 旁车）继续走 external-files-path 的 update/ 子目录。
+    - 内置更新模块的 APK（含 sha256 旁车）继续走 external-files-path 的 update/ 子目录；
+      外部私有目录不可用时回退 filesDir/update/（v4.20.x「磁盘剩余 0」误报修复），
+      所以 files-path 也只声明 update/ 这一个专用子目录，安装链路才能拿到 content URI。
 
     ⚠️ 新增任何 FileProvider 分享路径时，先把文件写进专用子目录，再在这里补一条
     对应子目录的声明；禁止再出现 path="."。
@@ -21,4 +23,6 @@
     <cache-path name="share" path="share/" />
     <!-- 内置更新模块（v4.6.0）：getExternalFilesDir/update/ 下的 update.apk -->
     <external-files-path name="update_files" path="update/" />
+    <!-- v4.20.x：更新目录内部回退 filesDir/update/（仅 update 子目录，符合上方约定） -->
+    <files-path name="update_files_internal" path="update/" />
 </paths>

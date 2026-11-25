@@ -8,7 +8,9 @@ import java.security.MessageDigest
  *
  * 背景：`restoreFromDisk` 原先只判断「文件存在且非空」就置 READY_TO_INSTALL ——
  * 冷启动时清单早已不在内存，代码根本没有可比的期望值，于是把「磁盘上有这个文件」
- * 当成了「这个文件可信」。update/ 在 `getExternalFilesDir` 下，root 或被篡改的环境
+ * 当成了「这个文件可信」。update/ 在应用私有目录（外部 `getExternalFilesDir`，
+ * 不可用时回退 `filesDir`，见 UpdateDownloadWorker.resolveUpdateDir；v4.20.x），
+ * root 或被篡改的环境
  * 可以直接替换文件，重启后 App 就会把它当成官方安装包呈现给用户。
  *
  * 现在的约定：

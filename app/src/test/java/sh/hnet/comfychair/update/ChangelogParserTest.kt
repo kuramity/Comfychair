@@ -43,7 +43,10 @@ class ChangelogParserTest {
         assertEquals("v4.14.0", first.version)
         assertEquals("2026-11-15", first.date)
         assertEquals(122, first.versionCode)
-        assertEquals(listOf("条目一", "条目二"), first.items)
+        assertEquals(
+            listOf(ChangelogItem("条目一", 1), ChangelogItem("条目二", 1)),
+            first.items
+        )
 
         val second = entries[1]
         assertEquals("v4.13.0", second.version)
@@ -69,7 +72,7 @@ class ChangelogParserTest {
         assertEquals(2, entries.size)
         assertEquals("v4.14.0", entries[0].version)
         assertNull(entries[0].versionCode)
-        assertEquals(listOf("无 code 段的版本头"), entries[0].items)
+        assertEquals(listOf(ChangelogItem("无 code 段的版本头", 1)), entries[0].items)
         assertEquals(121, entries[1].versionCode)
     }
 
@@ -133,10 +136,110 @@ class ChangelogParserTest {
 
         val entries = ChangelogParser.parse(markdown)
         assertEquals(1, entries.size)
-        assertEquals(listOf("星号条目一", "星号条目二（多空格）", "连字符条目"), entries[0].items)
+        assertEquals(
+            listOf(
+                ChangelogItem("星号条目一", 1),
+                ChangelogItem("星号条目二（多空格）", 1),
+                ChangelogItem("连字符条目", 1),
+            ),
+            entries[0].items
+        )
     }
 
-    // ---------- 7. 真实 assets 文件 ----------
+    // ---------- 7. 二级说明条目（`· ` / `• `）----------
+
+    /**
+     * 真机问题（2026-11-26）：CHANGELOG 的二级说明行是「两个空格 + · + 空格」，
+     * 旧解析器只认 `- ` / `* `，整行被丢掉 —— 卡片上只剩一级标题，
+     * 用户看到的就是「只写了标题，没写正文」。
+     */
+    @Test
+    fun `secondary bullet items are parsed as level 2`() {
+        val markdown = """
+            ## v4.22.4 | 2026-11-26 | code156
+            - 一级条目
+              · 二级说明一
+              · 二级说明二
+            • 中文圆点也算二级
+            - 再来一条一级
+        """.trimIndent()
+
+        val entries = ChangelogParser.parse(markdown)
+        assertEquals(1, entries.size)
+        assertEquals(
+            listOf(
+                ChangelogItem("一级条目", 1),
+                ChangelogItem("二级说明一", 2),
+                ChangelogItem("二级说明二", 2),
+                ChangelogItem("中文圆点也算二级", 2),
+                ChangelogItem("再来一条一级", 1),
+            ),
+            entries[0].items
+        )
+    }
+
+    @Test
+    fun `empty bullet markers are dropped`() {
+        val markdown = """
+            ## v4.22.4 | 2026-11-26 | code156
+            - 
+              · 
+            - 有效条目
+        """.trimIndent()
+        val entries = ChangelogParser.parse(markdown)
+        assertEquals(listOf(ChangelogItem("有效条目", 1)), entries[0].items)
+    }
+
+    // ---------- 8. 行内 Markdown ----------
+
+    @Test
+    fun `parseInline splits bold and code segments`() {
+        val segments = ChangelogParser.parseInline("前面 **加粗** 中间 `code` 后面")
+        assertEquals(
+            listOf(
+                InlineSegment("前面 ", InlineStyle.Normal),
+                InlineSegment("加粗", InlineStyle.Bold),
+                InlineSegment(" 中间 ", InlineStyle.Normal),
+                InlineSegment("code", InlineStyle.Code),
+                InlineSegment(" 后面", InlineStyle.Normal),
+            ),
+            segments
+        )
+    }
+
+    @Test
+    fun `parseInline keeps unclosed markers literally`() {
+        // 未闭合的 ** 与反引号一律按字面输出，绝不吞掉后面的文字
+        assertEquals(
+            listOf(InlineSegment("未闭合 **标签", InlineStyle.Normal)),
+            ChangelogParser.parseInline("未闭合 **标签")
+        )
+        assertEquals(
+            listOf(InlineSegment("未闭合 `code", InlineStyle.Normal)),
+            ChangelogParser.parseInline("未闭合 `code")
+        )
+        // 空内容（**** / ``）不认
+        assertEquals(
+            listOf(InlineSegment("****", InlineStyle.Normal)),
+            ChangelogParser.parseInline("****")
+        )
+    }
+
+    @Test
+    fun `parseInline handles mixed markers in one line`() {
+        // 真机 CHANGELOG 的典型一行：「· **质量**：全量单测 `2195 例`」
+        val segments = ChangelogParser.parseInline("**质量**：全量单测 `2195 例`")
+        assertEquals(
+            listOf(
+                InlineSegment("质量", InlineStyle.Bold),
+                InlineSegment("：全量单测 ", InlineStyle.Normal),
+                InlineSegment("2195 例", InlineStyle.Code),
+            ),
+            segments
+        )
+    }
+
+    // ---------- 9. 真实 assets 文件 ----------
 
     @Test
     fun `parses the bundled assets changelog`() {

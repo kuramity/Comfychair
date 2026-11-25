@@ -36,29 +36,50 @@ class BackgroundDegradationPolicyTest {
     // ---------- 决策表：降级 × UNMETERED ----------
 
     @Test
-    fun `降级且不限量网络保持连接放宽心跳（开关与任务均不影响）`() {
-        for (task in listOf(true, false)) {
-            for (keep in listOf(true, false)) {
-                assertEquals(
-                    "task=$task keep=$keep",
-                    BackgroundDegradationPolicy.WsPolicy.KEEP_RELAXED_HEARTBEAT,
-                    BackgroundDegradationPolicy.decideWsPolicy(
-                        AppVisibility.BACKGROUND,
-                        BackgroundDegradationPolicy.NetworkClass.UNMETERED,
-                        task, keep
-                    )
+    fun `降级且不限量网络有任务保持连接放宽心跳（开关不影响）`() {
+        for (keep in listOf(true, false)) {
+            assertEquals(
+                "keep=$keep",
+                BackgroundDegradationPolicy.WsPolicy.KEEP_RELAXED_HEARTBEAT,
+                BackgroundDegradationPolicy.decideWsPolicy(
+                    AppVisibility.BACKGROUND,
+                    BackgroundDegradationPolicy.NetworkClass.UNMETERED,
+                    hasActiveTask = true, keepConnectedWhenBackground = keep
                 )
-                assertEquals(
-                    "task=$task keep=$keep (小窗失焦)",
-                    BackgroundDegradationPolicy.WsPolicy.KEEP_RELAXED_HEARTBEAT,
-                    BackgroundDegradationPolicy.decideWsPolicy(
-                        AppVisibility.MULTI_WINDOW_UNFOCUSED,
-                        BackgroundDegradationPolicy.NetworkClass.UNMETERED,
-                        task, keep
-                    )
+            )
+            assertEquals(
+                "keep=$keep (小窗失焦)",
+                BackgroundDegradationPolicy.WsPolicy.KEEP_RELAXED_HEARTBEAT,
+                BackgroundDegradationPolicy.decideWsPolicy(
+                    AppVisibility.MULTI_WINDOW_UNFOCUSED,
+                    BackgroundDegradationPolicy.NetworkClass.UNMETERED,
+                    hasActiveTask = true, keepConnectedWhenBackground = keep
                 )
-            }
+            )
         }
+    }
+
+    @Test
+    fun `降级且不限量网络无任务断连省电（P4：WiFi 空闲不再空转）`() {
+        for (keep in listOf(true, false)) {
+            assertEquals(
+                "keep=$keep",
+                BackgroundDegradationPolicy.WsPolicy.DROP_AND_IDLE,
+                BackgroundDegradationPolicy.decideWsPolicy(
+                    AppVisibility.BACKGROUND,
+                    BackgroundDegradationPolicy.NetworkClass.UNMETERED,
+                    hasActiveTask = false, keepConnectedWhenBackground = keep
+                )
+            )
+        }
+        assertEquals(
+            BackgroundDegradationPolicy.WsPolicy.DROP_AND_IDLE,
+            BackgroundDegradationPolicy.decideWsPolicy(
+                AppVisibility.MULTI_WINDOW_UNFOCUSED,
+                BackgroundDegradationPolicy.NetworkClass.UNMETERED,
+                hasActiveTask = false, keepConnectedWhenBackground = false
+            )
+        )
     }
 
     // ---------- 决策表：降级 × METERED ----------

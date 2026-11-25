@@ -51,6 +51,8 @@
     <string name="error_upload_stalled">Téléversement bloqué</string>
     <string name="action_reconnect">Reconnecter</string>
     <string name="action_reconnecting">Reconnexion…</string>
+    <string name="action_try_later">Réessayer plus tard</string>
+    <string name="msg_connection_interrupted">Connexion interrompue. Nouvelle tentative en arrière-plan…</string>
     <string name="msg_reconnect_failed">Impossible de se reconnecter</string>
     <string name="action_return_to_login">Retour à la connexion</string>
 
@@ -729,10 +731,10 @@
     <!-- Export Markdown de la fiche modèle (modèle partagé : ModelIntroMarkdown) -->
     <string name="model_intro_export_md">Exporter en Markdown</string>
     <string name="model_intro_export_failed">Impossible d\'exporter les informations du modèle</string>
-    <!-- Couche utilisateur : désinstaller / sélection multiple / importer / restaurer -->
+    <string name="model_intro_copy_all">Tout copier</string>
+    <!-- Couche utilisateur : désinstaller / sélection multiple / restaurer -->
     <string name="model_intro_menu_more">Plus d\'actions</string>
     <string name="model_intro_batch_manage">Sélection multiple</string>
-    <string name="model_intro_import">Importer des infos</string>
     <string name="model_intro_hidden_menu">Désinstallés (%1$d)</string>
     <string name="model_intro_uninstall_title">Désinstaller cette fiche ?</string>
     <string name="model_intro_uninstall_message">« %1$s » ne sera masqué que sur cet appareil. La fiche intégrée n\'est pas supprimée et peut être restaurée à tout moment.</string>
@@ -748,11 +750,30 @@
     <string name="model_intro_batch_done">%1$d fiches désinstallées</string>
     <string name="model_intro_hidden_title">Fiches désinstallées</string>
     <string name="model_intro_hidden_empty">Aucune fiche désinstallée</string>
-    <string name="model_intro_import_success">%1$d fiches importées</string>
-    <string name="model_intro_import_error_read">Impossible de lire le fichier, réessayez</string>
-    <string name="model_intro_import_error_unsupported">Type de fichier non pris en charge (uniquement .json ou .md)</string>
-    <string name="model_intro_import_error_json">JSON invalide : attendez une table d\'infos modèles (models) ou un objet « nom de fichier → fiche »</string>
-    <string name="model_intro_import_error_empty">Aucune fiche importable dans ce fichier</string>
-    <string name="model_intro_import_error_md">Aucune info de modèle dans ce Markdown : il faut un titre « # nom » et des lignes de métadonnées comme « 名字：… »</string>
-    <string name="model_intro_import_error_save">Impossible d\'enregistrer les fiches importées, réessayez</string>
+    <!-- Intro document editor (v4.21) -->
+    <string name="model_intro_editor_entry">Créer une fiche</string>
+    <string name="model_intro_edit_entry">Modifier cette fiche</string>
+    <string name="model_intro_editor_title_new">Nouvelle fiche</string>
+    <string name="model_intro_editor_title_edit">Modifier la fiche</string>
+    <string name="model_intro_editor_field_file">Nom du fichier</string>
+    <string name="model_intro_editor_field_name">Nom</string>
+    <string name="model_intro_editor_field_base">Modèle de base</string>
+    <string name="model_intro_editor_field_version">Version</string>
+    <string name="model_intro_editor_field_kind">Type</string>
+    <string name="model_intro_editor_field_effect">Effet</string>
+    <string name="model_intro_custom_fields">Champs personnalisés</string>
+    <string name="model_intro_editor_add_field">Ajouter un champ</string>
+    <string name="model_intro_editor_remove_field">Retirer ce champ</string>
+    <string name="model_intro_editor_label_hint">Nom du champ</string>
+    <string name="model_intro_editor_value_hint">Valeur</string>
+    <string name="model_intro_editor_template_title">Choisir un modèle pour préremplir les champs</string>
+    <string name="model_intro_editor_template_skip">Partir de zéro</string>
+    <string name="model_intro_editor_save">Enregistrer</string>
+    <string name="model_intro_editor_saved">Enregistrée</string>
+    <string name="model_intro_editor_file_required">Le nom du fichier est requis</string>
+    <string name="model_intro_editor_builtin_override">Cette fiche existe dans la bibliothèque intégrée. L\'enregistrement la remplacera entièrement par votre version ; le contenu intégré peut être restauré à tout moment.</string>
+    <string name="model_intro_editor_delete">Supprimer</string>
+    <string name="model_intro_editor_delete_title">Supprimer cette fiche créée sur cet appareil ?</string>
+    <string name="model_intro_editor_delete_message">« %1$s » a été créée sur cet appareil. Sa suppression est définitive ; la bibliothèque intégrée n\'est pas affectée.</string>
+    <string name="model_intro_editor_deleted">Fiche supprimée</string>
 </resources>

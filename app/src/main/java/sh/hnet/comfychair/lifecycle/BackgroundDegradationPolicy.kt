@@ -59,17 +59,25 @@ object BackgroundDegradationPolicy {
      * | 可见性      | 网络      | 任务在跑 | 后台保连开关 | → 策略                   |
      * |-------------|-----------|----------|--------------|--------------------------|
      * | 前台        | 任意      | 任意     | 任意         | KEEP_FULL_HEARTBEAT      |
-     * | 降级        | UNMETERED | 任意     | 任意         | KEEP_RELAXED_HEARTBEAT   |
+     * | 降级        | UNMETERED | 有       | 任意         | KEEP_RELAXED_HEARTBEAT   |
+     * | 降级        | UNMETERED | 无       | 任意         | DROP_AND_IDLE            |
      * | 降级        | METERED   | 任意     | 开           | KEEP_RELAXED_HEARTBEAT   |
      * | 降级        | METERED   | 有       | 关           | DROP_AND_POLL            |
      * | 降级        | METERED   | 无       | 关           | DROP_AND_IDLE            |
      * | 降级        | UNKNOWN   | 任意     | 任意         | 按 METERED 处理          |
      *
      * 设计依据（用户已定的三个决策）：
-     * - 分网络：UNMETERED 后台保持 WS（结果推送零延迟），METERED 后台断开；
+     * - 分网络：UNMETERED 后台**有任务时**保持 WS（结果推送零延迟），空闲时断开省电；
      * - 「后台保持连接」开关打开 = 蜂窝下也保持（心跳 4 分钟），用户知情选择；
      * - 任务例外：METERED 且开关关但有任务在跑 → 断 WS 但保留 15 分钟轮询，
      *   完成时发系统通知（体验底线：进度收不到、完成必须知道）。
+     *
+     * P4（后台长任务通知可靠性）：
+     * - UNMETERED 行按 [hasActiveTask] 拆分 —— 修复前「WiFi 空闲也恒保持连接」，
+     *   既违背省电目标，又让「回前台才有降级」的回归项不成立；
+     * - 有任务的 KEEP_RELAXED 由 Coordinator 额外拉起**任务级**前台服务
+     *   （[sh.hnet.comfychair.notify.GenerationKeepAliveService]）保护进程不被冻结；
+     *   该服务不在决策表里，避免把「网络策略」与「进程保活」混成一张表。
      */
     fun decideWsPolicy(
         visibility: AppVisibility,
@@ -81,7 +89,9 @@ object BackgroundDegradationPolicy {
         // UNKNOWN 视同 METERED（拿不准就按省流量的方向走）
         val metered = network != NetworkClass.UNMETERED
         return if (!metered) {
-            WsPolicy.KEEP_RELAXED_HEARTBEAT
+            // WiFi：只有还有本机任务时才保持连接（进度依赖 WS 推送）；
+            // 空闲时断开，避免「连上 WiFi 就一直双心跳」的空转耗电。
+            if (hasActiveTask) WsPolicy.KEEP_RELAXED_HEARTBEAT else WsPolicy.DROP_AND_IDLE
         } else if (keepConnectedWhenBackground) {
             WsPolicy.KEEP_RELAXED_HEARTBEAT
         } else if (hasActiveTask) {

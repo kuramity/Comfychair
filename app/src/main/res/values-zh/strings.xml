@@ -51,6 +51,8 @@
     <string name="error_upload_stalled">上传停滞</string>
     <string name="action_reconnect">重新连接</string>
     <string name="action_reconnecting">重新连接中…</string>
+    <string name="action_try_later">稍后再试</string>
+    <string name="msg_connection_interrupted">连接中断，正在后台自动重试…</string>
     <string name="msg_reconnect_failed">无法重新连接</string>
     <string name="action_return_to_login">返回登录</string>
 
@@ -277,6 +279,8 @@
     <!-- Gallery selection mode strings -->
     <string name="gallery_selected_count">已选择 %d 项</string>
     <string name="button_gallery_select">选择项目</string>
+    <!-- 图库「加载更早」分页按钮（实现见 GalleryRepository.loadOlderItems） -->
+    <string name="button_gallery_load_older">加载更早</string>
     <string name="button_cancel_selection">取消选择</string>
     <string name="button_select_all">全选</string>
     <string name="button_deselect_all">取消全选</string>
@@ -809,22 +813,19 @@
     <string name="model_intro_used_in">用过的流</string>
     <string name="model_intro_original">作者原文</string>
     <string name="model_intro_path">存放路径</string>
-    <string name="model_intro_source">数据来源</string>
     <string name="model_intro_missing_badge">文件已移除</string>
     <string name="model_intro_missing_notice">⚠ 本地文件已移除 —— 该模型已从模型库删除，因此不再提供推荐参数与搭配建议。下面的介绍仅供辨认它曾经是什么。</string>
     <string name="model_intro_kind">分类</string>
     <string name="model_intro_effect_archive">LoRA 效果档案（%1$d 条）</string>
     <string name="model_intro_effect_archive_orphan_only">仅效果档案收录</string>
-    <!-- 模型介绍详情页（v4.17）：抽屉「查看完整详情」进入，20 个候选区块完整版 -->
+    <!-- 模型介绍详情页（v4.17）：列表点条目直接进入，20 个候选区块完整版 -->
     <string name="model_intro_detail_title">模型详情</string>
-    <string name="model_intro_open_detail">查看完整详情</string>
     <!-- Markdown 导出（界面渲染与导出共用 ModelIntroMarkdown 模板） -->
     <string name="model_intro_export_md">导出 Markdown</string>
     <string name="model_intro_export_failed">导出失败，请重试</string>
-    <!-- 用户覆盖层：卸载 / 批量 / 导入 / 恢复（见 ModelIntroViewModel） -->
+    <!-- 用户覆盖层：卸载 / 批量 / 恢复（见 ModelIntroViewModel） -->
     <string name="model_intro_menu_more">更多操作</string>
     <string name="model_intro_batch_manage">批量管理</string>
-    <string name="model_intro_import">导入介绍</string>
     <string name="model_intro_hidden_menu">已卸载（%1$d）</string>
     <string name="model_intro_uninstall_title">卸载此条介绍？</string>
     <string name="model_intro_uninstall_message">「%1$s」将只在本机隐藏，内置介绍不会被删除，可随时在「已卸载」里恢复。</string>
@@ -840,13 +841,32 @@
     <string name="model_intro_batch_done">已卸载 %1$d 条介绍</string>
     <string name="model_intro_hidden_title">已卸载的介绍</string>
     <string name="model_intro_hidden_empty">没有已卸载的介绍</string>
-    <string name="model_intro_import_success">已导入 %1$d 条介绍</string>
-    <string name="model_intro_import_error_read">文件读取失败，请重试</string>
-    <string name="model_intro_import_error_unsupported">不支持的文件类型（只接受 .json 或 .md）</string>
-    <string name="model_intro_import_error_json">JSON 格式不正确：需要模型介绍表（models）或「文件名 → 条目」对象</string>
-    <string name="model_intro_import_error_empty">文件里没有可导入的介绍条目</string>
-    <string name="model_intro_import_error_md">Markdown 里没找到介绍内容：需要「# 模型名」标题与元信息行（如「名字：…」）</string>
-    <string name="model_intro_import_error_save">导入内容保存失败，请重试</string>
+    <!-- 介绍文档编辑器（v4.21）：新建 / 编辑走用户覆盖层，内置数据文件不动（ModelIntroEditorScreen） -->
+    <string name="model_intro_editor_entry">新建介绍</string>
+    <string name="model_intro_edit_entry">编辑这条</string>
+    <string name="model_intro_editor_title_new">新建介绍</string>
+    <string name="model_intro_editor_title_edit">编辑介绍</string>
+    <string name="model_intro_editor_field_file">文件名</string>
+    <string name="model_intro_editor_field_name">名字</string>
+    <string name="model_intro_editor_field_base">底模</string>
+    <string name="model_intro_editor_field_version">版本</string>
+    <string name="model_intro_editor_field_kind">类型</string>
+    <string name="model_intro_editor_field_effect">效果</string>
+    <string name="model_intro_custom_fields">自定义字段</string>
+    <string name="model_intro_editor_add_field">添加字段</string>
+    <string name="model_intro_editor_remove_field">删除该字段</string>
+    <string name="model_intro_editor_label_hint">字段名</string>
+    <string name="model_intro_editor_value_hint">值</string>
+    <string name="model_intro_editor_template_title">选择一个模板，按模板预填字段</string>
+    <string name="model_intro_editor_template_skip">从空白开始</string>
+    <string name="model_intro_editor_save">保存</string>
+    <string name="model_intro_editor_saved">已保存</string>
+    <string name="model_intro_editor_file_required">请先填写文件名</string>
+    <string name="model_intro_editor_builtin_override">这条来自内置库，保存后将用你的版本整条覆盖，可随时恢复。</string>
+    <string name="model_intro_editor_delete">删除</string>
+    <string name="model_intro_editor_delete_title">删除这条自建条目？</string>
+    <string name="model_intro_editor_delete_message">「%1$s」是本机自建条目，删除后不可找回；内置库不受影响。</string>
+    <string name="model_intro_editor_deleted">已删除</string>
     <string name="model_intro_style_tags">风格</string>
     <string name="model_intro_lora_weight">LoRA 权重</string>
     <string name="model_intro_lora_weight_range">%1$s – %2$s</string>
@@ -865,6 +885,7 @@
     <string name="model_intro_confidence_note">置信度说明</string>
     <string name="model_intro_intro_missing">该模型暂无完整介绍，以下仅保留基本信息。</string>
     <string name="model_intro_copy_params">复制推荐参数</string>
+    <string name="model_intro_copy_all">复制全文</string>
     <string name="model_intro_copied">已复制</string>
     <string name="model_intro_source_from">来源 %1$s</string>
     <string name="model_list_loading">正在加载模型列表…</string>
@@ -1051,6 +1072,7 @@
     <string name="msg_trash_restored">已恢复</string>
     <string name="msg_trash_restore_failed">恢复失败（条目可能已不在回收站）</string>
     <string name="msg_trash_purged_server">已联动服务器删除 %1$d 项</string>
+    <string name="msg_trash_purged_already_gone">其中 %1$d 项在服务器上已不存在（可能已在电脑端删除）</string>
     <string name="msg_trash_purged_local_only">%1$d 项：服务器未安装删除接口，已清除本机记录（服务器文件保留）</string>
     <string name="msg_trash_purge_pending">%1$d 项服务器删除失败，已留在回收站待重试</string>
     <string name="msg_trash_kept_other_server">%1$d 项属于其它服务器，保留在回收站</string>
@@ -1065,6 +1087,8 @@
     <string name="notify_generation_progress_running">生成中…</string>
     <string name="notify_generation_completed_title">生成完成</string>
     <string name="notify_generation_failed_title">生成失败</string>
+    <string name="notify_generation_pending_title">结果待确认</string>
+    <string name="notify_generation_pending_text">打开应用查看最新状态</string>
     <string name="notify_generation_action_cancel">取消</string>
     <string name="label_generation_notifications">生成通知</string>
     <string name="desc_generation_notifications">生成期间在通知栏显示进度，完成或失败时提醒</string>

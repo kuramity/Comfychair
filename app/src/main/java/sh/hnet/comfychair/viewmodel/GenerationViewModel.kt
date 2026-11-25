@@ -30,6 +30,7 @@ import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.queue.JobStatus
 import sh.hnet.comfychair.queue.resolveExecutionStartOwner
 import sh.hnet.comfychair.model.ThreeDResultHolder
+import sh.hnet.comfychair.notify.GenerationKeepAliveService
 import sh.hnet.comfychair.notify.GenerationNotifier
 import sh.hnet.comfychair.prompt.SkillTextResult
 import sh.hnet.comfychair.storage.AppSettings
@@ -453,10 +454,11 @@ class GenerationViewModel : ViewModel() {
                     }
                     is WebSocketState.Failed -> {
                         _connectionStatus.value = ConnectionStatus.FAILED
-                        // Only show dialog if actively generating - otherwise user doesn't need to know
-                        // D10：瞬时失败不会走到这里——ConnectionManager 在排上自动重连时不再写 Failed，
-                        // 所以能到这里的 Failed 都是"没有待重连 job"的终态（认证失败、被阻断、静默重连失败），
-                        // 这时弹窗是用户需要的信号，不做额外屏蔽。
+                        // P3：这里不再直接决定"弹不弹模态"，只把失败交给统一分流入口。
+                        // `ConnectionManager.showConnectionAlert` 现在按失败类型处理：
+                        // 网络 / 传输停滞 → 非阻塞横幅（生成中也不拦截界面，进度与数据都保留）；
+                        // 只有认证失效才是模态，且对话框本身可随时关闭。
+                        // D10：瞬时失败不会走到这里——ConnectionManager 在排上自动重连时不再写 Failed。
                         if (_generationState.value.isGenerating) {
                             applicationContext?.let { ctx ->
                                 ConnectionManager.showConnectionAlert(ctx, state.failureType)
@@ -541,14 +543,18 @@ class GenerationViewModel : ViewModel() {
                     // 记到本机名下：本机进度条被外部任务推动、预览串页、外部任务结束时
                     // 还会把本机的 executing 指针清掉。
                     //
-                    // 归属只认两条证据（见 resolveExecutionStartOwner）：
+                    // 归属证据（见 resolveExecutionStartOwner）：
                     // 1. 注册表里有这个 promptId（提交成功时登记的）；
                     // 2. 这个 promptId 在本机提交记录里（promptId 是服务器返回给我们的）。
                     //
-                    // R2-L5：第 2 条**覆盖不到**"execution_start 早于 registerJob"这个时序 ——
-                    // 本机提交记录也只在 registerJob 里写入，那时还查不到。该时序由
-                    // `JobRegistry.markExecuting`（先把 executingPromptId 记下来）+
-                    // `registerJob` 的"已在执行则回填 owner"分支补正，最终状态一致。
+                    // P6：第三条证据在更早的 `JobRegistry.markExecuting` 里已经处理 ——
+                    // 弱网下 HTTP 响应丢失时，注册表/提交记录都查不到，但本机有"已发出、
+                    // 结果未知"的在途提交；`markExecuting` 会按 FIFO 认领并 registerJob。
+                    // 所以走到这里时，被 P6 接管的任务已经能在 registeredOwner 里查到了。
+                    //
+                    // R2-L5：第 2 条**覆盖不到**"execution_start 早于 registerJob"这个时序，
+                    // P6 之前由 markExecuting 记 executingPromptId + registerJob 回填补正；
+                    // P6 之后在途意图还在时会直接认领，最终状态一致。
                     // 第 2 条真正覆盖的是：条目已被完成/对账清掉之后，同一个 promptId 的
                     // 事件被重放（WS 重连补发、乱序到达）时仍能认出是自己的。
                     val registeredOwner = JobRegistry.findOwner(promptId)
@@ -607,6 +613,9 @@ class GenerationViewModel : ViewModel() {
                         val notifyContext = applicationContext
                         if (notifyContext != null) {
                             GenerationNotifier.onGenerationStarted(notifyContext, owner)
+                            // P4：任务开始即尝试拉起任务级保活（仅 WiFi + 通知开启时生效）。
+                            // 必须在 App 仍可见时启动 —— 后台启动前台服务会被系统拒绝。
+                            GenerationKeepAliveService.ensureRunning(notifyContext)
                         }
                         GenerationNotifier.registerCancelHandler { cancelGeneration { _ -> } }
 
@@ -1211,6 +1220,18 @@ class GenerationViewModel : ViewModel() {
             return
         }
 
+        // P6：提交**发出之前**登记在途意图。promptId 只有成功响应里才有，弱网下响应可能
+        // 永远到不了；先记下"发过一次提交"，等 execution_start 到达时按 FIFO 认领。
+        val submitOwnerId = generationOwnerId
+        val submitContentType = generationContentType
+        val submissionToken = submitOwnerId?.let { owner ->
+            JobRegistry.beginSubmission(
+                workflowName = owner,
+                ownerId = owner,
+                contentType = submitContentType
+            )
+        }
+
         DebugLogger.d(TAG, "Submitting workflow to server")
         client.submitPrompt(workflowJson, front) { success, promptId, errorMessage, failureType ->
             if (success && promptId != null) {
@@ -1219,11 +1240,25 @@ class GenerationViewModel : ViewModel() {
                 // Register job with JobRegistry for queue tracking.
                 // P1-1：这里同时把"本机提交返回的 promptId"记进注册表，之后 execution_start
                 // 的归属兜底只认这条记录，不再"查不到就当成自己的"。
-                generationOwnerId?.let { ownerId ->
-                    JobRegistry.registerJob(promptId, ownerId, generationContentType)
-                    // Save JobRegistry state for persistence
-                    applicationContext?.let { ctx -> JobRegistry.saveState(ctx) }
+                // P6：走 completeSubmission —— 它会先移除在途意图；若在途意图已被
+                // execution_start 提前认领，则不重复登记。
+                if (submissionToken != null && submitOwnerId != null) {
+                    JobRegistry.completeSubmission(
+                        token = submissionToken,
+                        promptId = promptId,
+                        ownerId = submitOwnerId,
+                        contentType = submitContentType
+                    )
+                } else {
+                    generationOwnerId?.let { ownerId ->
+                        JobRegistry.registerJob(promptId, ownerId, generationContentType)
+                    }
                 }
+                // Save JobRegistry state for persistence
+                applicationContext?.let { ctx -> JobRegistry.saveState(ctx) }
+                // P4：提交成功即有「本机活跃任务」，趁着 App 可见把保活服务拉起来；
+                // 等 execution_start 再拉可能已经切到后台（Android 12+ 不允许后台启动 FGS）。
+                applicationContext?.let { GenerationKeepAliveService.ensureRunning(it) }
 
                 // Determine if we should set up GenerationState now
                 // There's a race condition: ExecutionStart might fire before we register the job.
@@ -1253,6 +1288,31 @@ class GenerationViewModel : ViewModel() {
                 mainHandler.post { onResult(true, promptId, null) }
             } else {
                 DebugLogger.e(TAG, "Workflow submission failed: $errorMessage")
+
+                // P6：响应失败，但 execution_start 可能早已把这个任务认领回来了
+                //（弱网下 WS 比 HTTP 快，日志实测早 9 秒）。此时服务器确实收下并在跑，
+                // 绝不能再报"提交超时"误导用户 —— 按提交成功处理，进度由后续 WS 事件推进。
+                val claimedPromptId = submissionToken?.let { JobRegistry.findClaimedPromptId(it) }
+                if (claimedPromptId != null) {
+                    DebugLogger.i(
+                        TAG,
+                        "P6：提交响应失败，但任务已由 execution_start 接管（promptId: ${Obfuscator.promptId(claimedPromptId)}），不再上报提交失败"
+                    )
+                    generationOwnerId?.let { owner -> submittedCallbacks[owner]?.invoke() }
+                    mainHandler.post { onResult(true, claimedPromptId, null) }
+                    return@submitPrompt
+                }
+
+                // P6：区分"服务器可能已收下"与"明确未接收"。
+                // 前者保留在途意图等认领；后者立即丢弃，避免误吃后续的 execution_start。
+                if (submissionToken != null) {
+                    if (submissionMayHaveReachedServer(failureType, errorMessage)) {
+                        JobRegistry.markSubmissionUnresolved(submissionToken)
+                    } else {
+                        JobRegistry.abandonSubmission(submissionToken)
+                    }
+                }
+
                 // For authentication errors, show the connection alert dialog instead of Toast
                 if (failureType == ConnectionFailure.AUTHENTICATION) {
                     mainHandler.post {
@@ -1271,6 +1331,28 @@ class GenerationViewModel : ViewModel() {
                 }
             }
         }
+    }
+
+    /**
+     * P6：提交失败时判断"服务器是否**可能**已经收下了这次提交"。
+     *
+     * 无法从回调的 failureType 区分（ComfyUIClient 只给 NONE/AUTHENTICATION/NETWORK），
+     * 所以按它自己产出的错误文案归类（这些前缀是 ComfyUIClient.kt 里的硬编码英文，
+     * 不受系统语言影响，见 `submitPrompt`）：
+     * - `Failed to submit prompt`：连接/读写超时、连接被重置等 IO 失败 —— 请求可能
+     *   已经到达服务器，只是响应没回来 → 保留在途意图等 `execution_start` 认领；
+     * - `Failed to parse response`：服务器回了 200，但响应体解析失败 —— 任务大概率已入队
+     *   → 同样保留；
+     * - 其余（`Server error 4xx/5xx`、未连接、认证失败）：明确未接收 → 丢弃意图。
+     */
+    private fun submissionMayHaveReachedServer(
+        failureType: ConnectionFailure,
+        errorMessage: String?
+    ): Boolean {
+        if (failureType == ConnectionFailure.AUTHENTICATION) return false
+        val message = errorMessage.orEmpty()
+        return message.startsWith("Failed to submit prompt") ||
+            message.startsWith("Failed to parse response")
     }
 
     /**
@@ -1880,6 +1962,8 @@ class GenerationViewModel : ViewModel() {
             // 重启恢复的生成态：登记通知快照（进后台时可展示），并接回「取消」处理器
             GenerationNotifier.onGenerationStarted(context, ownerId)
             GenerationNotifier.registerCancelHandler { cancelGeneration { _ -> } }
+            // P4：恢复出的任务同样需要保活（打开 App 这一刻是可见的，启动合法）
+            GenerationKeepAliveService.ensureRunning(context)
         }
     }
 

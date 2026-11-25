@@ -178,8 +178,8 @@ class ModelIntroTableTest {
               "file":"x.safetensors",
               "params":{"步数":"28 步","CFG":"1"},
               "author_params":{"推荐分辨率":"1024x1024"},
-              "tags":["mature body"],
-              "used_in":["竖叉","潜空间放大"]
+              "tags":["soft lighting"],
+              "used_in":["flow_a","flow_b"]
             }}}
             """.trimIndent()
         )
@@ -189,8 +189,8 @@ class ModelIntroTableTest {
         assertEquals(listOf("步数", "CFG"), hit.params.keys.toList())
         assertEquals("28 步", hit.params["步数"])
         assertEquals("1024x1024", hit.authorParams["推荐分辨率"])
-        assertEquals(listOf("mature body"), hit.tags)
-        assertEquals(listOf("竖叉", "潜空间放大"), hit.usedIn)
+        assertEquals(listOf("soft lighting"), hit.tags)
+        assertEquals(listOf("flow_a", "flow_b"), hit.usedIn)
     }
 
     @Test

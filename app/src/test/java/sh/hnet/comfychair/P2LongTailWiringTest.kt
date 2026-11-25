@@ -115,13 +115,15 @@ class P2LongTailWiringTest {
 
     @Test
     fun `模型介绍表的装载必须在 IO 线程`() {
-        val text = source("src/main/java/sh/hnet/comfychair/ui/screens/ModelIntroScreen.kt")
-        val ioIndex = text.indexOf("withContext(Dispatchers.IO)")
-        val loadIndex = text.indexOf("ModelIntroTable.ensureLoaded(context)")
-        assertTrue("ModelIntroScreen 必须把装载放进 withContext(Dispatchers.IO)", ioIndex >= 0)
-        assertTrue("ModelIntroScreen 里找不到 ensureLoaded 调用", loadIndex >= 0)
+        // v4.21：装载从界面移进 ModelIntroViewModel（界面只读 StateFlow），
+        // 约束原样保留、只换归属点——513KB 的 JSON 仍然不许在主线程解析。
+        val text = source("src/main/java/sh/hnet/comfychair/viewmodel/ModelIntroViewModel.kt")
+        val ioIndex = text.indexOf("launch(Dispatchers.IO)")
+        val loadIndex = text.indexOf("ModelIntroTable.ensureLoaded(")
+        assertTrue("ModelIntroViewModel 必须在 Dispatchers.IO 上装载", ioIndex >= 0)
+        assertTrue("ModelIntroViewModel 里找不到 ensureLoaded 调用", loadIndex >= 0)
         assertTrue(
-            "ensureLoaded 必须在 withContext(Dispatchers.IO) 之后（513KB JSON 不许在主线程解析）",
+            "ensureLoaded 必须在 Dispatchers.IO 上执行（513KB JSON 不许在主线程解析）",
             ioIndex < loadIndex
         )
     }

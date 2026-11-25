@@ -15,6 +15,7 @@ import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -41,14 +42,17 @@ import kotlinx.coroutines.launch
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.WebSocketState
 import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.model.AuthCredentials
+import sh.hnet.comfychair.navigation.MODEL_INTRO_ROUTES
 import sh.hnet.comfychair.navigation.MainRoute
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.CredentialStorage
 import sh.hnet.comfychair.ui.components.ConnectionAlertDialog
+import sh.hnet.comfychair.ui.components.ConnectionStatusBanner
 import sh.hnet.comfychair.ui.components.ParticleOverlay
 import sh.hnet.comfychair.ui.components.ParticleTouchRouter
 import sh.hnet.comfychair.ui.components.shared.ProvideFilamentEngine
@@ -282,6 +286,21 @@ class MainContainerActivity : ComponentActivity() {
         // 本方法只做导航：连接不断、缓存不清、队列不动、生成状态不重置。
         val startRoute = startDestination
         onBackPressedDispatcher.addCallback(this) {
+            // P3（返回键优先级）：有可关闭的连接弹窗时，返回键**先关弹窗**，
+            // 不能让它落到下面的「回连接页」——那正是用户被"弹回连接页"的观感来源。
+            // 横幅不是模态、不需要拦截，返回键照常走原有逻辑。
+            if (ConnectionManager.connectionAlertState.value != null) {
+                ConnectionManager.clearConnectionAlert()
+                return@addCallback
+            }
+            // 介绍模块已迁入主容器：详情 → 列表 → 起始 tab 必须逐级返回，
+            // 不能被下面通用的“二级页直接切起始 tab”规则一次弹完。
+            val currentRoute = currentRouteName
+            if (currentRoute != null && currentRoute in MODEL_INTRO_ROUTES &&
+                navControllerRef?.popBackStack() == true
+            ) {
+                return@addCallback
+            }
             when (backActionAt(tabIndexOfRoute(currentRouteName), tabIndexOfRoute(startRoute))) {
                 // 不在起始 tab：切回起始 tab，不动连接、不动生成状态。
                 BackAction.SwitchToStartTab -> {
@@ -338,6 +357,13 @@ class MainContainerActivity : ComponentActivity() {
                 // Observe connection alert state from ConnectionManager (single source of truth)
                 val connectionAlertState by ConnectionManager.connectionAlertState.collectAsStateWithLifecycle()
                 val isReconnecting by ConnectionManager.isReconnecting.collectAsStateWithLifecycle()
+                val connectionNotice by ConnectionManager.connectionNotice.collectAsStateWithLifecycle()
+                val webSocketState by ConnectionManager.webSocketState.collectAsStateWithLifecycle()
+                // P3：断线/重连只给顶部细横幅，不弹模态。认证失效单独由会话过期弹窗处理。
+                val failedState = webSocketState as? WebSocketState.Failed
+                val connectionBannerVisible = webSocketState is WebSocketState.Reconnecting ||
+                    (failedState != null && failedState.failureType != ConnectionFailure.AUTHENTICATION) ||
+                    connectionNotice != null
                 val sessionExpired by ConnectionManager.sessionExpired.collectAsStateWithLifecycle()
                 // 4.3：启动期媒体恢复完成信号。loadFromDisk 改为异步后，未就绪时只组合占位内容，
                 // 否则各屏幕的 onInitialize 会在媒体还没进内存时读到 null，且之后不会再刷新
@@ -420,6 +446,15 @@ class MainContainerActivity : ComponentActivity() {
                                 }
                             }
                         }
+
+                        // P3：断线期间原位提示，界面与数据都不切走；重连成功后状态变 Connected 自动消失
+                        ConnectionStatusBanner(
+                            visible = connectionBannerVisible,
+                            text = stringResource(R.string.msg_connection_interrupted),
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .statusBarsPadding()
+                        )
                     }
                 }
 
@@ -682,7 +717,8 @@ internal enum class BackAction {
  *
  * 只用于把「当前路由 / 起始路由」折算成下标做同异比较，顺序本身不影响判定结果 ——
  * 但保持一致可以让日志和后续扩展（例如按方向做切换动画）不出错。
- * 注意：`Gallery` 是独立 Activity（FAB 打开），`TagDetail` 是二级页，都不在这里。
+ * 注意：`Gallery` 是独立 Activity（FAB 打开），介绍模块是主容器内的多级导航，
+ * `TagDetail` 与介绍模块的二级页也不在这个 tab 列表中。
  */
 internal val MAIN_TAB_ROUTES: List<String> = listOf(
     MainRoute.TextToImage.route,

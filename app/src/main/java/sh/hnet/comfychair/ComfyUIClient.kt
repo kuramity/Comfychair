@@ -63,6 +63,17 @@ class ComfyUIClient(
         private const val STALL_TIMEOUT_MS = 30_000L          // 30 seconds without progress = stalled
         private const val STALL_CHECK_INTERVAL_MS = 5_000L    // Check every 5 seconds
 
+        /** P2 观测日志：写入应用内缓冲，并在调试日志开启时同步到 logcat。 */
+        private fun logWsInfo(message: String) {
+            DebugLogger.i(TAG, message)
+            if (DebugLogger.isEnabled()) android.util.Log.i("ComfyChair", message)
+        }
+
+        private fun logWsWarn(message: String) {
+            DebugLogger.w(TAG, message)
+            if (DebugLogger.isEnabled()) android.util.Log.w("ComfyChair", message)
+        }
+
         /**
          * 图片解码的最大边长。
          *
@@ -305,16 +316,27 @@ class ComfyUIClient(
     @Volatile
     private var webSocketPingIntervalSec = 30L
 
-    private fun webSocketClient(): OkHttpClient = webSocketClientBase.newBuilder()
-        .pingInterval(webSocketPingIntervalSec, TimeUnit.SECONDS)
-        .build()
+    private fun webSocketClient(): OkHttpClient {
+        val intervalSec = webSocketPingIntervalSec
+        return webSocketClientBase.newBuilder()
+            .pingInterval(intervalSec, TimeUnit.SECONDS)
+            .build()
+            .also {
+                logWsInfo("[WS] ping interval = ${intervalSec}s (effective protocol ping for new socket)")
+            }
+    }
 
     /**
      * 更新协议层 ping 间隔（秒）。只影响**之后新建**的 WebSocket（在跑的连接保持旧节奏，
      * 降级断连 / 回前台重连时自然切到新值 —— 降级策略本来就伴随断连/保连切换）。
      */
     fun updateWebSocketPingInterval(intervalSec: Long) {
+        val previous = webSocketPingIntervalSec
         webSocketPingIntervalSec = intervalSec
+        logWsInfo(
+            "[WS] ping interval requested=${intervalSec}s (previous=${previous}s; " +
+                "existing socket unchanged, next socket effective)"
+        )
     }
 
     // Client for large transfers (uploads/downloads) - timeouts disabled, stall detection handles them
@@ -610,6 +632,7 @@ class ComfyUIClient(
         val wsUrl = "$wsProtocol://$hostname:$port/ws?clientId=$clientIdOverride"
 
         DebugLogger.i(TAG, "Opening WebSocket connection")
+        logWsInfo("[WS] open protocolPingRequested=${webSocketPingIntervalSec}s")
 
         // Create WebSocket request
         val request = Request.Builder()
@@ -1060,10 +1083,19 @@ class ComfyUIClient(
      *   server.py:1139 支持，另支持 offset）。v4.18.x 后台省流量：全量拉取每条都带完整
      *   prompt JSON，历史攒多后一次可达数十 MB —— 默认传 100 条（图库旧条目由本地索引
      *   兜底，合并语义只增不减，不会丢图）。传 null = 不带参数（旧行为，全量）。
+     * @param offset 服务端跳过的 history 条数。**实测语义（F:\ComfyUI\execution.py
+     *   :1423-1439）：从最旧一端开始计数**，且响应不带 total —— 客户端换算不出
+     *   "从最新端往更早"的 offset。图库"加载更早"因此走**放宽 max_items 窗口**
+     *   （GalleryRepository.olderWindowSize），本参数仅为网络层完整性保留；
+     *   传 null = 不带（服务端默认取最新端）。
      * @param callback Called with the result:
      *                 - historyJson: The full history JSON object with all prompts, or null on error
      */
-    fun fetchAllHistory(maxItems: Int? = null, callback: (historyJson: JSONObject?) -> Unit) {
+    fun fetchAllHistory(
+        maxItems: Int? = null,
+        offset: Int? = null,
+        callback: (historyJson: JSONObject?) -> Unit
+    ) {
         // P0：回调只投递一次。
         //
         // OkHttp 正常只会回调一次，但旧实现的 onResponse 里 `callback(historyJson)`
@@ -1079,7 +1111,7 @@ class ComfyUIClient(
             return
         }
 
-        val url = historyUrl(baseUrl, maxItems)
+        val url = historyUrl(baseUrl, maxItems, offset)
 
         val request = Request.Builder()
             .url(url)
@@ -1124,6 +1156,7 @@ class ComfyUIClient(
         callback: (historyJson: JSONObject?) -> Unit
     ) {
         val baseUrl = getBaseUrl() ?: run {
+            logWsWarn("[WS] fetchHistory failed promptId=${Obfuscator.promptId(promptId)} reason=no-protocol")
             callback(null)
             return
         }
@@ -1137,6 +1170,9 @@ class ComfyUIClient(
 
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: IOException) {
+                logWsWarn(
+                    "[WS] fetchHistory failed promptId=${Obfuscator.promptId(promptId)} reason=${e.message}"
+                )
                 callback(null)
             }
 
@@ -1147,9 +1183,17 @@ class ComfyUIClient(
                             val historyJson = JSONObject(response.body?.string() ?: "{}")
                             callback(historyJson)
                         } catch (e: Exception) {
+                            logWsWarn(
+                                "[WS] fetchHistory failed promptId=${Obfuscator.promptId(promptId)} " +
+                                    "reason=parse-error:${e.message}"
+                            )
                             callback(null)
                         }
                     } else {
+                        logWsWarn(
+                            "[WS] fetchHistory failed promptId=${Obfuscator.promptId(promptId)} " +
+                                "http=${response.code}"
+                        )
                         callback(null)
                     }
                 }
@@ -1166,6 +1210,7 @@ class ComfyUIClient(
      */
     fun fetchQueue(callback: (queueJson: JSONObject?) -> Unit) {
         val baseUrl = getBaseUrl() ?: run {
+            logWsWarn("[WS] fetchQueue failed reason=no-protocol")
             callback(null)
             return
         }
@@ -1179,6 +1224,7 @@ class ComfyUIClient(
 
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: IOException) {
+                logWsWarn("[WS] fetchQueue failed reason=${e.message}")
                 callback(null)
             }
 
@@ -1189,9 +1235,11 @@ class ComfyUIClient(
                             val queueJson = JSONObject(response.body?.string() ?: "{}")
                             callback(queueJson)
                         } catch (e: Exception) {
+                            logWsWarn("[WS] fetchQueue failed reason=parse-error:${e.message}")
                             callback(null)
                         }
                     } else {
+                        logWsWarn("[WS] fetchQueue failed http=${response.code}")
                         callback(null)
                     }
                 }
@@ -2128,9 +2176,16 @@ internal class SingleDeliveryGuard(
  * @param baseUrl 服务器根地址（如 `http://192.168.1.10:8188`）
  * @param maxItems 条数上限；null = 不带参数（全量，旧行为）。服务端实测支持
  *   `?max_items=N`（server.py:1139），这里保证只拼数字，非法值由服务端解析。
+ * @param offset 跳过的 history 条数；null = 不带（服务端默认最新端）。
+ *   **实测（execution.py:1423-1439）offset 从最旧一端计数**，与"省略 offset"
+ *   （取最新端）语义相反，所以 0 也是有效值、必须原样拼出，不得当"无 offset"吞掉。
  */
-internal fun historyUrl(baseUrl: String, maxItems: Int?): String {
-    if (maxItems == null) return "$baseUrl/history"
-    return "$baseUrl/history?max_items=$maxItems"
+internal fun historyUrl(baseUrl: String, maxItems: Int?, offset: Int? = null): String {
+    val params = buildList {
+        maxItems?.let { add("max_items=$it") }
+        offset?.let { add("offset=$it") }
+    }
+    if (params.isEmpty()) return "$baseUrl/history"
+    return "$baseUrl/history?" + params.joinToString("&")
 }
 

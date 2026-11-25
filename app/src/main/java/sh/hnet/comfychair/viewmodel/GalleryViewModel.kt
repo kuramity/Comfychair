@@ -80,7 +80,11 @@ data class GalleryUiState(
     val selectedItems: Set<String> = emptySet(), // Set of "${promptId}_${filename}" keys
     val isSelectionMode: Boolean = false,
     /** 当前列表是否已全部选中（决定「全选/取消全选」按钮的形态）。 */
-    val isAllSelected: Boolean = false
+    val isAllSelected: Boolean = false,
+    /** 服务端还有更早的历史可拉（图库底部显示「加载更早」按钮）。 */
+    val canLoadOlder: Boolean = false,
+    /** 「加载更早」请求在途（底部显示转圈，防连点重复发）。 */
+    val isLoadingOlder: Boolean = false
 )
 
 /**
@@ -144,21 +148,36 @@ class GalleryViewModel : ViewModel() {
     init {
         // Observe repository state and combine with local selection state
         viewModelScope.launch {
-            combine(
+            // 数据流 + 分页流 + 选择流 三组各自先合（combine 定长重载只到 5 个），
+            // 再汇成一份 GalleryUiState
+            val dataFlows = combine(
                 repository.galleryItems,
                 repository.isLoading,
-                repository.isManualRefreshing,
+                repository.isManualRefreshing
+            ) { items, isLoading, isManualRefreshing ->
+                Triple(items, isLoading, isManualRefreshing)
+            }
+            val pagingFlows = combine(
+                repository.canLoadOlder,
+                repository.isLoadingOlder
+            ) { canLoadOlder, isLoadingOlder -> canLoadOlder to isLoadingOlder }
+            val selectionFlows = combine(
                 _selectedItems,
                 _isSelectionMode
-            ) { items, isLoading, isManualRefreshing, selectedItems, isSelectionMode ->
+            ) { selectedItems, isSelectionMode -> selectedItems to isSelectionMode }
+            combine(dataFlows, pagingFlows, selectionFlows) { data, paging, selection ->
+                val (items, isLoading, isManualRefreshing) = data
                 GalleryUiState(
                     items = items,
                     isLoading = isLoading,
                     isRefreshing = isManualRefreshing, // Only show indicator for manual refresh
-                    selectedItems = selectedItems,
-                    isSelectionMode = isSelectionMode,
+                    selectedItems = selection.first,
+                    isSelectionMode = selection.second,
+                    canLoadOlder = paging.first,
+                    isLoadingOlder = paging.second,
                     // 逐项核对而不是比数量：刷新后列表可能变化，选中集合里可能残留已消失的键
-                    isAllSelected = items.isNotEmpty() && items.all { getItemKey(it) in selectedItems }
+                    isAllSelected = items.isNotEmpty() &&
+                        items.all { getItemKey(it) in selection.first }
                 )
             }.collect { state ->
                 _uiState.value = state
@@ -214,6 +233,16 @@ class GalleryViewModel : ViewModel() {
     fun refresh() {
         DebugLogger.d(TAG, "Background refresh")
         repository.refresh()
+    }
+
+    /**
+     * 「加载更早」：向服务端把 history 窗口放宽一档重拉，更早条目追加到列表尾部。
+     * 与下拉刷新/后台刷新是两条独立链路（仓库内部互斥），结果只影响 items/canLoadOlder/
+     * isLoadingOlder 三个状态。失败静默（按钮还在，可再点）。
+     */
+    fun loadOlder() {
+        DebugLogger.i(TAG, "Loading older gallery history")
+        repository.loadOlderItems()
     }
 
     fun deleteItem(item: GalleryItem) {
@@ -478,7 +507,14 @@ class GalleryViewModel : ViewModel() {
 
     // Selection mode functions
 
-    private fun getItemKey(item: GalleryItem): String = "${item.promptId}_${item.filename}"
+    /**
+     * 条目的选择键（`"${promptId}_${filename}"`）。
+     *
+     * N4-R 起从 private 放开到 internal（**仅可见性变化，语义没动**）：图库长按滑选要把
+     * 「layoutInfo 的 index」映射成选择键，UI 层不该再复制一份拼接口径 —— 一旦口径变了，
+     * 滑选会静默勾不上。
+     */
+    internal fun getItemKey(item: GalleryItem): String = "${item.promptId}_${item.filename}"
 
     fun toggleSelection(item: GalleryItem) {
         val key = getItemKey(item)
@@ -501,6 +537,17 @@ class GalleryViewModel : ViewModel() {
     fun clearSelection() {
         _selectedItems.value = emptySet()
         _isSelectionMode.value = false
+    }
+
+    /**
+     * 滑选（线性连续区间）：把选中集合**整体设置**为 [keys]，不是逐个 toggle。
+     *
+     * 空集时同时退出选择模式 —— 与 [toggleSelection] 取消最后一项的行为一致，
+     * 否则把区间拖回原点会留下一个空的选择模式界面。
+     */
+    fun applyDragSelection(keys: Set<String>) {
+        _selectedItems.value = keys
+        _isSelectionMode.value = keys.isNotEmpty()
     }
 
     fun enterSelectionMode() {

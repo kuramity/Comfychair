@@ -15,6 +15,15 @@ import sh.hnet.comfychair.taglibrary.search.AliasParser
  *
  * 性能约束：精确/前缀匹配走 tag 主键索引；子串匹配（`%关键词%`）没有可用索引，
  * 只作为内存索引未就绪时的兜底，调用方必须限制关键词长度与返回条数。
+ *
+ * 线程安全约束（方案 A）：本类的构造函数捕获了 `SQLiteDatabase` 句柄，而
+ * [TagDatabase.close] 可能随时被上层请求。因此**每一条** `rawQuery` 都必须在
+ * [guardedQuery] 里执行 —— 进入前加引用计数、退出时在 finally 里减。这样
+ * close 与查询之间有了互斥语义：close 落在查询中间时只会延迟到最后一个查询离开，
+ * 落在查询之前则被门挡住，本类返回空结果而不是抛
+ * `IllegalStateException: attempt to re-open an already-closed object`。
+ * 新增查询点时忘了套 [guardedQuery] 就等于把这个互斥丢掉（单测
+ * `TagCloseGuardWiringTest` 会钉住「不存在裸 rawQuery」）。
  */
 class TagDao(private val db: SQLiteDatabase) {
 
@@ -26,6 +35,21 @@ class TagDao(private val db: SQLiteDatabase) {
         const val HOT_TAG_THRESHOLD = 100
 
         private const val COLUMNS = "tag, category, count, alias"
+    }
+
+    /**
+     * 在引用计数保护下执行一次数据库访问（方案 A 的唯一入口）。
+     *
+     * @param onClosed 关闭已请求 / 句柄已关闭时返回的兜底值（正常路径用不到）
+     * @param query    真正的查询，参数是同一个 [db] 句柄
+     */
+    private inline fun <R> guardedQuery(onClosed: () -> R, query: (SQLiteDatabase) -> R): R {
+        if (!TagDatabase.acquire()) return onClosed()
+        return try {
+            query(db)
+        } finally {
+            TagDatabase.release()
+        }
     }
 
     /** LIKE 通配符转义（配合 SQL 中的 ESCAPE '\' 使用）。 */
@@ -50,8 +74,10 @@ class TagDao(private val db: SQLiteDatabase) {
      */
     fun searchByExactName(keyword: String, limit: Int = DEFAULT_LIMIT): List<Tag> {
         val sql = "SELECT $COLUMNS FROM tags WHERE tag = ? ORDER BY count DESC LIMIT ?"
-        return db.rawQuery(sql, arrayOf(keyword, limit.toString())).use { c ->
-            c.toTagList()
+        return guardedQuery(onClosed = { emptyList() }) { database ->
+            database.rawQuery(sql, arrayOf(keyword, limit.toString())).use { c ->
+                c.toTagList()
+            }
         }
     }
 
@@ -70,10 +96,12 @@ class TagDao(private val db: SQLiteDatabase) {
         if (prefix.isEmpty()) return emptyList()
         val sql = "SELECT $COLUMNS FROM tags WHERE tag >= ? AND tag < ? " +
                 "ORDER BY count DESC LIMIT ?"
-        return db.rawQuery(
-            sql,
-            arrayOf(prefix, prefixUpperBound(prefix), limit.toString())
-        ).use { c -> c.toTagList() }
+        return guardedQuery(onClosed = { emptyList() }) { database ->
+            database.rawQuery(
+                sql,
+                arrayOf(prefix, prefixUpperBound(prefix), limit.toString())
+            ).use { c -> c.toTagList() }
+        }
     }
 
     /**
@@ -92,8 +120,10 @@ class TagDao(private val db: SQLiteDatabase) {
     fun searchByNameContains(keyword: String, limit: Int = DEFAULT_LIMIT): List<Tag> {
         val sql = "SELECT $COLUMNS FROM tags WHERE tag LIKE ? ESCAPE '\\' " +
                 "ORDER BY count DESC LIMIT ?"
-        return db.rawQuery(sql, arrayOf("%" + escapeLike(keyword) + "%", limit.toString())).use { c ->
-            c.toTagList()
+        return guardedQuery(onClosed = { emptyList() }) { database ->
+            database.rawQuery(sql, arrayOf("%" + escapeLike(keyword) + "%", limit.toString())).use { c ->
+                c.toTagList()
+            }
         }
     }
 
@@ -103,8 +133,10 @@ class TagDao(private val db: SQLiteDatabase) {
     fun searchByAliasContains(keyword: String, limit: Int = DEFAULT_LIMIT): List<Tag> {
         val sql = "SELECT $COLUMNS FROM tags WHERE alias LIKE ? ESCAPE '\\' " +
                 "ORDER BY count DESC LIMIT ?"
-        return db.rawQuery(sql, arrayOf("%" + escapeLike(keyword) + "%", limit.toString())).use { c ->
-            c.toTagList()
+        return guardedQuery(onClosed = { emptyList() }) { database ->
+            database.rawQuery(sql, arrayOf("%" + escapeLike(keyword) + "%", limit.toString())).use { c ->
+                c.toTagList()
+            }
         }
     }
 
@@ -114,26 +146,33 @@ class TagDao(private val db: SQLiteDatabase) {
      * @param names 标签名列表（去重后长度需 > 0）
      */
     fun getByNames(names: List<String>): List<Tag> {
+        // 空列表根本不打库，也就不需要占用引用计数
         if (names.isEmpty()) return emptyList()
         val placeholders = names.joinToString(",") { "?" }
         val sql = "SELECT $COLUMNS FROM tags WHERE tag IN ($placeholders)"
-        return db.rawQuery(sql, names.toTypedArray()).use { c -> c.toTagList() }
+        return guardedQuery(onClosed = { emptyList() }) { database ->
+            database.rawQuery(sql, names.toTypedArray()).use { c -> c.toTagList() }
+        }
     }
 
     /**
      * 按分类浏览高频标签（供"未输入关键词"时的默认列表使用）。
      */
     fun loadHotTags(category: TagCategory? = null, limit: Int = DEFAULT_LIMIT): List<Tag> {
-        return if (category == null) {
-            val sql = "SELECT $COLUMNS FROM tags WHERE count > ? ORDER BY count DESC LIMIT ?"
-            db.rawQuery(sql, arrayOf(HOT_TAG_THRESHOLD.toString(), limit.toString())).use { c ->
-                c.toTagList()
-            }
-        } else {
-            val sql = "SELECT $COLUMNS FROM tags WHERE category = ? " +
-                    "ORDER BY count DESC LIMIT ?"
-            db.rawQuery(sql, arrayOf(category.code.toString(), limit.toString())).use { c ->
-                c.toTagList()
+        // 一次引用覆盖整个方法：两个分支各自只跑一条 rawQuery，
+        // 若在分支内部 acquire，分支选择逻辑就得复制两遍，更容易漏配对。
+        return guardedQuery(onClosed = { emptyList() }) { database ->
+            if (category == null) {
+                val sql = "SELECT $COLUMNS FROM tags WHERE count > ? ORDER BY count DESC LIMIT ?"
+                database.rawQuery(sql, arrayOf(HOT_TAG_THRESHOLD.toString(), limit.toString())).use { c ->
+                    c.toTagList()
+                }
+            } else {
+                val sql = "SELECT $COLUMNS FROM tags WHERE category = ? " +
+                        "ORDER BY count DESC LIMIT ?"
+                database.rawQuery(sql, arrayOf(category.code.toString(), limit.toString())).use { c ->
+                    c.toTagList()
+                }
             }
         }
     }
@@ -143,7 +182,9 @@ class TagDao(private val db: SQLiteDatabase) {
      */
     fun loadTagsForMemoryIndex(): List<Tag> {
         val sql = "SELECT $COLUMNS FROM tags WHERE count > ? ORDER BY count DESC"
-        return db.rawQuery(sql, arrayOf(HOT_TAG_THRESHOLD.toString())).use { c -> c.toTagList() }
+        return guardedQuery(onClosed = { emptyList() }) { database ->
+            database.rawQuery(sql, arrayOf(HOT_TAG_THRESHOLD.toString())).use { c -> c.toTagList() }
+        }
     }
 
     /**
@@ -159,10 +200,12 @@ class TagDao(private val db: SQLiteDatabase) {
      */
     fun loadAliasRows(): List<Pair<String, String>> {
         val sql = "SELECT tag, alias FROM tags WHERE alias != '' ORDER BY count DESC"
-        return db.rawQuery(sql, null).use { c ->
-            val out = ArrayList<Pair<String, String>>(c.count)
-            while (c.moveToNext()) out.add(c.getString(0) to c.getString(1))
-            out
+        return guardedQuery(onClosed = { emptyList<Pair<String, String>>() }) { database ->
+            database.rawQuery(sql, null).use { c ->
+                val out = ArrayList<Pair<String, String>>(c.count)
+                while (c.moveToNext()) out.add(c.getString(0) to c.getString(1))
+                out
+            }
         }
     }
 

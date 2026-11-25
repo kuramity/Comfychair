@@ -55,6 +55,15 @@ object DownloadPolicy {
         /** 磁盘空间不足（不可靠重试解决） */
         DISK_FULL,
 
+        /**
+         * 存储不可用（派工单第 3 层）：update/ 目录解析失败或 1KB 写探针失败。
+         *
+         * 与 [DISK_FULL] 的区别必须保留：DISK_FULL 是「测到了真实数值且不够」，
+         * STORAGE_UNAVAILABLE 是「这条路径本身不能存东西」——重试/清空间都解决不了，
+         * 不可重试，横幅也不得展示伪造的剩余字节数。
+         */
+        STORAGE_UNAVAILABLE,
+
         /** 重定向目标不在更新域白名单内（P0-7，不可恢复：重试解决不了策略问题） */
         INSECURE_REDIRECT,
 
@@ -65,12 +74,20 @@ object DownloadPolicy {
     /** HTTP 状态码异常（响应非 2xx 时抛出，替代原来只有字符串的裸 IOException） */
     class DownloadHttpException(val code: Int) : IOException("服务器返回 HTTP $code")
 
-    /** 磁盘空间不足（带剩余/需要字节数，横幅文案用） */
+    /** 磁盘空间不足（带剩余/需要字节数，横幅文案用；只在空间预检判 INSUFFICIENT 时抛，必带真实数值） */
     class DiskFullException(val usableBytes: Long, val neededBytes: Long) :
         IOException(
             "存储空间不足（剩余 ${usableBytes / (1024 * 1024)}MB，" +
                 "需要约 ${neededBytes / (1024 * 1024)}MB）"
         )
+
+    /**
+     * 存储不可用（派工单第 3 层）：目录解析失败（外部+内部都建不出来）或写探针失败。
+     * [reason] 面向日志（带路径等诊断信息）；面向用户的横幅走
+     * `R.string.update_error_storage_unavailable`，不展示任何伪造的剩余字节数。
+     */
+    class StorageUnavailableException(val reason: String) :
+        IOException("存储不可用：$reason")
 
     /** 进度级停滞（看门狗主动 cancel 连接后抛出，按可恢复异常处理续传重试） */
     class StalledTransferException(val lastByteAtMs: Long, val detectedAtMs: Long) :
@@ -95,6 +112,7 @@ object DownloadPolicy {
         is UnknownHostException -> FailureKind.CONNECT_FAILED
         is SSLException -> FailureKind.CONNECT_FAILED
         is DiskFullException -> FailureKind.DISK_FULL
+        is StorageUnavailableException -> FailureKind.STORAGE_UNAVAILABLE
         else -> FailureKind.UNKNOWN
     }
 
@@ -109,6 +127,7 @@ object DownloadPolicy {
         FailureKind.SERVER_ERROR -> true
         FailureKind.HTTP_REJECTED,
         FailureKind.DISK_FULL,
+        FailureKind.STORAGE_UNAVAILABLE,
         FailureKind.INSECURE_REDIRECT -> false
         FailureKind.UNKNOWN -> e is IOException
     }

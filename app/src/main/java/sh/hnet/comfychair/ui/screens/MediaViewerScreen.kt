@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.util.Log
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.DecayAnimationSpec
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
@@ -15,6 +16,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -92,6 +94,8 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import sh.hnet.comfychair.BuildConfig
 import sh.hnet.comfychair.MediaViewerActivity
@@ -102,6 +106,7 @@ import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.ui.components.ImageViewer
+import sh.hnet.comfychair.ui.components.MaxDistanceDecaySpec
 import sh.hnet.comfychair.ui.components.MetadataBottomSheet
 import sh.hnet.comfychair.ui.components.VideoPlayer
 import sh.hnet.comfychair.ui.components.ViewerExitCleanup
@@ -113,6 +118,7 @@ import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.components.ViewerSideBySide
 import sh.hnet.comfychair.ui.components.rememberLazyBitmap
 import sh.hnet.comfychair.ui.components.VideoScaleMode
+import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.viewerInitialPage
 import sh.hnet.comfychair.viewmodel.MediaViewerEvent
 import sh.hnet.comfychair.viewmodel.MediaViewerViewModel
@@ -153,6 +159,22 @@ private fun copyUrlToClipboard(context: android.content.Context, url: String): B
  */
 private fun viewerItemKey(promptId: String, filename: String): String =
     GalleryMetadataCache.itemIdentityKey(promptId, filename)
+
+/**
+ * GESTURE_PROBE 翻页手势诊断日志的 TAG（临时埋点，真机采集甩速数据用）。
+ * 走 DebugLogger 内存缓冲（设置里可导出），消息统一带 GESTURE_PROBE 前缀方便 grep。
+ */
+private const val GESTURE_PROBE_TAG = "MediaViewer"
+
+/**
+ * 「静止残留归零」在动手前先等的宽限时长（ms）。
+ *
+ * 松手到 fling 真正起步之间有几毫秒空窗，旧实现在这空窗里就把位移抹平了
+ * （2026-11-26 真机：normalize 比 calculateTargetPage 早 2ms，frac=0.14 被清）。
+ * 300ms 足够让正常翻页的 fling 把 isScrollInProgress 置 true 从而取消本次归零，
+ * 又不会让真正卡住的残留值停留过久（用户感知不到）。
+ */
+private const val NORMALIZE_GRACE_MS = 300L
 
 /**
  * 由缓存侧标记推断失败档位（H6，与 MediaViewerViewModel.inferLoadFailure 同口径）。
@@ -226,8 +248,10 @@ fun MediaViewerScreen(
     // finish() 取的窗口转场快照因此是一幅"画歪了的图"，淡出时就像一层贴歪的残影。
     // 提到最外层后，三条路径统一调 exitViewer(reason)（任务书实施指令 1）。
     //
-    // remember 仍以条目列表指纹为 key：删图会让 pager 整段重建，档位与越界状态
+    // remember 仍以条目列表指纹为 key：删图会让 pager 整段重建，**越界位移与手势相位**
     // 照旧回到中性值（与提升前的行为一致）。
+    // N1（2026-11-24）：**档位进度与它的动画作业不在此列** —— 它们改成会话级，
+    // 列表变化（删除 / 撤销）不再把它们打回 0，否则队列态删一张就掉回单体全屏。
     // 指纹字符串 remember 住：items 引用不变的重组不再每次 map + joinToString
     val itemsKey = remember(uiState.items) {
         uiState.items.map { viewerItemKey(it.promptId, it.filename) }
@@ -235,12 +259,38 @@ fun MediaViewerScreen(
     }
 
     // 并排预览三级手势的进度状态（语义见 ViewerSideBySide：0 = 全屏；1 = 并排；1.5 = 临时缩小档）
-    var sideProgress by remember(itemsKey) { mutableFloatStateOf(0f) }
+    //
+    // N1（执行书-N1N2N3 §N1）：这三个状态改为**会话级**（remember 不带 key）。
+    // 根因：原先 `remember(itemsKey)` → 删图让 itemsKey 变 → 整个状态被重建为 0 →
+    // 队列（并排）态掉回单体全屏。补位索引本身不用改：ViewModel 删后给的
+    // `actualIndexToRemove.coerceIn(0, size-1)` 已经是「右优先、末位左补」
+    // （MediaViewerViewModel.kt:906-908），pager 重建后新页码就是那张图，
+    // 保持档位 1 时它自然落在屏幕中间那一格。
+    // 会话边界 = 一次组合：查看器每次打开都是新的 Activity 组合，天然从 0 起步；
+    // 同一次查看器内的删除/撤销只改列表，不再重置档位。
+    var sideProgress by remember { mutableFloatStateOf(0f) }
     // 本次捏合的起始进度：ImageViewer 只上报"自手势起点累计的缩放倍率"，
     // 换算成绝对进度必须知道起点（全屏 0 / 并排 1 / 吸附动画被打断的中间值）
-    var gestureBaseProgress by remember(itemsKey) { mutableFloatStateOf(0f) }
-    var progressJob by remember(itemsKey) { mutableStateOf<Job?>(null) }
+    var gestureBaseProgress by remember { mutableFloatStateOf(0f) }
+    var progressJob by remember { mutableStateOf<Job?>(null) }
     var pagerSize by remember(itemsKey) { mutableStateOf(IntSize.Zero) }
+
+    // 列表变化时的档位归位（N1 实施指令 2 / 3）：
+    // ① 取消在途档位动画（它的起点/终点可能已不属于新列表）；
+    // ② 档位吸附到合法档（0 或 1）：按变化前的档位四舍五入，1.5 的临时缩小档也归 1；
+    // ③ 只剩 1 张（或更少）时队列无意义 → 明确落回单体全屏。
+    // 用**瞬时赋值**而不是 animate：删除会让 pager 按 itemsKey 整段重建
+    // （见下方 key(itemsKey)），新一帧本来就是全新布局，再叠一段档位动画反而
+    // 会出现"先抽一下再铺开"。正常路径（删除前停稳在 1）此处的赋值等于空操作。
+    LaunchedEffect(itemsKey) {
+        progressJob?.cancel()
+        progressJob = null
+        sideProgress = if (uiState.items.size <= 1) {
+            0f
+        } else {
+            ViewerSideBySide.settleProgress(sideProgress)
+        }
+    }
 
     // G1（v4.16.11）：横向越界（rubber-band）位移，px、带符号。
     // 全屏与并排（队列）两态共用同一套状态与同一段回弹动画——
@@ -406,6 +456,22 @@ fun MediaViewerScreen(
                             pageCount = { uiState.items.size }
                         )
 
+                        // 留手感（v4.22.3）：手势期间**手指实际拖出的横向位移**（px，带符号），供下方
+                        // ViewerPagerSnapDistance 的"快甩翻一页"分支使用（除以此处页宽 = 页数）。
+                        //
+                        // 为什么不再用 pagerState.currentPageOffsetFraction（v4.20.3 旧做法，已证伪）：
+                        // DragInteraction.Stop 的投递是**异步**的（interactionSource 背后是
+                        // Channel/SharedFlow）。收集器拿到 Stop 时，pager 早已跑完 onDragStopped、
+                        // fling 已启动、偏移被框架吸收为 0 —— 读到的一律是 0.0。
+                        // 真机铁证（iQOO，v4.22.2）：连续 8 次手势 leavePages 全部 0.0，
+                        // 于是 snapTargetPage 第 0 步的「abs(leave) >= 0.03」永不成立，
+                        // 只能落到第 1 步的「过半才翻」，用户体感就是「没滑过一半就弹回原图」。
+                        // 偶尔读到 0.1787 只是协程调度恰好早一帧，属于时好时坏，不能依赖。
+                        //
+                        // 新来源：HorizontalPager 上那个 pointerInput 手势循环（见下方），
+                        // 逐帧累加 position - previousPosition，与 pager 消费、与协程调度都无关。
+                        val gestureDragPx = remember(pagerState) { mutableFloatStateOf(0f) }
+
                         // ============================================================
                         // 下拉透出图库 + 位置飞回（B-23b 第三批，E1~E5）
                         // ============================================================
@@ -540,6 +606,37 @@ fun MediaViewerScreen(
                                 }
                         }
 
+                        // GESTURE_PROBE（临时诊断，真机甩速采集）：会话起点 + 本会话第一次
+                        // 翻页手势标记。放在 key(itemsKey) 内的 LaunchedEffect(pagerState)：
+                        // 进入查看器、删图整段重建各跑一次，恰好对应一个"子会话"。
+                        // DragInteraction.Start 只由用户拖动发出（程序化 scrollToPage /
+                        // animateScrollToPage 不发），所以 first_swipe_done 精确等于
+                        // "第一次真实翻页拖动开始"；后续 calculateTargetPage 的日志
+                        // 按 session_start 分段就能区分第一次与后续手势。
+                        // v4.22.3：本收集器现在**只负责**这条诊断日志。
+                        // 位移证据改由 pointerInput 自己累计（gestureDragPx）——旧做法
+                        // （在 Stop 分支读 currentPageOffsetFraction）被真机证伪：
+                        // Stop 投递是异步的，收集器拿到时框架已把偏移吸收为 0，8 次手势全读到 0.0。
+                        // 本收集器仍只开一条：两条 interactions.collect 会在同一 Channel 上重复消费。
+                        LaunchedEffect(pagerState) {
+                            DebugLogger.d(
+                                GESTURE_PROBE_TAG,
+                                "GESTURE_PROBE session_start: " +
+                                    "promptId=${uiState.currentItem?.promptId} " +
+                                    "itemCount=${uiState.items.size} initialPage=$initialPage"
+                            )
+                            var firstSwipeLogged = false
+                            pagerState.interactionSource.interactions.collect { interaction ->
+                                // 这里只留"第一次真实拖动"这条诊断。
+                                // 位移证据已改由 pointerInput 自己累计（见 gestureDragPx 注释）——
+                                // 不要再从 Stop 分支读 currentPageOffsetFraction，那里读到的是 0。
+                                if (interaction is DragInteraction.Start && !firstSwipeLogged) {
+                                    firstSwipeLogged = true
+                                    DebugLogger.d(GESTURE_PROBE_TAG, "GESTURE_PROBE first_swipe_done")
+                                }
+                            }
+                        }
+
                         // ============================================================
                         // 翻页位移状态机 · 静止残留归零（N5 治本；G3 规则 2 的唯一例外）
                         // ============================================================
@@ -550,6 +647,14 @@ fun MediaViewerScreen(
                         // 拖动未释放时它会挂在 pager 的 mutator 队列上，恢复时就是一次位移跳变）。
                         // 渲染侧不依赖这次归零（displayPageFraction 在静止时直接按 0 显示），
                         // 它是治本兜底：把状态修好，下一次拖动才始终从整页起步。
+                        // v4.22.4 修正（2026-11-26 真机实证）：**必须给 fling 留启动窗口**。
+                        // 旧实现只要 snapshotFlow 看到「没在滚 + 没按着 + 有残留」就立刻归零，
+                        // 而松手到 fling 真正起步之间存在几毫秒的空窗（真机日志：normalize 在
+                        // calc 之前 2ms 就跑了，frac=0.14 被瞬时抹平，随后 calculateTargetPage
+                        // 才算出正确的下一页 —— 于是"判定对了、页面不动"）。
+                        // 现在改成 collectLatest + 300ms 延迟：这 300ms 内只要状态再次变化
+                        // （正常翻页时 fling 会立刻把 isScrollInProgress 置 true），本次归零就被取消。
+                        // 只有真的静止了 300ms 还带着残留（N5 那种双指取消）才归零。
                         LaunchedEffect(pagerState) {
                             snapshotFlow {
                                 Triple(
@@ -559,11 +664,19 @@ fun MediaViewerScreen(
                                     pagerGestureActive || swipeDeleteActiveState.value,
                                     pagerState.currentPageOffsetFraction
                                 )
-                            }.collect { (scrolling, gestureActive, fraction) ->
+                            }.collectLatest { (scrolling, gestureActive, fraction) ->
+                                // 明显在动/按着：直接放弃，不必等
+                                if (scrolling || gestureActive) return@collectLatest
+                                // 宽限期：正常翻页的 fling 会在这里面把 scrolling 翻成 true
+                                delay(NORMALIZE_GRACE_MS)
+                                // 宽限期后重新读实时状态，不能用 300ms 前的快照
+                                val nowScrolling = pagerState.isScrollInProgress
+                                val nowGesture = pagerGestureActive || swipeDeleteActiveState.value
+                                val nowFraction = pagerState.currentPageOffsetFraction
                                 if (ViewerPageMotion.mayNormalizeStalePager(
-                                        gestureActive = gestureActive,
-                                        scrollInProgress = scrolling,
-                                        pagerFraction = fraction
+                                        gestureActive = nowGesture,
+                                        scrollInProgress = nowScrolling,
+                                        pagerFraction = nowFraction
                                     )
                                 ) {
                                     pagerState.scrollToPage(pagerState.currentPage)
@@ -866,13 +979,116 @@ fun MediaViewerScreen(
                                 pageCountProvider = { pagerState.pageCount },
                                 allowInertia = {
                                     pagerInertiaAllowed(threeLevelEnabled, sideBySideActive)
+                                },
+                                // 留手感（v4.22.3）：位移来源是 pointerInput 自己累计的手指横向总位移
+                                // （gestureDragPx，px），除以页宽换算成"页"。
+                                // 不用 pagerState.currentPageOffsetFraction：框架在
+                                // calculateTargetPage 之前已把偏移吸收为 0；改用
+                                // DragInteraction.Stop 冻结也不行（投递异步，见 gestureDragPx 注释）。
+                                // 页宽未测得时返回 0：快甩分支不触发，退回"过半才翻"，不会误翻。
+                                // ⚠️ 符号必须取反（2026-11-26 真机实证）：
+                                // gestureDragPx 是**手指**位移（左滑为负），而 snapTargetPage
+                                // 的 gestureLeavePages 要的是**翻页进度**——与 pager 的 velocity
+                                // 同轴（正 = 下一页方向）。左滑时 pager 的 velocity 是正的
+                                // （真机日志 v=3882.95）、手指位移是负的（-200px → -0.185），
+                                // 不取反的话第 0 步的 sign 一致性条件永不成立，
+                                // 快甩分支等于没接上，只剩「过半才翻」。
+                                offsetFractionProvider = {
+                                    val width = pagerSize.width
+                                    if (width > 0) -gestureDragPx.floatValue / width else 0f
                                 }
                             )
                         }
+                        // ============================================================
+                        // P1（2026-11-24）：衰减距离与吸附目标必须**一起**钳制
+                        // ============================================================
+                        // 现状（执行书-P1 §5 的根因）：
+                        // 框架松手后分两段 —— 先用 decayAnimationSpec 按真实甩速把位移
+                        // 衰减出去（foundation 1.10 的 `SnapFlingBehavior.fling`：
+                        // `decayOffset = decayAnimationSpec.calculateTargetValue(v, 0f)`
+                        // → `snapLayoutInfoProvider.calculateApproachOffset(v, decayOffset)`），
+                        // 再用 snapAnimationSpec 吸附到 `PagerSnapDistance` 收窄后的目标。
+                        // 本项目只在**第二步**钳了（全屏态目标恒为 start±1），第一步仍是
+                        // 框架默认的 spline 衰减，8000-12000px/s 对应 3-9 页。
+                        // 所以这里把衰减距离也钳住：全屏态最多一页，队列（并排）态原样放开。
+                        //
+                        // 取值必须在**松手那一刻**（所以 maxDistance 是 lambda，不是常量快照）：
+                        // 模式会随捏合实时变化，构造函数里读到的值可能已经过期。
+                        //
+                        // rememberSplineBasedDecay 必须在 Composable 作用域取（它内部读
+                        // LocalDensity）；类本身是纯包装，不碰 Compose 状态。
+                        val splineBasedDecay: DecayAnimationSpec<Float> = rememberSplineBasedDecay()
+                        val maxDistanceDecaySpec = remember(splineBasedDecay) {
+                            MaxDistanceDecaySpec(
+                                delegate = splineBasedDecay,
+                                maxDistance = {
+                                    if (pagerInertiaAllowed(threeLevelEnabled, sideBySideActive)) {
+                                        // 队列态：跨多张惯性原样保留，不钳
+                                        Float.POSITIVE_INFINITY
+                                    } else {
+                                        // 全屏单图：单页步距（pitch = 页宽 + 页间距；
+                                        // 本 pager 未传 pageSpacing，故页间距为 0）
+                                        pagerSize.width.toFloat()
+                                    }
+                                }
+                            )
+                        }
+                        // ============================================================
+                        // B1（2026-11-25）：snap 段回退到 PagerDefaults 的默认吸附
+                        // ============================================================
+                        // 用户反馈「换成弹簧后依然回弹、很僵硬」，所以本轮**只动这一个变量**：
+                        // 删掉 snapAnimationSpec 实参，让框架用它自己的默认值
+                        // （Spring.StiffnessMediumLow = 400f）。
+                        // 若单独改这一项手感就恢复正常，即证明根因是「250 比默认慢、加上连续滑动
+                        // 间隔约 500ms，吸附还没收敛就被下一次按下打断」；若无效，再按执行书
+                        // 的 B2~B5 逐层剥离（本轮一律不动）。
+                        // 回退点：把 snapAnimationSpec 实参加回去即可，写法见下方历史记录。
+                        //
+                        // —— 以下 P1-B2 段落为历史记录，保留备查 ——
+                        // ============================================================
+                        // P1-B2（2026-11-24）：snap 段 Tween → **弹簧**（小位移柔、大位移有惯性）
+                        // ============================================================
+                        // 为什么退掉 Tween（真机探针结论，PM 复核 118 条日志）：
+                        // · Tween 是**固定时长 + 固定曲线**：零速起步、前 30% 时间几乎不动。
+                        //   小位移慢松手（拖 200–300px、松手速度≈0 → 走"回原页"分支）时，
+                        //   观感就是"卡一瞬再猛弹"——用户说的"硬"。
+                        //   （探针样本：totalDx=-272 leave=0.0000 v=-25；totalDx=-299 leave=0.0000 v=34）
+                        // · 弹簧的加速度 ∝ 位移：位移小 → 加速度小 → 小位移天然柔；
+                        //   位移大 → 时长自然变长、带惯性 → 大位移仍然跟手。
+                        //   这正是"固定时长"做不到的，也是本轮回退的原因。
+                        // 参数：
+                        // · dampingRatio = Spring.DampingRatioNoBouncy（= 1.0，临界阻尼）
+                        //   → 不过冲，硬要求"无二次回跳"由它保证。
+                        // · stiffness = 250f（框架默认 StiffnessMediumLow = 400f）→ 比默认柔一档。
+                        // · visibilityThreshold：标定文档建议的 `PagerState.SnapPositionThreshold`
+                        //   在 foundation 1.10 **不存在**（javap 实查：PagerState 只有
+                        //   `getPositionThresholdFraction$foundation()`；PagerStateKt 只有
+                        //   `getDefaultPositionThreshold()` —— 两者都是"选页"用的 0.5 页分数，
+                        //   不是动画收敛阈值）。为不引入自造常量，按框架自身的默认**省略**该参数
+                        //   （`PagerDefaults.flingBehavior` 自带的默认 snap spec 同样不传）。
+                        // 队列态：snap 只覆盖最后一页（见上一段 1.10 字节码结论），
+                        // 弹簧不会让队列态"一甩飞过去"——多页距离仍由 decay 承担。
+                        // remember 的选择：SpringSpec 是**纯数据**（无状态，每次动画自建
+                        // simulation），remember 与否行为完全等价；保留 remember 只是避免
+                        // 每次重组新建对象（本文件所有 spec 都是这个约定）。
                         val pagerFlingBehavior = PagerDefaults.flingBehavior(
                             state = pagerState,
                             pagerSnapDistance = pagerSnapDistance,
-                            decayAnimationSpec = rememberSplineBasedDecay()
+                            decayAnimationSpec = maxDistanceDecaySpec,
+                            // v4.22.4（2026-11-26 真机实证）：这个参数在 foundation 1.10 里是
+                            // **页宽的比例**（契约 0..1），不是 dp/px —— 传 `1.dp.toPx()`
+                            // 会直接抛 IllegalArgumentException（实测 3.0 越界崩溃）。
+                            // 默认值对应 56dp ≈ 5.2% 页宽，会把「小幅滑动」直接判成
+                            // "已经停在目标附近"当场不滚：真机拖 60px（5.5% 页宽）时
+                            // calculateTargetPage 已经返回下一页，页面却纹丝不动。
+                            // 收到 0.1%（1080 屏上约 1px）—— 只要目标页与当前页不同，
+                            // 就一定会把那段位移走完。
+                            snapPositionalThreshold = 0.001f
+                            // snapAnimationSpec：B1（2026-11-25）已回退，改用 PagerDefaults
+                            // 自带的默认吸附（框架默认 StiffnessMediumLow = 400f）。
+                            // 见上方注释块开头的「B1 回退」说明。
+                            // 回退点：加回
+                            // snapAnimationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 250f)
                         )
 
                         HorizontalPager(
@@ -895,9 +1111,25 @@ fun MediaViewerScreen(
                                     awaitEachGesture {
                                         awaitFirstDown(requireUnconsumed = false)
                                         pagerGestureActive = true
+                                        // v4.22.3：新手势从零起算，上一次的残留不带进来
+                                        gestureDragPx.floatValue = 0f
                                         try {
                                             do {
                                                 val event = awaitPointerEvent()
+                                                // 手指横向累计（px，带符号）。用
+                                                // position - previousPosition 而不是 positionChange()：
+                                                // 前者是原始位移，即使下游（pager / 越界机制）
+                                                // 已经 consume 过也照样读得到，正是"快甩翻一页"
+                                                // 需要的那个量。
+                                                // 只在单指时累计：双指是捏合（改档位/缩放），
+                                                // 不代表翻页意图。
+                                                if (event.changes.size == 1) {
+                                                    val change = event.changes.first()
+                                                    val dx = change.position.x - change.previousPosition.x
+                                                    if (dx.isFinite()) {
+                                                        gestureDragPx.floatValue += dx
+                                                    }
+                                                }
                                             } while (event.changes.any { it.pressed })
                                         } finally {
                                             // 松手与手势取消（被双指接管）都走这里：
@@ -1723,10 +1955,34 @@ private fun MediaLoadFailureBar(
  *
  * 本类只负责"给什么速度就按什么口径吸附"，**判断当前该不该有惯性不在本类里**：
  * 判据是 [pagerInertiaAllowed]（当前是否真的处于队列态），由屏幕的接线传进来。
+ *
+ * v4.20.1：新增 [offsetFractionProvider]（同样 lambda 注入）。"快甩翻一页"
+ * （ViewerPageMotion 的 v4.20.1 分支）需要两个框架归零拿不到的量：**真实甩速**
+ * 与**手指已拖出的位移**（currentPageOffsetFraction）。前者作为独立参数传给
+ * 纯函数（归零只用于跨页上限，见下）。
+ * v4.20.3 更正：v4.20.1 曾假设"fling 启动瞬间读 currentPageOffsetFraction
+ * 还是松手时的值"——真机日志（v4.20.2，iQOO）证伪：同一手势拖出 312px
+ * （0.29 页），calculateTargetPage 里读到 0.0（框架在回调之前已把偏移吸收为 0）。
+ * v4.20.3 的补救（改喂 DragInteraction.Stop 时冻结的值）**同样失败**：
+ * Stop 事件的投递是异步的，收集器拿到时 fling 已起步、偏移已被吸收为 0，
+ * 真机日志（v4.22.2，iQOO）连续 8 次全部读到 0.0，于是"快甩翻一页"分支永不触发，
+ * 用户体感=「没滑过一半就弹回原图」。
+ * **v4.22.3 定稿**：位移改由 MediaViewerScreen 自己的 pointerInput 手势循环
+ * 逐帧累计手指横向位移（gestureDragPx），与 pager 消费和协程调度都无关，
+ * 再除以页宽换算成"页"。本类的判定逻辑与常量一律不动。
+ * 两个模式同口径传入——全屏单图不放大跨页上限（新分支最多翻一张），
+ * 队列态的大幅甩动由"甩幅在相邻页内"条件挡回原通道，多张惯性原样保留。
+ *
+ * v4.20.2：全屏态（`velocityPxPerSec` 归零）**不再要求"衰减 + 位移 ≤ 1 页"**。
+ * 实测（iQOO Neo10 Pro+，2026-11-23）3990 / 4085px/s 的快速小幅滑衰减已达
+ * 0.98~1.02 页，加上位移恰好越过 1 页线，旧条件把本应翻页的手势挡成回弹；
+ * 而归零后跨页上限本来就只有 1 张，"砍掉多页惯性"的风险并不存在。
+ * 队列态（`allowInertia` = true）保持全部原条件，多张惯性不受影响。
  */
 internal class ViewerPagerSnapDistance(
     private val pageCountProvider: () -> Int,
-    private val allowInertia: () -> Boolean = { true }
+    private val allowInertia: () -> Boolean = { true },
+    private val offsetFractionProvider: () -> Float = { 0f }
 ) : PagerSnapDistance {
 
     override fun calculateTargetPage(
@@ -1735,16 +1991,50 @@ internal class ViewerPagerSnapDistance(
         velocity: Float,
         pageSize: Int,
         pageSpacing: Int
-    ): Int = ViewerPageMotion.snapTargetPage(
-        // 起点一律用框架传进来的 startPage：衰减终点是相对它算的，
-        // 换成 currentPage 会在"速度方向令 firstVisiblePage 偏移"时错一页
-        startPage = startPage,
-        decayEndPage = suggestedTargetPage.toFloat(),
-        // 全屏单图：速度视为 0，只允许相邻一张（见类注释）
-        velocityPxPerSec = if (allowInertia()) velocity else 0f,
-        pagePitchPx = (pageSize + pageSpacing).toFloat(),
-        pageCount = pageCountProvider()
-    )
+    ): Int {
+        // GESTURE_PROBE（临时诊断，真机甩速采集）：松手瞬间的框架输入快照。
+        // 只读不改——allowInertia / offsetFraction / pageCount 都是幂等的 State 读取，
+        // 这里各取一次存进局部变量，判定与日志用同一份快照；框架在每次松手发起
+        // fling 时调用本回调一次，频率天然等于"每次松手一条"，不会刷屏。
+        // v4.20.2：日志补上**最终返回值**（target=）——旧日志只有入参，
+        // 看不出判定结果，真机复盘时无法区分"框架没给对输入"还是"我们判错了"。
+        val allowInertiaNow = allowInertia()
+        val velocityForInertia = if (allowInertiaNow) velocity else 0f
+        val leavePages = offsetFractionProvider()
+        val totalPages = pageCountProvider()
+        val pitch = (pageSize + pageSpacing).toFloat()
+        // v4.22.4（用户规格 2026-11-26）：全屏单图态**只要有滑动迹象就翻一张**，
+        // 不看速度、也不要求过半。并排/队列态（allowInertiaNow = true）不受影响，
+        // 仍走下面"速度 + 惯性"的原规则。
+        if (!allowInertiaNow) {
+            val swipeTarget = ViewerPageMotion.swipeTargetPage(startPage, leavePages, totalPages)
+            if (swipeTarget != null) return swipeTarget
+        }
+        val target = ViewerPageMotion.snapTargetPage(
+            // 起点一律用框架传进来的 startPage：衰减终点是相对它算的，
+            // 换成 currentPage 会在"速度方向令 firstVisiblePage 偏移"时错一页
+            startPage = startPage,
+            decayEndPage = suggestedTargetPage.toFloat(),
+            // 全屏单图：速度视为 0，只允许相邻一张（见类注释）——这个归零**只管
+            // 跨页上限**，快甩翻一页的判定用的是下面的真实甩速（v4.20.1）；
+            // v4.20.2 起全屏态还据此识别"不需要衰减≤1页检查"（ViewerPageMotion 内）
+            velocityPxPerSec = velocityForInertia,
+            pagePitchPx = pitch,
+            pageCount = totalPages,
+            // 快甩翻一页判定（v4.20.1）：真实甩速 + 手指拖出的位移，两个模式同口径。
+            // 新分支最多翻相邻一张，"只滑一张"与"队列跨多张"的既有规格都不动
+            flingVelocityPxPerSec = velocity,
+            gestureLeavePages = leavePages
+        )
+        DebugLogger.d(
+            GESTURE_PROBE_TAG,
+            "GESTURE_PROBE calculateTargetPage: startPage=$startPage " +
+                "suggested=$suggestedTargetPage velocity=$velocity " +
+                "allowInertia=$allowInertiaNow leavePages=$leavePages " +
+                "pageCount=$totalPages pitch=${pageSize + pageSpacing} -> target=$target"
+        )
+        return target
+    }
 }
 
 /**

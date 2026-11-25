@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -168,6 +169,10 @@ enum class ActiveView {
 
 /**
  * Prefetch request with priority ordering
+ *
+ * @param thumbnailOnly true = 只暖**缩略图**档（图库网格用）；false = 拉原图（查看器用）。
+ *   这一位不能省：同一个队列同时服务两个诉求，网格只显示 720 档，按原图预取是
+ *   纯浪费（3 路 6144 px 下载 + 解码会在滑动时和滚动抢 CPU/带宽，见 P2 执行书 4.2）。
  */
 data class PrefetchRequest(
     val key: MediaCacheKey,
@@ -175,6 +180,7 @@ data class PrefetchRequest(
     val subfolder: String,
     val type: String,
     val priority: PrefetchPriority,
+    val thumbnailOnly: Boolean = false,
     val timestamp: Long = System.currentTimeMillis()
 ) : Comparable<PrefetchRequest> {
     override fun compareTo(other: PrefetchRequest): Int {
@@ -199,6 +205,12 @@ data class PrefetchRequest(
 object MediaCache {
 
     private const val TAG = "MediaCache"
+
+    /** 缩略图内存预算占堆的比例分母（P2-C：1/8，旧值 1/16） */
+    private const val THUMBNAIL_HEAP_DIVISOR = 8
+
+    /** 缩略图内存预算地板（KB）：小堆设备也不至于只放得下 4 张（P2-C，旧值 8 MB） */
+    private const val THUMBNAIL_MIN_CACHE_KB = 16 * 1024
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -237,6 +249,17 @@ object MediaCache {
     private val bitmapCacheSize = maxMemoryKb / 3
     private val videoCacheSize = maxMemoryKb / 8
 
+    /**
+     * 缩略图内存预算（P2-C）：堆的 1/8，下限 [THUMBNAIL_MIN_CACHE_KB]。
+     *
+     * 以 [maxMemoryKb] 为基准而不是写死张数：720 档单张字节数与图片来源有关
+     * （方图 2.07 MB，竖长图按长边等比更小），按堆比例算对两种图都成立。
+     * 256 MB 堆 → 32 MB（≈15 张），512 MB 堆 → 64 MB（≈30 张）；
+     * 128 MB 的小堆设备被地板托到 16 MB（≈8 张，仍比旧值 8 MB 翻一倍）。
+     */
+    private val thumbnailCacheSize = (maxMemoryKb / THUMBNAIL_HEAP_DIVISOR)
+        .coerceAtLeast(THUMBNAIL_MIN_CACHE_KB)
+
     // Single bitmap cache for all images (full-size for both gallery and viewer)
     private val bitmapCache = PriorityLruCache<String, Bitmap>(
         maxSize = bitmapCacheSize,
@@ -250,16 +273,33 @@ object MediaCache {
     )
 
     /**
-     * 缩略图专用的小缓存（预算约为原图缓存的 1/5）。
+     * 缩略图专用的小缓存（预算约为原图缓存的 1/3）。
      *
-     * 为什么与原图分开：列表里的缩略图只有几十 KB，原图动辄几 MB 到上百 MB。
+     * 为什么与原图分开：列表里的缩略图只有几十 KB ~ 2 MB，原图动辄几 MB 到上百 MB。
      * 共用一个 LRU 时，只要用户点开一张大图，整屏的缩略图就被挤出去，
      * 滚回列表又要全部重拉 —— 这是"看过一张大图之后列表也变慢"的来源之一。
+     *
+     * P2-C：预算从 `heap/16` 提到 [thumbnailCacheSize]（`heap/8`，下限
+     * [THUMBNAIL_MIN_CACHE_KB]）。旧值在 256 MB 堆上只有 16 MB ——
+     * 720 档方图 `720×720×4B ≈ 2.07 MB/张`，约 8 张，2 列一屏都不够；
+     * 滚过一屏再滚回来就整屏落盘重解码（每次 bounds + 采样两次 BitmapFactory），
+     * 期间每格再闪一帧转圈 —— 这是"发粘"的第二条根因。
+     * 提高后 256 MB 堆 ≈ 32 MB ≈ 15 张、512 MB 堆 ≈ 64 MB ≈ 30 张；
+     * 超出预算时仍由 [PriorityLruCache] 按 LRU 淘汰（缩略图统一 PRIORITY_DEFAULT，
+     * 淘汰顺序就是"最久未使用"）。
      */
     private val thumbnailCache = PriorityLruCache<String, Bitmap>(
-        maxSize = (maxMemoryKb / 16).coerceAtLeast(8 * 1024),
+        maxSize = thumbnailCacheSize,
         sizeOf = { _, bitmap -> bitmap.byteCount / 1024 }
     )
+
+    /**
+     * 同一 key 正在飞的缩略图请求（单飞闸门，见 [fetchThumbnail]）。
+     *
+     * 网格格子的组合与预取 worker 是两条独立的调用链，会同时请求同一张缩略图；
+     * 没有这张表时两趟都去抢 3 个网络许可、服务端把同一张图压两遍（现场压缩很贵）。
+     */
+    private val thumbnailInFlight = ConcurrentHashMap<String, CompletableDeferred<Bitmap?>>()
 
     /**
      * 拉原图时被判定为"超过下载上限"的条目。
@@ -878,12 +918,16 @@ object MediaCache {
      * @param visibleItemCount Number of items currently visible on screen
      * @param allItems All gallery items for priority calculation
      * @param columnsInGrid Number of columns in the grid (for row-based calculations)
+     * @param thumbnailOnly true（默认）= 网格只暖缩略图档（P2-B）。原图不在这里预取 ——
+     *   格子显示的就是 720 档，为它去拉 6144 px 原图是纯浪费；原图只在点开查看器时需要，
+     *   由 [prefetchOriginal] / [prefetchAround] 负责。
      */
     fun updateGalleryPosition(
         firstVisibleIndex: Int,
         visibleItemCount: Int,
         allItems: List<PrefetchItem>,
-        columnsInGrid: Int = 2
+        columnsInGrid: Int = 2,
+        thumbnailOnly: Boolean = true
     ) {
         if (allItems.isEmpty()) return
 
@@ -914,35 +958,50 @@ object MediaCache {
         bitmapCache.updateAllPriorities(priorityMap)
 
         // Trigger prefetch for items in buffer zone
-        prefetchGalleryItems(firstVisibleIndex, visibleItemCount, columnsInGrid, allItems)
+        prefetchGalleryItems(
+            firstVisibleIndex = firstVisibleIndex,
+            visibleItemCount = visibleItemCount,
+            columnsInGrid = columnsInGrid,
+            allItems = allItems,
+            thumbnailOnly = thumbnailOnly
+        )
     }
 
     /**
      * Prefetch gallery items around visible area.
+     *
+     * 可见项本身不排（格子组合时自己会取图，排进来只会让同一张图有两趟请求排队）：
+     * 只暖**可见范围之外**的一圈缓冲，这才是滑动时提前就位的部分。
      */
     private fun prefetchGalleryItems(
         firstVisibleIndex: Int,
         visibleItemCount: Int,
         columnsInGrid: Int,
-        allItems: List<PrefetchItem>
+        allItems: List<PrefetchItem>,
+        thumbnailOnly: Boolean
     ) {
         val bufferRows = 3
         val bufferItems = bufferRows * columnsInGrid
 
         val startIndex = (firstVisibleIndex - bufferItems).coerceAtLeast(0)
         val endIndex = (firstVisibleIndex + visibleItemCount + bufferItems).coerceAtMost(allItems.size)
+        // 布局还没量出来时（visibleItemCount = 0）不做"排除可见项"处理，
+        // 否则第一次上报会把首屏整片漏掉
+        val visibleEnd = if (visibleItemCount > 0) firstVisibleIndex + visibleItemCount else startIndex
 
         // Build set of keys that should be prefetched with their priorities
         val desiredPrefetches = mutableMapOf<String, Pair<PrefetchItem, PrefetchPriority>>()
 
         for (i in startIndex until endIndex) {
             val item = allItems[i]
-            // 源已不存在：不预取原图（重试也是 404）
+            // 源已不存在：不预取（重试也是 404）
             if (item.sourceMissing) continue
+            // 可见项自己会取，跳过（见本函数注释）
+            if (i in firstVisibleIndex until visibleEnd) continue
             val keyStr = item.key.keyString
 
-            // Skip if already cached
-            if (isCached(item.key, item.isVideo)) continue
+            // Skip if already cached（口径由 thumbnailOnly 决定，见 isCached）
+            if (isCached(item.key, item.isVideo, thumbnailOnly)) continue
             // Skip if already in progress
             if (inProgressKeys.contains(keyStr)) continue
 
@@ -958,9 +1017,12 @@ object MediaCache {
         }
 
         // Merge approach: remove outdated requests, keep existing ones in range
+        // 只清**同类**任务：缩略图队列由网格管，原图任务由查看器（prefetchAround /
+        // prefetchOriginal）管；网格这次上报不该顺手把用户刚点开那张的原图任务删掉
         val iterator = prefetchQueue.iterator()
         while (iterator.hasNext()) {
             val request = iterator.next()
+            if (request.thumbnailOnly != thumbnailOnly) continue
             val keyStr = request.key.keyString
             if (!desiredPrefetches.containsKey(keyStr)) {
                 // Remove item no longer in desired range
@@ -979,7 +1041,8 @@ object MediaCache {
                 isVideo = item.isVideo,
                 subfolder = item.subfolder,
                 type = item.type,
-                priority = priority
+                priority = priority,
+                thumbnailOnly = thumbnailOnly
             ))
         }
     }
@@ -987,22 +1050,49 @@ object MediaCache {
     /**
      * Initial prefetch for gallery startup.
      * Fetches first N items with high priority.
+     *
+     * P2-B：默认只暖缩略图（[thumbnailOnly] = true）。首屏这 24 张原本按原图拉，
+     * 是冷启动后第一次滑动最主要的卡顿源。
      */
-    fun initialPrefetch(items: List<PrefetchItem>) {
+    fun initialPrefetch(items: List<PrefetchItem>, thumbnailOnly: Boolean = true) {
         for (item in items) {
-            // 源已不存在：不预取原图（重试也是 404）
+            // 源已不存在：不预取（重试也是 404）
             if (item.sourceMissing) continue
             val keyStr = item.key.keyString
-            if (!isCached(item.key, item.isVideo) && !inProgressKeys.contains(keyStr)) {
+            if (!isCached(item.key, item.isVideo, thumbnailOnly) && !inProgressKeys.contains(keyStr)) {
                 prefetchQueue.offer(PrefetchRequest(
                     key = item.key,
                     isVideo = item.isVideo,
                     subfolder = item.subfolder,
                     type = item.type,
-                    priority = PrefetchPriority.ADJACENT
+                    priority = PrefetchPriority.ADJACENT,
+                    thumbnailOnly = thumbnailOnly
                 ))
             }
         }
+    }
+
+    /**
+     * 点开查看器前，把**这一张**的原图排进预取队列（P2-B 的配套）。
+     *
+     * 为什么需要：网格预取改成缩略图之后，查看器首帧不再有"原图已在缓存"的待遇。
+     * 从点击到查看器真正显示之间还有 PixelCopy 截图 + 挖空 + startActivity，
+     * 这段空档用来提前发起原图拉取，命中则由 worker 直接跳过。
+     * 尽力而为：查看器自己也会按 [prefetchAround] 补 ±1~±3 张，这里只负责被点开那张。
+     */
+    fun prefetchOriginal(item: PrefetchItem) {
+        if (item.sourceMissing) return
+        val keyStr = item.key.keyString
+        if (isCached(item.key, item.isVideo, thumbnailOnly = false)) return
+        if (inProgressKeys.contains(keyStr)) return
+        prefetchQueue.offer(PrefetchRequest(
+            key = item.key,
+            isVideo = item.isVideo,
+            subfolder = item.subfolder,
+            type = item.type,
+            priority = PrefetchPriority.ADJACENT,
+            thumbnailOnly = false
+        ))
     }
 
     /**
@@ -1174,6 +1264,45 @@ object MediaCache {
         /** true = 只读本机缓存，绝不发网络请求（「源已不存在」条目走这条） */
         localOnly: Boolean = false
     ): Bitmap? {
+        val keyStr = key.keyString
+        // ① 内存命中不进门（列表格首次组合时走的就是这一条）
+        // 第三态只读本机：内存里已有原图就直接用（省掉一次落盘读 + 解码）
+        if (localOnly) bitmapCache.get(keyStr)?.let { return it }
+        thumbnailCache.get(keyStr)?.let { return it }
+
+        // ② 单飞（P2-B 配套）：同一 key 只允许一趟在途。
+        // 格子组合与预取 worker 会**同时**请求同一张缩略图（预取刚排上、格子已经渲染），
+        // 两趟都去抢那 3 个网络许可，服务端还要把同一张图现场压两遍 ——
+        // preview 是现场压缩，204 MB 的图单次约 9 秒，重复一次就是双倍。
+        // 后来者直接等第一个人的结果：缓存键相同，拿到的位图完全一致。
+        // localOnly 不进门：它只读本机（几十毫秒），没有等待别人的理由 ——
+        // 让它去等同 key 的网络请求等于把「源已不存在」的格子挂住最多一个压缩周期。
+        if (!localOnly) {
+            thumbnailInFlight[keyStr]?.let { return it.await() }
+            val gate = CompletableDeferred<Bitmap?>()
+            thumbnailInFlight.putIfAbsent(keyStr, gate)?.let { return it.await() }
+            try {
+                return fetchThumbnailUnshared(key, isVideo, subfolder, type, localOnly)
+                    .also { gate.complete(it) }
+            } finally {
+                // 取消/异常时也要唤醒等待者，否则它们会永远挂在这个 key 上
+                if (!gate.isCompleted) gate.complete(null)
+                thumbnailInFlight.remove(keyStr, gate)
+            }
+        }
+        return fetchThumbnailUnshared(key, isVideo, subfolder, type, localOnly)
+    }
+
+    /**
+     * [fetchThumbnail] 的实际实现（内存命中与单飞已在调用方挡过）。
+     */
+    private suspend fun fetchThumbnailUnshared(
+        key: MediaCacheKey,
+        isVideo: Boolean,
+        subfolder: String,
+        type: String,
+        localOnly: Boolean
+    ): Bitmap? {
         // v4.16.1 分流：持久化开关开启 → 走 filesDir 统一档链路（720 档 + 落盘 + 重开立即清晰）；
         // 关闭 → 走下方原逻辑（cacheDir + 512 档），两套互不读写对方目录。
         // 开关每次调用读一次（SharedPreferences 有内存缓存，读取极快）：设置变化即时生效。
@@ -1183,10 +1312,6 @@ object MediaCache {
         }
 
         val keyStr = key.keyString
-        // 第三态只读本机：内存里已有原图就直接用（省掉一次落盘读 + 解码）
-        if (localOnly) bitmapCache.get(keyStr)?.let { return it }
-        thumbnailCache.get(keyStr)?.let { return it }
-
         if (isVideo) {
             return fetchBitmap(key, true, subfolder, type, localOnly = localOnly)
                 ?.also { thumbnailCache.put(keyStr, it) }
@@ -2244,10 +2369,17 @@ object MediaCache {
         }
 
         // Remove outdated requests from queue (items no longer in desired range)
+        // 两处例外不能删：
+        // - 缩略图任务（网格那一队）不归查看器管，删了会把滚回图库前的预热全作废；
+        // - 当前这一张的原图任务（[prefetchOriginal] 在点击时排的）也不删：查看器首帧就靠它，
+        //   desiredPrefetches 只含 ±1~±3，当前项不在其中。
+        val currentKeyStr = allItems.getOrNull(currentIndex)?.key?.keyString
         val iterator = prefetchQueue.iterator()
         while (iterator.hasNext()) {
             val request = iterator.next()
+            if (request.thumbnailOnly) continue
             val keyStr = request.key.keyString
+            if (keyStr == currentKeyStr) continue
             if (!desiredPrefetches.containsKey(keyStr)) {
                 iterator.remove()
             } else {
@@ -2269,7 +2401,8 @@ object MediaCache {
                 isVideo = item.isVideo,
                 subfolder = item.subfolder,
                 type = item.type,
-                priority = priority
+                priority = priority,
+                thumbnailOnly = false
             ))
         }
     }
@@ -2326,10 +2459,27 @@ object MediaCache {
         val sourceMissing: Boolean = false
     )
 
-    private fun isCached(key: MediaCacheKey, isVideo: Boolean): Boolean {
+    /**
+     * 这个条目对**当前这条预取诉求**来说是否已经有货。
+     *
+     * @param thumbnailOnly true = 问"网格能显示了吗"：缩略图内存命中或 720 档磁盘命中
+     *   都算已缓存，不再排原图任务（P2-B 第二条：修复前只认原图缓存，刚看过的格子
+     *   缩略图明明在内存里，仍会再排一次 6144 px 的原图拉取）。
+     *   false = 问"查看器能直接显示原图了吗"：只有原图缓存命中才算，缩略图不算 ——
+     *   否则查看器会把 720 档当原图直接用，打开就是糊的。
+     *
+     * 磁盘分支的文件存在性判断（stat ×3）只在 [updateGalleryPosition] 的
+     * Dispatchers.Default 上下文里跑到，不占主线程（见 GalleryScreen 的 P2-D 注释）。
+     */
+    private fun isCached(
+        key: MediaCacheKey,
+        isVideo: Boolean,
+        thumbnailOnly: Boolean = false
+    ): Boolean {
+        val keyStr = key.keyString
+        if (thumbnailOnly && thumbnailCache.get(keyStr) != null) return true
         if (isMemoryFirstMode) {
             // Memory-first: check in-memory cache
-            val keyStr = key.keyString
             return if (isVideo) {
                 videoCache.get(keyStr) != null
             } else {
@@ -2338,6 +2488,13 @@ object MediaCache {
         } else {
             // Disk-first: check disk cache
             val context = applicationContext ?: return false
+            if (thumbnailOnly) {
+                // 磁盘优先模式下图库读的是 720 统一档（filesDir/gallery_store）与旧缩略图目录，
+                // 不能只看 gallery_cache 的原图：那里没有，网格照样能立刻出图
+                return resolvePersistFile(context, key, isVideo) != null ||
+                    resolveThumbFile(context, key) != null ||
+                    existsInDiskCache(context, key, isVideo)
+            }
             return existsInDiskCache(context, key, isVideo)
         }
     }
@@ -2351,7 +2508,7 @@ object MediaCache {
                     if (request != null) {
                         val keyStr = request.key.keyString
 
-                        if (!isCached(request.key, request.isVideo) &&
+                        if (!isCached(request.key, request.isVideo, request.thumbnailOnly) &&
                             inProgressKeys.add(keyStr)) {
 
                             try {
@@ -2362,7 +2519,18 @@ object MediaCache {
                                     PrefetchPriority.DISTANT -> PriorityLruCache.PRIORITY_DISTANT
                                 }
 
-                                if (request.isVideo) {
+                                // P2-B：两种任务分两条链路 ——
+                                // 缩略图（网格）= 服务端压缩预览 + 720 采样解码，几十 KB~2 MB；
+                                // 原图（查看器）= 6144 px / 48 MB 上限，只在真的要看全屏时才拉。
+                                // 修复前一律走 fetchImage，等于给每格预览都按原图付费。
+                                if (request.thumbnailOnly) {
+                                    fetchThumbnail(
+                                        key = request.key,
+                                        isVideo = request.isVideo,
+                                        subfolder = request.subfolder,
+                                        type = request.type
+                                    )
+                                } else if (request.isVideo) {
                                     // P2-3：预取只拉字节，**不再预生成播放临时文件**。
                                     // 修复前这里走 fetchVideoUri → getVideoUri，会给每个预取到的
                                     // 视频都在 cacheDir 写一份 playback_*.mp4，而预取窗口有 3 个方向，

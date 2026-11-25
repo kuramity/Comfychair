@@ -51,6 +51,8 @@
     <string name="error_upload_stalled">Wysyłanie zatrzymane</string>
     <string name="action_reconnect">Połącz ponownie</string>
     <string name="action_reconnecting">Ponowne łączenie…</string>
+    <string name="action_try_later">Spróbuj później</string>
+    <string name="msg_connection_interrupted">Połączenie przerwane. Ponawianie w tle…</string>
     <string name="msg_reconnect_failed">Nie można połączyć</string>
     <string name="action_return_to_login">Powrót do logowania</string>
 
@@ -729,10 +731,10 @@
     <!-- Eksport informacji o modelu do Markdown (wspólny szablon: ModelIntroMarkdown) -->
     <string name="model_intro_export_md">Eksportuj Markdown</string>
     <string name="model_intro_export_failed">Nie udało się wyeksportować informacji o modelu</string>
-    <!-- Warstwa użytkownika: odinstaluj / zaznaczanie wielu / importuj / przywróć -->
+    <string name="model_intro_copy_all">Kopiuj wszystko</string>
+    <!-- Warstwa użytkownika: odinstaluj / zaznaczanie wielu / przywróć -->
     <string name="model_intro_menu_more">Więcej działań</string>
     <string name="model_intro_batch_manage">Zaznaczanie wielu</string>
-    <string name="model_intro_import">Importuj informacje</string>
     <string name="model_intro_hidden_menu">Odinstalowane (%1$d)</string>
     <string name="model_intro_uninstall_title">Odinstalować ten wpis?</string>
     <string name="model_intro_uninstall_message">„%1$s” zostanie ukryty tylko na tym urządzeniu. Wbudowany wpis nie jest usuwany i można go w każdej chwili przywrócić.</string>
@@ -748,11 +750,30 @@
     <string name="model_intro_batch_done">Odinstalowano %1$d wpisów</string>
     <string name="model_intro_hidden_title">Odinstalowane wpisy</string>
     <string name="model_intro_hidden_empty">Brak odinstalowanych wpisów</string>
-    <string name="model_intro_import_success">Zaimportowano %1$d wpisów</string>
-    <string name="model_intro_import_error_read">Nie udało się odczytać pliku, spróbuj ponownie</string>
-    <string name="model_intro_import_error_unsupported">Nieobsługiwany typ pliku (tylko .json lub .md)</string>
-    <string name="model_intro_import_error_json">Nieprawidłowy JSON: oczekiwano tabeli informacji o modelach (models) lub obiektu „nazwa pliku → wpis”</string>
-    <string name="model_intro_import_error_empty">Brak wpisów do zaimportowania w tym pliku</string>
-    <string name="model_intro_import_error_md">Nie znaleziono informacji o modelu w tym Markdown: wymagany jest tytuł „# nazwa” i wiersze metadanych, np. „名字：…”</string>
-    <string name="model_intro_import_error_save">Nie udało się zapisać zaimportowanych wpisów, spróbuj ponownie</string>
+    <!-- Intro document editor (v4.21) -->
+    <string name="model_intro_editor_entry">Nowy wpis</string>
+    <string name="model_intro_edit_entry">Edytuj ten wpis</string>
+    <string name="model_intro_editor_title_new">Nowy wpis</string>
+    <string name="model_intro_editor_title_edit">Edycja wpisu</string>
+    <string name="model_intro_editor_field_file">Nazwa pliku</string>
+    <string name="model_intro_editor_field_name">Nazwa</string>
+    <string name="model_intro_editor_field_base">Model bazowy</string>
+    <string name="model_intro_editor_field_version">Wersja</string>
+    <string name="model_intro_editor_field_kind">Typ</string>
+    <string name="model_intro_editor_field_effect">Efekt</string>
+    <string name="model_intro_custom_fields">Pola niestandardowe</string>
+    <string name="model_intro_editor_add_field">Dodaj pole</string>
+    <string name="model_intro_editor_remove_field">Usuń to pole</string>
+    <string name="model_intro_editor_label_hint">Nazwa pola</string>
+    <string name="model_intro_editor_value_hint">Wartość</string>
+    <string name="model_intro_editor_template_title">Wybierz szablon, aby wstępnie wypełnić pola</string>
+    <string name="model_intro_editor_template_skip">Zacznij od zera</string>
+    <string name="model_intro_editor_save">Zapisz</string>
+    <string name="model_intro_editor_saved">Zapisano</string>
+    <string name="model_intro_editor_file_required">Nazwa pliku jest wymagana</string>
+    <string name="model_intro_editor_builtin_override">Ten wpis istnieje w bibliotece wbudowanej. Zapis zastąpi go w całości Twoją wersją; można to cofnąć w dowolnej chwili.</string>
+    <string name="model_intro_editor_delete">Usuń</string>
+    <string name="model_intro_editor_delete_title">Usunąć ten własny wpis?</string>
+    <string name="model_intro_editor_delete_message">Wpis „%1$s” utworzono na tym urządzeniu. Usunięcie jest nieodwracalne; biblioteka wbudowana nie zostanie zmieniona.</string>
+    <string name="model_intro_editor_deleted">Wpis usunięty</string>
 </resources>

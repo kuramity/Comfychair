@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Collections
+import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.ui.unit.dp
@@ -41,6 +42,7 @@ import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.currentBackStackEntryAsState
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.cache.MediaCache
+import sh.hnet.comfychair.navigation.MODEL_INTRO_ROUTES
 import sh.hnet.comfychair.navigation.MainRoute
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.storage.AppSettings
@@ -57,13 +59,15 @@ import sh.hnet.comfychair.ui.components.ripple.PRESS_BG_ALPHA_V2_LIGHT
  * - Image-to-Video (icon button)
  *
  * FAB launches Gallery activity.
+ * 模型介绍入口与生成页共用本容器导航图；介绍模块的列表、详情、隐藏页和编辑器
+ * 都保持书图标选中态。
  *
  * Uses BottomAppBar with navigation buttons on left and FAB on right.
  */
 @Composable
 fun MainNavigationBar(
     navController: NavController,
-    onNavigateToGallery: () -> Unit
+    onNavigateToGallery: () -> Unit,
 ) {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
@@ -163,6 +167,19 @@ fun MainNavigationBar(
                 Icon(
                     Icons.Default.Tag,
                     contentDescription = stringResource(R.string.nav_tag_library),
+                    tint = tint,
+                )
+            }
+            // 模型介绍（标签库 tab 右边、图库 FAB 左边）：走本容器导航图，
+            // 列表、详情、隐藏页和编辑器都保持同一书图标选中态。
+            NavBarTab(
+                selected = currentRoute in MODEL_INTRO_ROUTES,
+                label = stringResource(R.string.nav_model_intro),
+                onClick = { navigateTo(MainRoute.ModelIntro.route) },
+            ) { tint ->
+                Icon(
+                    Icons.Filled.MenuBook,
+                    contentDescription = stringResource(R.string.nav_model_intro),
                     tint = tint,
                 )
             }

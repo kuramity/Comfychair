@@ -9,7 +9,7 @@ import org.json.JSONObject
  *
  * 数据来自人工维护的 `lora_effects.json`（`model_intros` 的 `effect` 字段即由它合并而来），
  * 因此本表的角色是**兜底 / 对照源**：
- * - 详情抽屉里条目自身没有 `effect` 时，按文件名到这里兜底取一条；
+ * - 详情页里条目自身没有 `effect` 时，按文件名到这里兜底取一条；
  * - 浏览页顶部有独立的「LoRA 效果档案」分区，整表可见。
  *
  * 键是小写文件名，值是纯文本段落；数据里有相当一部分条目值为 null/空（人工还没补上），
@@ -117,7 +117,7 @@ object LoraEffectTable {
      * 有值、但文件名不在 [knownFiles] 里的条目，按文件名排序。
      *
      * 「孤儿」= 效果档案收录了、模型介绍表里却没有的 LoRA（数据侧人工先记了效果，
-     * 模型还没进全量溯源）——它们在独立分区里要标出来，点击不能跳详情抽屉。
+     * 模型还没进全量溯源）——它们在独立分区里要标出来，点击不能跳详情页。
      * [knownFiles] 接受任意大小写，比较前统一转小写。
      */
     fun orphans(knownFiles: Set<String>): List<Pair<String, String>> {

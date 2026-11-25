@@ -12,8 +12,14 @@ package sh.hnet.comfychair.model
  *
  * 切分策略：优先在换行（段边界）处断开，让段落显示保持完整；单个段落本身超过
  * [maxCharsPerChunk] 时（没有段边界可借）再按定长硬切。
+ *
+ * **320 的标定**：详情页原文卡 300dp 固定高度、行高 21sp，约 13 行 ≈ 260 字可见；
+ * 片段略大于可见量可减少切分段数，又不至于让单段排版远超可见面积。
+ * 原默认 1200 时单段约 4 倍超量，是详情页滑动卡顿的候选主因之一。
+ * 详情页原文卡（ModelIntroDetailScreen）用 300dp/21sp 几何
+ * （曾与已下线的抽屉共用同一标定），调用点吃默认值即可，无须传参。
  */
-fun splitIntroText(text: String, maxCharsPerChunk: Int = 1200): List<String> {
+fun splitIntroText(text: String, maxCharsPerChunk: Int = 320): List<String> {
     // 钳到 >=1 而不是抛异常：本函数在 UI 渲染路径上（详情页逐段排版），抛异常会让详情页
     // 直接崩；0/负数只可能是调用方笔误，钳成 1 退化为逐字符切分，拼接仍等于原文。
     val max = maxCharsPerChunk.coerceAtLeast(1)

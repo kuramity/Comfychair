@@ -115,6 +115,45 @@ internal fun recoverFromCachedKeys(
     return known + recovered
 }
 
+/**
+ * 「加载更早」第 `tapsDone + 1` 次要向服务端请求的 history 窗口大小。
+ *
+ * ## 为什么用"放宽 max_items 窗口"而不是任务书设想的 offset 步进（实测纠偏）
+ *
+ * 读码证据（F:\ComfyUI\execution.py:1423-1439，server.py:1138-1149 原样透传）：
+ * `self.history` 是**按完成顺序追加**的 dict（task_done 里 `self.history[prompt_id] = …`，
+ * 超 MAXIMUM_HISTORY_SIZE=10000 从**头部裁掉最旧的**），`get_history` 的循环
+ * `for k in self.history: if i >= offset …` 于是**从最旧一端**数 offset 条再往后取；
+ * 只有省略 offset（服务端置 -1）时才换算 `offset = len - max_items` 取**最新端**。
+ * 响应是裸 dict、没有 total —— 客户端拿不到 len，就换算不出"从最新端再往更早一档"
+ * 的 offset；硬用 `offset = 页数×100` 步进会拉到错误切片并**误判到底**：
+ * 反例 L=150：首屏 = 位置 50..149（100 条，满页），offset=100 返回 100..149 ——
+ * 全是已知条目且不足 100 条 → 按"页不满 = 到底"会停住，最旧的 0..49 永远拉不到。
+ *
+ * 放宽窗口则每一步都成立：响应永远是**最新 W 条**，索引合并（GalleryMetadataCache
+ * .olderItemsNotKnown 同口径的条目去重）天然吃掉重叠部分，每档净增 ~100 条更早历史；
+ * "返回条数 < 请求窗口"就是可靠的整段到底信号（见 [olderHistoryExhausted]）。
+ * 重复下载的重叠部分受 [maxTaps] 上限约束（默认 5 档 → 最大窗口 600 条 history，
+ * 与"服务端 history 是内存态、重启即清"的特性匹配：值得翻的更早段本就不多）。
+ *
+ * @param tapsDone 已完成的"加载更早"档数（0 = 只拉过首屏）
+ * @param pageSize 每档放宽的条数 = 首屏单页常量（BackgroundDegradationPolicy.HISTORY_MAX_ITEMS，
+ *                 其"单页上限 100"的语义不在本任务改动）
+ * @param maxTaps 最大档数（防无限翻；首屏已含第 1 档窗口，故第 t 档窗口 = pageSize×(t+2)）
+ * @return 下一次请求的窗口条数；null = 已达上限，不再提供"加载更早"
+ */
+internal fun olderWindowSize(tapsDone: Int, pageSize: Int, maxTaps: Int): Int? {
+    if (tapsDone < 0 || pageSize <= 0 || maxTaps <= 0 || tapsDone >= maxTaps) return null
+    return pageSize * (tapsDone + 2)
+}
+
+/**
+ * 终止判定：服务端本页返回的 history 条数 **< 请求窗口** → 内存里整段历史都已在手，
+ * 没有更早的了。（窗口取的是"最新 W 条"，返回不满 W 说明总条数就这么多。）
+ */
+internal fun olderHistoryExhausted(pageEntryCount: Int, requestedWindow: Int): Boolean =
+    pageEntryCount < requestedWindow
+
 class GalleryRepository private constructor() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -285,6 +324,29 @@ class GalleryRepository private constructor() {
     private val _lastRefreshTime = MutableStateFlow(0L)
     val lastRefreshTime: StateFlow<Long> = _lastRefreshTime.asStateFlow()
 
+    // ============================================================
+    // 「加载更早」分页状态（会话内；clearCache 复位）
+    // ============================================================
+    //
+    // 与首屏/刷新链路完全解耦：这里只多发一次"窗口放宽一档"的 /history，
+    // 结果照旧走索引合并 + 同一套可见列表合成（buildVisibleFromIndex），
+    // 下拉刷新（manualRefresh）与周期刷新（startPeriodicRefresh）的代码路径不动。
+
+    /** 已完成的"加载更早"档数（窗口大小由它推，见 [olderWindowSize]） */
+    private var olderTapsDone = 0
+
+    /** 服务端历史已确认拉尽（页不满窗口 / 净新增为 0），或明确不满足分页前提 */
+    private var olderExhausted = false
+
+    /** 在途闸：AtomicBoolean CAS，防按钮双击/回填与手动翻页并发出两笔同一窗口的请求 */
+    private val olderInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private val _canLoadOlder = MutableStateFlow(false)
+    val canLoadOlder: StateFlow<Boolean> = _canLoadOlder.asStateFlow()
+
+    private val _isLoadingOlder = MutableStateFlow(false)
+    val isLoadingOlder: StateFlow<Boolean> = _isLoadingOlder.asStateFlow()
+
     // Periodic refresh job
     private var periodicRefreshJob: Job? = null
 
@@ -301,6 +363,17 @@ class GalleryRepository private constructor() {
         private var instance: GalleryRepository? = null
 
         private const val PERIODIC_REFRESH_INTERVAL_MS = 5 * 60 * 1000L // 5 minutes
+
+        /**
+         * 「加载更早」每档放宽的 history 条数：与首屏单页常量同值。
+         * 注意**不修改** BackgroundDegradationPolicy.HISTORY_MAX_ITEMS 本身
+         * （BackgroundDegradationPolicyTest:171 钉着它 = 首屏单页上限 100 的语义）。
+         */
+        internal const val OLDER_WINDOW_STEP_ITEMS =
+            BackgroundDegradationPolicy.HISTORY_MAX_ITEMS
+
+        /** 「加载更早」最大档数（5 档 → 最大窗口 600 条 history，防无限翻） */
+        internal const val MAX_OLDER_WINDOW_TAPS = 5
 
         fun getInstance(): GalleryRepository {
             return instance ?: synchronized(this) {
@@ -477,58 +550,28 @@ class GalleryRepository private constructor() {
 
             // 本地索引是图库的底座：把服务器这次返回的**并进**索引，用合并结果当列表。
             //
-            // 两条都不能少：
+            // 两条都不能少（口径详见 buildVisibleFromIndex 的 KDoc）：
             // - 不能只用服务器返回的 —— ComfyUI 的 /history 是内存态，重启即清空，
             //   而图片文件仍在 output 目录里。"图库突然一张都没有、只剩新生成的图"
             //   就是这个原因（不是图片丢了，是索引丢了）。
             // - 不能把空的服务器结果写回索引 —— 合并语义保证索引只增不减，
             //   否则一次服务器重启就会把之前攒下的记录全冲掉，连离线退路一起断。
             //
-            // 已在手机上删掉的条目（持久墓碑 + 本次待删）在最后统一滤掉。
-            //
-            // null 的语义：索引读不出来（不存在/解析失败）且服务器这次也没有条目。
-            // 这时**仍然要走磁盘缓存恢复**（R1：图片文件还在本机，这是"图库加载不出
-            // 任何图片"的最后一道补救）；只有"索引读不出 + 磁盘也一条都恢复不出来"时
-            // 才保留上一次的列表 —— 绝不能把 null 当成"图库空了"清空界面。
-            val visible: List<GalleryItem>? = if (context != null && serverId != null) {
-                withContext(Dispatchers.IO) {
-                    val tombstones = GalleryMetadataCache.loadTombstones(context, serverId) + deletionsSnapshot
-                    val indexMerged = GalleryMetadataCache.mergeMetadata(context, serverId, serverItems)
-                    val recovered = buildVisibleItems(
-                        indexItems = indexMerged,
-                        cachedKeys = MediaCache.listCachedKeys(context, ConnectionManager.currentServerId),
-                        tombstones = tombstones
-                    )
-                    if (indexMerged == null && recovered.isEmpty()) {
-                        DebugLogger.w(
-                            TAG,
-                            "索引读取失败且磁盘无缓存条目：保留上一次列表（${_galleryItems.value.size} 条），不清空"
-                        )
-                        null
-                    } else {
-                        if (indexMerged == null) {
-                            DebugLogger.w(
-                                TAG,
-                                "索引读取失败，已用磁盘缓存恢复 ${recovered.size} 条（服务器本次 ${serverItems.size} 条）"
-                            )
-                        }
-                        recovered
-                    }
+            // 合成规则（墓碑过滤 + 磁盘恢复 + R1「null 不清空」+ R2-N1 去重护栏）
+            // 与"加载更早"分页共用 buildVisibleFromIndex 这一份实现，不留第二套。
+            val distinctVisible: List<GalleryItem>? = if (context != null && serverId != null) {
+                val indexMerged = withContext(Dispatchers.IO) {
+                    GalleryMetadataCache.mergeMetadata(context, serverId, serverItems)
                 }
+                buildVisibleFromIndex(context, serverId, indexMerged, deletionsSnapshot)
             } else {
-                serverItems.filterNot { GalleryMetadataCache.isDeleted(it, deletionsSnapshot) }
+                serverItems
+                    .filterNot { GalleryMetadataCache.isDeleted(it, deletionsSnapshot) }
+                    .distinctBy { GalleryMetadataCache.itemIdentityKey(it.promptId, it.filename) }
             }
 
-            if (visible == null) {
+            if (distinctVisible == null) {
                 return false
-            }
-
-            // R2-N1 最终护栏：图库 LazyGrid 的 key 是 (promptId, filename)，
-            // 列表里只要出现重复二元组就会抛 IllegalArgumentException。
-            // 服务器解析、索引合并、磁盘恢复任一路带来重复都在这里收敛。
-            // 口径与 GalleryMetadataCache.itemIdentityKey 完全一致（NUL 分隔，不是下划线）。
-            val distinctVisible = visible.distinctBy {
-                GalleryMetadataCache.itemIdentityKey(it.promptId, it.filename)
             }
 
             val previousCount = _galleryItems.value.size
@@ -541,6 +584,36 @@ class GalleryRepository private constructor() {
                     "(was $previousCount, server reported ${serverItems.size})"
             )
 
+            // ============================================================
+            // 「加载更早」分页基线 + 新用户首访自动回填（config-audit-report 事项2）
+            // ============================================================
+            //
+            // 首屏窗口 = HISTORY_MAX_ITEMS 条 **history**（服务端按 prompt 条目计数，
+            // 一次批量出图 4 张只占 1 条 —— 分页算术全部按条目数走，
+            // 理由与"为什么不是 offset 步进"见顶层 olderWindowSize 的 KDoc）。
+            // 满页 = 服务端可能还有更早的；不满 = 整段内存历史已在手里。
+            val serverHistoryCount = historyJson.length()
+            olderExhausted =
+                serverHistoryCount < BackgroundDegradationPolicy.HISTORY_MAX_ITEMS
+            _canLoadOlder.value = !olderExhausted &&
+                olderWindowSize(olderTapsDone, OLDER_WINDOW_STEP_ITEMS, MAX_OLDER_WINDOW_TAPS) != null
+
+            // 首次进图库若索引为空 → 自动回填一页更早数据（报告建议的性价比做法）。
+            // 判据「展示条数 == 本次服务器条目数」= 索引对合并的净贡献为零 → 索引是空表
+            //（全新用户）。老用户索引攒有更早条目，合并结果必然多于首屏条目数，条件不成立
+            // → 不发多余请求，既有链路零影响。回填会推进 olderTapsDone，本会话后续加载
+            // 靠 olderTapsDone == 0 再也不会二次触发。
+            // 回填在**本协程内**执行：此刻 _isLoading/_isRefreshing 尚未复位（finally
+            // 还没跑），周期刷新与下拉刷新天然进不来，两笔 /history 不会并发写列表。
+            if (olderTapsDone == 0 &&
+                context != null && serverId != null &&
+                serverItems.isNotEmpty() && !olderExhausted &&
+                distinctVisible.size == serverItems.size
+            ) {
+                DebugLogger.i(TAG, "索引为空的首次加载：自动回填一页更早历史")
+                loadOlderInternal(context, serverId)
+            }
+
             return true
         } catch (e: Exception) {
             DebugLogger.w(TAG, "Gallery refresh failed: ${e.message}")
@@ -548,6 +621,154 @@ class GalleryRepository private constructor() {
         } finally {
             _isLoading.value = false
             _isRefreshing.value = false
+        }
+    }
+
+    /**
+     * 索引合并结果 → 最终展示列表。**首屏/刷新与「加载更早」分页共用这一份合成**，
+     * 墓碑过滤、磁盘恢复、R1「null 不清空」、R2-N1 去重护栏都不留第二处实现。
+     *
+     * 三条规则的口径（原内联版逐条保留）：
+     * - 已在手机上删掉的条目（持久墓碑 + 本次待删快照）在最后统一滤掉；
+     * - null 的语义：索引读不出来（不存在/解析失败）且服务器本次也没有条目时
+     *   返回 null —— 调用方**必须保留上一次列表**，绝不能把 null 当成"图库空了"
+     *   清空界面（R1：磁盘缓存恢复出的条目是这时用户唯一能看到的图库）；
+     * - 图库 LazyGrid 的 key 是 (promptId, filename)，重复二元组会抛
+     *   IllegalArgumentException = 闪退，所以这里统一 distinctBy 收敛（R2-N1）。
+     */
+    private suspend fun buildVisibleFromIndex(
+        context: Context,
+        serverId: String,
+        indexMerged: List<GalleryItem>?,
+        deletionsSnapshot: Set<String>
+    ): List<GalleryItem>? = withContext(Dispatchers.IO) {
+        val tombstones = GalleryMetadataCache.loadTombstones(context, serverId) + deletionsSnapshot
+        val recovered = buildVisibleItems(
+            indexItems = indexMerged,
+            cachedKeys = MediaCache.listCachedKeys(context, ConnectionManager.currentServerId),
+            tombstones = tombstones
+        )
+        if (indexMerged == null && recovered.isEmpty()) {
+            DebugLogger.w(
+                TAG,
+                "索引读取失败且磁盘无缓存条目：保留上一次列表（${_galleryItems.value.size} 条），不清空"
+            )
+            null
+        } else {
+            if (indexMerged == null) {
+                DebugLogger.w(TAG, "索引读取失败，已用磁盘缓存恢复 ${recovered.size} 条")
+            }
+            recovered.distinctBy { GalleryMetadataCache.itemIdentityKey(it.promptId, it.filename) }
+        }
+    }
+
+    /**
+     * 「加载更早」按钮入口：向服务端把 history 窗口放宽一档重拉，把更早的条目
+     * 追加进列表尾部（"新的在前"，更早的必然垫底 —— 顺序不会错乱）。
+     *
+     * 失败静默：按钮留在原地可再点，不发 toast（翻页失败不该打断浏览，
+     * 且 canLoadOlder 未被消耗，重试无额外条件）。
+     * 与首屏/刷新互斥：那两条链路在途时分页结果会和它们的列表回写竞争。
+     */
+    fun loadOlderItems(onComplete: (Boolean) -> Unit = {}) {
+        if (!canLoadOlder.value) {
+            onComplete(false)
+            return
+        }
+        if (_isLoading.value || _isRefreshing.value) {
+            onComplete(false)
+            return
+        }
+        if (!olderInFlight.compareAndSet(false, true)) {
+            onComplete(false)
+            return
+        }
+        scope.launch {
+            try {
+                val ctx = applicationContext
+                val sid = ConnectionManager.currentServerId
+                onComplete(if (ctx != null && sid != null) loadOlderInternal(ctx, sid) else false)
+            } finally {
+                olderInFlight.set(false)
+            }
+        }
+    }
+
+    /**
+     * 分页主体。两个入口：[loadOlderItems]（按钮，olderInFlight 已占位）与
+     * loadGalleryInternal 的首访回填（**不经过** olderInFlight —— 它跑在加载协程内、
+     * _isLoading/_isRefreshing 未复位时，由那两个标志互斥）。
+     */
+    private suspend fun loadOlderInternal(context: Context, serverId: String): Boolean {
+        val client = comfyUIClient ?: return false
+        // 离线态（含自动切换）没有可翻页的服务端；索引里已翻到的更早条目照常可见
+        if (ConnectionManager.isOffline || AppSettings.isOfflineMode(context)) return false
+
+        val window = olderWindowSize(olderTapsDone, OLDER_WINDOW_STEP_ITEMS, MAX_OLDER_WINDOW_TAPS)
+            ?: run {
+                olderExhausted = true
+                _canLoadOlder.value = false
+                return false
+            }
+
+        _isLoadingOlder.value = true
+        try {
+            val historyJson = withContext(Dispatchers.IO) {
+                awaitCallbackOnce<JSONObject?> { deliver ->
+                    // 只放宽 max_items 窗口，**offset 恒不传** —— 传了服务端会从最旧一端
+                    // 跳过条数（execution.py:1423-1439），拿到的不是"首屏再往更早"而是
+                    // 别处切片；理由见 olderWindowSize 的 KDoc。
+                    client.fetchAllHistory(maxItems = window) { history -> deliver(history) }
+                }
+            } ?: return false
+
+            val deletionsSnapshot: Set<String>
+            synchronized(pendingDeletions) { deletionsSnapshot = pendingDeletions.toSet() }
+
+            val olderItems = parseHistoryToGalleryItems(historyJson)
+
+            // 净新增按**当前展示列表**判定：整页全是熟面孔 → 更早的已经都在索引里
+            //（索引条目全部来自服务端页面，窗口档位单调放宽 → 再往更早也不会出新的；
+            // 保守起见这里只终止本会话翻页，不弄丢任何数据）。
+            val knownKeys = _galleryItems.value.mapTo(mutableSetOf()) {
+                GalleryMetadataCache.itemIdentityKey(it.promptId, it.filename)
+            }
+            val netNew = olderItems.count {
+                GalleryMetadataCache.itemIdentityKey(it.promptId, it.filename) !in knownKeys
+            }
+
+            val mergedIndex = withContext(Dispatchers.IO) {
+                GalleryMetadataCache.mergeOlderMetadata(context, serverId, olderItems)
+            }
+            if (mergedIndex == null) {
+                // 索引读不出来：分页**完全不动列表**（区别于首屏路径的 R1 —— 首屏的
+                // 服务器数据能撑起新列表，更早页撑不起，硬换会把当前可见图库缩水）。
+                DebugLogger.w(TAG, "索引读取失败，跳过本次加载更早（保留现有 ${_galleryItems.value.size} 条）")
+                return false
+            }
+
+            val visible = buildVisibleFromIndex(context, serverId, mergedIndex, deletionsSnapshot)
+                ?: return false
+
+            if (olderHistoryExhausted(historyJson.length(), window) || netNew == 0) {
+                olderExhausted = true
+            }
+            olderTapsDone++
+
+            _galleryItems.value = visible
+            hasLoadedOnce = true
+            _canLoadOlder.value = !olderExhausted &&
+                olderWindowSize(olderTapsDone, OLDER_WINDOW_STEP_ITEMS, MAX_OLDER_WINDOW_TAPS) != null
+            DebugLogger.i(
+                TAG,
+                "加载更早完成: 窗口 $window 条 history，净新增 $netNew 条，展示 ${visible.size} 条（已翻 $olderTapsDone 档）"
+            )
+            return true
+        } catch (e: Exception) {
+            DebugLogger.w(TAG, "加载更早失败: ${e.message}")
+            return false
+        } finally {
+            _isLoadingOlder.value = false
         }
     }
 
@@ -574,6 +795,8 @@ class GalleryRepository private constructor() {
             _galleryItems.value = visible
             _lastRefreshTime.value = GalleryMetadataCache.getCacheTimestamp(context, serverId)
             hasLoadedOnce = true
+            // 离线态没有可翻页的服务端：不显示"加载更早"（索引里已翻到的更早条目照常可见）
+            _canLoadOlder.value = false
             DebugLogger.d(TAG, "Gallery loaded from local index: ${visible.size} items (offline)")
             return true
         }
@@ -802,6 +1025,9 @@ class GalleryRepository private constructor() {
     data class TrashPurgeSummary(
         /** 服务器确认删除（或已不存在）且本机残留已清理 */
         val removedWithServer: Int,
+        /** [removedWithServer] 的子集：删除时返回 404，文件在服务器上本就不在了
+         *  （多半已在电脑端删除）—— 照常收尾本地，UI 需单独提示 */
+        val alreadyGone: Int,
         /** 服务器不支持删除接口：只清了本机记录（服务器文件保留，必须提示） */
         val removedLocalOnly: Int,
         /** 服务器删除失败/探测不通，已标记待重试、留在回收站 */
@@ -816,8 +1042,10 @@ class GalleryRepository private constructor() {
      * 阶段二：回收站内"彻底删除"（服务器联动 + 本地残留清理）。
      *
      * 硬约束的代码化：
-     * - 服务器删除**只**经 [ComfyUIClient.deleteBrowserFile]，定位符先过
-     *   [toBrowserFolderType] 白名单与 [isLocatorSafe] 守卫，拼不出也发不出路径；
+     * - 服务器删除**只**经 [ComfyUIClient.deleteBrowserFile]，子目录先过
+     *   [normalizeFolderPath]（Windows 反斜杠形态统一成正斜杠，校验与发送同一个值），
+     *   再过 [toBrowserFolderType] 白名单（未知 type 兜底 outputs 并记日志）与
+     *   [isLocatorSafe] 守卫，拼不出也发不出路径；
      * - 能力必须先探测（[capabilityOf]），UNKNOWN 不发删除请求、下次可再探；
      * - 删除请求失败/超时 → [ServerDeleteAttempt.RETRYABLE] → 条目保留 + 标记
      *   pendingRetry，**本地一个文件都不清**，绝不谎报成功；
@@ -829,6 +1057,7 @@ class GalleryRepository private constructor() {
         ensureTrashLoaded()
         scope.launch {
             var removedWithServer = 0
+            var alreadyGone = 0
             var removedLocalOnly = 0
             var queuedForRetry = 0
             var keptForOtherServer = 0
@@ -891,21 +1120,39 @@ class GalleryRepository private constructor() {
                             markEntry(entry.identityKey, true, "客户端不可用")
                         } else {
                         val folderType = toBrowserFolderType(entry.item.type)
-                        if (folderType == null || !isLocatorSafe(entry.item.filename, entry.item.subfolder)) {
-                            // 定位符不合法（文件名里带路径分隔等异常数据）：宁可不删。
-                            // 标待重试并留证据，绝不把可疑字符串送进服务端的路径拼接。
+                        if (folderType.fellBackToOutputs) {
+                            // type 缺失/不认识：图库只展示 outputs 目录的产出，兜底按 outputs 根处理；
+                            // 不静默 —— 调试日志带原值（原值永不进请求体）
+                            DebugLogger.w(
+                                TAG,
+                                "回收站条目 type 无法识别（原值：\"${entry.item.type}\"），" +
+                                    "按 outputs 根删除: ${entry.item.filename}"
+                            )
+                        }
+                        // Windows 下的 ComfyUI 返回 "anima\hires" 反斜杠子目录：校验与发送前先
+                        // 统一成正斜杠，两处用同一个归一化值，杜绝"校验过却发原值"或"合法却被拦"
+                        val folderPath = normalizeFolderPath(entry.item.subfolder)
+                        if (!isLocatorSafe(entry.item.filename, folderPath)) {
+                            // 归一化后定位符仍非法（filename 含路径分隔 / `..` / 绝对前缀）：宁可不删，
+                            // 不发请求、条目留在回收站 —— 安全行为不变；文案给用户可执行的指引，
+                            // 不再出现"条目定位符异常"这类内部术语
                             queuedForRetry++
-                            markEntry(entry.identityKey, true, "条目定位符异常，未发起服务器删除")
+                            markEntry(
+                                entry.identityKey, true,
+                                "文件名含非法字符，无法自动删除；请在电脑端手动删除后重试"
+                            )
                             continue
                         }
                         val (code, networkFailed) = activeClient.deleteBrowserFileAwait(
-                            entry.item.filename, entry.item.subfolder, folderType
+                            entry.item.filename, folderPath, folderType.value
                         )
-                            when (classifyDeleteAttempt(code, networkFailed)) {
+                            when (val attempt = classifyDeleteAttempt(code, networkFailed)) {
                                 ServerDeleteAttempt.REMOVED, ServerDeleteAttempt.ALREADY_GONE -> {
                                     // 2xx = 服务器确认删除；404 = 文件本就不在了（幂等收敛，
-                                    // 能力已由探测确认在位，这个 404 来自插件的"未找到文件"）
+                                    // 能力已由探测确认在位，这个 404 来自插件的"未找到文件"，
+                                    // 通常是电脑端已删 —— 照常收尾本地，摘要里单独提示用户）
                                     removedWithServer++
+                                    if (attempt == ServerDeleteAttempt.ALREADY_GONE) alreadyGone++
                                     finishLocalCleanup(context, currentServerId, entry, tombstoneKey)
                                 }
                                 ServerDeleteAttempt.UNSUPPORTED_FALLBACK -> {
@@ -929,6 +1176,7 @@ class GalleryRepository private constructor() {
             onResult(
                 TrashPurgeSummary(
                     removedWithServer = removedWithServer,
+                    alreadyGone = alreadyGone,
                     removedLocalOnly = removedLocalOnly,
                     queuedForRetry = queuedForRetry,
                     keptForOtherServer = keptForOtherServer
@@ -1055,6 +1303,11 @@ class GalleryRepository private constructor() {
         _galleryItems.value = emptyList()
         _lastRefreshTime.value = 0L
         hasLoadedOnce = false
+        // 「加载更早」分页状态随列表一起复位：断连/换服务器后重走首屏加载，
+        // 由那一次的"满页判据"重新决定能否翻页（olderTapsDone 归零 → 窗口重新从一档起）
+        olderTapsDone = 0
+        olderExhausted = false
+        _canLoadOlder.value = false
         synchronized(pendingDeletions) {
             pendingDeletions.clear()
         }

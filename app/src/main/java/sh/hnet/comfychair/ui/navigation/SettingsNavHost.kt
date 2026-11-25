@@ -1,8 +1,5 @@
 package sh.hnet.comfychair.ui.navigation
 
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -36,9 +33,6 @@ import sh.hnet.comfychair.ui.screens.AboutSettingsScreen
 import sh.hnet.comfychair.ui.screens.AppearanceSettingsScreen
 import sh.hnet.comfychair.ui.screens.ChangelogScreen
 import sh.hnet.comfychair.ui.screens.ApplicationSettingsScreen
-import androidx.compose.material.icons.filled.MenuBook
-import sh.hnet.comfychair.ui.screens.ModelIntroDetailScreen
-import sh.hnet.comfychair.ui.screens.ModelIntroScreen
 import sh.hnet.comfychair.ui.screens.ServerSettingsScreen
 import sh.hnet.comfychair.ui.screens.WorkflowsSettingsScreen
 import sh.hnet.comfychair.viewmodel.SettingsViewModel
@@ -49,7 +43,7 @@ fun SettingsNavHost(
     settingsViewModel: SettingsViewModel,
     workflowManagementViewModel: WorkflowManagementViewModel,
     onNavigateToGeneration: () -> Unit,
-    onLogout: () -> Unit
+    onLogout: () -> Unit,
 ) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -94,37 +88,7 @@ fun SettingsNavHost(
                         }
                     }
 
-                    // 模型介绍（按目录浏览全部模型的名称与介绍）
-                    if (currentRoute == SettingsRoute.ModelIntro.route) {
-                        FilledIconButton(
-                            onClick = { },
-                            colors = IconButtonDefaults.filledIconButtonColors(
-                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
-                            )
-                        ) {
-                            Icon(
-                                Icons.Filled.MenuBook,
-                                contentDescription = stringResource(R.string.nav_model_intro)
-                            )
-                        }
-                    } else {
-                        IconButton(onClick = {
-                            navController.navigate(SettingsRoute.ModelIntro.route) {
-                                popUpTo(navController.graph.findStartDestination().id) {
-                                    saveState = true
-                                }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        }) {
-                            Icon(
-                                Icons.Filled.MenuBook,
-                                contentDescription = stringResource(R.string.nav_model_intro),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
+                    // 模型介绍入口只在主容器底栏，设置底栏不再保留第二个入口。
 
                     // Application Settings（外观配色是它的二级页面，一并算选中，
                     // 否则进了调色页底部四个图标全变未选中态，看起来像迷路了）
@@ -255,27 +219,6 @@ fun SettingsNavHost(
                     onNavigateToGeneration = onNavigateToGeneration,
                     onLogout = onLogout
                 )
-            }
-
-            composable(SettingsRoute.ModelIntro.route) {
-                ModelIntroScreen(
-                    onBack = { navController.popBackStack() },
-                    onOpenDetail = { intro ->
-                        navController.navigate(SettingsRoute.ModelIntroDetail.createRoute(intro.file))
-                    }
-                )
-            }
-
-            // 模型介绍详情页（v4.17 二级页面）：转场只做淡入淡出（200/150ms），不做 slide
-            composable(
-                SettingsRoute.ModelIntroDetail.route,
-                enterTransition = { fadeIn(tween(200)) },
-                exitTransition = { fadeOut(tween(150)) },
-                popEnterTransition = { fadeIn(tween(200)) },
-                popExitTransition = { fadeOut(tween(150)) },
-            ) { backStackEntry ->
-                val file = backStackEntry.arguments?.getString(SettingsRoute.ModelIntroDetail.ARG_FILE).orEmpty()
-                ModelIntroDetailScreen(file = file, onBack = { navController.popBackStack() })
             }
 
             composable(SettingsRoute.Application.route) {

@@ -51,6 +51,8 @@
     <string name="error_upload_stalled">Upload gestoppt</string>
     <string name="action_reconnect">Erneut verbinden</string>
     <string name="action_reconnecting">Verbindung wird hergestellt…</string>
+    <string name="action_try_later">Später erneut versuchen</string>
+    <string name="msg_connection_interrupted">Verbindung unterbrochen. Neuer Versuch läuft im Hintergrund…</string>
     <string name="msg_reconnect_failed">Verbindung fehlgeschlagen</string>
     <string name="action_return_to_login">Zur Anmeldung</string>
 
@@ -727,10 +729,10 @@
     <!-- Markdown-Export der Modellinfo (gemeinsame Vorlage: ModelIntroMarkdown) -->
     <string name="model_intro_export_md">Markdown exportieren</string>
     <string name="model_intro_export_failed">Modellinfo konnte nicht exportiert werden</string>
-    <!-- Benutzer-Overlay: deinstallieren / Mehrfachauswahl / importieren / wiederherstellen -->
+    <string name="model_intro_copy_all">Alle kopieren</string>
+    <!-- Benutzer-Overlay: deinstallieren / Mehrfachauswahl / wiederherstellen -->
     <string name="model_intro_menu_more">Weitere Aktionen</string>
     <string name="model_intro_batch_manage">Mehrfachauswahl</string>
-    <string name="model_intro_import">Info importieren</string>
     <string name="model_intro_hidden_menu">Deinstalliert (%1$d)</string>
     <string name="model_intro_uninstall_title">Diesen Eintrag deinstallieren?</string>
     <string name="model_intro_uninstall_message">„%1$s“ wird nur auf diesem Gerät ausgeblendet. Der integrierte Eintrag wird nicht gelöscht und kann jederzeit wiederhergestellt werden.</string>
@@ -746,11 +748,30 @@
     <string name="model_intro_batch_done">%1$d Einträge deinstalliert</string>
     <string name="model_intro_hidden_title">Deinstallierte Einträge</string>
     <string name="model_intro_hidden_empty">Keine deinstallierten Einträge</string>
-    <string name="model_intro_import_success">%1$d Einträge importiert</string>
-    <string name="model_intro_import_error_read">Datei konnte nicht gelesen werden, bitte erneut versuchen</string>
-    <string name="model_intro_import_error_unsupported">Nicht unterstützter Dateityp (nur .json oder .md)</string>
-    <string name="model_intro_import_error_json">Ungültiges JSON: erwartet wird eine Modellinfo-Tabelle (models) oder ein Objekt „Dateiname → Eintrag“</string>
-    <string name="model_intro_import_error_empty">Keine importierbaren Einträge in dieser Datei</string>
-    <string name="model_intro_import_error_md">Keine Modellinfos in diesem Markdown: erforderlich sind eine „# Name“-Überschrift und Metazeilen wie „名字：…“</string>
-    <string name="model_intro_import_error_save">Importierte Einträge konnten nicht gespeichert werden, bitte erneut versuchen</string>
+    <!-- Intro document editor (v4.21) -->
+    <string name="model_intro_editor_entry">Neuen Eintrag hinzufügen</string>
+    <string name="model_intro_edit_entry">Diesen Eintrag bearbeiten</string>
+    <string name="model_intro_editor_title_new">Neuer Eintrag</string>
+    <string name="model_intro_editor_title_edit">Eintrag bearbeiten</string>
+    <string name="model_intro_editor_field_file">Dateiname</string>
+    <string name="model_intro_editor_field_name">Name</string>
+    <string name="model_intro_editor_field_base">Basismodell</string>
+    <string name="model_intro_editor_field_version">Version</string>
+    <string name="model_intro_editor_field_kind">Typ</string>
+    <string name="model_intro_editor_field_effect">Wirkung</string>
+    <string name="model_intro_custom_fields">Eigene Felder</string>
+    <string name="model_intro_editor_add_field">Feld hinzufügen</string>
+    <string name="model_intro_editor_remove_field">Dieses Feld entfernen</string>
+    <string name="model_intro_editor_label_hint">Feldname</string>
+    <string name="model_intro_editor_value_hint">Wert</string>
+    <string name="model_intro_editor_template_title">Vorlage zum Vorbelegen der Felder wählen</string>
+    <string name="model_intro_editor_template_skip">Leer beginnen</string>
+    <string name="model_intro_editor_save">Speichern</string>
+    <string name="model_intro_editor_saved">Gespeichert</string>
+    <string name="model_intro_editor_file_required">Dateiname erforderlich</string>
+    <string name="model_intro_editor_builtin_override">Dieser Eintrag existiert in der integrierten Bibliothek. Beim Speichern wird er vollständig durch Ihre Version ersetzt; der integrierte Inhalt ist jederzeit wiederherstellbar.</string>
+    <string name="model_intro_editor_delete">Löschen</string>
+    <string name="model_intro_editor_delete_title">Diesen eigenen Eintrag löschen?</string>
+    <string name="model_intro_editor_delete_message">„%1$s“ wurde auf diesem Gerät erstellt. Nach dem Löschen ist er endgültig entfernt; die integrierte Bibliothek bleibt unberührt.</string>
+    <string name="model_intro_editor_deleted">Eintrag gelöscht</string>
 </resources>

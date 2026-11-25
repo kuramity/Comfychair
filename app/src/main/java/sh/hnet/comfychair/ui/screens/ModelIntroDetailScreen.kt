@@ -1,5 +1,7 @@
 package sh.hnet.comfychair.ui.screens
 
+import android.content.Intent
+import android.widget.Toast
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -26,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -69,18 +72,22 @@ import sh.hnet.comfychair.model.LoraEffectTable
 import sh.hnet.comfychair.model.LoraWeightSuggestion
 import sh.hnet.comfychair.model.LoraWeightShape
 import sh.hnet.comfychair.model.ModelIntro
+import sh.hnet.comfychair.model.ModelIntroMarkdown
+import sh.hnet.comfychair.model.ModelIntroPresentation
 import sh.hnet.comfychair.model.ModelIntroTable
 import sh.hnet.comfychair.model.splitIntroText
 import sh.hnet.comfychair.ui.components.ripple.rippleFeedback
+import sh.hnet.comfychair.ui.components.shared.MetaHeaderRows
 import sh.hnet.comfychair.ui.theme.Dimensions
+import sh.hnet.comfychair.ui.util.ModelIntroMarkdownExport
 import sh.hnet.comfychair.ui.util.withStableKeys
 import kotlin.math.roundToInt
 
 /**
  * 模型介绍详情页（二级页面，v4.17）。
  *
- * 从介绍抽屉（[sh.hnet.comfychair.ui.components.shared.ModelIntroSheet]）的
- * 「查看完整详情」进入，按 20 个候选区块完整呈现一条介绍；字段为空的区块整块不渲染
+ * 从介绍列表（[sh.hnet.comfychair.ui.screens.ModelIntroScreen]）点条目**直接进入**，
+ * 按 20 个候选区块完整呈现一条介绍；字段为空的区块整块不渲染
  * （列表见各区块组件的 KDoc）。整页 LazyColumn，每个区块一个 item（带业务 key 与
  * contentType），折叠状态沉到各区块组件内部（rememberSaveable），不做页面级展开集合。
  *
@@ -95,7 +102,7 @@ fun ModelIntroDetailScreen(file: String, onBack: () -> Unit) {
     var intro by remember { mutableStateOf<ModelIntro?>(null) }
 
     // 与浏览页同一装载纪律（P2-17）：513KB 的表不许在主线程解析；ensureLoaded 幂等，
-    // 已装好时直接返回，所以从抽屉进来时这里不会重复读盘
+    // 已装好时直接返回，所以从列表进来时这里不会重复读盘
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) { ModelIntroTable.ensureLoaded(context) }
         intro = ModelIntroTable.lookup(file)
@@ -103,6 +110,8 @@ fun ModelIntroDetailScreen(file: String, onBack: () -> Unit) {
 
     Scaffold(
         topBar = {
+            val exportLabel = stringResource(R.string.model_intro_export_md)
+            val exportFailed = stringResource(R.string.model_intro_export_failed)
             TopAppBar(
                 title = { Text(stringResource(R.string.model_intro_detail_title)) },
                 navigationIcon = {
@@ -110,6 +119,31 @@ fun ModelIntroDetailScreen(file: String, onBack: () -> Unit) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = stringResource(R.string.button_back)
+                        )
+                    }
+                },
+                actions = {
+                    // 导出：按 ModelIntroMarkdown 的模板生成 .md，走项目既有的分享链路
+                    // （cacheDir/share/ + FileProvider + ACTION_SEND，见 ui/util/ModelIntroMarkdownExport）
+                    IconButton(
+                        onClick = {
+                            val target = intro ?: return@IconButton
+                            try {
+                                val intent = ModelIntroMarkdownExport.shareIntent(context, target)
+                                if (intent == null) {
+                                    Toast.makeText(context, exportFailed, Toast.LENGTH_SHORT).show()
+                                } else {
+                                    context.startActivity(Intent.createChooser(intent, exportLabel))
+                                }
+                            } catch (e: Exception) {
+                                Toast.makeText(context, exportFailed, Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        enabled = intro != null
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = exportLabel
                         )
                     }
                 }
@@ -155,13 +189,10 @@ private fun DetailContent(intro: ModelIntro, modifier: Modifier = Modifier) {
         )
     ) {
         // ---- 头部区（坐背景上，不进卡）----
+        // 标题 + 元信息 + 效果由 Markdown 模板渲染（与导出的 .md 同源）；
+        // 原先独立的「简介卡」并入这一块，避免效果在页面上出现两次
         item(key = "header", contentType = "header") {
             DetailHeader(intro = intro)
-        }
-
-        // ---- 组 1：介绍卡（简介 + 效果）----
-        item(key = "intro_card", contentType = "card") {
-            IntroCard(intro = intro, modifier = Modifier.padding(top = Dimensions.Spacing12))
         }
 
         // ---- 组 2：权重 + 参数 + 复制 ----
@@ -263,76 +294,110 @@ private fun DetailContent(intro: ModelIntro, modifier: Modifier = Modifier) {
 }
 
 // ============================================================
-// 头部区（区块 1-4：模型名 / 类型徽章 / 元信息行 / 风格 chips）
+// 头部区（模型名 / 元信息 / 效果 / 来源 / 风格 chips）
 // ============================================================
 
+/**
+ * 元信息头 + 剩余简介：**逐行键值渲染**（名字 / 底模 / 版本 / 类型 / 模型效果或 LoRA 效果）。
+ *
+ * 键值来源是 [ModelIntroPresentation.buildMetaHeader]（与导出的 `.md` 同源），
+ * 但**界面这里不用 Markdown 渲染**：
+ * 用户要求开头是分行元信息头，键列要对齐、可逐行选中复制，Markdown 渲染做不到对齐。
+ *
+ * Markdown 模板管不到的三件事仍用原来的 Compose 渲染：
+ * 1. 「文件已移除」提示（模板里没有这一行，但它是本页最要紧的警示）；
+ * 2. 数据来源（元信息头里不含 source）；
+ * 3. 风格定位 chips（local_positioning 拆词是界面行为）。
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DetailHeader(intro: ModelIntro) {
     val sourceText = sourceLabel(intro.source)
         ?.let { stringResource(R.string.model_intro_source_from, it) }
+    // 效果档案兜底：读的是 [LoraEffectTable] 这张**全局可变表**（懒加载，可能在首次组合之后
+    // 才装好），所以这道取值必须留在组合期每次取一次，不能进 remember——取到的值本身只是
+    // 3 次字符串处理 + 一次 map 取值（LoraEffectTable.kt:108），开销可忽略。
+    val effectFallback = LoraEffectTable.lookup(intro.file)
+    // 下面两个纯展示计算原先每次重组都重跑：buildMetaHeader 与 summaryRestForDisplay 各自
+    // 都会走 cleanIntroSummary（8 条正则的 replace 链，ModelIntroPresentation.kt:204），
+    // summaryRestForDisplay 内部还再调一次 effectText → 又一遍 cleanIntroSummary，
+    // 一次重组合计约 24 次正则 replace。结果只由 intro 与 effectFallback 决定，
+    // 用这两个 key 钉住（ModelIntro 是 data class，结构化 equals 覆盖这两个函数读到的
+    // file/name/base/version/type/kind/effect/summary/loraWeight 全部输入）。
+    val metaHeader = remember(intro, effectFallback) {
+        ModelIntroPresentation.buildMetaHeader(intro, effectFallback)
+    }
+    // 效果行之外**剩余的真实简介**：清掉重复模板段、且避开效果行已取用的那段文字
+    // （effect 与档案都为空时效果行取的就是清洗后的 summary，再渲染一遍就是重复）
+    val summaryRest = remember(intro, effectFallback) {
+        ModelIntroPresentation.summaryRestForDisplay(intro, effectFallback)
+    }
 
-    Column(verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing8)) {
-        Text(
-            text = intro.name ?: intro.file,
-            style = MaterialTheme.typography.titleLarge,
-            maxLines = 3,
-            overflow = TextOverflow.Ellipsis,
-            color = MaterialTheme.colorScheme.onSurface
-        )
+    SelectionContainer {
+        Column(verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing8)) {
+            // 元信息头逐行（键 labelMedium/onSurfaceVariant、值 bodyMedium/onSurface，键列 72dp 对齐）
+            MetaHeaderRows(metaHeader)
 
-        // 文件已移除：先说这件事，再说它曾经是什么（与抽屉同一文案键）
-        if (intro.missing) {
-            Text(
-                text = stringResource(R.string.model_intro_missing_notice),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.error
-            )
-        }
-
-        // 类型徽章：恒显示（数据侧的中文类型，「大模型（Checkpoint）」）
-        intro.type?.let { type ->
-            Surface(
-                shape = RoundedCornerShape(Dimensions.Radius8),
-                color = MaterialTheme.colorScheme.secondaryContainer,
-                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
-            ) {
+            // 用户自定义字段（编辑器写入的覆盖层内容）：紧跟元信息头、在正文之前，
+            // 与参数卡同款两列键值排版（ParamRow）。customFields 为空时整块不渲染
+            // （零占位——数据层落盘已剔除空白项，这里只判非空列表，不再逐行过滤）。
+            if (intro.customFields.isNotEmpty()) {
                 Text(
-                    text = type,
+                    text = stringResource(R.string.model_intro_custom_fields),
                     style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.padding(horizontal = Dimensions.Spacing8, vertical = Dimensions.Spacing4)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                intro.customFields.forEach { field ->
+                    ParamRow(key = field.label, value = field.value)
+                }
+            }
+
+            // 剩余简介：bodyLarge + 28sp 行高（长中文正文的呼吸感，任务书指定）
+            summaryRest?.let { text ->
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 28.sp),
+                    color = MaterialTheme.colorScheme.onSurface
                 )
             }
-        }
 
-        // 元信息行：version · base · source（缺项跳过，全缺整行不渲染）
-        val metaLine = listOfNotNull(intro.version, intro.base, sourceText).joinToString(" · ")
-        if (metaLine.isNotBlank()) {
-            Text(
-                text = metaLine,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
+            // 文件已移除：先说这件事，再说它曾经是什么（与列表副标题同一事实的两处呈现）
+            if (intro.missing) {
+                Text(
+                    text = stringResource(R.string.model_intro_missing_notice),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
 
-        // 风格标签 chips：local_positioning 按「+」拆（「动漫插画 + 真实皮肤质感」→ 两枚）
-        val styleTags = remember(intro.localPositioning) { splitStyleTags(intro.localPositioning) }
-        if (styleTags.isNotEmpty()) {
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(Dimensions.Spacing8),
-                verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing4)
-            ) {
-                styleTags.forEach { tag ->
-                    Surface(
-                        shape = RoundedCornerShape(Dimensions.Radius8),
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        contentColor = MaterialTheme.colorScheme.onSurface
-                    ) {
-                        Text(
-                            text = tag,
-                            style = MaterialTheme.typography.labelMedium,
-                            modifier = Modifier.padding(horizontal = Dimensions.Spacing8, vertical = Dimensions.Spacing4)
-                        )
+            // 数据来源：模板元信息行里没有它，但这是详情页既有信息，保留一行
+            sourceText?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            // 风格标签 chips：local_positioning 按「+」拆（「动漫插画 + 真实皮肤质感」→ 两枚）
+            val styleTags = remember(intro.localPositioning) { splitStyleTags(intro.localPositioning) }
+            if (styleTags.isNotEmpty()) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(Dimensions.Spacing8),
+                    verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing4)
+                ) {
+                    styleTags.forEach { tag ->
+                        Surface(
+                            shape = RoundedCornerShape(Dimensions.Radius8),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = MaterialTheme.colorScheme.onSurface
+                        ) {
+                            Text(
+                                text = tag,
+                                style = MaterialTheme.typography.labelMedium,
+                                modifier = Modifier.padding(horizontal = Dimensions.Spacing8, vertical = Dimensions.Spacing4)
+                            )
+                        }
                     }
                 }
             }
@@ -341,73 +406,42 @@ private fun DetailHeader(intro: ModelIntro) {
 }
 
 // ============================================================
-// 介绍卡（区块 5-6：简介 + 效果）—— SelectionContainer 作用域
-// ============================================================
-
-@Composable
-private fun IntroCard(intro: ModelIntro, modifier: Modifier = Modifier) {
-    SelectionContainer {
-        DetailCard(modifier = modifier) {
-            // 简介：恒显示（表未收录时上层根本进不来这个页面，因此必有数据）
-            Text(
-                text = intro.summary ?: stringResource(R.string.model_intro_none),
-                style = longBodyStyle(),
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            // 效果：有值才显示；数据里自带「效果：」前缀，剥掉（标题就是它，重复读一遍很难受）。
-            // 条目自身没有 effect 时退到独立维护的效果档案里兜底（与抽屉同一兜底链）
-            (intro.effect ?: LoraEffectTable.lookup(intro.file))?.let { effect ->
-                Spacer(Modifier.height(Dimensions.Spacing8))
-                SectionTitle(stringResource(R.string.model_intro_effect))
-                Text(
-                    text = stripEffectPrefix(effect),
-                    style = longBodyStyle(),
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-            }
-        }
-    }
-}
-
-/** 长文样式（简介/效果）：bodyLarge + 行高 28sp（16×1.75，中文最佳可读区间）。 */
-@Composable
-private fun longBodyStyle() = MaterialTheme.typography.bodyLarge.copy(lineHeight = 28.sp)
-
-// ============================================================
 // LoRA 权重卡（区块 10：五种形态，绝不把单边界画成区间）
 // ============================================================
 
 @Composable
 private fun LoraWeightCard(lw: LoraWeightSuggestion, modifier: Modifier = Modifier) {
-    DetailCard(modifier = modifier) {
-        SectionTitle(stringResource(R.string.model_intro_lora_weight))
-        // 权重条静态（无入场动画，任务书明令）
-        when (lw.shape) {
-            LoraWeightShape.RANGE, LoraWeightShape.RANGE_WITH_DEFAULT ->
-                WeightBarCanvas(
-                    lw = lw,
-                    highlightFrom = lw.min,
-                    highlightTo = lw.max,
-                    fadeFrom = null,
-                )
-            LoraWeightShape.MIN_ONLY ->
-                WeightBarCanvas(lw = lw, highlightFrom = null, highlightTo = null, fadeFrom = lw.min)
-            LoraWeightShape.MAX_ONLY ->
-                WeightBarCanvas(
-                    lw = lw,
-                    highlightFrom = null,
-                    highlightTo = null,
-                    fadeFrom = lw.max,
-                    fadeToRight = false
-                )
-            LoraWeightShape.DEFAULT_ONLY -> DefaultOnlyWeightBar(lw = lw)
-            LoraWeightShape.EMPTY -> {}
+    SelectionContainer {
+        DetailCard(modifier = modifier) {
+            SectionTitle(stringResource(R.string.model_intro_lora_weight))
+            // 权重条静态（无入场动画，任务书明令）
+            when (lw.shape) {
+                LoraWeightShape.RANGE, LoraWeightShape.RANGE_WITH_DEFAULT ->
+                    WeightBarCanvas(
+                        lw = lw,
+                        highlightFrom = lw.min,
+                        highlightTo = lw.max,
+                        fadeFrom = null,
+                    )
+                LoraWeightShape.MIN_ONLY ->
+                    WeightBarCanvas(lw = lw, highlightFrom = null, highlightTo = null, fadeFrom = lw.min)
+                LoraWeightShape.MAX_ONLY ->
+                    WeightBarCanvas(
+                        lw = lw,
+                        highlightFrom = null,
+                        highlightTo = null,
+                        fadeFrom = lw.max,
+                        fadeToRight = false
+                    )
+                LoraWeightShape.DEFAULT_ONLY -> DefaultOnlyWeightBar(lw = lw)
+                LoraWeightShape.EMPTY -> {}
+            }
+            Text(
+                text = weightCaption(lw),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
         }
-        Text(
-            text = weightCaption(lw),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurface
-        )
     }
 }
 
@@ -551,7 +585,10 @@ private fun ParamRow(key: String, value: String) {
             text = value,
             style = MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings = "tnum"),
             color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.weight(1f)
+            // U1-B：fill = false —— 短值按内容宽度收窄，Text 布局框不再一直顶到屏幕右边缘。
+            // SelectionContainer 的命中判定基于 Text 的布局矩形，框比文字宽就会「点右侧空白也选中」。
+            // 长值仍可占满剩余宽度并正常换行，排版不变。
+            modifier = Modifier.weight(1f, fill = false)
         )
     }
 }
@@ -618,23 +655,25 @@ private fun CopyParamsButton(intro: ModelIntro, modifier: Modifier = Modifier) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TagsCard(intro: ModelIntro, modifier: Modifier = Modifier) {
-    DetailCard(modifier = modifier) {
-        SectionTitle(stringResource(R.string.model_intro_tags))
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(Dimensions.Spacing8),
-            verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing4)
-        ) {
-            intro.tags.forEach { tag ->
-                Surface(
-                    shape = RoundedCornerShape(Dimensions.Radius8),
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    contentColor = MaterialTheme.colorScheme.onSurface
-                ) {
-                    Text(
-                        text = tag,
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(horizontal = Dimensions.Spacing8, vertical = Dimensions.Spacing4)
-                    )
+    SelectionContainer {
+        DetailCard(modifier = modifier) {
+            SectionTitle(stringResource(R.string.model_intro_tags))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(Dimensions.Spacing8),
+                verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing4)
+            ) {
+                intro.tags.forEach { tag ->
+                    Surface(
+                        shape = RoundedCornerShape(Dimensions.Radius8),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        contentColor = MaterialTheme.colorScheme.onSurface
+                    ) {
+                        Text(
+                            text = tag,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(horizontal = Dimensions.Spacing8, vertical = Dimensions.Spacing4)
+                        )
+                    }
                 }
             }
         }
@@ -643,14 +682,15 @@ private fun TagsCard(intro: ModelIntro, modifier: Modifier = Modifier) {
 
 @Composable
 private fun PlainTextCard(title: String, text: String, modifier: Modifier = Modifier) {
-    // 不包 SelectionContainer：规范限定可选中复制只覆盖介绍卡/参数卡/社区卡三块
-    DetailCard(modifier = modifier) {
-        SectionTitle(title)
-        Text(
-            text = text,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface
-        )
+    SelectionContainer {
+        DetailCard(modifier = modifier) {
+            SectionTitle(title)
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+        }
     }
 }
 
@@ -688,14 +728,21 @@ private fun CommunityParamsCard(
                         text = item.value,
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.weight(1f)
+                        // U1-B：fill = false，理由同 ParamRow —— 短值框只占文字宽度，
+                        // 点行尾空白不再命中该 Text
+                        modifier = Modifier.weight(1f, fill = false)
                     )
-                    // count < 3 不显示数字：两三张图撑不起「常用」二字
-                    if (item.count >= 3) {
+                    // 注意：这里特意**不加**可伸缩 Spacer 去把计数顶回最右侧 —— Row 里两个
+                    // weight 子项会平分剩余宽度，值的 maxWidth 会被砍半，长值会比原来更早换行。
+                    // 代价是计数改成紧跟值文字（下加 8dp 间距），换来长值排版与原来一致。
+                    // count 不到门槛不显示数字：两三张图撑不起「常用」二字
+                    // （门槛与导出的 .md「社区常用」节共用同一个常量）
+                    if (item.count >= ModelIntroMarkdown.COMMUNITY_COUNT_MIN_DISPLAY) {
                         Text(
                             text = stringResource(R.string.model_intro_community_count, item.count),
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = Dimensions.Spacing8)
                         )
                     }
                 }
@@ -747,31 +794,40 @@ private fun CommunityNotice() {
 
 @Composable
 private fun OriginalTextCard(text: String, modifier: Modifier = Modifier) {
+    val clipboard = LocalClipboardManager.current
     DetailCard(modifier = modifier, container = MaterialTheme.colorScheme.surfaceContainerLow) {
-        SectionTitle(stringResource(R.string.model_intro_original))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SectionTitle(stringResource(R.string.model_intro_original))
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = { clipboard.setText(AnnotatedString(text)) }) {
+                Text(stringResource(R.string.model_intro_copy_all))
+            }
+        }
         // 独立滚动框：原文动辄几千字，跟整页一起滚会把参数区顶得老远。固定高度 + 自己的
         // 滚动（外层 LazyColumn 不能嵌无限高度的滚动容器，item 内固定高度没问题）；整段塞
         // 一个 Text 最长 5 万多字符单次排版慢到肉眼可见，切成小片段逐段排版（拼接恒等于原文）。
         val chunks = remember(text) { splitIntroText(text) }
         val keyedChunks = remember(chunks) { chunks.withStableKeys { it } }
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(300.dp)
-                .border(
-                    Dimensions.Stroke1,
-                    MaterialTheme.colorScheme.outlineVariant,
-                    RoundedCornerShape(Dimensions.Radius8)
-                )
-        ) {
-            LazyColumn(modifier = Modifier.fillMaxWidth().padding(Dimensions.Spacing12)) {
-                items(keyedChunks, key = { it.key }, contentType = { "original_chunk" }) { item ->
-                    Text(
-                        text = item.value,
-                        // 长文行高覆盖：12sp 正文 × 1.75 = 21sp（中文可读性，字号保持）
-                        style = MaterialTheme.typography.bodySmall.copy(lineHeight = 21.sp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+        SelectionContainer {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(300.dp)
+                    .border(
+                        Dimensions.Stroke1,
+                        MaterialTheme.colorScheme.outlineVariant,
+                        RoundedCornerShape(Dimensions.Radius8)
                     )
+            ) {
+                LazyColumn(modifier = Modifier.fillMaxWidth().padding(Dimensions.Spacing12)) {
+                    items(keyedChunks, key = { it.key }, contentType = { "original_chunk" }) { item ->
+                        Text(
+                            text = item.value,
+                            // 长文行高覆盖：12sp 正文 × 1.75 = 21sp（中文可读性，字号保持）
+                            style = MaterialTheme.typography.bodySmall.copy(lineHeight = 21.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }
@@ -784,55 +840,57 @@ private fun OriginalTextCard(text: String, modifier: Modifier = Modifier) {
 
 @Composable
 private fun ArchiveCard(intro: ModelIntro, modifier: Modifier = Modifier) {
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .background(
-                MaterialTheme.colorScheme.surfaceVariant,
-                RoundedCornerShape(Dimensions.Radius16)
-            )
-            .padding(Dimensions.Spacing16),
-        verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing8)
-    ) {
-        // 路径：恒显示（列表里只给文件名，这里给能对着文件系统找的位置）
-        Text(
-            text = stringResource(R.string.model_intro_path),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Text(
-            text = "models/" + (intro.rel ?: intro.file),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        // 置信度说明：有值才显示——它是在告诉用户"这条介绍可能认错了模型"
-        intro.confidenceNote?.let { note ->
+    SelectionContainer {
+        Column(
+            modifier = modifier
+                .fillMaxWidth()
+                .background(
+                    MaterialTheme.colorScheme.surfaceVariant,
+                    RoundedCornerShape(Dimensions.Radius16)
+                )
+                .padding(Dimensions.Spacing16),
+            verticalArrangement = Arrangement.spacedBy(Dimensions.Spacing8)
+        ) {
+            // 路径：恒显示（列表里只给文件名，这里给能对着文件系统找的位置）
             Text(
-                text = stringResource(R.string.model_intro_confidence_note),
+                text = stringResource(R.string.model_intro_path),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                text = note,
+                text = "models/" + (intro.rel ?: intro.file),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-        }
-        // 缺介绍占位：数据侧标记只有套话没有完整介绍，说明白而不是硬渲染空架子
-        if (intro.introMissing) {
-            Text(
-                text = stringResource(R.string.model_intro_intro_missing),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        // 来源链接：有值才显示（浏览原文/下载页用）
-        intro.url?.let { url ->
-            Text(
-                text = url,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.primary
-            )
+            // 置信度说明：有值才显示——它是在告诉用户"这条介绍可能认错了模型"
+            intro.confidenceNote?.let { note ->
+                Text(
+                    text = stringResource(R.string.model_intro_confidence_note),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = note,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            // 缺介绍占位：数据侧标记只有套话没有完整介绍，说明白而不是硬渲染空架子
+            if (intro.introMissing) {
+                Text(
+                    text = stringResource(R.string.model_intro_intro_missing),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            // 来源链接：有值才显示（浏览原文/下载页用）
+            intro.url?.let { url ->
+                Text(
+                    text = url,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
         }
     }
 }
@@ -885,9 +943,13 @@ internal fun sourceLabel(source: String?): String? = when (source?.trim()?.lower
     else -> null
 }
 
-/** 剥掉效果段自带的「效果：」前缀（数据里自带，标题已经写明 What it does）。 */
-internal fun stripEffectPrefix(effect: String): String =
-    effect.trim().removePrefix("效果：").removePrefix("效果:").trim()
+/**
+ * 剥掉效果段自带的「效果：」前缀（数据里自带，标题已经写明 What it does）。
+ *
+ * 实现移到 [ModelIntroMarkdown.stripEffectLabel]（Markdown 模板的「效果：」行也用它，
+ * 否则会输出「效果：效果：……」）；这里保留同签名转接，既有单测继续钉住这条规则。
+ */
+internal fun stripEffectPrefix(effect: String): String = ModelIntroMarkdown.stripEffectLabel(effect)
 
 /** 风格定位拆 chips：「+」与「、」都是分隔符（数据侧人工概括的惯用连接符）。 */
 internal fun splitStyleTags(positioning: String?): List<String> {
@@ -918,14 +980,13 @@ internal fun loraWeightDomain(lw: LoraWeightSuggestion): ClosedFloatingPointRang
     return values.min()..values.max()
 }
 
-/** 社区参数键的中文标签（数据键是英文枚举，界面按固定映射显示）。 */
-internal fun communityKeyLabel(key: String): String = when (key) {
-    "sampler" -> "采样器"
-    "cfg" -> "CFG"
-    "steps" -> "步数"
-    "scheduler" -> "调度器"
-    else -> key
-}
+/**
+ * 社区参数键的中文标签（数据键是英文枚举，界面按固定映射显示）。
+ *
+ * 映射在 [ModelIntroMarkdown.communityParamLabel]（导出的 .md 的「社区常用」节也用它），
+ * 这里保留同签名转接，避免界面与导出各写一份中文标签。
+ */
+internal fun communityKeyLabel(key: String): String = ModelIntroMarkdown.communityParamLabel(key)
 
 /**
  * 复制到剪贴板的参数文本（纯函数，供单测）。

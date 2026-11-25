@@ -194,6 +194,63 @@ object GalleryMetadataCache {
     }
 
     /**
+     * 「加载更早」分页专用：**筛出索引里还没有的条目**（保持 incoming 的顺序与首次出现）。
+     *
+     * 与 [mergeItems] 的去重口径完全一致（NUL 条目键），差别只在方向 ——
+     * 分页拉回的窗口里绝大部分条目索引早已认识（首屏那 100 条必然重叠），
+     * 净新增只有更旧的一段，所以要按条目去重而不是按 promptId。
+     */
+    internal fun olderItemsNotKnown(
+        existing: List<GalleryItem>,
+        incoming: List<GalleryItem>
+    ): List<GalleryItem> {
+        val known = existing.mapTo(mutableSetOf()) { it.identityKey() }
+        val seen = mutableSetOf<String>()
+        return incoming.filter { it.identityKey() !in known && seen.add(it.identityKey()) }
+    }
+
+    /**
+     * 把「更早一页」的条目**追加**到索引尾部，返回追加后的全量列表。
+     *
+     * 为什么方向与 [mergeMetadata] 相反（那边"服务器条目在前"）：分页拉回的是
+     * 比现有索引**更旧**的条目，若走 mergeMetadata 会被排到列表最前 ——
+     * 展示顺序（新的在前）当场错乱。这里保持 existing 原序，新条目接在尾部，
+     * 与磁盘恢复条目/墓碑过滤的后续合成共用同一条链路（GalleryRepository）。
+     *
+     * 三条护栏与 mergeMetadata 同源：
+     * - 索引**读不出来**（null）时不动盘、返回 null —— 更早页不含最新条目，
+     *   用它重建索引会把首屏数据挤掉；"读不出来"的恢复归首屏合并路径负责。
+     * - 净新增为 0 时**不写盘**直接返回原表（原子写 + fsync + 读回校验代价不低，
+     *   且"拒绝写空"护栏与此语义天然一致：这里本来就没得写）。
+     * - 落盘失败只记 error，返回值仍用于本次展示（与 R10 口径一致）。
+     */
+    fun mergeOlderMetadata(
+        context: Context,
+        serverId: String,
+        incoming: List<GalleryItem>
+    ): List<GalleryItem>? = mergeOlderInto(context.filesDir, serverId, incoming)
+
+    /** [mergeOlderMetadata] 的文件目录版本：JVM 单测用临时目录直接钉住追加与拒绝重建规则。 */
+    internal fun mergeOlderInto(
+        filesDir: File,
+        serverId: String,
+        incoming: List<GalleryItem>
+    ): List<GalleryItem>? = synchronized(indexWriteLock) {
+        val existing = loadMetadataFromDir(filesDir, serverId)
+        if (existing == null) return null
+        val appended = olderItemsNotKnown(existing, incoming)
+        if (appended.isEmpty()) return existing
+        val merged = renumberByPosition(existing + appended)
+        if (!writeMetadataToFile(getCacheFile(filesDir, serverId), merged)) {
+            DebugLogger.e(
+                TAG,
+                "更早页追加结果未能落盘（磁盘保留旧索引），本次仅用于展示: ${merged.size} 条"
+            )
+        }
+        merged
+    }
+
+    /**
      * 把「源已不存在（/view 404）」标记写进本地索引（纯函数：JVM 单测可直接钉住）。
      *
      * 只把命中键的 `sourceMissing` 置 true，其余字段原样保留；已经为 true 的条目
