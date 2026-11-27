@@ -112,42 +112,26 @@ object TemplateKeyRegistry {
      * 与替换逻辑，若被引擎重复接管，同一个参数会在配置面板里出现两遍。
      * 清单与设计文档约束 1 一致（`docs/superpowers/specs/2026-09-13-dynamic-node-params-design.md`）。
      */
-    val RECOGNIZED_PLACEHOLDERS: Set<String> = PLACEHOLDER_TO_KEY.keys + setOf(
-        // 主 LoRA 名称：由 replaceLoraPlaceholder() 专用处理，不在 PLACEHOLDER_TO_KEY 里
-        "lora_name",
-        // 种子别名：replaceCommonPlaceholders() 里与 seed 同源（RandomNoise 等节点用这个键）
-        "noise_seed",
-        // 参考音频位：由 AudioSlotDetector + WorkflowManager.injectAudioSlots 专用处理，
-        // 不登记的话动态参数引擎会把它渲染成一个多余的文本框（界面上出现两遍）
-        "audio_filename",
-        // 技能流的两个 md 字段：由 WorkflowManager.applySkillPrompt 读 assets 后整体替换，
-        // 真正的选择器是配置面板底部的「技能提示词」下拉。不登记的话引擎会把它们当成普通
-        // 文本框渲染出来（值就是占位符字面量），用户一滚动面板就被持久化成空串，
-        // 提交时先行替换掉占位符 —— applySkillPrompt 从此认不出它、静默注入空内容
-        // （实测：队列里 加载文件名 为空、正文 0 字符，模型只能瞎猜）
-        "skill_file_name",
-        "skill_file_content",
-        // 技能流的两个模型字段：与 skill_file_name / skill_file_content 同属技能流，由
-        // WorkflowManager.applySkillPrompt 从工作流 defaults 里读取并替换（技能流模板各配一对）
-        "skill_model",
-        "skill_mmproj"
-    )
+    /**
+     * 所有「已识别」的占位符名 —— B3 起委托 [sh.hnet.comfychair.workflow.rules.RuleTable]：
+     * 数据源是 `assets/rules/placeholder_rules.json`（可被 B5 服务器下发覆盖），加载失败回退
+     * 编译期内置表，行为与本表 2026-11-28 前的硬编码值逐条一致（钉子 RuleTableTest 防漂移）。
+     * 调用方 API 不变。
+     */
+    val RECOGNIZED_PLACEHOLDERS: Set<String>
+        get() = sh.hnet.comfychair.workflow.rules.RuleTable.recognizedPlaceholders
 
     /**
-     * 编号型占位符（N 可变，无法穷举进上面的 Set），同样视为「已识别」。
+     * 编号型占位符（N 可变，无法穷举）已随 B3 数据化迁入 [sh.hnet.comfychair.workflow.rules.RuleTable]
+     * （recognized_patterns），运行时判据统一走 [isRecognizedPlaceholder]；本字段已无运行时消费者。
      */
-    private val RECOGNIZED_PLACEHOLDER_PATTERNS: List<Regex> = listOf(
-        Regex("""reference_image_\d+"""),
-        Regex("""reference_audio_\d+""")
-    )
 
     /**
      * 判断某个占位符是否已被专用逻辑识别（= 动态参数引擎必须跳过）。
+     * B3 起委托 [sh.hnet.comfychair.workflow.rules.RuleTable]（清单 + 编号型模式同源）。
      */
-    fun isRecognizedPlaceholder(placeholder: String): Boolean {
-        return placeholder in RECOGNIZED_PLACEHOLDERS ||
-            RECOGNIZED_PLACEHOLDER_PATTERNS.any { it.matches(placeholder) }
-    }
+    fun isRecognizedPlaceholder(placeholder: String): Boolean =
+        sh.hnet.comfychair.workflow.rules.RuleTable.isRecognized(placeholder)
 
     /**
      * Keys that require graph tracing to find (not direct JSON key lookups).

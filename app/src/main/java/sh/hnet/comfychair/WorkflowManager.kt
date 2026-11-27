@@ -18,6 +18,7 @@ import sh.hnet.comfychair.util.Obfuscator
 import sh.hnet.comfychair.util.UuidUtils
 import sh.hnet.comfychair.util.ValidationUtils
 import sh.hnet.comfychair.workflow.PlaceholderLiterals
+import sh.hnet.comfychair.workflow.PlaceholderPipeline
 import sh.hnet.comfychair.workflow.SaveFormatMaterializer
 import sh.hnet.comfychair.workflow.TemplateKeyRegistry
 import sh.hnet.comfychair.workflow.TemplatePatterns
@@ -1828,41 +1829,38 @@ object WorkflowManager {
         scaleBy: Float? = null,
         stopAtClipLayer: Int? = null
     ): String {
-        var result = json
-        // 数值参数走 [PlaceholderLiterals.number]：模板里写成 `"{{steps}}"`（带引号）时会把引号
-        // 一起吃掉、写出 JSON 数字。原先的 `replace("{{steps}}", "8")` 留下引号得到 `"8"` ——
-        // 一个字符串，KSampler 的 INT 输入在服务端校验时被拒（prompt_outputs_failed_validation）。
-        // 字符串参数走 [PlaceholderLiterals.string]（自带引号），两种写法同样都对。
-        //
-        // Seed - always required, support both {{seed}} and {{noise_seed}} placeholders
-        result = PlaceholderLiterals.number(result, "{{seed}}", seed.toString())
-        result = PlaceholderLiterals.number(result, "{{noise_seed}}", seed.toString())
-        // Also handle legacy "seed": 0 and "noise_seed": 0 patterns
-        result = result.replace("\"seed\": 0", "\"seed\": $seed")
-        result = result.replace("\"noise_seed\": 0", "\"noise_seed\": $seed")
-        // Optional parameters - only replace if provided
-        steps?.let { result = PlaceholderLiterals.number(result, "{{steps}}", it.toString()) }
-        cfg?.let { result = PlaceholderLiterals.number(result, "{{cfg}}", it.toString()) }
-        samplerName?.let { result = PlaceholderLiterals.string(result, "{{sampler_name}}", it) }
-        scheduler?.let { result = PlaceholderLiterals.string(result, "{{scheduler}}", it) }
-        denoise?.let { result = PlaceholderLiterals.number(result, "{{denoise}}", it.toString()) }
-        batchSize?.let { result = PlaceholderLiterals.number(result, "{{batch_size}}", it.toString()) }
-        width?.let { result = PlaceholderLiterals.number(result, "{{width}}", it.toString()) }
-        height?.let { result = PlaceholderLiterals.number(result, "{{height}}", it.toString()) }
-        megapixels?.let { result = PlaceholderLiterals.number(result, "{{megapixels}}", it.toString()) }
-        // 宽高比 / 加速模式：值是带空格与括号的字符串（如 "9:16 (Portrait Widescreen)"），
-        // 本身不含引号或反斜杠，转义后原样进入 JSON 字符串字面量
-        aspectRatio?.let { result = PlaceholderLiterals.string(result, "{{aspect_ratio}}", it) }
-        speedMode?.let { result = PlaceholderLiterals.string(result, "{{speed_mode}}", it) }
-        // 主 LoRA 权重是数值字面量（节点原值同为数值），与 cfg / megapixels 一样
-        // 直接 toString 写进 JSON 数值位置，不走 escapeForJson（那会把数字变成字符串）
-        loraStrength?.let { result = PlaceholderLiterals.number(result, "{{lora_strength}}", it.toString()) }
-        length?.let { result = PlaceholderLiterals.number(result, "{{length}}", it.toString()) }
-        frameRate?.let { result = PlaceholderLiterals.number(result, "{{frame_rate}}", it.toString()) }
-        upscaleMethod?.let { result = PlaceholderLiterals.string(result, "{{upscale_method}}", it) }
-        scaleBy?.let { result = PlaceholderLiterals.number(result, "{{scale_by}}", it.toString()) }
-        stopAtClipLayer?.let { result = PlaceholderLiterals.number(result, "{{stop_at_clip_layer}}", it.toString()) }
-        return result
+        // B3：替换机制统一走 [PlaceholderPipeline.substituteText]（值类型决定 number/string
+        // 字面量策略，与原逐行 PlaceholderLiterals 调用逐字节等价，等价性钉子在
+        // PlaceholderPipelineTest）。值顺序 = 原实现顺序（seed/noise_seed 无条件在前）。
+        val values = buildList<Pair<String, Any?>> {
+            add("seed" to seed)
+            add("noise_seed" to seed)
+            steps?.let { add("steps" to it) }
+            cfg?.let { add("cfg" to it) }
+            samplerName?.let { add("sampler_name" to it) }
+            scheduler?.let { add("scheduler" to it) }
+            denoise?.let { add("denoise" to it) }
+            batchSize?.let { add("batch_size" to it) }
+            width?.let { add("width" to it) }
+            height?.let { add("height" to it) }
+            megapixels?.let { add("megapixels" to it) }
+            // 宽高比 / 加速模式：值是带空格与括号的字符串（如 "9:16 (Portrait Widescreen)"），
+            // 走 string 策略转义后原样进入 JSON 字符串字面量
+            aspectRatio?.let { add("aspect_ratio" to it) }
+            speedMode?.let { add("speed_mode" to it) }
+            // 主 LoRA 权重是数值字面量（Float → number 策略，与 cfg/megapixels 同路）
+            loraStrength?.let { add("lora_strength" to it) }
+            length?.let { add("length" to it) }
+            frameRate?.let { add("frame_rate" to it) }
+            upscaleMethod?.let { add("upscale_method" to it) }
+            scaleBy?.let { add("scale_by" to it) }
+            stopAtClipLayer?.let { add("stop_at_clip_layer" to it) }
+        }
+        val replaced = PlaceholderPipeline.substituteText(json, values)
+        // Also handle legacy "seed": 0 and "noise_seed": 0 patterns（非占位符写法，保持原样处理）
+        return replaced
+            .replace("\"seed\": 0", "\"seed\": $seed")
+            .replace("\"noise_seed\": 0", "\"noise_seed\": $seed")
     }
 
     /**

@@ -11,6 +11,7 @@ import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.feature.tools.PromptEnhanceGateway
 import sh.hnet.comfychair.util.UuidUtils
+import sh.hnet.comfychair.workflow.PlaceholderPipeline
 import kotlin.coroutines.resume
 
 /**
@@ -118,6 +119,14 @@ class PromptEnhanceGatewayImpl(
                 if (continuation.isActive) continuation.resume(Result.failure(e))
             }
         }
+    }
+
+    /**
+     * 结构级占位符替换：委托 app 的 [PlaceholderPipeline.substituteTree]（B3 双通道合一，
+     * 替换机制统一收口到这一份；values 迭代序即替换序，防二次替换）。
+     */
+    override fun substituteInTree(root: JSONObject, values: LinkedHashMap<String, String>) {
+        PlaceholderPipeline.substituteTree(root, values)
     }
 
     /**

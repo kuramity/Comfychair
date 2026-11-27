@@ -86,7 +86,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
-import org.json.JSONArray
 import org.json.JSONObject
 
 /** 模式下标：与顶部两个标签的下标一致。 */
@@ -163,6 +162,14 @@ interface PromptEnhanceGateway {
      */
     suspend fun uploadImage(uri: String): Result<String> =
         Result.failure(UnsupportedOperationException("PromptEnhanceGateway.uploadImage is not implemented"))
+
+    /**
+     * 结构级占位符替换（B3 双通道合一）：递归遍历 [root] 树，只替换字符串叶子值。
+     *
+     * [values] 迭代序即替换序（先派生值、后用户值，防二次替换——方向性语义见
+     * app 侧的 `PlaceholderPipeline`）。实现委托 `PlaceholderPipeline.substituteTree`。
+     */
+    fun substituteInTree(root: JSONObject, values: LinkedHashMap<String, String>)
 }
 
 /**
@@ -327,6 +334,7 @@ fun PromptEnhanceScreen(
                     ruleFileName = ruleFileName,
                     ruleFileContent = ruleText.orEmpty(),
                     imageFileName = imageFileName,
+                    gateway = gateway,
                 )
                 val promptId = gateway.submit(workflowJson).getOrThrow()
 
@@ -1008,6 +1016,7 @@ private fun buildWorkflowJson(
     ruleFileName: String,
     ruleFileContent: String,
     imageFileName: String?,
+    gateway: PromptEnhanceGateway,
 ): String {
     val root = JSONObject(template)
     val defaults = root.optJSONObject("defaults")
@@ -1020,45 +1029,8 @@ private fun buildWorkflowJson(
         "image_filename" to imageFileName.orEmpty(),
         "positive_prompt" to userPrompt.ifBlank { defaults?.optString("positive_prompt").orEmpty() },
     )
-    substituteInJson(root, values)
+    gateway.substituteInTree(root, values)
     return root.toString()
-}
-
-/** 递归遍历 JSON，把字符串值里的占位符替换掉（JSONObject/JSONArray 原地改）。 */
-private fun substituteInJson(node: Any?, values: Map<String, String>) {
-    when (node) {
-        is JSONObject -> {
-            val keys = node.keys().asSequence().toList()
-            for (key in keys) {
-                val value = node.opt(key)
-                if (value is String) {
-                    node.put(key, applyPlaceholders(value, values))
-                } else if (value is JSONObject || value is JSONArray) {
-                    substituteInJson(value, values)
-                }
-            }
-        }
-
-        is JSONArray -> {
-            for (index in 0 until node.length()) {
-                val value = node.opt(index)
-                if (value is String) {
-                    node.put(index, applyPlaceholders(value, values))
-                } else if (value is JSONObject || value is JSONArray) {
-                    substituteInJson(value, values)
-                }
-            }
-        }
-    }
-}
-
-private fun applyPlaceholders(text: String, values: Map<String, String>): String {
-    if (!text.contains("{{")) return text
-    var result = text
-    values.forEach { (key, value) ->
-        result = result.replace("{{$key}}", value)
-    }
-    return result
 }
 
 /**

@@ -16,6 +16,7 @@ import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.queue.JobStatus
 import sh.hnet.comfychair.util.CrashLogger
 import sh.hnet.comfychair.util.DebugLogger
+import sh.hnet.comfychair.workflow.rules.RuleTable
 
 /**
  * 全局 Application（AndroidManifest 的 `<application android:name=".ComfyChairApp">`）。
@@ -75,6 +76,8 @@ class ComfyChairApp : Application() {
 
         // 前后台监视（幂等）：注册 ProcessLifecycleOwner 与 ActivityLifecycleCallbacks
         AppLifecycleMonitor.attach(this)
+        // B3：占位符规则表加载（assets/rules/placeholder_rules.json，失败回退内置表不阻塞启动）
+        RuleTable.load(assets)
         // B1：notify↔lifecycle 环解除——前台信号由装配根接线，监视器回归「只喂信号」职责。
         // collect StateFlow 先发当前值，与原 attach 内订阅语义等价；
         // 主线程 immediate 保证通知操作线程不变。
