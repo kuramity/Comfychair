@@ -2,7 +2,7 @@
 
 An unofficial, native Android UI for [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 
-**Current version**: v4.23.0（二次开发版 / Community Edition）
+**Current version**: v4.24.0（二次开发版 / Community Edition）
 
 > **This project is a fork of [ComfyChair](https://github.com/legal-hkr/comfychair),
 > originally developed by Legal HKr, licensed under GPL-3.0.
@@ -30,23 +30,18 @@ A streamlined mobile interface for ComfyUI servers — generate and manage AI im
 
 <img src="metadata/en-US/images/phoneScreenshots/1.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/2.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/3.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/4.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/5.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/6.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/7.png" width="200"/> <img src="metadata/en-US/images/phoneScreenshots/8.png" width="200"/>
 
-## Recent changes (v4.22.5 → v4.23.0)
+## Recent changes (v4.23.0 → v4.24.0)
 
 **Added**
 
-- Tools module (separate library): tag library moved here as a secondary page, plus prompt enhancement
-- Prompt enhancement: two tabs (text→text, text+image→text) with per-mode rule presets, independent background state, streaming output
-- Four-stage wait visualisation with a live VRAM curve (requires crystools on the ComfyUI side)
-- Bottom bar trimmed to six entries (tag library no longer occupies a slot)
+- Prompt enhancement is now the only entry for the skill templates: the two template files moved out of the preset-workflow directory into a dedicated one, so generation-page dropdowns no longer list them
+- Skill placeholder replacement completed (model + visual-projection fields no longer sent as literals)
 
 **Fixed**
 
-- Workflow description length is no longer capped (the 80-char code limit contradicted the 120-char hint, and duplication re-validated unconditionally)
-- Stale error text cleared when reopening the duplicate dialog
-
-**Changed**
-
-- Toolchain upgraded: Kotlin 2.4.21, Compose BOM 2026.11.01, Material3 1.5.0 stable, AGP 9.5.2, Gradle 9.9.2, okhttp 5.5.1, compile/target SDK 37
+- Skill templates on the generation page no longer 400 (`Value not in list: mmproj`) — all four fields are replaced before submit
+- "Auto-select skill failed" gone: the two new fields are registered as recognised, and stale empty-string values fall back to type defaults
+- The "(no injection)" option removed from the rule dropdown (it always errored)
 
 Full history: [CHANGELOG](app/src/main/assets/CHANGELOG.md).
 
@@ -319,7 +314,7 @@ To connect to your ComfyUI server, you'll need:
 - **Architecture**: MVVM with ViewModels and StateFlow
 - **Navigation**: Jetpack Compose Navigation
 - **Build system**: Gradle with Kotlin DSL
-- **Testing**: 2195 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
+- **Testing**: 2202 JVM unit tests (pure-logic extraction keeps effects, gestures, download policy, security policy and viewer logic testable without a device)
 
 ## Contributing
 

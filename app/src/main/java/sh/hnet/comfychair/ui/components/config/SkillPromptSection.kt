@@ -41,9 +41,13 @@ import sh.hnet.comfychair.prompt.SkillPromptStore
 /**
  * 「技能提示词」选择区：给工作流挑一份 md 规则文件。
  *
- * 只在工作流本身带 `{{skill_file_name}}` 占位符（技能流 prebuilt_24/25）时才出现 ——
+ * 只在工作流本身带 `{{skill_file_name}}` 占位符（技能流 技能流模板）时才出现 ——
  * 普通出图流没有这个字段，露出来只会让人困惑。默认值按工作流类型给（文生图 / 图像编辑各一份），
  * 用户改过的选择按工作流名持久化（[SkillPromptStore]）。
+ *
+ * 选项只有 assets 里真实存在的规则文件，**没有「不注入」入口**：空规则会让 ComfyUI 走
+ * 「自动选择 Skill」分支并报错（提示词增强页的 usableRuleFiles 同样过滤了这一点）；
+ * 历史上存过空串的用户加载时会自动落到默认规则上。
  *
  * 「查看」按钮是任务书要的**独立入口**：弹窗里能看到全部技能文件、随时切换、并预览正文。
  */
@@ -63,11 +67,13 @@ fun SkillPromptSection(
     if (options.isEmpty()) return
 
     var selected by remember(workflowName) {
-        mutableStateOf(
-            SkillPromptStore.get(context, workflowName)
-                ?: workflow?.let { SkillPromptRepository.defaultFor(it.type, options) }
-                    .orEmpty()
-        )
+        // 历史上存过空串（旧版「（不注入）」选项写入）的用户：空串不在 options 里，
+        // 落到按类型给的默认规则上 —— 「不注入」会让 ComfyUI 走自动选择分支并报错，
+        // 不许再把用户带进这个状态
+        val stored = SkillPromptStore.get(context, workflowName)
+        val chosen = options.firstOrNull { it.fileName == stored }?.fileName
+            ?: workflow?.let { SkillPromptRepository.defaultFor(it.type, options) }.orEmpty()
+        mutableStateOf(chosen)
     }
     var expanded by remember { mutableStateOf(false) }
     var showManager by remember { mutableStateOf(false) }
@@ -96,15 +102,6 @@ fun SkillPromptSection(
                     singleLine = true
                 )
                 DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                    DropdownMenuItem(
-                        text = { Text("（不注入）") },
-                        onClick = {
-                            selected = SkillPromptRepository.NONE
-                            SkillPromptStore.set(context, workflowName, selected)
-                            expanded = false
-                        },
-                        contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
-                    )
                     options.forEach { option ->
                         DropdownMenuItem(
                             text = { Text(option.displayName) },
@@ -167,11 +164,6 @@ private fun SkillPromptManagerDialog(
                     style = MaterialTheme.typography.labelLarge
                 )
                 Spacer(modifier = Modifier.height(4.dp))
-                SkillRow(
-                    label = "（不注入）",
-                    chosen = selected.isEmpty(),
-                    onClick = { onSelect(SkillPromptRepository.NONE) }
-                )
                 options.forEach { option ->
                     SkillRow(
                         label = option.displayName,

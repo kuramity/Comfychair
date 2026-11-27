@@ -126,7 +126,11 @@ object TemplateKeyRegistry {
         // 提交时先行替换掉占位符 —— applySkillPrompt 从此认不出它、静默注入空内容
         // （实测：队列里 加载文件名 为空、正文 0 字符，模型只能瞎猜）
         "skill_file_name",
-        "skill_file_content"
+        "skill_file_content",
+        // 技能流的两个模型字段：与 skill_file_name / skill_file_content 同属技能流，由
+        // WorkflowManager.applySkillPrompt 从工作流 defaults 里读取并替换（技能流模板各配一对）
+        "skill_model",
+        "skill_mmproj"
     )
 
     /**

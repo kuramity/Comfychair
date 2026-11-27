@@ -1710,24 +1710,39 @@ object WorkflowManager {
      * 否则会和逐个 `replace("{{xxx}}", ...)` 的既有逻辑打架。
      */
     /**
-     * 技能提示词注入：把用户选的 md（规则文件）写进工作流里的
-     * `{{skill_file_name}}` / `{{skill_file_content}}`。技能流（prebuilt_24/25）靠这两个字段
-     * 把「规则」交给本地模型，模型再按规则把用户需求改写成成品提示词。
+     * 技能提示词注入：把用户选的 md（规则文件）与技能流配套的模型字段写进工作流。
      *
-     * 不含这两个占位符的工作流原样返回，所以对普通出图流是零成本的空操作。
+     * - `{{skill_file_name}}` / `{{skill_file_content}}`：用户在「技能提示词」下拉选的 md
+     *   规则（SkillPromptStore / assets）。技能流（技能流模板）靠它把「规则」交给本地
+     *   模型，模型再按规则把用户需求改写成成品提示词；
+     * - `{{skill_model}}` / `{{skill_mmproj}}`：技能流配套的 gguf 模型名，从该工作流自己的
+     *   `defaults` 读（[getRawDefaultsObject]，技能流模板各配一对），不跟用户选择走。
+     *
+     * 判据必须用 `{{skill_` 前缀而不是逐个点名：技能流新增字段时漏改判据，占位符就会
+     * 原样发给服务器（实测：`Value not in list: 视觉投影mmproj: '{{skill_mmproj}}'`）。
+     * 不含这些占位符的工作流原样返回，所以对普通出图流是零成本的空操作。
      * **未选技能时也要替换**（写成空串）：留着占位符会被服务器当字面文本塞进文本框；
      * 写成空串则节点回到自身默认值（`skill = 自动选择`），行为更合理。
      */
     private fun applySkillPrompt(json: String, workflow: Workflow): String {
-        if (!json.contains("{{skill_file")) return json
+        if (!json.contains("{{skill_")) return json
         val assets = applicationContext.assets
+        // SkillPromptStore 里可能存着空串（旧版「（不注入）」选项写入的历史脏数据）：Elvis 对
+        // 空串不回退（非 null），会去读空文件名 → 正文为空 → ComfyUI 走「自动选择 Skill」
+        // 分支必抛错。空串必须与 null 同样视为「没有记录」，回退到按类型给的默认规则。
         val selected = SkillPromptStore.get(applicationContext, workflow.name)
+            ?.takeIf { it.isNotBlank() }
             ?: SkillPromptRepository.defaultFor(workflow.type, SkillPromptRepository.list(assets))
         val content = SkillPromptRepository.read(assets, selected).orEmpty()
+        val defaults = getRawDefaultsObject(workflow.id)
+        val model = defaults?.optString("skill_model").orEmpty()
+        val mmproj = defaults?.optString("skill_mmproj").orEmpty()
         DebugLogger.d(TAG, "Skill prompt: ${selected.ifEmpty { "(不注入)" }} (${content.length} 字符)")
         return json
             .replace("{{skill_file_name}}", escapeForJson(selected))
             .replace("{{skill_file_content}}", escapeForJson(content))
+            .replace("{{skill_model}}", escapeForJson(model))
+            .replace("{{skill_mmproj}}", escapeForJson(mmproj))
     }
 
     internal fun applyDynamicParamsToJson(

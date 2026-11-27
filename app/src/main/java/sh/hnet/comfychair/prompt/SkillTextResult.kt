@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
 
 /**
- * 技能流（prebuilt_24/25）的**文本产物**通道。
+ * 技能流（技能流模板）的**文本产物**通道。
  *
  * 这类工作流不出图：本地模型按 Skill 规则把用户需求改写成成品提示词，结果落在
  * `TE_text_display` 的输出里（实测 `/history` 的 outputs 节点下有 `text` 与 `input_text`

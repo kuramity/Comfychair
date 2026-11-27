@@ -234,7 +234,9 @@ fun MainNavHost(
             //   gateway          → PromptEnhanceGatewayImpl（内部每次调用都取 ConnectionManager 当前 client，
             //                      避免重连换了 client 之后还握着旧实例）
             //   ruleFiles / 正文  → assets/prompts 下的技能规则文件（「不注入」不是文件，天然不会出现）
-            //   text/image 工作流 → assets/prebuilt_workflows 的 25 / 24 两套模板原文
+            //   text/image 工作流 → assets/tool_templates 的 25 / 24 两套模板原文
+            //   （不进 prebuilt_workflows：那里的 json 会被 seed 进生成页的工作流下拉，
+            //   提示词增强的唯一入口必须是小工具页）
             //   onPickImage      → 系统相册（PickVisualMedia）；App 图库来源本轮未接
             //   vramUsageFlow    → ConnectionManager.vramUsageFraction（crystools 的 WebSocket 推送）
             composable(ToolsRoutes.PROMPT_ENHANCE) {
@@ -323,16 +325,16 @@ fun MainNavHost(
     }
 }
 
-/** 提示词增强「文字→文字」模板（assets 原文，含 defaults / nodes）。 */
-private const val TEXT_WORKFLOW_ASSET = "prebuilt_workflows/prebuilt_25_qwen21_skill_t2i.json"
+/** 提示词增强「文字→文字」模板（assets/tool_templates 原文，含 defaults / nodes）。 */
+private const val TEXT_WORKFLOW_ASSET = "tool_templates/qwen21_skill_t2i.json"
 
 /** 提示词增强「文字+图片→文字」模板（同上）。 */
-private const val IMAGE_WORKFLOW_ASSET = "prebuilt_workflows/prebuilt_24_qwen21_skill_edit.json"
+private const val IMAGE_WORKFLOW_ASSET = "tool_templates/qwen21_skill_edit.json"
 
 private const val TAG = "MainNavHost"
 
 /**
- * 读 assets 文本（用于提示词增强的两份预置工作流）。
+ * 读 assets 文本（用于提示词增强的两份 tool_templates 模板）。
  *
  * 读失败返回空串：[sh.hnet.comfychair.feature.tools.PromptEnhanceScreen] 用「模板为空白」
  * 判定禁用生成按钮，所以宁可禁用也不要发一份缺 nodes 的工作流出去。
