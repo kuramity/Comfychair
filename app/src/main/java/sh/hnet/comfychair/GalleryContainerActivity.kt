@@ -26,7 +26,7 @@ import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.connection.WebSocketState
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
 import sh.hnet.comfychair.ui.components.ConnectionAlertDialog
 import sh.hnet.comfychair.ui.components.ConnectionStatusBanner
 import sh.hnet.comfychair.ui.components.shared.ProvideFilamentEngine

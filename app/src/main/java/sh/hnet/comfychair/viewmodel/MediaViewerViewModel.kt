@@ -488,9 +488,6 @@ class MediaViewerViewModel : ViewModel() {
         MediaCache.prefetchAround(index, prefetchItems)
     }
 
-    /** Convert MediaViewerItem to MediaCacheKey（type + 当前服务器进键，见 P2-2） */
-    private fun MediaViewerItem.toCacheKey() = MediaCacheKey.of(promptId, filename, type)
-
     fun navigateNext() {
         val state = _uiState.value
         if (state.canNavigateForward) {
@@ -723,9 +720,7 @@ class MediaViewerViewModel : ViewModel() {
                         // 视频的参数在文件尾部（moov box），取头部没有意义，必须拿到完整字节。
                         // 先复用内存缓存里的那一份：图库预取/缩略图提取通常已经取过同一段视频，
                         // 不查缓存就会同一条目下两份（几十 MB）。缓存没命中才真去下载。
-                        val cached = MediaCache.getCachedVideoBytes(
-                            MediaCacheKey.of(item.promptId, item.filename, item.type)
-                        )
+                        val cached = MediaCache.getCachedVideoBytes(cacheKey)
                         if (cached != null) {
                             android.util.Log.i(
                                 "ComfyChairMetadata",
@@ -1305,3 +1300,6 @@ class MediaViewerViewModel : ViewModel() {
         }
     }
 }
+
+/** Convert MediaViewerItem to MediaCacheKey（type + 当前服务器进键，见 P2-2） */
+fun MediaViewerItem.toCacheKey() = MediaCacheKey.of(promptId, filename, type)

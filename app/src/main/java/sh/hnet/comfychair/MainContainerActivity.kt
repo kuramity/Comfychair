@@ -44,12 +44,12 @@ import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.WebSocketState
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.model.AuthCredentials
 import sh.hnet.comfychair.navigation.MODEL_INTRO_ROUTES
 import sh.hnet.comfychair.navigation.SMALL_TOOLS_ROUTES
 import sh.hnet.comfychair.navigation.TAG_LIBRARY_ROUTES
 import sh.hnet.comfychair.navigation.MainRoute
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.CredentialStorage

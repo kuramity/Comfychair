@@ -1,4 +1,4 @@
-package sh.hnet.comfychair.lifecycle
+package sh.hnet.comfychair.platform
 
 import android.content.Context
 import android.net.ConnectivityManager

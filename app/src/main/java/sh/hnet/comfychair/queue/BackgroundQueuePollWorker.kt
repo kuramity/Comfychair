@@ -12,9 +12,9 @@ import androidx.work.WorkerParameters
 import org.json.JSONObject
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.connection.ConnectionManager
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
-import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy
 import sh.hnet.comfychair.notify.GenerationNotifier
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.BackgroundDegradationPolicy
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.repository.awaitCallbackOnce
 import sh.hnet.comfychair.storage.AppSettings

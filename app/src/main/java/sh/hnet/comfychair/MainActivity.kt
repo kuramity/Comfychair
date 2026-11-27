@@ -11,7 +11,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
 import sh.hnet.comfychair.storage.PreferencesMaintenance
 import sh.hnet.comfychair.ui.screens.LoginScreen
 import sh.hnet.comfychair.ui.theme.ComfyChairTheme

@@ -7,11 +7,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
-import sh.hnet.comfychair.lifecycle.AppVisibility
 import sh.hnet.comfychair.lifecycle.BackgroundDegradationCoordinator
-import sh.hnet.comfychair.lifecycle.NetworkClassMonitor
 import sh.hnet.comfychair.notify.GenerationNotifier
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.AppVisibility
+import sh.hnet.comfychair.platform.NetworkClassMonitor
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.queue.JobStatus
 import sh.hnet.comfychair.util.CrashLogger

@@ -1,4 +1,4 @@
-package sh.hnet.comfychair.lifecycle
+package sh.hnet.comfychair.platform
 
 /**
  * App 的可见性三态（后台降级的判定基础，v4.18.x 后台省流量）。

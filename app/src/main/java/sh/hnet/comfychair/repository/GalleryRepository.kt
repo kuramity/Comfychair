@@ -19,11 +19,12 @@ import org.json.JSONObject
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheKey
+import sh.hnet.comfychair.cache.toCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
-import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy
 import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.model.ThreeDResultHolder
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.BackgroundDegradationPolicy
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.storage.GalleryTrashEntry
@@ -1288,7 +1289,7 @@ class GalleryRepository private constructor() {
 
         if (evictMedia) {
             items.forEach {
-                MediaCache.evict(MediaCacheKey.of(it.promptId, it.filename, it.type))
+                MediaCache.evict(it.toCacheKey())
             }
         }
     }

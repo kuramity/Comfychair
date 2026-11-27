@@ -13,9 +13,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
-import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy
-import sh.hnet.comfychair.lifecycle.NetworkClassMonitor
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.BackgroundDegradationPolicy
+import sh.hnet.comfychair.platform.NetworkClassMonitor
 import sh.hnet.comfychair.queue.BackgroundQueuePollWorker
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.util.DebugLogger

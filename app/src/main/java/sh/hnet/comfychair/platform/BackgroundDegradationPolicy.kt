@@ -1,4 +1,4 @@
-package sh.hnet.comfychair.lifecycle
+package sh.hnet.comfychair.platform
 
 /**
  * 后台降级的**纯决策函数**（v4.18.x 后台省流量）。

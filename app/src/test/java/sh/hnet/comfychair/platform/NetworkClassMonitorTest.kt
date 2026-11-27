@@ -1,4 +1,4 @@
-package sh.hnet.comfychair.lifecycle
+package sh.hnet.comfychair.platform
 
 import org.junit.Assert.assertEquals
 import org.junit.Test

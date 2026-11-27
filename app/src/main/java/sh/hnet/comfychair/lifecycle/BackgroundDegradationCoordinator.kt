@@ -10,9 +10,13 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import sh.hnet.comfychair.connection.ConnectionManager
-import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy.NetworkClass
-import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy.WsPolicy
 import sh.hnet.comfychair.notify.GenerationKeepAliveService
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.AppVisibility
+import sh.hnet.comfychair.platform.BackgroundDegradationPolicy
+import sh.hnet.comfychair.platform.BackgroundDegradationPolicy.NetworkClass
+import sh.hnet.comfychair.platform.BackgroundDegradationPolicy.WsPolicy
+import sh.hnet.comfychair.platform.NetworkClassMonitor
 import sh.hnet.comfychair.queue.BackgroundQueuePollWorker
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.repository.GalleryRepository

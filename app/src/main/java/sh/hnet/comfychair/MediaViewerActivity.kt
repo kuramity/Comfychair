@@ -19,7 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
+import sh.hnet.comfychair.platform.AppLifecycleMonitor
 import sh.hnet.comfychair.ui.components.SharedVideoPlayer
 import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.ui.screens.MediaViewerScreen

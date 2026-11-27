@@ -126,6 +126,7 @@ import sh.hnet.comfychair.viewmodel.ViewerFailureCategory
 import sh.hnet.comfychair.viewmodel.ViewerLoadPolicy
 import sh.hnet.comfychair.viewmodel.ViewerMode
 import sh.hnet.comfychair.viewmodel.ViewerShowState
+import sh.hnet.comfychair.viewmodel.toCacheKey
 
 /**
  * 并排进度吸附时长（ms，v4.16.2）。
@@ -599,7 +600,7 @@ fun MediaViewerScreen(
 
                                         // Update cache priorities based on new position
                                         val allKeys = uiState.items.map {
-                                            MediaCacheKey.of(it.promptId, it.filename, it.type)
+                                            it.toCacheKey()
                                         }
                                         MediaCache.updateNavigationPriorities(page, allKeys)
                                     }
@@ -1158,7 +1159,7 @@ fun MediaViewerScreen(
                                 ?: uiState.items.firstOrNull()
                                 ?: return@HorizontalPager
                             val isCurrentPage = page == pagerState.currentPage
-                            val cacheKey = MediaCacheKey.of(item.promptId, item.filename, item.type)
+                            val cacheKey = item.toCacheKey()
                             // 本页的稳定键：与 entryItemKey 比对，判断"是不是进入时那一张"
                             //（P1-24：不能再用页索引，删除会让索引移位）
                             val pageItemKey = viewerItemKey(item.promptId, item.filename)
@@ -1489,7 +1490,7 @@ fun MediaViewerScreen(
                 )
                 val singleFailure = if (showState == ViewerShowState.FAILED && item != null) {
                     inferFailureCategory(
-                        MediaCacheKey.of(item.promptId, item.filename, item.type),
+                        item.toCacheKey(),
                         uiState.loadFailure
                     )
                 } else {
@@ -1548,7 +1549,7 @@ fun MediaViewerScreen(
             if (currentItem == null) {
                 true
             } else {
-                val key = MediaCacheKey.of(currentItem.promptId, currentItem.filename, currentItem.type)
+                val key = currentItem.toCacheKey()
                 !((currentItem.sourceMissing || MediaCache.isFileMissing(key)) &&
                     !MediaCache.hasLocalImage(key, currentItem.isVideo))
             }
