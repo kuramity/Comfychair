@@ -1,5 +1,11 @@
 package sh.hnet.comfychair.ui.navigation
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.tween
@@ -9,7 +15,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -18,11 +28,18 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.feature.tools.PromptEnhanceImage
+import sh.hnet.comfychair.feature.tools.PromptEnhanceScreen
+import sh.hnet.comfychair.feature.tools.ToolsListScreen
+import sh.hnet.comfychair.feature.tools.ToolsRoutes
 import sh.hnet.comfychair.navigation.MainRoute
+import sh.hnet.comfychair.prompt.SkillPromptRepository
 import sh.hnet.comfychair.taglibrary.state.PromptBridge
 import sh.hnet.comfychair.taglibrary.state.TagLibraryViewModel
 import sh.hnet.comfychair.taglibrary.ui.TagDetailScreen
 import sh.hnet.comfychair.taglibrary.ui.TagLibraryScreen
+import sh.hnet.comfychair.tools.PromptEnhanceGatewayImpl
 import sh.hnet.comfychair.ui.components.MainNavigationBar
 import sh.hnet.comfychair.ui.screens.ModelIntroDetailScreen
 import sh.hnet.comfychair.ui.screens.ModelIntroEditorScreen
@@ -32,6 +49,7 @@ import sh.hnet.comfychair.ui.screens.TextToImageScreen
 import sh.hnet.comfychair.ui.screens.ImageToImageScreen
 import sh.hnet.comfychair.ui.screens.TextToVideoScreen
 import sh.hnet.comfychair.ui.screens.ImageToVideoScreen
+import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.viewmodel.GenerationViewModel
 import sh.hnet.comfychair.viewmodel.TextToImageViewModel
 import sh.hnet.comfychair.viewmodel.ImageToImageViewModel
@@ -129,7 +147,8 @@ fun MainNavHost(
                 )
             }
 
-            // ---------- 标签库（独立 Tab） ----------
+            // ---------- 标签库（小工具二级页：工具列表 → 标签库） ----------
+            // 不再占底栏；注册保留在这里，供 ToolsListScreen 的标签库卡片导航进来。
             composable(MainRoute.TagLibrary.route) {
                 TagLibraryScreen(
                     viewModel = tagLibraryViewModel,
@@ -188,6 +207,89 @@ fun MainNavHost(
                 ModelIntroHiddenScreen(onBack = { navController.popBackStack() })
             }
 
+            // ---------- 小工具（底栏第 6 个 tab，:feature-tools 模块） ----------
+            // 直接注册模块暴露的两个屏幕，不在这里嵌第二层 NavHost：
+            // 返回栈、底栏 currentRoute 判定和外层导航图共用一套，省掉嵌套 NavHost 的坑。
+            // 模块自带的 ToolsNavGraph 是给「小工具独立成容器」时用的入口，这里不用它。
+            // 标签库是本 tab 的二级页：工具列表 → 标签库 → 标签详情，返回逐级退回。
+            composable(MainRoute.SmallTools.route) {
+                ToolsListScreen(
+                    onOpenTagLibrary = {
+                        navController.navigate(MainRoute.TagLibrary.route) {
+                            launchSingleTop = true
+                        }
+                    },
+                    onOpenPromptEnhance = {
+                        navController.navigate(ToolsRoutes.PROMPT_ENHANCE) {
+                            launchSingleTop = true
+                        }
+                    }
+                )
+            }
+
+            // 提示词增强（小工具二级页面，UI 等设计稿）：顶栏返回与系统返回键都退回列表页。
+            //
+            // 该屏幕在 :feature-tools 里，读不到 app 的 assets，也没有网络/相册依赖，
+            // 所以下面这些全部由这里注入：
+            //   gateway          → PromptEnhanceGatewayImpl（内部每次调用都取 ConnectionManager 当前 client，
+            //                      避免重连换了 client 之后还握着旧实例）
+            //   ruleFiles / 正文  → assets/prompts 下的技能规则文件（「不注入」不是文件，天然不会出现）
+            //   text/image 工作流 → assets/prebuilt_workflows 的 25 / 24 两套模板原文
+            //   onPickImage      → 系统相册（PickVisualMedia）；App 图库来源本轮未接
+            //   vramUsageFlow    → ConnectionManager.vramUsageFraction（crystools 的 WebSocket 推送）
+            composable(ToolsRoutes.PROMPT_ENHANCE) {
+                val context = LocalContext.current
+                val appContext = context.applicationContext ?: context
+
+                val gateway = remember(appContext) { PromptEnhanceGatewayImpl(appContext) }
+                // 空文件名的「（不注入）」项过滤掉：选它会走 ComfyUI 的自动选择分支并报错
+                val ruleFiles = remember(appContext) {
+                    SkillPromptRepository.list(appContext.assets)
+                        .filter { it.fileName.isNotBlank() }
+                        .map { it.displayName to it.fileName }
+                }
+                // 屏幕侧是同步回调（点「开始生成」时立即取正文），规则 md 只有几 KB
+                val ruleFileContent: (String) -> String? = remember(appContext) {
+                    { fileName: String ->
+                        SkillPromptRepository.read(appContext.assets, fileName)
+                    }
+                }
+                val textWorkflowJson = remember(appContext) {
+                    readAssetText(appContext, TEXT_WORKFLOW_ASSET)
+                }
+                val imageWorkflowJson = remember(appContext) {
+                    readAssetText(appContext, IMAGE_WORKFLOW_ASSET)
+                }
+
+                var pickedImage by remember { mutableStateOf<PromptEnhanceImage?>(null) }
+                val imagePicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.PickVisualMedia()
+                ) { uri ->
+                    if (uri != null) {
+                        pickedImage = PromptEnhanceImage(
+                            displayName = queryDisplayName(appContext, uri),
+                            uri = uri.toString(),
+                        )
+                    }
+                }
+
+                PromptEnhanceScreen(
+                    onBack = { navController.popBackStack() },
+                    ruleFiles = ruleFiles,
+                    ruleFileContent = ruleFileContent,
+                    textWorkflowJson = textWorkflowJson,
+                    imageWorkflowJson = imageWorkflowJson,
+                    onPickImage = {
+                        imagePicker.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    },
+                    pickedImage = pickedImage,
+                    gateway = gateway,
+                    vramUsageFlow = ConnectionManager.vramUsageFraction,
+                )
+            }
+
             // 模型介绍详情页（v4.17 二级页面）：转场只做淡入淡出（200/150ms），不做 slide
             composable(
                 MainRoute.ModelIntroDetail.route,
@@ -219,4 +321,39 @@ fun MainNavHost(
             }
         }
     }
+}
+
+/** 提示词增强「文字→文字」模板（assets 原文，含 defaults / nodes）。 */
+private const val TEXT_WORKFLOW_ASSET = "prebuilt_workflows/prebuilt_25_qwen21_skill_t2i.json"
+
+/** 提示词增强「文字+图片→文字」模板（同上）。 */
+private const val IMAGE_WORKFLOW_ASSET = "prebuilt_workflows/prebuilt_24_qwen21_skill_edit.json"
+
+private const val TAG = "MainNavHost"
+
+/**
+ * 读 assets 文本（用于提示词增强的两份预置工作流）。
+ *
+ * 读失败返回空串：[sh.hnet.comfychair.feature.tools.PromptEnhanceScreen] 用「模板为空白」
+ * 判定禁用生成按钮，所以宁可禁用也不要发一份缺 nodes 的工作流出去。
+ */
+private fun readAssetText(context: Context, assetPath: String): String = try {
+    context.assets.open(assetPath).bufferedReader().use { it.readText() }
+} catch (e: Exception) {
+    DebugLogger.w(TAG, "读取 assets 失败: $assetPath (${e.message})")
+    ""
+}
+
+/** 相册选图后取用户看得懂的文件名（内容提供者的显示名，拿不到时退回路径末段）。 */
+private fun queryDisplayName(context: Context, uri: Uri): String {
+    val fallback = uri.lastPathSegment
+        ?.substringAfterLast('/')
+        ?.takeIf { it.isNotBlank() }
+        ?: "image"
+    return runCatching {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+        }
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: fallback
 }

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小工具模块（:feature-tools）的中文文案。
+  英文默认见 values/strings.xml（与 app 模块同口径）。
+-->
+<resources>
+    <!-- 工具列表页 -->
+    <string name="tools_tag_library_title">标签库</string>
+    <string name="tools_tag_library_desc">搜标签、查译名、看搭配，拼进正负提示词</string>
+    <string name="tools_prompt_enhance_title">提示词增强</string>
+    <string name="tools_prompt_enhance_desc">把一句话扩写成完整描述，或者看图写描述</string>
+    <!-- 模块单独成容器时标签库不可用（标签库屏幕在 app 模块） -->
+    <string name="tools_tag_library_requires_main">标签库需在主容器中打开</string>
+
+    <!-- 提示词增强页 -->
+    <string name="tools_prompt_enhance_tab_text">文字→文字</string>
+    <string name="tools_prompt_enhance_tab_image">文字+图片→文字</string>
+    <string name="tools_prompt_enhance_placeholder">UI 设计稿接入中</string>
+    <string name="tools_back">返回</string>
+    <string name="tools_tab_text_to_text">文字→文字</string>
+    <string name="tools_tab_image_to_text">文字+图片→文字</string>
+    <string name="tools_input_hint">输入你的提示词，例如：一位女孩在樱花树下</string>
+    <string name="tools_pick_image">选图片</string>
+    <string name="tools_rule_file">规则文件</string>
+    <string name="tools_generate">开始生成</string>
+    <string name="tools_result_title">结果</string>
+    <string name="tools_copy">复制</string>
+    <string name="tools_copied">已复制</string>
+    <string name="tools_empty_hint">结果会显示在这里</string>
+    <string name="tools_stage_model">模型加载</string>
+    <string name="tools_stage_skill">技能加载</string>
+    <string name="tools_stage_infer">推理</string>
+    <string name="tools_stage_output">输出</string>
+    <string name="tools_generating">正在生成</string>
+    <string name="tools_background_note">后台仍在生成</string>
+    <string name="tools_error_timeout">生成超时</string>
+    <string name="tools_error_empty_result">服务器没有返回文本</string>
+    <string name="tools_error_unknown">生成失败</string>
+    <string name="tools_error_rule_file">规则文件读取失败</string>
+</resources>

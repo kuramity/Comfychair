@@ -33,7 +33,9 @@ val releaseKeyReady = releaseStoreFile.isNotEmpty() &&
 
 android {
     namespace = "sh.hnet.comfychair"
-    compileSdk = 36
+    compileSdk = 37
+    // Compose 1.13（BOM 2026.11.01）要求至少 android-37.1；本机装的是 37.2，显式点小版本
+    compileSdkMinor = 2
 
     signingConfigs {
         if (releaseKeyReady) {
@@ -49,7 +51,7 @@ android {
     defaultConfig {
         applicationId = "sh.hnet.comfychair.plus"
         minSdk = 33
-        targetSdk = 36
+        targetSdk = 37
         // 版本规则（2026-09-25 修订）：三段式 major.minor.patch，**按改动性质**决定升哪一段。
         //   · 小 bug 修复                            → patch +1（v1.0.0 → v1.0.1）
         //   · 功能修改（改了既有行为，不是新功能）    → minor +1、patch 归零（v1.0.3 → v1.1.0）
@@ -60,8 +62,8 @@ android {
         // versionCode 与版本名**解耦**：每次发版 +1，只保证单调递增（Android 的硬性要求）。
         // ⚠️ 发版前务必同时改这两行：只 cp 改文件名不改这里，会得到一个 versionCode
         //    与上一版完全相同的包（装不上也分不清，v0.9.33 踩过）。
-        versionCode = 157
-        versionName = "v4.22.5"
+        versionCode = 158
+        versionName = "v4.23.0"
 
         // 更新清单地址注入 BuildConfig（空字符串 = 未配置更新源）
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"$updateManifestUrl\"")
@@ -88,8 +90,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions {
-        jvmTarget = "11"
+    // Kotlin 2.4 起 `kotlinOptions { jvmTarget = ... }` 由警告升级为编译错误，
+    // 必须改用 compilerOptions DSL（见 https://kotl.in/u1r8ln）。
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+        }
     }
     buildFeatures {
         compose = true
@@ -149,6 +155,9 @@ tasks.whenTaskAdded {
 }
 
 dependencies {
+    // 小工具（底栏第 6 个 tab）：独立 library 模块，UI 在模块内维护
+    implementation(project(":feature-tools"))
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.appcompat)

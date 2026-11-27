@@ -47,9 +47,14 @@ class MainContainerBackActionTest {
         assertEquals(BackAction.SwitchToStartTab, backActionAt(tabIndex = 2, startIndex = 0))
         assertEquals(BackAction.SwitchToStartTab, backActionAt(tabIndex = 3, startIndex = 0))
         assertEquals(
-            "标签库是第 5 个 tab，也要先回起始页",
+            "模型介绍是第 5 个 tab，也要先回起始页",
             BackAction.SwitchToStartTab,
             backActionAt(tabIndex = 4, startIndex = 0)
+        )
+        assertEquals(
+            "小工具是第 6 个 tab（底栏最后一个），也要先回起始页",
+            BackAction.SwitchToStartTab,
+            backActionAt(tabIndex = 5, startIndex = 0)
         )
         // 起始页 = 图生视频（第 3 个）：在文生图上按返回要回图生视频（不能写死成第一个）
         assertEquals(BackAction.SwitchToStartTab, backActionAt(tabIndex = 0, startIndex = 3))
@@ -66,8 +71,11 @@ class MainContainerBackActionTest {
         assertEquals(1, tabIndexOfRoute(MainRoute.ImageToImage.route))
         assertEquals(2, tabIndexOfRoute(MainRoute.TextToVideo.route))
         assertEquals(3, tabIndexOfRoute(MainRoute.ImageToVideo.route))
-        assertEquals(4, tabIndexOfRoute(MainRoute.TagLibrary.route))
-        assertEquals("tab 顺序不能重复", 5, MAIN_TAB_ROUTES.toSet().size)
+        assertEquals(4, tabIndexOfRoute(MainRoute.ModelIntro.route))
+        assertEquals(5, tabIndexOfRoute(MainRoute.SmallTools.route))
+        // 标签库已收进小工具，不再占底栏
+        assertEquals(NOT_A_TAB_INDEX, tabIndexOfRoute(MainRoute.TagLibrary.route))
+        assertEquals("tab 顺序不能重复", 6, MAIN_TAB_ROUTES.toSet().size)
     }
 
     @Test

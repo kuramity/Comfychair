@@ -15,6 +15,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
@@ -288,11 +289,11 @@ private fun fixedParamLabel(placeholder: String): String? = when (placeholder) {
 @Composable
 private fun fixedComboLabels(placeholder: String): Map<String, String> = when (placeholder) {
     "moss_mode" -> mapOf(
-        "moss_25" to stringResource(R.string.moss_mode_opt_25),
-        "moss_spec25" to stringResource(R.string.moss_mode_opt_spec25),
-        "moss_50" to stringResource(R.string.moss_mode_opt_50),
-        "moss_c25" to stringResource(R.string.moss_mode_opt_c25),
-        "moss_28" to stringResource(R.string.moss_mode_opt_28)
+        "moss_25" to stringResource(R.string.mode_opt_25),
+        "moss_spec25" to stringResource(R.string.mode_opt_spec25),
+        "moss_50" to stringResource(R.string.mode_opt_50),
+        "moss_c25" to stringResource(R.string.mode_opt_c25),
+        "moss_28" to stringResource(R.string.mode_opt_28)
     )
     else -> emptyMap()
 }
@@ -483,7 +484,7 @@ private fun FlatOptionDropdown(
                 .fillMaxWidth()
         )
 
-        ExposedDropdownMenu(
+        DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false }
         ) {

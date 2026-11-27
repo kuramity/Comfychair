@@ -74,23 +74,26 @@ class WorkflowManagementViewModelStateTest {
     }
 
     @Test
-    fun `超长导入描述被截断到80字符`() {
+    fun `超长导入描述不再被截断（2026-11-27 取消字数限制）`() {
         val longDesc = "乙".repeat(90)
         vm.onImportDescriptionChange(longDesc)
         assertEquals(
-            "导入描述超过 ValidationUtils.MAX_WORKFLOW_DESCRIPTION_LENGTH(80) 必须被截断",
-            80,
-            state().importDescription.length
+            "描述已取消字数限制，必须原样保留 —— 原限制为 80 字，而提示文案写的是 120，" +
+                "两者本就不一致；且复制弹窗在确认时会无条件再校验一次，" +
+                "导致原描述超 80 字时一个字不改也存不进去",
+            longDesc,
+            state().importDescription
         )
     }
 
     @Test
-    fun `编辑对话框的名字与描述同样被截断`() {
+    fun `编辑对话框名字仍截断但描述不再截断`() {
         vm.onEditNameChange("丙".repeat(45))
-        assertEquals(40, state().editName.length)
+        assertEquals("名称仍限 40 字", 40, state().editName.length)
 
-        vm.onEditDescriptionChange("丁".repeat(85))
-        assertEquals(80, state().editDescription.length)
+        val longDesc = "丁".repeat(500)
+        vm.onEditDescriptionChange(longDesc)
+        assertEquals("描述已取消字数限制，任意长度都要原样保留", longDesc, state().editDescription)
     }
 
     // ---------- 编辑/删除的内置工作流保护 ----------

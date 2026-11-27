@@ -47,6 +47,8 @@ import sh.hnet.comfychair.connection.WebSocketState
 import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.model.AuthCredentials
 import sh.hnet.comfychair.navigation.MODEL_INTRO_ROUTES
+import sh.hnet.comfychair.navigation.SMALL_TOOLS_ROUTES
+import sh.hnet.comfychair.navigation.TAG_LIBRARY_ROUTES
 import sh.hnet.comfychair.navigation.MainRoute
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.storage.AppSettings
@@ -295,8 +297,14 @@ class MainContainerActivity : ComponentActivity() {
             }
             // 介绍模块已迁入主容器：详情 → 列表 → 起始 tab 必须逐级返回，
             // 不能被下面通用的“二级页直接切起始 tab”规则一次弹完。
+            // 小工具（:feature-tools）同一个口径：提示词增强 → 小工具列表 → 起始 tab。
+            // 标签库也收进了小工具，是一条二级路径：标签详情 → 标签库 → 小工具列表 → 起始 tab
+            // （TAG_LIBRARY_ROUTES；它不属于小工具模块，不并进 SMALL_TOOLS_ROUTES）。
             val currentRoute = currentRouteName
-            if (currentRoute != null && currentRoute in MODEL_INTRO_ROUTES &&
+            if (currentRoute != null &&
+                (currentRoute in MODEL_INTRO_ROUTES ||
+                    currentRoute in SMALL_TOOLS_ROUTES ||
+                    currentRoute in TAG_LIBRARY_ROUTES) &&
                 navControllerRef?.popBackStack() == true
             ) {
                 return@addCallback
@@ -717,15 +725,17 @@ internal enum class BackAction {
  *
  * 只用于把「当前路由 / 起始路由」折算成下标做同异比较，顺序本身不影响判定结果 ——
  * 但保持一致可以让日志和后续扩展（例如按方向做切换动画）不出错。
- * 注意：`Gallery` 是独立 Activity（FAB 打开），介绍模块是主容器内的多级导航，
- * `TagDetail` 与介绍模块的二级页也不在这个 tab 列表中。
+ * 注意：`Gallery` 是独立 Activity（FAB 打开）；`TagLibrary` 已收进小工具（工具列表 →
+ * 标签库 → 标签详情，返回逐级退回），与 `TagDetail`、介绍模块的详情/隐藏/编辑器、
+ * 小工具的提示词增强（tools/prompt_enhance）一样都是二级页，不在这个 tab 列表中。
  */
 internal val MAIN_TAB_ROUTES: List<String> = listOf(
     MainRoute.TextToImage.route,
     MainRoute.ImageToImage.route,
     MainRoute.TextToVideo.route,
     MainRoute.ImageToVideo.route,
-    MainRoute.TagLibrary.route
+    MainRoute.ModelIntro.route,
+    MainRoute.SmallTools.route
 )
 
 /**

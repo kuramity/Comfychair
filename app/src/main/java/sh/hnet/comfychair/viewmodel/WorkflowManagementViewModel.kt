@@ -945,7 +945,11 @@ class WorkflowManagementViewModel : ViewModel() {
             duplicatingWorkflow = workflow,
             duplicateName = suggestedName,
             duplicateDescription = workflow.description,
-            duplicateNameError = null
+            duplicateNameError = null,
+            // 2026-11-27：打开弹窗时必须把上一次残留的描述错误清掉。
+            // 否则 Save 按钮的 enabled 条件（descriptionError == null）会一直是 false，
+            // 表现就是"弹窗刚打开、什么都没动，保存按钮是灰的"。
+            duplicateDescriptionError = null
         )
     }
 

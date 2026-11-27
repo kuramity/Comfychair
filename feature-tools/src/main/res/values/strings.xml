@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小工具模块（:feature-tools）的文案：values 为英文默认（与 app 模块同口径），
+  中文见 values-zh。
+-->
+<resources>
+    <!-- 工具列表页 -->
+    <string name="tools_tag_library_title">Tag Library</string>
+    <string name="tools_tag_library_desc">Search tags, look up translations, see pairings, and build positive/negative prompts</string>
+    <string name="tools_prompt_enhance_title">Prompt Enhance</string>
+    <string name="tools_prompt_enhance_desc">Expand one sentence into a full description, or describe an image</string>
+    <!-- 模块单独成容器时标签库不可用（标签库屏幕在 app 模块） -->
+    <string name="tools_tag_library_requires_main">Tag Library is only available inside the main app</string>
+
+    <!-- 提示词增强页 -->
+    <string name="tools_prompt_enhance_tab_text">Text→Text</string>
+    <string name="tools_prompt_enhance_tab_image">Text+Image→Text</string>
+    <string name="tools_prompt_enhance_placeholder">UI design in progress</string>
+    <string name="tools_back">Back</string>
+    <string name="tools_tab_text_to_text">Text→Text</string>
+    <string name="tools_tab_image_to_text">Text+Image→Text</string>
+    <string name="tools_input_hint">Enter your prompt, e.g. a girl under the cherry blossom tree</string>
+    <string name="tools_pick_image">Pick image</string>
+    <string name="tools_rule_file">Rule file</string>
+    <string name="tools_generate">Generate</string>
+    <string name="tools_result_title">Result</string>
+    <string name="tools_copy">Copy</string>
+    <string name="tools_copied">Copied</string>
+    <string name="tools_empty_hint">The result appears here</string>
+    <string name="tools_stage_model">Model</string>
+    <string name="tools_stage_skill">Skill</string>
+    <string name="tools_stage_infer">Inference</string>
+    <string name="tools_stage_output">Output</string>
+    <string name="tools_generating">Generating</string>
+    <string name="tools_background_note">Still generating in background</string>
+    <string name="tools_error_timeout">Generation timed out</string>
+    <string name="tools_error_empty_result">The server returned no text</string>
+    <string name="tools_error_unknown">Generation failed</string>
+    <string name="tools_error_rule_file">Failed to read the rule file</string>
+</resources>

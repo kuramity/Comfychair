@@ -1640,7 +1640,7 @@ private fun SaveNewWorkflowDialog(
                             .fillMaxWidth(),
                         enabled = !isValidating
                     )
-                    ExposedDropdownMenu(
+                    DropdownMenu(
                         expanded = isTypeDropdownExpanded,
                         onDismissRequest = onToggleTypeDropdown
                     ) {

@@ -62,6 +62,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import sh.hnet.comfychair.ui.components.WorkflowThumbnail
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
@@ -505,7 +506,11 @@ private fun WorkflowListItemContent(
                 Text(
                     text = workflow.description,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    // 2026-11-27：描述不再限字数，列表里必须自己收着显示，
+                    // 否则一条超长描述会把整张卡片撑到没边（想看全文点进编辑/复制弹窗）
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             if (workflow.isBuiltIn) {
@@ -668,7 +673,7 @@ private fun ImportWorkflowDialog(
                             .fillMaxWidth(),
                         enabled = !isValidating
                     )
-                    ExposedDropdownMenu(
+                    DropdownMenu(
                         expanded = isTypeDropdownExpanded,
                         onDismissRequest = onToggleTypeDropdown
                     ) {

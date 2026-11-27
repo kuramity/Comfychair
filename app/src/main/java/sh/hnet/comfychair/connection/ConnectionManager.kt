@@ -233,6 +233,21 @@ object ConnectionManager {
     private val _sessionExpired = MutableStateFlow(false)
     val sessionExpired: StateFlow<Boolean> = _sessionExpired.asStateFlow()
 
+    /**
+     * 显存占用（GB，未装 crystools 插件 / 断开 / 无 GPU 时为 null）。
+     *
+     * 数据源是 crystools 插件每秒推送的 `crystools.monitor` WebSocket 消息
+     * （`data.gpus[0].vram_used`，见 F:\ComfyUI\custom_nodes\ComfyUI-Crystools\general\hardware.py
+     * 的 getStatus()）。断开与重连时会清空，避免界面显示过期数据。
+     *
+     * **单位注意**：本机安装的 crystools 直接透传 NVML 的 `mem.used`（字节，
+     * 见 general/gpu.py:273-283；其前端用 formatBytes 按 1024 进制显示），
+     * 与任务书假设的「GB 的 float」不符。这里按要求原样取 `vram_used`，
+     * 接入显存曲线前需按 1024³ 换算（或改用 `vram_used_percent`）。
+     */
+    private val _vramUsageFraction = MutableStateFlow<Float?>(null)
+    val vramUsageFraction: StateFlow<Float?> = _vramUsageFraction.asStateFlow()
+
     // 跨线程读写：尝试静默重连（[attemptSilentReconnect]）在无锁情况下直接读这两个字段，
     // 写侧在连接/断开流程里。不加 @Volatile 可能读到旧引用（旧 client / 旧 clientId）导致重连失败。
     @Volatile
@@ -1364,6 +1379,7 @@ object ConnectionManager {
                     // 若先排重连，scheduleReconnect 在离线/手动重连中/被阻断时会提前 return，
                     // 状态就永久停在 Connecting（界面一直显示"连接中"）。
                     stopKeepalive()
+                    _vramUsageFraction.value = null
                     connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
 
                     val failureType = WebSocketRecoveryPolicy.failureTypeFor(response?.code)
@@ -1409,6 +1425,7 @@ object ConnectionManager {
                     )
                     connectedAtElapsedMs = 0L
                     stopKeepalive()
+                    _vramUsageFraction.value = null
                     connectingSinceElapsedMs = WebSocketRecoveryPolicy.NO_CONNECTING_SINCE
                     // 无论 code 是多少都先收尾为 Disconnected，再决定要不要重连（条目 4.1）
                     val outcome = WebSocketRecoveryPolicy.afterClosed(
@@ -1471,6 +1488,7 @@ object ConnectionManager {
      */
     private fun closeWebSocketInternal() {
         stopKeepalive()
+        _vramUsageFraction.value = null
         // 主动关闭：先让当前监听器的回调作废，避免 close() 触发的 onFailure
         // 又把状态写成 Failed 并排一次多余的重连
         invalidateWebSocketCallbacks()
@@ -1555,6 +1573,25 @@ object ConnectionManager {
                     WebSocketMessage.Status(queueRemaining)
                 }
                 "previewing", "executed" -> null  // Don't emit for these types
+                "crystools.monitor" -> {
+                    // crystools 的监控推送：按「已用 / 总量」算成 0..1 的占用比例。
+                    //
+                    // 2026-11-27 修正：crystools 的 vram_used / vram_total 是 NVML 原始**字节数**
+                    // （见 ComfyUI-Crystools/general/gpu.py），不是 GB。之前原样当 GB 传出去，
+                    // 而消费方（提示词增强页的显存曲线）按 0..1 比例使用 —— 只要有占用就恒满格。
+                    // 这里直接算比例，字段名也改成 vramUsageFraction 以免再被误用。
+                    val gpu = message.optJSONObject("data")
+                        ?.optJSONArray("gpus")
+                        ?.optJSONObject(0)
+                    val used = gpu?.optDouble("vram_used", -1.0) ?: -1.0
+                    val total = gpu?.optDouble("vram_total", -1.0) ?: -1.0
+                    _vramUsageFraction.value = if (used >= 0.0 && total > 0.0) {
+                        (used / total).toFloat().coerceIn(0f, 1f)
+                    } else {
+                        null
+                    }
+                    null
+                }
                 else -> {
                     if (messageType.isNotEmpty()) WebSocketMessage.Unknown(messageType) else null
                 }

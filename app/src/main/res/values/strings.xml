@@ -91,6 +91,7 @@
     <string name="nav_text_to_image">Text to Image</string>
     <string name="nav_image_to_image">Image to Image</string>
     <string name="nav_gallery">Gallery</string>
+    <string name="nav_small_tools">Small tools</string>
 
     <!-- Configuration fragment strings -->
     <string name="title_server_info">Server Information</string>
@@ -616,7 +617,7 @@
     <!-- Workflow validation errors -->
     <string name="error_workflow_fetch_nodes_failed">Failed to fetch server nodes</string>
     <string name="error_workflow_name_too_long">Name must be 40 characters or less</string>
-    <string name="error_workflow_description_too_long">Description must be 120 characters or less</string>
+    <string name="error_workflow_description_too_long">Description is too long</string>
 
     <!-- Metadata viewer strings -->
     <string name="button_show_metadata">Info</string>
@@ -989,11 +990,11 @@
     <string name="dynamic_param_lora3_strength_label">LoRA 3 weight</string>
     <string name="dynamic_param_seedvr2_enabled_label">4K upscale</string>
     <string name="dynamic_param_seedvr2_size_label">Upscale target size</string>
-    <string name="moss_mode_opt_25">25 steps</string>
-    <string name="moss_mode_opt_spec25">25 steps (Spectrum)</string>
-    <string name="moss_mode_opt_50">50 steps</string>
-    <string name="moss_mode_opt_c25">25 steps (Comfy)</string>
-    <string name="moss_mode_opt_28">28-step dual sampling</string>
+    <string name="mode_opt_25">25 steps</string>
+    <string name="mode_opt_spec25">25 steps (Spectrum)</string>
+    <string name="mode_opt_50">50 steps</string>
+    <string name="mode_opt_c25">25 steps (Comfy)</string>
+    <string name="mode_opt_28">28-step dual sampling</string>
     <string name="update_channel_name">App update</string>
     <string name="update_channel_desc">Notifications for update download progress and readiness</string>
     <string name="update_dialog_title">App update</string>

@@ -451,8 +451,20 @@ object ValidationUtils {
     /** Maximum length for workflow names */
     const val MAX_WORKFLOW_NAME_LENGTH = 40
 
-    /** Maximum length for workflow descriptions */
-    const val MAX_WORKFLOW_DESCRIPTION_LENGTH = 80
+    /**
+     * Maximum length for workflow descriptions.
+     *
+     * 2026-11-27 起**取消实际限制**（用户决策）：原值 80，而提示文案写的是 120，
+     * 两者本就不一致；且「复制工作流」在确认时会无条件再校验一次，导致原描述超过 80 字时
+     * 即使一个字都不改也存不进去。现在保留一个极大的技术兜底值，只防意外（例如误把整个
+     * 文件粘贴进来），正常内容任何长度都放行。
+     *
+     * 相关调用点（均已同步放开）：
+     * - [validateWorkflowDescription] / [truncateWorkflowDescription]
+     * - `WorkflowManagementViewModel.onDuplicateDescriptionChange` / `confirmDuplicate`
+     * - `storage.BackupValidator.validateWorkflowDescription`（备份校验同口径）
+     */
+    const val MAX_WORKFLOW_DESCRIPTION_LENGTH = 100_000
 
     /**
      * Validate workflow name format.

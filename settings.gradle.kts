@@ -32,4 +32,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "ComfyChair"
 include(":app")
+// 小工具（底栏第 6 个 tab）独立成 library 模块：UI 先在模块内做，app 只做依赖与导航挂载
+include(":feature-tools")
  
