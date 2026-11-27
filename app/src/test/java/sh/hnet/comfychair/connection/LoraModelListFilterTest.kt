@@ -19,8 +19,9 @@ import org.junit.Test
  * Efficient Loader / easy *_Loader 等节点各带一个字面量 `"None"` 表示"不加 LoRA"。
  * 它并进下拉后被用户当成真实模型选中，提交给 LoraLoaderModelOnly 时不在服务器的 66 项里 → 400。
  *
- * `extractModelLists()` 是 ConnectionManager 的私有方法（生产代码不动），这里用反射直接钉住
- * 它返回的 `ModelCache.loras`：这是"None 永远进不了下拉"的唯一防线。
+ * `extractModelLists()` 现为 ModelListCatalog 的私有方法（B4-W2 自 ConnectionManager 拆出，
+ * 生产代码不动），这里用反射直接钉住它返回的 `ModelCache.loras`：
+ * 这是"None 永远进不了下拉"的唯一防线。
  */
 class LoraModelListFilterTest {
 
@@ -49,23 +50,25 @@ class LoraModelListFilterTest {
         return root
     }
 
-    /** 走生产代码路径取模型缓存里的 LoRA 列表（extractModelLists 为私有，用反射调用） */
+    /** 走生产代码路径取模型缓存里的 LoRA 列表（extractModelLists 为私有，用反射调用；catalog 无参构造，JVM 直建实例） */
+    private val catalog = ModelListCatalog()
+
     private fun extractLoras(): List<String> {
-        val method = ConnectionManager::class.java.getDeclaredMethod("extractModelLists")
+        val method = ModelListCatalog::class.java.getDeclaredMethod("extractModelLists")
         method.isAccessible = true
-        return (method.invoke(ConnectionManager) as ModelCache).loras
+        return (method.invoke(catalog) as ModelCache).loras
     }
 
     @After
     fun tearDown() {
         // ConnectionManager 是全局单例，测试用的假 /object_info 必须清掉，免得影响别的测试
-        ConnectionManager.nodeTypeRegistry.parseObjectInfo(JSONObject())
+        catalog.nodeTypeRegistry.parseObjectInfo(JSONObject())
     }
 
     @Test
     fun `LoRA 列表剔除未选择的 None 保留真实模型`() {
         // LoraLoaderModelOnly 的选项里没有 None；另外两个节点各带一个字面量 None
-        ConnectionManager.nodeTypeRegistry.parseObjectInfo(
+        catalog.nodeTypeRegistry.parseObjectInfo(
             objectInfo(
                 "LoraLoaderModelOnly" to listOf(realLoraA, realLoraB),
                 "CR Load LoRA" to listOf("None", realLoraA),
@@ -73,7 +76,7 @@ class LoraModelListFilterTest {
             )
         )
 
-        val rawUnion = ConnectionManager.nodeTypeRegistry.getOptionsForField("lora_name")
+        val rawUnion = catalog.nodeTypeRegistry.getOptionsForField("lora_name")
         assertTrue(
             "根因对照：下拉的原始并集里确实混着字面量 None（若将来改成在解析层剔除，请同步更新本测试）",
             "None" in rawUnion
@@ -96,7 +99,7 @@ class LoraModelListFilterTest {
 
     @Test
     fun `名字里含 None 的真实 LoRA 不会被过滤掉`() {
-        ConnectionManager.nodeTypeRegistry.parseObjectInfo(
+        catalog.nodeTypeRegistry.parseObjectInfo(
             objectInfo(
                 "LoraLoaderModelOnly" to listOf(
                     "None.safetensors",
@@ -118,7 +121,7 @@ class LoraModelListFilterTest {
 
     @Test
     fun `所有节点都只报 None 时列表为空且不抛异常`() {
-        ConnectionManager.nodeTypeRegistry.parseObjectInfo(
+        catalog.nodeTypeRegistry.parseObjectInfo(
             objectInfo(
                 "CR Load LoRA" to listOf("None"),
                 "easy LoraLoader" to listOf("None", "  none  ")

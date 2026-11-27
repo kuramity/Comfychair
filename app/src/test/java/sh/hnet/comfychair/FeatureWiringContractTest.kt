@@ -25,6 +25,8 @@ class FeatureWiringContractTest {
 
     private val connectionManagerPath =
         "src/main/java/sh/hnet/comfychair/connection/ConnectionManager.kt"
+    private val modelListCatalogPath =
+        "src/main/java/sh/hnet/comfychair/connection/ModelListCatalog.kt"
     private val imageToImageViewModelPath =
         "src/main/java/sh/hnet/comfychair/viewmodel/ImageToImageViewModel.kt"
 
@@ -70,11 +72,13 @@ class FeatureWiringContractTest {
         // 需求 0 的唯一触发路径：连接成功与用户手点刷新都汇到 fetchServerData。
         // 删掉这一行 = 热更新形同不存在（用户新下载的模型永远看不到介绍），
         // 而既有的 ModelIntroFetchTest / ModelIntroSyncTest 全是纯逻辑测试，一条都不会红。
-        val sourceText = source(connectionManagerPath)
-        val body = bodyOf(sourceText, "private fun fetchServerData()")
+        // B4-W2 起 fetchServerData/applyObjectInfo/syncModelIntros 拆入 ModelListCatalog
+        // （ConnectionManager 经转发 API 委托），钉子目标源码随拆解同步切换，意图不变。
+        val sourceText = source(modelListCatalogPath)
+        val body = bodyOf(sourceText, "fun fetchServerData(")
         assertTrue(
-            "fetchServerData 里必须有一条 syncModelIntros() 语句（终审反证 B3：删掉它，全量测试仍全绿）",
-            hasStatement(body, "syncModelIntros()")
+            "fetchServerData 里必须有一条 syncModelIntros 语句（终审反证 B3：删掉它，全量测试仍全绿；B4-W2 起带 client/context 参数）",
+            hasStatement(body, "syncModelIntros(client, context)")
         )
         // 该调用必须排在模型列表装配之前：它要用「刚装好的本地表」做比对基准。
         // Q3-1（v4.16.5）演进：parse + 就绪信号 + extract 收进了 applyObjectInfo
@@ -102,8 +106,9 @@ class FeatureWiringContractTest {
         // 闸门 + 异常边界都在 ModelIntroSyncRunner 里（见 ModelIntroSyncRunnerTest）。
         // 若有人把接线改回"自己 tryEnter、自己在回调里 try/catch"，
         // 「发起阶段同步抛出」这条路就又没人兜底了：闸门卡死 + 异常冒泡进 /object_info 回调。
-        val sourceText = source(connectionManagerPath)
-        val body = folded(bodyOf(sourceText, "private fun syncModelIntros()"))
+        // B4-W2：syncModelIntros 拆入 ModelListCatalog（带 client/context 参数），钉子随迁
+        val sourceText = source(modelListCatalogPath)
+        val body = folded(bodyOf(sourceText, "private fun syncModelIntros("))
         assertTrue(
             "syncModelIntros 必须把拉取与落盘交给 ModelIntroSyncRunner（异常兜底在那里）",
             body.contains("introSyncRunner.run(")
