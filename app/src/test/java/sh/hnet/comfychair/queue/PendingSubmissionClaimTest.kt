@@ -3,7 +3,7 @@ package sh.hnet.comfychair.queue
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
-import sh.hnet.comfychair.viewmodel.ContentType
+import sh.hnet.comfychair.model.ContentType
 
 /**
  * P6：在途提交认领的纯逻辑（[pickPendingSubmission]）。

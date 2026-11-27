@@ -3,6 +3,7 @@ package sh.hnet.comfychair.viewmodel
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sh.hnet.comfychair.model.GalleryItem
 
 /**
  * 「源已不存在」请求门的纯函数钉子（JVM 直测，不碰 Android）。

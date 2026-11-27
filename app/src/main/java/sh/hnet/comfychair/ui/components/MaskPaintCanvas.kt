@@ -22,7 +22,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
-import sh.hnet.comfychair.viewmodel.MaskPathData
+import sh.hnet.comfychair.model.MaskPathData
 
 /**
  * Scale mode for image display in MaskPaintCanvas

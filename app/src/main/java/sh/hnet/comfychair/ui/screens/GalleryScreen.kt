@@ -131,7 +131,9 @@ import sh.hnet.comfychair.ui.components.ViewerRect
 import sh.hnet.comfychair.cache.ActiveView
 import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheKey
+import sh.hnet.comfychair.cache.toCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.ui.components.shared.NoOverscrollContainer
 import sh.hnet.comfychair.ui.components.shared.ThreeDViewerSheet
@@ -141,7 +143,6 @@ import sh.hnet.comfychair.util.galleryInitialFirstVisibleItemIndex
 import sh.hnet.comfychair.util.galleryOpenIndex
 import sh.hnet.comfychair.viewmodel.ConnectionStatus
 import sh.hnet.comfychair.viewmodel.GalleryEvent
-import sh.hnet.comfychair.viewmodel.GalleryItem
 import sh.hnet.comfychair.viewmodel.GalleryViewModel
 import sh.hnet.comfychair.viewmodel.GenerationViewModel
 import sh.hnet.comfychair.viewmodel.MediaViewerItem

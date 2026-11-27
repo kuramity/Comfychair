@@ -5,8 +5,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.model.ThreeDResultHolder
-import sh.hnet.comfychair.viewmodel.GalleryItem
 
 /**
  * G4 回收站 JSON 编解码的往返测试（JVM，不碰文件）。

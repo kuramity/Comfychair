@@ -7,10 +7,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import sh.hnet.comfychair.model.ContentType
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.Obfuscator
-import sh.hnet.comfychair.viewmodel.ContentType
 import java.util.concurrent.atomic.AtomicLong
 
 /**

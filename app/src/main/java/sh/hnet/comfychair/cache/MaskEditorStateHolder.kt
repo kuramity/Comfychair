@@ -5,7 +5,7 @@ import android.graphics.Path
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import sh.hnet.comfychair.viewmodel.MaskPathData
+import sh.hnet.comfychair.model.MaskPathData
 
 /**
  * Singleton that holds state for the Mask Editor activity.

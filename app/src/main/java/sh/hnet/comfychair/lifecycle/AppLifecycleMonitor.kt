@@ -5,14 +5,9 @@ import android.app.Application
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ProcessLifecycleOwner
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
-import sh.hnet.comfychair.notify.GenerationNotifier
 import sh.hnet.comfychair.util.DebugLogger
 
 /**
@@ -34,7 +29,8 @@ import sh.hnet.comfychair.util.DebugLogger
  * 媒体查看器 —— 用户驻留最久的界面；短时编辑页不覆盖，由 ON_STOP 兜底）。
  *
  * 前后台判定历史上散在 ComfyChairApp 的 onStart/onStop 计数里（它感知不到小窗收球），
- * 本类接管后 [GenerationNotifier.setAppInForeground] 由 [attach] 内的订阅统一驱动。
+ * 本类接管后 [GenerationNotifier.setAppInForeground] 由装配根 collect [visibility] 统一驱动
+ * （B1 起接线在 ComfyChairApp，本类不依赖 notify 包）。
  */
 object AppLifecycleMonitor {
 
@@ -59,15 +55,12 @@ object AppLifecycleMonitor {
     @Volatile
     private var attached = false
 
-    /** 通知前台判定的订阅作用域（attach 时启动，进程内常驻） */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-
     /**
      * 安装信号源（Application.onCreate 调用一次，重复调用幂等）。
      *
-     * 同时接管 [GenerationNotifier.setAppInForeground] 的驱动：可见性一变就同步，
-     * 不再依赖散落的 onStart/onStop 计数 —— 那套计数对小窗收球失效（不触发 onStop），
-     * 正是「上一版前台不发通知没生效」的根因。
+     * B1 起本类回归「只喂信号」职责：可见性变化由装配根（ComfyChairApp）collect
+     * [visibility] 后驱动 [sh.hnet.comfychair.notify.GenerationNotifier.setAppInForeground]，
+     * 本类不再直接依赖 notify 包（解除 notify↔lifecycle 双向环）。
      */
     fun attach(app: Application) {
         if (attached) {
@@ -111,12 +104,8 @@ object AppLifecycleMonitor {
             override fun onActivityDestroyed(activity: Activity) = Unit
         })
 
-        // 通知前台判定接线（阶段 F）：可见性变化统一驱动，替代 ComfyChairApp 的计数法
-        scope.launch {
-            visibility.collect { state ->
-                GenerationNotifier.setAppInForeground(app, state == AppVisibility.FOREGROUND)
-            }
-        }
+        // B1：通知前台判定接线已移至 ComfyChairApp（装配根）——
+        // 本类只负责合成 visibility，不再依赖 notify 包
     }
 
     /**

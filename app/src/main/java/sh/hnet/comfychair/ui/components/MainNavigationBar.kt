@@ -46,6 +46,7 @@ import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.currentBackStackEntryAsState
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.cache.MediaCache
+import sh.hnet.comfychair.cache.toCacheKey
 import sh.hnet.comfychair.navigation.MODEL_INTRO_ROUTES
 import sh.hnet.comfychair.navigation.SMALL_TOOLS_ROUTES
 import sh.hnet.comfychair.navigation.MainRoute

@@ -2,7 +2,7 @@ package sh.hnet.comfychair.storage
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
-import sh.hnet.comfychair.viewmodel.GalleryItem
+import sh.hnet.comfychair.model.GalleryItem
 
 /**
  * 图库本地索引的合并规则。

@@ -19,6 +19,7 @@ import kotlinx.coroutines.withContext
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.ExifOrientation
@@ -189,6 +190,13 @@ data class PrefetchRequest(
         else timestamp.compareTo(other.timestamp)
     }
 }
+
+/**
+ * GalleryItem → 缓存键（B1 自 viewmodel.GalleryItem.toCacheKey() 外移；原成员 KDoc 的
+ * 「type 与 serverId 进键防串台」语义见 [MediaCacheKey] 类级 KDoc 的 P2-2 记载）。
+ * 放 cache 包而非 model：MediaCacheKey 是缓存域概念，model 层不得依赖 cache。
+ */
+fun GalleryItem.toCacheKey(): MediaCacheKey = MediaCacheKey.of(promptId, filename, type)
 
 /**
  * Centralized media cache singleton for Gallery and MediaViewer.

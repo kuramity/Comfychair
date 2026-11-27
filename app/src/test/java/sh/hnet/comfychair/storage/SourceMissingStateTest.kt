@@ -6,7 +6,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import sh.hnet.comfychair.ComfyUIClient
-import sh.hnet.comfychair.viewmodel.GalleryItem
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.viewmodel.MediaViewerItem
 import sh.hnet.comfychair.viewmodel.shouldRequestOriginal
 

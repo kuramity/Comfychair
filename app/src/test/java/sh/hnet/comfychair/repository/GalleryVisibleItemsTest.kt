@@ -5,8 +5,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import sh.hnet.comfychair.cache.MediaCacheKey
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.storage.GalleryMetadataCache
-import sh.hnet.comfychair.viewmodel.GalleryItem
 
 /**
  * P0-R1 回归：索引读不出来时，图库仍然必须走**磁盘缓存恢复**。

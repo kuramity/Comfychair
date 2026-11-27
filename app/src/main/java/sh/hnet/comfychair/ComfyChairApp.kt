@@ -3,7 +3,12 @@ package sh.hnet.comfychair
 import android.app.Application
 import android.os.Handler
 import android.os.Looper
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
+import sh.hnet.comfychair.lifecycle.AppVisibility
 import sh.hnet.comfychair.lifecycle.BackgroundDegradationCoordinator
 import sh.hnet.comfychair.lifecycle.NetworkClassMonitor
 import sh.hnet.comfychair.notify.GenerationNotifier
@@ -23,13 +28,19 @@ import sh.hnet.comfychair.util.DebugLogger
  *    「完成提醒必达」在进程重启后就没有对照面。
  * 3. 安装进程级前后台监视器（[AppLifecycleMonitor]）：三重信号（ProcessLifecycleOwner
  *    ON_START/ON_STOP + 小窗失焦 + top-resumed）合成可见性状态，供生成通知的前后台判定
- *    （[GenerationNotifier.setAppInForeground]，由监视器内部订阅驱动）与后台降级协调器
- *    （停画廊刷新 / 分网络断连）统一消费。旧版在这里用 onStart/onStop 计数，感知不到
- *    小窗收球（不触发 onStop），已整体迁入监视器。
+ *    （[GenerationNotifier.setAppInForeground]，本类 collect 监视器的 visibility 接线驱动）
+ *    与后台降级协调器（停画廊刷新 / 分网络断连）统一消费。旧版在这里用 onStart/onStop 计数，
+ *    感知不到小窗收球（不触发 onStop），已整体迁入监视器。
  */
 class ComfyChairApp : Application() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 进程级协程作用域（B1 接线用）：Application 伴生进程存活，无需取消。
+     * 主线程 immediate——GenerationNotifier 的通知操作要求主线程。
+     */
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     override fun onCreate() {
         // 崩溃捕获必须最先安装（早于 super.onCreate 之后的任何初始化）
@@ -62,9 +73,16 @@ class ComfyChairApp : Application() {
             }, PROCESS_START_NOTIFY_DELAY_MS)
         }
 
-        // 前后台监视（幂等）：注册 ProcessLifecycleOwner 与 ActivityLifecycleCallbacks，
-        // 并以可见性状态驱动生成通知的前后台判定
+        // 前后台监视（幂等）：注册 ProcessLifecycleOwner 与 ActivityLifecycleCallbacks
         AppLifecycleMonitor.attach(this)
+        // B1：notify↔lifecycle 环解除——前台信号由装配根接线，监视器回归「只喂信号」职责。
+        // collect StateFlow 先发当前值，与原 attach 内订阅语义等价；
+        // 主线程 immediate 保证通知操作线程不变。
+        appScope.launch {
+            AppLifecycleMonitor.visibility.collect { state ->
+                GenerationNotifier.setAppInForeground(this@ComfyChairApp, state == AppVisibility.FOREGROUND)
+            }
+        }
         // 网络计量类别监视（幂等）：默认网络 WiFi/蜂窝 分类，降级协调器的第二信号源
         NetworkClassMonitor.attach(this)
         // 后台降级协调器（幂等）：可见性/网络/任务 × 开关 → 停刷新、断连/放宽心跳、轮询兜底

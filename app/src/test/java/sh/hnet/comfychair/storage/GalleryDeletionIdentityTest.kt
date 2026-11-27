@@ -5,7 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import sh.hnet.comfychair.viewmodel.GalleryItem
+import sh.hnet.comfychair.model.GalleryItem
 
 /**
  * P1-19 的纯逻辑测试：删除身份键必须是 `(promptId, filename)`，不是 promptId。

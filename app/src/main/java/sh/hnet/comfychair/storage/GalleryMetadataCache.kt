@@ -3,9 +3,9 @@ package sh.hnet.comfychair.storage
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.util.DebugLogger
-import sh.hnet.comfychair.viewmodel.GalleryItem
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files

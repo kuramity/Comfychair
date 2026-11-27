@@ -22,13 +22,13 @@ import sh.hnet.comfychair.cache.MediaCacheKey
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.lifecycle.AppLifecycleMonitor
 import sh.hnet.comfychair.lifecycle.BackgroundDegradationPolicy
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.GalleryMetadataCache
 import sh.hnet.comfychair.storage.GalleryTrashEntry
 import sh.hnet.comfychair.storage.GalleryTrashStorage
 import sh.hnet.comfychair.util.DebugLogger
-import sh.hnet.comfychair.viewmodel.GalleryItem
 import java.util.UUID
 
 /**

@@ -2,8 +2,8 @@ package sh.hnet.comfychair.repository
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import sh.hnet.comfychair.model.GalleryItem
 import sh.hnet.comfychair.storage.GalleryTrashEntry
-import sh.hnet.comfychair.viewmodel.GalleryItem
 
 /**
  * G4（任务书 11.4）两阶段删除状态机的纯函数测试。

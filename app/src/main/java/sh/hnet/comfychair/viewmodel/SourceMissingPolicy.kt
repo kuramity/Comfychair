@@ -1,5 +1,7 @@
 package sh.hnet.comfychair.viewmodel
 
+import sh.hnet.comfychair.model.GalleryItem
+
 /**
  * 「源已不存在」条目的请求门（纯函数，JVM 单测直接钉住）。
  *

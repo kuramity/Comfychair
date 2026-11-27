@@ -15,7 +15,7 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
-import sh.hnet.comfychair.viewmodel.MaskPathData
+import sh.hnet.comfychair.model.MaskPathData
 
 /**
  * 蒙版预览绘制画笔缓存（模式参考 WorkflowGraphCanvas 的 GraphPaintCache / MaskPaintCanvas

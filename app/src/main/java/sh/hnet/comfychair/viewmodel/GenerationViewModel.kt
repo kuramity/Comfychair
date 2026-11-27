@@ -29,6 +29,7 @@ import sh.hnet.comfychair.connection.WebSocketState
 import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.queue.JobStatus
 import sh.hnet.comfychair.queue.resolveExecutionStartOwner
+import sh.hnet.comfychair.model.ContentType
 import sh.hnet.comfychair.model.ThreeDResultHolder
 import sh.hnet.comfychair.notify.GenerationKeepAliveService
 import sh.hnet.comfychair.notify.GenerationNotifier
@@ -36,6 +37,7 @@ import sh.hnet.comfychair.prompt.SkillTextResult
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.Obfuscator
+import sh.hnet.comfychair.viewmodel.base.GenerationCompletionRelay
 import sh.hnet.comfychair.workflow.WorkflowPreflight
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -61,14 +63,6 @@ enum class ConnectionStatus {
     CONNECTED,
     RECONNECTING,
     FAILED
-}
-
-/**
- * Content type for generation (determines which event to dispatch on completion)
- */
-enum class ContentType {
-    IMAGE,
-    VIDEO
 }
 
 /**
@@ -209,7 +203,7 @@ internal fun isCurrentGenerationEvent(
  * - Multiple instances can safely coexist (e.g., MainContainer + GalleryContainer)
  * - Only the instance whose ownerId matches the generation state processes events
  */
-class GenerationViewModel : ViewModel() {
+class GenerationViewModel : ViewModel(), GenerationCompletionRelay {
 
     /**
      * 各页面注册的"提交成功"回调，**按 ownerId 存**。
@@ -231,7 +225,7 @@ class GenerationViewModel : ViewModel() {
     }
 
     /** 注销（页面离开时调；与 [registerSubmittedCallback] 成对） */
-    fun unregisterSubmittedCallback(ownerId: String) {
+    override fun unregisterSubmittedCallback(ownerId: String) {
         submittedCallbacks.remove(ownerId)
     }
 
@@ -249,6 +243,10 @@ class GenerationViewModel : ViewModel() {
     // Generation state
     private val _generationState = MutableStateFlow(GenerationState())
     val generationState: StateFlow<GenerationState> = _generationState.asStateFlow()
+
+    // B1：GenerationCompletionRelay 的窄接口实现——base 包只看这一个布尔，不再触碰完整 state
+    override val isGeneratingNow: Boolean
+        get() = generationState.value.isGenerating
 
     // One-time events
     private val _events = MutableSharedFlow<GenerationEvent>()
@@ -723,7 +721,7 @@ class GenerationViewModel : ViewModel() {
      * Only clears the handler if this owner actually registered it.
      * If the owner started generation that's still running, keep handler active for pending completion.
      */
-    fun unregisterEventHandler(ownerId: String) {
+    override fun unregisterEventHandler(ownerId: String) {
         val state = _generationState.value
         val executingOwner = state.ownerId
 
@@ -1559,7 +1557,7 @@ class GenerationViewModel : ViewModel() {
      * @param promptId Optional promptId to verify - only resets if matches current generation.
      *                 This prevents late completion calls from clearing state for a different job.
      */
-    fun completeGeneration(promptId: String? = null) {
+    override fun completeGeneration(promptId: String?) {
         val currentPromptId = _generationState.value.promptId
 
         // If promptId specified, only reset if it matches current generation

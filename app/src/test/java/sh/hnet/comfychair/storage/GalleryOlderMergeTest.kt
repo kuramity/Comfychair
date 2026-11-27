@@ -7,7 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
-import sh.hnet.comfychair.viewmodel.GalleryItem
+import sh.hnet.comfychair.model.GalleryItem
 import java.io.File
 
 /**
