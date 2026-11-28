@@ -49,13 +49,14 @@ class P2LongTailWiringTest {
     fun `四个生成页面的 ViewModel 销毁时必须注销 PromptBridge`() {
         // 修复前只有 init 里的 register，onCleared 不注销 —— 静态 map 长期钉住
         // 已销毁的 ViewModel。只加在 PromptBridge 里没用，必须四个 VM 都接上。
-        val viewModels = listOf(
+        // B4.2-B 视频对合并：TTV/ITV 的桥接注册与注销随共享实现迁入
+        // BaseVideoGenerationViewModel（两个页面继承基类，行为不变），钉子目标随实现
+        // 切换到基类；图对（TTI/ITI）仍各自持有，钉子原样保留。
+        val imagePair = listOf(
             "src/main/java/sh/hnet/comfychair/viewmodel/TextToImageViewModel.kt",
-            "src/main/java/sh/hnet/comfychair/viewmodel/ImageToImageViewModel.kt",
-            "src/main/java/sh/hnet/comfychair/viewmodel/TextToVideoViewModel.kt",
-            "src/main/java/sh/hnet/comfychair/viewmodel/ImageToVideoViewModel.kt"
+            "src/main/java/sh/hnet/comfychair/viewmodel/ImageToImageViewModel.kt"
         )
-        for (path in viewModels) {
+        for (path in imagePair) {
             val text = source(path)
             assertTrue("$path 缺少 register（桥接本身没了）", text.contains("PromptBridge.register("))
             val body = memberBody(text, "override fun onCleared()")
@@ -66,6 +67,37 @@ class P2LongTailWiringTest {
             assertTrue(
                 "$path 的 onCleared 必须先调用 super.onCleared()",
                 hasStatement(body, "super.onCleared()")
+            )
+        }
+
+        val basePath = "src/main/java/sh/hnet/comfychair/viewmodel/base/BaseVideoGenerationViewModel.kt"
+        val baseText = source(basePath)
+        assertTrue("$basePath 缺少 register（桥接本身没了）", baseText.contains("PromptBridge.register("))
+        val baseCleared = memberBody(baseText, "override fun onCleared()")
+        assertTrue(
+            "$basePath 的 onCleared 必须有 PromptBridge.unregister(generationOwnerId)（P2-20 的修复点）",
+            hasStatement(baseCleared, "PromptBridge.unregister(generationOwnerId)")
+        )
+        assertTrue(
+            "$basePath 的 onCleared 必须先调用 super.onCleared()",
+            hasStatement(baseCleared, "super.onCleared()")
+        )
+        // 两个视频页必须仍继承承载桥接的基类（防止某个页面脱开基类自己另写一套）
+        for (path in listOf(
+            "src/main/java/sh/hnet/comfychair/viewmodel/TextToVideoViewModel.kt",
+            "src/main/java/sh/hnet/comfychair/viewmodel/ImageToVideoViewModel.kt"
+        )) {
+            val text = source(path)
+            assertTrue(
+                "$path 必须继承 BaseVideoGenerationViewModel（P2-20 桥接随基类生效）",
+                text.contains("BaseVideoGenerationViewModel<")
+            )
+            // 防 onCleared 脱钩：注销逻辑只许留在基类。子类一旦 override onCleared
+            // 而不透传 super 的注销，PromptBridge 静态 map 会重新钉住已销毁的
+            // ViewModel（P2-20 回归）——此钉当场变红。
+            assertFalse(
+                "$path 不得自行 override onCleared（注销只在 BaseVideoGenerationViewModel）",
+                text.contains("override fun onCleared")
             )
         }
     }
