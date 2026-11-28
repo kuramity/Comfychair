@@ -25,5 +25,13 @@
 
 ## 执行记录
 
-- W1：两代理并行（环边 2 / MediaCacheKey 收编），验收 + commit 待回。
-- W2/W3：W1 落地后滚动。
+- W1：两代理并行（环边 2 / MediaCacheKey 收编）——完成，commit 61d7d8f。
+- W2：ModelListCatalog 拆出——完成，commit c2dea46（ConnectionManager 2830→2267 行）；计划书落盘 commit c6c9d1d。
+- W3 模拟器四项验收（2026-11-28 上午，AVD cf_test，320×640，debug 包 195,295,429 bytes）：
+  - ① 界面：生成页/工具页/图库/连接页/服务器表单/Options 面板/模型下拉全部结构正确，无新增异常界面；
+  - ② 恶性崩溃：`logcat -b crash` 全程 0 FATAL，无新增 ANR（唯一 anr 文件为 2026-11-15 旧文件）；
+  - ③ 流畅度：页面切换即时无卡死（软渲染模拟器 gfxinfo 82% janky 为环境噪声，真机数字留 B6）；
+  - ④ 前端视觉：图库截图确认渲染正常；**v4.16.13 图库「Deleted 第三态」角标实机首验通过**（此前仅单测覆盖）。
+  - 超额验证：HTTPS 域名连接（comfyui.comfyx.site:443 + TOFU 证书）走通；**ModelListCatalog 全链路实机验证**（/object_info → UNET 下拉真实模型列表，含 image/moss/Qwen/video 分类）。
+  - 过程事故记录：图库缩略图曾将 NSFW 数据渲染进底栏 Gallery 按钮，导致一次截图污染（截图已删、App 数据已 `pm clear` 重置）；整改：后续截图前先用 uiautomator 文本树确认页面无图片内容元素。
+- W4 → B4.2：独立批次推进（时序敏感点密集，见上表裁决）。
