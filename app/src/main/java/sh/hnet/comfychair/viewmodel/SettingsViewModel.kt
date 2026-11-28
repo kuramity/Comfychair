@@ -27,6 +27,7 @@ import sh.hnet.comfychair.cache.MediaCache
 import sh.hnet.comfychair.cache.MediaCacheCleanupPolicy
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionManager
+import sh.hnet.comfychair.distribute.AssetDistributor
 import sh.hnet.comfychair.lifecycle.BackgroundDegradationCoordinator
 import sh.hnet.comfychair.notify.GenerationNotifier
 import sh.hnet.comfychair.storage.AppSettings
@@ -39,6 +40,8 @@ import sh.hnet.comfychair.storage.PromptPresetStorage
 import sh.hnet.comfychair.storage.WorkflowValuesStorage
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.ShareFileStore
+import sh.hnet.comfychair.workflow.rules.RuleTable
+import java.io.File
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 
@@ -460,6 +463,64 @@ class SettingsViewModel : ViewModel() {
             }
 
             _events.emit(SettingsEvent.ShowToast(sh.hnet.comfychair.R.string.msg_defaults_restored_success))
+            _events.emit(SettingsEvent.RefreshNeeded)
+        }
+    }
+
+    /**
+     * 恢复预置与规则的内置版（B5）：删除服务器下发的覆盖层（filesDir/overlay/ 整目录），
+     * 回到 App 内置版本。
+     *
+     * 清理范围是固定常量路径 [AssetDistributor.OVERLAY_DIR]（filesDir 一层之下），只含
+     * 下发的预置流 / 技能规则 / 规则表 / manifest 状态——用户自建工作流（user_workflows/）
+     * 与其他业务数据一概不碰。overlay 目录不在 MediaCacheCleanupPolicy 任何白名单里
+     * （fail-closed），所以「清缓存」不会误删它，只有这个显式入口会。
+     *
+     * 删除后：规则表重载（overlay 已不存在 → 回 assets）；WorkflowManager 全量重装配 +
+     * bump workflowsVersion（生成页与管理页 VM 自动刷新回内置版）。
+     */
+    fun restoreBuiltInAssets(context: Context) {
+        viewModelScope.launch {
+            // null = 覆盖层删除失败（deleteRecursively 返回 false / 目录仍存在 / 抛异常）；
+            // true = 删除成功且原本有下发内容；false = 删除成功但本来就没有下发内容。
+            val restoreResult = withContext(Dispatchers.IO) {
+                val overlayRoot = File(context.filesDir, AssetDistributor.OVERLAY_DIR)
+                val existed = overlayRoot.isDirectory &&
+                    (overlayRoot.listFiles()?.isNotEmpty() == true)
+                val deleted = if (overlayRoot.exists()) {
+                    try {
+                        overlayRoot.deleteRecursively() && !overlayRoot.exists()
+                    } catch (e: Exception) {
+                        DebugLogger.e(TAG, "restoreBuiltInAssets: 覆盖层删除失败: ${e.message}")
+                        false
+                    }
+                } else {
+                    true
+                }
+                if (!deleted) {
+                    // 删除失败：覆盖层残留的资产仍在生效，不能宣布「已恢复内置版」，也不做
+                    // 任何重载/bump（重装配只会把残留的下发内容原样搬回内存层）——只报失败。
+                    null
+                } else {
+                    // 规则表回到 assets 内置文件（overlay 已删，overlayFile() 不存在 → pickTable 走 assets）
+                    RuleTable.load(context.assets, null)
+                    // 预置流内存层重装配（下发层清空 → 回内置版）并 bump 版本号
+                    WorkflowManager.ensureInitialized(context)
+                    WorkflowManager.notifyDistributedAssetsChanged()
+                    existed
+                }
+            }
+
+            if (restoreResult == null) {
+                _events.emit(SettingsEvent.ShowToast(R.string.msg_overlay_restore_failed))
+                return@launch
+            }
+            _events.emit(
+                SettingsEvent.ShowToast(
+                    if (restoreResult) R.string.msg_built_in_assets_restored
+                    else R.string.msg_no_distributed_assets
+                )
+            )
             _events.emit(SettingsEvent.RefreshNeeded)
         }
     }

@@ -1,22 +1,28 @@
 package sh.hnet.comfychair.workflow.rules
 
+import android.content.Context
 import android.content.res.AssetManager
 import org.json.JSONObject
+import sh.hnet.comfychair.distribute.AssetDistributor
+import sh.hnet.comfychair.distribute.AssetKind
 import sh.hnet.comfychair.util.DebugLogger
+import java.io.File
 
 /**
  * 占位符规则表（B3 数据化）：recognized 清单 + 编号型模式 + 通道元数据。
  *
- * 数据源：assets/rules/placeholder_rules.json（服务器可下发覆盖，B5 接入）；
- * 加载失败（文件缺失 / JSON 非法 / schema 校验不过）回退 [DEFAULT_TABLE]（编译期内置，
- * 与 2026-11-28 TemplateKeyRegistry 现值逐条一致），用 DebugLogger.w 告警，不阻塞启动。
+ * 数据源（B5 起三层优先级）：**服务器下发覆盖层**（`filesDir/overlay/rules/placeholder_rules.json`，
+ * 存在且 schema 合规 → 优先用）→ **assets/rules/placeholder_rules.json**（无覆盖层或覆盖层
+ * 坏时用）→ [DEFAULT_TABLE]（编译期内置，与 2026-11-28 TemplateKeyRegistry 现值逐条一致）。
+ * 全部失败路径都有 DebugLogger 告警，不阻塞启动；坏 overlay 绝不「半生效」——直接回退下一层。
  *
  * 为什么数据化：TemplateKeyRegistry.RECOGNIZED_PLACEHOLDERS 是编译期硬编码，新工作流模板
  * 引入新占位符必须发版才能让动态参数引擎放行；抽成规则文件后 B5 可下发调整，不必发版。
  * DEFAULT_TABLE 保证「识别行为永远有底」——规则文件坏了宁可退回编译期现值，也不空表启动。
  *
  * 一致性由 RuleTableTest 钉住（防漂移）：DEFAULT_TABLE 与 TemplateKeyRegistry 现值双向 diff、
- * 规则文件解析结果与 DEFAULT_TABLE 全字段比对。上游改清单时这两条测试会先响，提示同步更新。
+ * 规则文件解析结果与 DEFAULT_TABLE 全字段比对、overlay→assets→内置的三层回退顺序。
+ * 上游改清单时这些测试会先响，提示同步更新。
  */
 object RuleTable {
 
@@ -44,26 +50,69 @@ object RuleTable {
     private var loaded: Table? = null
 
     /**
-     * 读取 assets 里的规则文件并解析；成功则缓存为当前表，失败回退 [DEFAULT_TABLE]。
-     * 重复调用以最后一次成功加载为准（B5 下发刷新场景）。
+     * 加载规则表并缓存为当前表（重复调用以最后一次为准，B5 下发刷新场景）。
+     *
+     * 优先读 [overlayFile]（服务器下发覆盖层，存在且 schema 合规 → 用之；坏 → 回退 assets），
+     * assets 也失败 → [DEFAULT_TABLE]（与 B3 行为完全一致）。全部 IO 都在调用线程同步完成
+     * （ComfyChairApp 从 Dispatchers.IO 调用，见其 onCreate 注释）。
      */
-    fun load(assets: AssetManager): Table {
-        val table = try {
-            val raw = assets.open(RULES_ASSET_PATH).bufferedReader().use { it.readText() }
-            parseTableJson(raw).also {
-                DebugLogger.i(
-                    TAG,
-                    "占位符规则表加载成功：v${it.version}，recognized ${it.recognized.size} 条，patterns ${it.patterns.size} 条",
-                )
+    fun load(assets: AssetManager, overlayFile: File? = null): Table {
+        val overlayRaw = overlayFile?.takeIf { it.isFile }?.let {
+            try {
+                it.readText()
+            } catch (e: Exception) {
+                DebugLogger.w(TAG, "读取规则表覆盖层失败（${e.message}），按无覆盖层处理")
+                null
             }
-        } catch (e: Exception) {
-            // 文件缺失 / JSON 坏 / schema 不过：一律退回内置表，行为与数据化之前完全一致
-            DebugLogger.w(TAG, "占位符规则表加载失败（${e.message}），回退内置默认表")
-            DEFAULT_TABLE
         }
+        val assetsRaw = try {
+            assets.open(RULES_ASSET_PATH).bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            DebugLogger.w(TAG, "读取 assets 规则文件失败（${e.message}）")
+            null
+        }
+        val table = pickTable(overlayRaw, assetsRaw)
         loaded = table
         return table
     }
+
+    /**
+     * 三层选择（internal 纯函数，RuleTableTest 直测）：overlay 有效 → overlay；overlay 坏/缺 →
+     * assets；两者都坏 → [DEFAULT_TABLE]。每层失败都单独告警，绝不产出「半生效」的表。
+     */
+    internal fun pickTable(overlayRaw: String?, assetsRaw: String?): Table {
+        if (overlayRaw != null) {
+            try {
+                return parseTableJson(overlayRaw).also {
+                    DebugLogger.i(
+                        TAG,
+                        "占位符规则表使用服务器下发覆盖层：v${it.version}，recognized ${it.recognized.size} 条，patterns ${it.patterns.size} 条",
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLogger.w(TAG, "规则表覆盖层 schema 不合规（${e.message}），回退 assets 内置文件")
+            }
+        }
+        if (assetsRaw != null) {
+            try {
+                return parseTableJson(assetsRaw).also {
+                    DebugLogger.i(
+                        TAG,
+                        "占位符规则表加载成功：v${it.version}，recognized ${it.recognized.size} 条，patterns ${it.patterns.size} 条",
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLogger.w(TAG, "占位符规则表加载失败（${e.message}），回退内置默认表")
+            }
+        }
+        return DEFAULT_TABLE
+    }
+
+    /** 服务器下发覆盖层的标准位置（与 AssetKind.RULE_TABLE 的落盘路径三方共用同一常量）。 */
+    fun overlayFile(context: Context): File = File(
+        File(File(context.filesDir, AssetDistributor.OVERLAY_DIR), AssetKind.RULE_TABLE.dirName),
+        AssetKind.RULE_TABLE_FILENAME,
+    )
 
     /**
      * 解析规则 JSON 并做 schema 校验（internal：RuleTableTest 用它做「文件 = DEFAULT_TABLE」

@@ -76,8 +76,14 @@ class ComfyChairApp : Application() {
 
         // 前后台监视（幂等）：注册 ProcessLifecycleOwner 与 ActivityLifecycleCallbacks
         AppLifecycleMonitor.attach(this)
-        // B3：占位符规则表加载（assets/rules/placeholder_rules.json，失败回退内置表不阻塞启动）
-        RuleTable.load(assets)
+        // B3：占位符规则表加载（assets/rules/placeholder_rules.json，失败回退内置表不阻塞启动）。
+        // B5：挪入 IO 后台——加载是磁盘/asset IO（且新增 overlay 覆盖层读取），不必占主线程；
+        // 加载完成前 RuleTable.current() 是内置默认表，与旧「加载失败」路径的行为一致，
+        // 消费方（动态参数引擎）只在生成时读表，短暂窗口无感。CrashLogger.install 与
+        // super.onCreate 的相对顺序不受影响（见 onCreate 开头）。
+        appScope.launch(Dispatchers.IO) {
+            RuleTable.load(assets, RuleTable.overlayFile(this@ComfyChairApp))
+        }
         // B1：notify↔lifecycle 环解除——前台信号由装配根接线，监视器回归「只喂信号」职责。
         // collect StateFlow 先发当前值，与原 attach 内订阅语义等价；
         // 主线程 immediate 保证通知操作线程不变。

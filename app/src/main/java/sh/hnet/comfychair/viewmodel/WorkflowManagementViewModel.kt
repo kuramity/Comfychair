@@ -147,6 +147,14 @@ class WorkflowManagementViewModel : ViewModel() {
             WorkflowManager.ensureInitialized(context)
             loadWorkflows()
         }
+        // B5：订阅 workflowsVersion——服务器下发的预置流落盘（或设置页「恢复内置版」删掉
+        // 覆盖层）都会 bump 版本号，管理页要跟着自动刷，否则用户重启前看不到变化。
+        // 与三个生成页 VM 的订阅模式一致。
+        viewModelScope.launch {
+            WorkflowManager.workflowsVersion.collect {
+                loadWorkflows()
+            }
+        }
     }
 
     /**

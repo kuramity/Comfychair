@@ -176,6 +176,15 @@
     <string name="button_clear_cache">清空缓存</string>
     <string name="button_restore_defaults">恢复默认设置</string>
 
+    <!-- B5：恢复内置版——删除服务器下发的覆盖层，回到 App 内置版本 -->
+    <string name="button_restore_built_in_assets">恢复预置与规则内置版</string>
+    <string name="desc_restore_built_in_assets">删除服务器下发的覆盖层（预置工作流、技能提示词、占位符规则表），回到 App 内置版本</string>
+    <string name="title_restore_built_in_assets_confirm">恢复内置版本？</string>
+    <string name="msg_restore_built_in_assets_confirm">将删除服务器下发的覆盖层（预置工作流、技能提示词、占位符规则表），回到 App 内置版本。你自己上传的工作流不受影响。</string>
+    <string name="msg_built_in_assets_restored">已删除服务器下发的覆盖层，恢复为内置版本</string>
+    <string name="msg_no_distributed_assets">没有需要恢复的内容（当前已是内置版本）</string>
+    <string name="msg_overlay_restore_failed">覆盖层删除失败，未能恢复为内置版本</string>
+
     <!-- Gallery item strings -->
     <string name="button_delete_history_item">从历史记录中删除</string>
     <string name="content_description_gallery_video_thumbnail">生成视频缩略图</string>

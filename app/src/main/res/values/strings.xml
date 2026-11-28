@@ -179,6 +179,15 @@
     <string name="button_clear_cache">Clear Cache</string>
     <string name="button_restore_defaults">Restore Defaults</string>
 
+    <!-- Built-in asset restore (B5): delete the server-distributed overlay, fall back to APK built-in versions -->
+    <string name="button_restore_built_in_assets">Restore Built-in Presets &amp; Rules</string>
+    <string name="desc_restore_built_in_assets">Delete the server-distributed overlay (prebuilt workflows, skill prompts, placeholder rules) and fall back to the versions built into the app</string>
+    <string name="title_restore_built_in_assets_confirm">Restore built-in assets?</string>
+    <string name="msg_restore_built_in_assets_confirm">This deletes the server-distributed overlay (prebuilt workflows, skill prompts, placeholder rules) and falls back to the versions built into the app. Your own workflows are not affected.</string>
+    <string name="msg_built_in_assets_restored">Distributed assets removed; built-in versions restored</string>
+    <string name="msg_no_distributed_assets">Nothing to restore — no distributed assets present</string>
+    <string name="msg_overlay_restore_failed">Failed to delete distributed assets; built-in versions not restored</string>
+
     <!-- Backup and restore strings -->
     <string name="title_backup_restore">Backup and Restore</string>
     <string name="desc_backup_restore">Export or import your app configuration</string>

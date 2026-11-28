@@ -246,14 +246,14 @@ fun MainNavHost(
                 val gateway = remember(appContext) { PromptEnhanceGatewayImpl(appContext) }
                 // 空文件名的「（不注入）」项过滤掉：选它会走 ComfyUI 的自动选择分支并报错
                 val ruleFiles = remember(appContext) {
-                    SkillPromptRepository.list(appContext.assets)
+                    SkillPromptRepository.list(appContext.assets, SkillPromptRepository.overlayDir(appContext))
                         .filter { it.fileName.isNotBlank() }
                         .map { it.displayName to it.fileName }
                 }
                 // 屏幕侧是同步回调（点「开始生成」时立即取正文），规则 md 只有几 KB
                 val ruleFileContent: (String) -> String? = remember(appContext) {
                     { fileName: String ->
-                        SkillPromptRepository.read(appContext.assets, fileName)
+                        SkillPromptRepository.read(appContext.assets, fileName, SkillPromptRepository.overlayDir(appContext))
                     }
                 }
                 val textWorkflowJson = remember(appContext) {

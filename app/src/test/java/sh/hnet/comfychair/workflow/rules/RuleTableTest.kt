@@ -3,10 +3,10 @@ package sh.hnet.comfychair.workflow.rules
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Test
 import sh.hnet.comfychair.workflow.TemplateKeyRegistry
 import java.io.File
+import java.nio.file.Files
 
 /**
  * RuleTable 的等价性钉子（B3-T1b）。
@@ -69,7 +69,7 @@ class RuleTableTest {
     @Test
     fun `规则文件解析结果与 DEFAULT_TABLE 全字段一致`() {
         val raw = rulesFileText()
-        assumeTrue("placeholder_rules.json 不在磁盘上时跳过", raw != null)
+        org.junit.Assume.assumeTrue("placeholder_rules.json 不在磁盘上时跳过", raw != null)
         val parsed = RuleTable.parseTableJson(raw!!)
         assertEquals(defaultTable.version, parsed.version)
         assertEquals(defaultTable.recognized, parsed.recognized)
@@ -96,5 +96,58 @@ class RuleTableTest {
         assertFalse("width 在 TTI 是合法通道", RuleTable.forbiddenIn("width", "tti"))
         assertFalse("seed 无 forbidden_in 约束", RuleTable.forbiddenIn("seed", "iti_editing"))
         assertFalse("未登记 meta 的占位符恒无约束", RuleTable.forbiddenIn("totally_unknown", "tti"))
+    }
+
+    // ---------------- ④ overlay 优先级（B5：下发规则表覆盖 assets，坏 overlay 回退）----------------
+
+    private fun tempDir(): File = Files.createTempDirectory("rule-table").toFile()
+
+    private fun tableRaw(version: Int, key: String): String =
+        """{"version": $version, "recognized_placeholders": ["$key"], "recognized_patterns": []}"""
+
+    @Test
+    fun `overlay 有效时优先于 assets`() {
+        val parsed = RuleTable.pickTable(
+            overlayRaw = tableRaw(9, "overlay_only_key"),
+            assetsRaw = tableRaw(1, "positive_prompt"),
+        )
+        assertEquals(9, parsed.version)
+        assertEquals(setOf("overlay_only_key"), parsed.recognized)
+    }
+
+    @Test
+    fun `overlay 缺失时用 assets`() {
+        val parsed = RuleTable.pickTable(
+            overlayRaw = null,
+            assetsRaw = tableRaw(1, "positive_prompt"),
+        )
+        assertEquals(1, parsed.version)
+        assertEquals(setOf("positive_prompt"), parsed.recognized)
+    }
+
+    @Test
+    fun `overlay 坏 schema 时回退 assets`() {
+        val parsed = RuleTable.pickTable(
+            overlayRaw = """{"version": 0, "recognized_placeholders": []}""", // require 失败的坏表
+            assetsRaw = tableRaw(1, "positive_prompt"),
+        )
+        assertEquals("坏 overlay 必须回退 assets，绝不能用半生效的表", 1, parsed.version)
+        assertEquals(setOf("positive_prompt"), parsed.recognized)
+    }
+
+    @Test
+    fun `overlay 与 assets 都坏时回退内置默认表`() {
+        val parsed = RuleTable.pickTable(
+            overlayRaw = "not json",
+            assetsRaw = "not json either",
+        )
+        assertEquals(defaultTable.version, parsed.version)
+        assertEquals(defaultTable.recognized, parsed.recognized)
+    }
+
+    @Test
+    fun `assets 坏且无 overlay 时回退内置默认表`() {
+        val parsed = RuleTable.pickTable(overlayRaw = null, assetsRaw = null)
+        assertEquals(defaultTable.recognized, parsed.recognized)
     }
 }

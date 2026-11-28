@@ -63,7 +63,7 @@ fun SkillPromptSection(
     // 技能流才显示（占位符是转换脚本注入的，普通出图流里没有）
     if (!json.contains("{{skill_file")) return
 
-    val options = remember { SkillPromptRepository.list(context.assets) }
+    val options = remember { SkillPromptRepository.list(context.assets, SkillPromptRepository.overlayDir(context)) }
     if (options.isEmpty()) return
 
     var selected by remember(workflowName) {
@@ -151,7 +151,8 @@ private fun SkillPromptManagerDialog(
 ) {
     val context = LocalContext.current
     val preview = remember(selected) {
-        if (selected.isEmpty()) "" else SkillPromptRepository.read(context.assets, selected).orEmpty()
+        if (selected.isEmpty()) ""
+        else SkillPromptRepository.read(context.assets, selected, SkillPromptRepository.overlayDir(context)).orEmpty()
     }
 
     AlertDialog(

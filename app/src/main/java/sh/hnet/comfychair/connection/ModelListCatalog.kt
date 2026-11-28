@@ -12,6 +12,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import sh.hnet.comfychair.ComfyUIClient
+import sh.hnet.comfychair.WorkflowManager
+import sh.hnet.comfychair.distribute.AssetDistributor
+import sh.hnet.comfychair.distribute.AssetKind
 import sh.hnet.comfychair.model.LoraSelection
 import sh.hnet.comfychair.model.ModelIntroSync
 import sh.hnet.comfychair.model.ModelIntroTable
@@ -20,6 +23,8 @@ import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.SingleFlight
 import sh.hnet.comfychair.workflow.NodeTypeRegistry
 import sh.hnet.comfychair.workflow.TemplateKeyRegistry
+import sh.hnet.comfychair.workflow.rules.RuleTable
+import java.io.File
 
 /**
  * 模型列表子系统：节点类型注册表 + 模型列表缓存 + `/object_info` 网络装配（B4-W2）。
@@ -145,6 +150,16 @@ class ModelListCatalog {
      */
     private val introSyncRunner = ModelIntroSyncRunner(
         gate = introSyncInFlight,
+        logInfo = { DebugLogger.i(TAG, it) },
+        logWarn = { DebugLogger.w(TAG, it) },
+    )
+
+    /**
+     * 资产下发（B5）的执行编排（闸门 + 异常兜底都在 [AssetDistributor] 里）。
+     * 与 [introSyncRunner] 同款实例化模式：日志注入 + 独立闸门实例。
+     */
+    private val assetDistributor = AssetDistributor(
+        gate = SingleFlight(),
         logInfo = { DebugLogger.i(TAG, it) },
         logWarn = { DebugLogger.w(TAG, it) },
     )
@@ -285,6 +300,11 @@ class ModelListCatalog {
                     // 放在回调里而不是 fetchServerData 开头，是为了不跟 8MB 的 /object_info 抢带宽，
                     // 也避免列表列表拉取失败时白拉一次介绍。
                     syncModelIntros(client, context)
+
+                    // 资产下发（B5）：预置工作流 / 技能规则 / 占位符规则表的覆盖层同步，
+                    // 与介绍同步同点触发、同为同源 /view 拉取；闸门防重入与异常兜底全在
+                    // AssetDistributor 里，失败只记日志，绝不影响模型列表装配。
+                    context?.let { syncDistributedAssets(client, it) }
 
                     // Cache object_info to disk for offline mode
                     if (context != null && serverId != null) {
@@ -465,6 +485,35 @@ class ModelListCatalog {
             apply = { json ->
                 val result = ModelIntroSync.apply(json, ModelIntroTable.cacheFile(context))
                 DebugLogger.i(TAG, "介绍数据同步结果：$result")
+            },
+        )
+    }
+
+    /**
+     * 资产下发同步（B5）：把服务器上的 asset_manifest.json 及其列出的资产拉回本地覆盖层。
+     *
+     * 排在 [syncModelIntros] 之后触发——同为同源 /view 小文件拉取，不抢 /object_info 带宽。
+     * 落盘副作用在 [AssetDistributor] 的完成回调里接线：预置流 → WorkflowManager 重装配
+     * （bump workflowsVersion，订阅 VM 自动刷新）；规则表 → RuleTable 重载；SKILL_MD 无需
+     * 主动副作用（下次读时生效）。回调线程是 OkHttp 线程，重装配已由
+     * WorkflowManager.notifyDistributedAssetsChanged 的 @Synchronized 保证写-写互斥。
+     */
+    private fun syncDistributedAssets(client: ComfyUIClient, context: Context) {
+        assetDistributor.sync(
+            overlayRoot = File(context.filesDir, AssetDistributor.OVERLAY_DIR),
+            fetch = { filename, callback ->
+                client.fetchRawBytes(filename, AssetDistributor.REMOTE_SUBFOLDER, "output") { bytes, _ ->
+                    callback(bytes)
+                }
+            },
+            onComplete = { result ->
+                if (result.outcome != AssetDistributor.Outcome.COMPLETED) return@sync
+                if (AssetKind.PREBUILT_WORKFLOW in result.writtenKinds) {
+                    WorkflowManager.notifyDistributedAssetsChanged()
+                }
+                if (AssetKind.RULE_TABLE in result.writtenKinds) {
+                    RuleTable.load(context.assets, RuleTable.overlayFile(context))
+                }
             },
         )
     }

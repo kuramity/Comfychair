@@ -31,6 +31,11 @@ import sh.hnet.comfychair.workflow.dynamic.DynamicParamValues
 import sh.hnet.comfychair.workflow.dynamic.NodeTypeRegistryDefinitionSource
 import sh.hnet.comfychair.workflow.dynamic.PeGateMaterializer
 import sh.hnet.comfychair.workflow.dynamic.escapeJsonString
+import sh.hnet.comfychair.distribute.AssetAdmission
+import sh.hnet.comfychair.distribute.AssetDistributor
+import sh.hnet.comfychair.distribute.AssetKind
+import sh.hnet.comfychair.distribute.AdmissionResult
+import sh.hnet.comfychair.workflow.DistributedWorkflowMerge
 import sh.hnet.comfychair.prompt.SkillPromptRepository
 import sh.hnet.comfychair.prompt.SkillPromptStore
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -166,6 +171,16 @@ object WorkflowManager {
 
     // Available workflows loaded from res/raw and user storage
     private val workflows = mutableListOf<Workflow>()
+
+    /**
+     * 服务器下发预置流覆盖层（B5）：`filesDir/overlay/prebuilt_workflows/` 里通过准入的
+     * 文件装配成的列表。**不并入 [workflows]**——基础列表的写路径（增删改用户流）与
+     * 读取路径共用，混入下发条目会让按 id 写 metadata 的位置错位；下发层只在各出口
+     * （[mergedWorkflows]）按 name 合并。@Volatile：AssetDistributor 的 OkHttp 回调线程
+     * 调 [notifyDistributedAssetsChanged] 重装配，主线程读。
+     */
+    @Volatile
+    private var distributedWorkflows: List<Workflow> = emptyList()
     private val workflowValuesStorage by lazy { WorkflowValuesStorage(applicationContext) }
 
     // Workflow change notification - increments when workflows are added/updated/deleted
@@ -186,13 +201,14 @@ object WorkflowManager {
     fun didLastLoadHaveErrors(): Boolean = lastLoadHadErrors
 
     /**
-     * Load all workflows (built-in and user-uploaded)
+     * Load all workflows (built-in and user-uploaded and distributed overlay)
      */
     private fun loadAllWorkflows() {
         lastLoadHadErrors = false
         workflows.clear()
         loadBuiltInWorkflows()
         loadUserWorkflows()
+        loadDistributedWorkflows()
     }
 
     /**
@@ -224,7 +240,11 @@ object WorkflowManager {
                 if (fn.startsWith("prebuilt_")) indexByFilename[fn] = i
             }
             var synced = 0
-            // 清理：资产中已移除的预置条目（如被删除的预置流），从 metadata 与磁盘移除
+            // 清理：资产中已移除的预置条目（如被删除的预置流），从 metadata 与磁盘移除。
+            // （B5 的服务器下发覆盖层在 filesDir/overlay/prebuilt_workflows/，不进 user_workflows/
+            //  目录，本清理段只扫 user_workflows/ 里 prebuilt_ 前缀文件，对下发层天然无影响；
+            //  下发层的生命周期由 AssetDistributor 与设置页「恢复预置与规则内置版」管理——
+            //  改这里时不要把下发层卷进来。）
             val assetSet = assetNames.filter { it.endsWith(".json") && it.startsWith("prebuilt_") }.toSet()
             var removed = 0
             var cleanupIdx = 0
@@ -421,6 +441,65 @@ object WorkflowManager {
         }
     }
 
+    /**
+     * Load server-distributed prebuilt workflows from filesDir/overlay/prebuilt_workflows/.
+     *
+     * 每份文件都再走一遍 [AssetAdmission] 准入（启动时二次防御：磁盘层可能被旧版本 /
+     * 备份恢复写脏，不盲信已落盘内容）。准入失败或读取失败 → 跳过该文件并标
+     * [lastLoadHadErrors]（fail-closed：部分列表不是全集）。id 用确定性 UUID（对 filename
+     * 做哈希，与内置 raw 资源同款），同名文件跨安装升级 id 稳定。
+     */
+    private fun loadDistributedWorkflows() {
+        val dir = File(
+            File(applicationContext.filesDir, AssetDistributor.OVERLAY_DIR),
+            AssetKind.PREBUILT_WORKFLOW.dirName,
+        )
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".json", ignoreCase = true) }
+        if (files.isNullOrEmpty()) {
+            distributedWorkflows = emptyList()
+            return
+        }
+        val loaded = mutableListOf<Workflow>()
+        for (file in files.sortedBy { it.name }) {
+            val filename = file.name
+            if (!WorkflowFilePolicy.isValidFilename(filename)) {
+                lastLoadHadErrors = true
+                DebugLogger.w(TAG, "下发工作流文件名非法，已跳过：$filename")
+                continue
+            }
+            val bytes = try {
+                file.readBytes()
+            } catch (e: Exception) {
+                lastLoadHadErrors = true
+                DebugLogger.w(TAG, "下发工作流读取失败：$filename（${e.message}）")
+                continue
+            }
+            val accepted = AssetAdmission.admit(AssetKind.PREBUILT_WORKFLOW, bytes)
+                as? AdmissionResult.Accepted
+            if (accepted == null) {
+                lastLoadHadErrors = true
+                DebugLogger.w(TAG, "下发工作流准入拒绝：$filename")
+                continue
+            }
+            val type = accepted.workflowType
+            if (type == null) {
+                lastLoadHadErrors = true
+                DebugLogger.w(TAG, "下发工作流类型缺失：$filename")
+                continue
+            }
+            val json = JSONObject(accepted.decodedText)
+            val name = json.optString("name", filename.removeSuffix(".json"))
+            val description = json.optString("description", "")
+            val defaults = WorkflowDefaults.fromJson(json.optJSONObject("defaults"))
+            val id = UuidUtils.generateDeterministicId(filename)
+            loaded.add(Workflow(id, name, description, accepted.decodedText, type, isBuiltIn = true, defaults))
+        }
+        distributedWorkflows = loaded
+        if (loaded.isNotEmpty()) {
+            DebugLogger.i(TAG, "下发预置流加载完成：${loaded.size} 份")
+        }
+    }
+
     // Workflow JSON analysis - delegates to WorkflowJsonAnalyzer
 
     /** Parse workflow type from filename prefix */
@@ -456,7 +535,7 @@ object WorkflowManager {
      * @param excludeWorkflowId Optional workflow ID to exclude from the check (used when editing)
      */
     fun isWorkflowNameTaken(name: String, excludeWorkflowId: String? = null): Boolean {
-        return workflows.any { workflow ->
+        return mergedWorkflows().any { workflow ->
             workflow.name.equals(name, ignoreCase = true) &&
             (excludeWorkflowId == null || workflow.id != excludeWorkflowId)
         }
@@ -468,7 +547,7 @@ object WorkflowManager {
      * The original name is kept intact, e.g. "My Workflow (2)" becomes "My Workflow (2) (1)".
      */
     fun generateUniqueDuplicateName(originalName: String): String {
-        val existingNames = workflows.map { it.name }.toSet()
+        val existingNames = mergedWorkflows().map { it.name }.toSet()
 
         // Find all numbers already used with this exact base name
         val numberPattern = Regex("""^\Q$originalName\E \((\d+)\)$""", RegexOption.IGNORE_CASE)
@@ -494,7 +573,7 @@ object WorkflowManager {
         newName: String,
         newDescription: String
     ): Result<Workflow> {
-        val sourceWorkflow = workflows.find { it.id == sourceWorkflowId }
+        val sourceWorkflow = mergedWorkflows().find { it.id == sourceWorkflowId }
             ?: return Result.failure(Exception("Source workflow not found"))
 
         // Validate new name
@@ -593,7 +672,7 @@ object WorkflowManager {
      * @return Result containing the JSON string in ComfyUI format, or error
      */
     fun exportWorkflowToComfyUIFormat(workflowId: String): Result<String> {
-        val workflow = workflows.find { it.id == workflowId }
+        val workflow = mergedWorkflows().find { it.id == workflowId }
             ?: return Result.failure(Exception("Workflow not found"))
 
         val json = try {
@@ -650,7 +729,7 @@ object WorkflowManager {
      * @return Result containing the JSON string in internal format, or error
      */
     fun exportWorkflowInternal(workflowId: String): Result<String> {
-        val workflow = workflows.find { it.id == workflowId }
+        val workflow = mergedWorkflows().find { it.id == workflowId }
             ?: return Result.failure(Exception("Workflow not found"))
 
         return try {
@@ -1143,7 +1222,7 @@ object WorkflowManager {
         fieldMappings: Map<String, Pair<String, String>>  // fieldKey -> (nodeId, inputKey)
     ): Result<Workflow> {
         // Find existing workflow
-        val existingWorkflow = workflows.find { it.id == workflowId }
+        val existingWorkflow = mergedWorkflows().find { it.id == workflowId }
             ?: return Result.failure(Exception("Workflow not found"))
 
         if (existingWorkflow.isBuiltIn) {
@@ -1420,7 +1499,7 @@ object WorkflowManager {
      * Delete a user workflow
      */
     fun deleteUserWorkflow(workflowId: String): Boolean {
-        val workflow = workflows.find { it.id == workflowId }
+        val workflow = mergedWorkflows().find { it.id == workflowId }
         if (workflow == null || workflow.isBuiltIn) return false
 
         // Remove from list
@@ -1519,71 +1598,90 @@ object WorkflowManager {
     }
 
     /**
+     * 合并视图（唯一读取路径）：基础列表（内置 + 用户）与下发覆盖层按 name 合并。
+     * **写路径不走这里**（按 id 定位 + 原位赋值的 metadata 更新必须对准 [workflows] 本身）。
+     */
+    private fun mergedWorkflows(): List<Workflow> =
+        DistributedWorkflowMerge.merge(workflows, distributedWorkflows)
+
+    /**
+     * 下发资产覆盖层变更（新预置流落盘 / 覆盖层被删除）后的重装配入口：
+     * 全量重载（内置 + 用户 + 下发层）并 bump 版本号，订阅 ViewModel 自动刷新。
+     * AssetDistributor 在网络回调线程调用；@Synchronized 与 [initialize] 共用类锁，
+     * 保证两次 loadAllWorkflows 不会并发交错。
+     */
+    @Synchronized
+    fun notifyDistributedAssetsChanged() {
+        loadAllWorkflows()
+        _workflowsVersion.value++
+    }
+
+    /**
      * Get all workflows
      */
-    fun getAllWorkflows(): List<Workflow> = workflows.toList()
+    fun getAllWorkflows(): List<Workflow> = mergedWorkflows()
 
     /**
      * Get workflows by type
      */
     fun getWorkflowsByType(type: WorkflowType): List<Workflow> {
-        return workflows.filter { it.type == type }.sortedBy { it.name.lowercase() }
+        return mergedWorkflows().filter { it.type == type }.sortedBy { it.name.lowercase() }
     }
 
     /**
      * Check if a workflow can be deleted (not built-in)
      */
     fun canDeleteWorkflow(workflowId: String): Boolean {
-        return workflows.find { it.id == workflowId }?.isBuiltIn == false
+        return mergedWorkflows().find { it.id == workflowId }?.isBuiltIn == false
     }
 
     /**
      * Get list of text-to-image workflow names for dropdown
      */
     fun getTtiWorkflowNames(): List<String> {
-        return workflows.filter { it.type == WorkflowType.TTI }.map { it.name }
+        return mergedWorkflows().filter { it.type == WorkflowType.TTI }.map { it.name }
     }
 
     /**
      * Get list of Image-to-image inpainting workflow names for dropdown
      */
     fun getItiInpaintingWorkflowNames(): List<String> {
-        return workflows.filter { it.type == WorkflowType.ITI_INPAINTING }.map { it.name }
+        return mergedWorkflows().filter { it.type == WorkflowType.ITI_INPAINTING }.map { it.name }
     }
 
     /**
      * Get list of Image-to-image editing workflow names for dropdown
      */
     fun getItiEditingWorkflowNames(): List<String> {
-        return workflows.filter { it.type == WorkflowType.ITI_EDITING }.map { it.name }
+        return mergedWorkflows().filter { it.type == WorkflowType.ITI_EDITING }.map { it.name }
     }
 
     /**
      * Get list of text-to-video workflow names for dropdown
      */
     fun getTtvWorkflowNames(): List<String> {
-        return workflows.filter { it.type == WorkflowType.TTV }.map { it.name }
+        return mergedWorkflows().filter { it.type == WorkflowType.TTV }.map { it.name }
     }
 
     /**
      * Get list of image-to-video workflow names for dropdown
      */
     fun getItvWorkflowNames(): List<String> {
-        return workflows.filter { it.type == WorkflowType.ITV }.map { it.name }
+        return mergedWorkflows().filter { it.type == WorkflowType.ITV }.map { it.name }
     }
 
     /**
      * Get workflow by name
      */
     fun getWorkflowByName(name: String): Workflow? {
-        return workflows.find { it.name == name }
+        return mergedWorkflows().find { it.name == name }
     }
 
     /**
      * Get workflow by ID
      */
     fun getWorkflowById(id: String): Workflow? {
-        return workflows.find { it.id == id }
+        return mergedWorkflows().find { it.id == id }
     }
 
     /**
@@ -1733,8 +1831,8 @@ object WorkflowManager {
         // 分支必抛错。空串必须与 null 同样视为「没有记录」，回退到按类型给的默认规则。
         val selected = SkillPromptStore.get(applicationContext, workflow.name)
             ?.takeIf { it.isNotBlank() }
-            ?: SkillPromptRepository.defaultFor(workflow.type, SkillPromptRepository.list(assets))
-        val content = SkillPromptRepository.read(assets, selected).orEmpty()
+            ?: SkillPromptRepository.defaultFor(workflow.type, SkillPromptRepository.list(assets, SkillPromptRepository.overlayDir(applicationContext)))
+        val content = SkillPromptRepository.read(assets, selected, SkillPromptRepository.overlayDir(applicationContext)).orEmpty()
         val defaults = getRawDefaultsObject(workflow.id)
         val model = defaults?.optString("skill_model").orEmpty()
         val mmproj = defaults?.optString("skill_mmproj").orEmpty()

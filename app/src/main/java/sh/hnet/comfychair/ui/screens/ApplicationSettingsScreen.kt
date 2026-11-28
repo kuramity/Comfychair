@@ -104,6 +104,8 @@ fun ApplicationSettingsScreen(
     // Backup/restore state
     var showRestoreDialog by remember { mutableStateOf(false) }
     var pendingRestoreUri by remember { mutableStateOf<Uri?>(null) }
+    // B5：恢复预置与规则内置版的确认弹窗（destructive 操作，先确认再删覆盖层）
+    var showRestoreBuiltInAssetsDialog by remember { mutableStateOf(false) }
 
     // Debug logging state
     var showLogViewer by remember { mutableStateOf(false) }
@@ -199,6 +201,35 @@ fun ApplicationSettingsScreen(
                         showRestoreDialog = false
                         pendingRestoreUri = null
                     }
+                ) {
+                    Text(stringResource(android.R.string.cancel))
+                }
+            }
+        )
+    }
+
+    // B5：恢复内置版确认弹窗（说明文案讲清「删除下发覆盖层、回内置版；用户自建流不受影响」）
+    if (showRestoreBuiltInAssetsDialog) {
+        AlertDialog(
+            onDismissRequest = { showRestoreBuiltInAssetsDialog = false },
+            title = { Text(stringResource(R.string.title_restore_built_in_assets_confirm)) },
+            text = { Text(stringResource(R.string.msg_restore_built_in_assets_confirm)) },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.restoreBuiltInAssets(context)
+                        showRestoreBuiltInAssetsDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text(stringResource(R.string.button_restore_built_in_assets))
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { showRestoreBuiltInAssetsDialog = false }
                 ) {
                     Text(stringResource(android.R.string.cancel))
                 }
@@ -843,6 +874,28 @@ fun ApplicationSettingsScreen(
                     )
                 ) {
                     Text(stringResource(R.string.button_restore_defaults))
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // B5：恢复预置与规则内置版——删除服务器下发的覆盖层（预置工作流/技能提示词/
+                // 占位符规则表），回到 App 内置版本。destructive 操作，弹确认框再执行。
+                Text(
+                    text = stringResource(R.string.desc_restore_built_in_assets),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Button(
+                    onClick = { showRestoreBuiltInAssetsDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text(stringResource(R.string.button_restore_built_in_assets))
                 }
             }
         }

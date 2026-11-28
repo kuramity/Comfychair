@@ -177,6 +177,14 @@ class TranslationCompletenessTest {
      */
     private val KNOWN_GAPS_DE_ES_FR_PL = setOf(
         "action_confirm",
+        // B5（资产下发/恢复内置版）新增键：本轮未补德/西/法/波人审翻译，按约定记入 allowlist
+        "button_restore_built_in_assets",
+        "desc_restore_built_in_assets",
+        "msg_built_in_assets_restored",
+        "msg_no_distributed_assets",
+        "msg_overlay_restore_failed",
+        "msg_restore_built_in_assets_confirm",
+        "title_restore_built_in_assets_confirm",
         "action_gallery_trash",
         "audio_section_title",
         "audio_slot_add",

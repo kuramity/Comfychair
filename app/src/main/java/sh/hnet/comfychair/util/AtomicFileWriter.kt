@@ -25,9 +25,19 @@ object AtomicFileWriter {
     private const val TMP_SUFFIX = ".tmp"
 
     fun writeText(file: File, content: String) {
+        writeBytes(file, content.toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * 二进制文件的原子写（写入序列与 [writeText] 一致）：`.tmp` → flush + fsync → 原子改名。
+     * B5 资产下发按字节落盘（清单校验的是字节 SHA），文本入口保留为编码转换的便捷层。
+     * 父目录不存在时自动创建（B5 的 overlay/<dirName>/ 两层目录首次落盘时可能都缺）。
+     */
+    fun writeBytes(file: File, content: ByteArray) {
+        file.parentFile?.let { parent -> if (!parent.isDirectory) parent.mkdirs() }
         val tmp = File(file.parentFile, file.name + TMP_SUFFIX)
         FileOutputStream(tmp).use { out ->
-            out.write(content.toByteArray(Charsets.UTF_8))
+            out.write(content)
             out.flush()
             out.fd.sync()
         }

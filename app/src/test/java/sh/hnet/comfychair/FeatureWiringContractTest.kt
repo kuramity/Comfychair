@@ -126,6 +126,38 @@ class FeatureWiringContractTest {
         )
     }
 
+    // ------------------------------------------------------------ ① 资产下发（B5）的接线
+
+    @Test
+    fun `资产下发同步必须接线在模型列表刷新之后`() {
+        // B5 的唯一触发路径：与介绍同步同点触发（/object_info 回调里、syncModelIntros 之后）。
+        // 删掉这一行 = 预置流 / 技能规则 / 规则表的覆盖层永远不下发（纯逻辑单测仍全绿，
+        // 与介绍同步钉子同一教训：接线只能靠源码钉）。
+        val sourceText = source(modelListCatalogPath)
+        val body = bodyOf(sourceText, "fun fetchServerData(")
+        assertTrue(
+            "fetchServerData 里必须有一条 syncDistributedAssets 触发语句（B5：syncModelIntros 之后）",
+            hasStatement(body, "context?.let { syncDistributedAssets(client, it) }")
+        )
+        val syncBody = folded(bodyOf(sourceText, "private fun syncDistributedAssets("))
+        assertTrue(
+            "资产同步必须交给 AssetDistributor（闸门与异常兜底在里面）",
+            syncBody.contains("assetDistributor.sync(")
+        )
+        assertTrue(
+            "拉取必须走同源 /view（fetchRawBytes），subfolder 用共享常量（不引入任意 URL 下载面）",
+            syncBody.contains("fetchRawBytes") && syncBody.contains("AssetDistributor.REMOTE_SUBFOLDER")
+        )
+        assertTrue(
+            "预置流落盘后必须触发工作流重装配（否则下发流在重启前不可见）",
+            syncBody.contains("WorkflowManager.notifyDistributedAssetsChanged()")
+        )
+        assertTrue(
+            "规则表落盘后必须触发重载（否则新规则要重启才生效）",
+            syncBody.contains("RuleTable.load(")
+        )
+    }
+
     // ------------------------------------------------------------ ② ITI 双流隔离的接线
 
     @Test
