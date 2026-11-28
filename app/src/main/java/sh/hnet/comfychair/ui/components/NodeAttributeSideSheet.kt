@@ -64,6 +64,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.cache.MediaGateway
 import sh.hnet.comfychair.connection.ConnectionManager
 import sh.hnet.comfychair.model.SamplerOptions
 import sh.hnet.comfychair.ui.components.shared.ExpandableTooltip
@@ -885,10 +886,14 @@ private fun ImagePreview(
             return@LaunchedEffect
         }
 
+        // B4.2-A：默认值收口到 MediaGateway 接口侧，直调点显式补参（值同旧默认）
         client.fetchImage(
             filename = filename,
             subfolder = "",
-            type = "input"
+            type = "input",
+            maxDimension = MediaGateway.DEFAULT_MAX_DECODE_DIMENSION,
+            preview = null,
+            useThumbnailClient = false
         ) { bitmap, _ ->
             loadState = if (bitmap != null) {
                 DebugLogger.d(TAG, "ImagePreview: Successfully loaded image")

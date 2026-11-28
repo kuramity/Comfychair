@@ -223,7 +223,9 @@ object MediaCache {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     // Accessor for shared client from ConnectionManager
-    private val comfyUIClient: ComfyUIClient?
+    // B4.2-A：类型收窄到 MediaGateway 窄接口 —— 缓存层只依赖 fetchImage/fetchVideo/viewUrl
+    // 三个签名，不再看见连接层客户端的全部内部（离线闸门保持原位，行为零变化）
+    private val comfyUIClient: MediaGateway?
         get() = ConnectionManager.clientOrNull
 
     // Context for temp file operations (set once when first needed)
@@ -1615,7 +1617,7 @@ object MediaCache {
 
     /** 取服务端压缩版（同分辨率、有损），用于大图降级 */
     private suspend fun fetchCompressed(
-        client: ComfyUIClient,
+        client: MediaGateway,
         key: MediaCacheKey,
         subfolder: String,
         type: String
@@ -1843,7 +1845,7 @@ object MediaCache {
         key: MediaCacheKey,
         subfolder: String,
         type: String,
-        client: ComfyUIClient,
+        client: MediaGateway,
         priority: Int
     ): Bitmap? {
         val bitmap = suspendCancellableCoroutine { continuation ->
@@ -1875,7 +1877,7 @@ object MediaCache {
         key: MediaCacheKey,
         subfolder: String,
         type: String,
-        client: ComfyUIClient,
+        client: MediaGateway,
         context: Context,
         priority: Int
     ): Bitmap? {
@@ -1950,7 +1952,7 @@ object MediaCache {
         key: MediaCacheKey,
         subfolder: String,
         type: String,
-        client: ComfyUIClient,
+        client: MediaGateway,
         context: Context
     ): Bitmap? {
         val bitmap = suspendCancellableCoroutine { continuation ->
@@ -1980,7 +1982,7 @@ object MediaCache {
         key: MediaCacheKey,
         subfolder: String,
         type: String,
-        client: ComfyUIClient,
+        client: MediaGateway,
         context: Context
     ): Bitmap? {
         val keyStr = key.keyString

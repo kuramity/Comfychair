@@ -25,6 +25,7 @@ import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.R
 import sh.hnet.comfychair.WorkflowManager
 import sh.hnet.comfychair.WorkflowType
+import sh.hnet.comfychair.cache.MediaGateway
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
@@ -2754,7 +2755,13 @@ class ImageToImageViewModel : BaseGenerationViewModel<ImageToImageUiState, Image
                     val subfolder = imageInfo.optString("subfolder", "")
                     val type = imageInfo.optString("type", "output")
 
-                    client.fetchImage(filename, subfolder, type) { bitmap, failureType ->
+                    // B4.2-A：默认值收口到 MediaGateway 接口侧，直调点显式补参（值同旧默认）
+                    client.fetchImage(
+                        filename, subfolder, type,
+                        maxDimension = MediaGateway.DEFAULT_MAX_DECODE_DIMENSION,
+                        preview = null,
+                        useThumbnailClient = false
+                    ) { bitmap, failureType ->
                         _uiState.update { it.copy(isFetching = false) }
                         if (bitmap != null) {
                             // Store in cache (memory or disk based on mode)

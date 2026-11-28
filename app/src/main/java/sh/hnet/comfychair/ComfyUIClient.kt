@@ -13,6 +13,7 @@ import okhttp3.ResponseBody
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import sh.hnet.comfychair.cache.MediaGateway
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.model.AuthCredentials
 import sh.hnet.comfychair.model.ModelIntroFetch
@@ -57,7 +58,7 @@ class ComfyUIClient(
     private val serverId: String? = null,
     /** 用户为该服务器显式选择的协议（"http" / "https"）；null 时回落到地址前缀解析 */
     preferredProtocol: String? = null
-) {
+) : MediaGateway {
     companion object {
         private const val TAG = "API"
         private const val STALL_TIMEOUT_MS = 30_000L          // 30 seconds without progress = stalled
@@ -693,11 +694,15 @@ class ComfyUIClient(
      * 视频流来抽首帧（P2-5）。认证方式较特殊的服务器（Basic/Bearer/Cookie）
      * 上它可能失败，调用方按"失败即回退到整段下载"处理。
      */
-    fun viewUrl(
+    // B4.2-A：三方法实现 MediaGateway。Kotlin 规定 override 不得带参数默认值，
+    // 默认值收口到接口侧（MediaGateway.DEFAULT_MAX_DECODE_DIMENSION 等）——
+    // 经 MediaGateway 类型调用（MediaCache 等缓存层）走接口默认值，行为与迁移前一致；
+    // 直调 ComfyUIClient 的调用点显式补参（补参值与旧默认值同源同值）。
+    override fun viewUrl(
         filename: String,
-        subfolder: String = "",
-        type: String = "output",
-        preview: String? = null
+        subfolder: String,
+        type: String,
+        preview: String?
     ): String? {
         val baseUrl = getBaseUrl() ?: return null
         return ComfyViewUrl.build(baseUrl, filename, subfolder, type, preview)
@@ -1509,13 +1514,13 @@ class ComfyUIClient(
         })
     }
 
-    fun fetchImage(
+    override fun fetchImage(
         filename: String,
-        subfolder: String = "",
-        type: String = "output",
-        maxDimension: Int = MAX_DECODE_DIMENSION,
-        preview: String? = null,
-        useThumbnailClient: Boolean = false,
+        subfolder: String,
+        type: String,
+        maxDimension: Int,
+        preview: String?,
+        useThumbnailClient: Boolean,
         callback: (bitmap: Bitmap?, failureType: ConnectionFailure) -> Unit
     ) {
         DebugLogger.d(TAG, "Fetching image: ${Obfuscator.filename(filename)}")
@@ -1769,10 +1774,10 @@ class ComfyUIClient(
      *                 - bytes: The raw video bytes, or null on error
      *                 - failureType: type of failure (NONE for success, STALLED if download stalled, NETWORK for other errors)
      */
-    fun fetchVideo(
+    override fun fetchVideo(
         filename: String,
-        subfolder: String = "",
-        type: String = "output",
+        subfolder: String,
+        type: String,
         callback: (bytes: ByteArray?, failureType: ConnectionFailure) -> Unit
     ) {
         DebugLogger.d(TAG, "Fetching video: ${Obfuscator.filename(filename)}")

@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import sh.hnet.comfychair.ComfyUIClient
 import sh.hnet.comfychair.R
+import sh.hnet.comfychair.cache.MediaGateway
 import sh.hnet.comfychair.cache.MediaStateHolder
 import sh.hnet.comfychair.connection.ConnectionFailure
 import sh.hnet.comfychair.connection.ConnectionManager
@@ -1033,7 +1034,13 @@ class GenerationViewModel : ViewModel(), GenerationCompletionRelay {
                             val subfolder = imageInfo.optString("subfolder", "")
                             val type = imageInfo.optString("type", "output")
 
-                            client.fetchImage(filename, subfolder, type) { bitmap, failureType ->
+                            // B4.2-A：默认值收口到 MediaGateway 接口侧，直调点显式补参（值同旧默认）
+                            client.fetchImage(
+                                filename, subfolder, type,
+                                maxDimension = MediaGateway.DEFAULT_MAX_DECODE_DIMENSION,
+                                preview = null,
+                                useThumbnailClient = false
+                            ) { bitmap, failureType ->
                                 if (bitmap != null) {
                                     MediaStateHolder.putBitmap(mediaKey, bitmap, context)
                                     // 记下这张图属于哪个 promptId：屏幕侧稍后收到缓冲的完成事件时

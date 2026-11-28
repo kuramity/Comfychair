@@ -21,8 +21,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import okhttp3.Response
@@ -40,7 +38,6 @@ import sh.hnet.comfychair.queue.JobRegistry
 import sh.hnet.comfychair.repository.GalleryRepository
 import sh.hnet.comfychair.storage.AppSettings
 import sh.hnet.comfychair.storage.CredentialStorage
-import sh.hnet.comfychair.storage.ObjectInfoCache
 import sh.hnet.comfychair.storage.ServerStorage
 import sh.hnet.comfychair.util.DebugLogger
 import sh.hnet.comfychair.util.Obfuscator
@@ -193,7 +190,8 @@ object ConnectionManager {
     ): Boolean = PreviewFramePolicy.shouldDecode(payloadBytes, maxBytes)
 
     // Connection state
-    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    // B4.2-A：_connectionState 对离线控制器开放 internal 写入（loadFromOfflineCache 置离线态）
+    internal val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
     // WebSocket state - observable by subscribers
@@ -218,7 +216,8 @@ object ConnectionManager {
      * 背景（P3）：弱网下「切离线失败 → 模态框」会把用户困住，唯一出路是按返回，
      * 而返回被解释成"回连接页"。现在网络类失败只写这里，界面保持当前数据并原位重连。
      */
-    private val _connectionNotice = MutableStateFlow<ConnectionNotice?>(null)
+    // B4.2-A：离线控制器要写自动切换横幅（enterOfflineModeInternal）
+    internal val _connectionNotice = MutableStateFlow<ConnectionNotice?>(null)
     val connectionNotice: StateFlow<ConnectionNotice?> = _connectionNotice.asStateFlow()
 
     // Connection check in progress (for "Connecting..." button state)
@@ -255,7 +254,8 @@ object ConnectionManager {
     private var _client: ComfyUIClient? = null
     @Volatile
     private var _clientId: String? = null
-    private var _applicationContext: Context? = null
+    // B4.2-A：离线控制器要写它（enterOfflineMode / loadFromOfflineCache 的缓存操作上下文）
+    internal var _applicationContext: Context? = null
 
     // ── 模型列表子系统（B4-W2 拆出，委托给 ModelListCatalog）──────────────────────
     //
@@ -269,7 +269,8 @@ object ConnectionManager {
     // 3. 对外转发方法（refreshServerData / ensureModelListLoadedAfterResume /
     //    retryCoreCategory，见下方 T 块原位置），会话侧资源（client / context /
     //    serverId）在调用点显式传参 —— catalog 不持 ConnectionManager 引用。
-    private val catalog = ModelListCatalog()
+    // B4.2-A：loadFromOfflineCache 迁入离线控制器，catalog 对其开放 internal
+    internal val catalog = ModelListCatalog()
 
     // Shared node type registry (populated from /object_info)
     val nodeTypeRegistry: NodeTypeRegistry
@@ -292,7 +293,7 @@ object ConnectionManager {
      * 不加 @Volatile 时主线程可能一直读到旧值，退避时长计算与状态描述会滞后。
      */
     @Volatile
-    private var reconnectAttempts = 0
+    internal var reconnectAttempts = 0
 
     /**
      * 自动重连是否被显式阻断（登出 / 认证失败 / 切离线）。
@@ -307,7 +308,7 @@ object ConnectionManager {
      * 401 之后仍多排一轮自动重连。
      */
     @Volatile
-    private var reconnectBlocked = false
+    internal var reconnectBlocked = false
     /**
      * 心跳协程句柄。跨线程读写（与模型列表加载看门狗句柄同族，后者已随 B4-W2
      * 拆入 [ModelListCatalog]）：startKeepalive 在
@@ -317,11 +318,20 @@ object ConnectionManager {
      */
     @Volatile
     private var keepaliveJob: Job? = null
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    // B4.2-A：离线看门狗协程从这里 launch（OfflineModeController.startOfflineProbeIfAllowed）
+    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // Reconnection coordination - prevents race conditions between multiple reconnection paths
     private var reconnectionSessionId = 0L
-    private var pendingReconnectJob: Job? = null
+    // B4.2-A：切离线时由 OfflineModeController 取消待执行重连
+    internal var pendingReconnectJob: Job? = null
+
+    /**
+     * 离线模式控制器（B4.2-A 件二）：离线自动切换 / 强制离线 / 恢复在线 / 离线看门狗的
+     * 整体动作迁入 [OfflineModeController]；本类保留对外转发 API（签名不变，调用方
+     * 零改动）与连接/WebSocket 生命周期。lazy 装配：首次访问时单例必已完成初始化。
+     */
+    internal val offlineController: OfflineModeController by lazy { OfflineModeController(this) }
 
     /**
      * 本轮 Connecting 的起始时刻（elapsedRealtime）；未处于 Connecting 时为 0。
@@ -354,20 +364,17 @@ object ConnectionManager {
     // ── 离线自动切换 ────────────────────────────────────────────────────
     // 判定逻辑刻意抽到 ConnectionStability（零 Android 依赖，可在 JVM 单测里钉住）：
     // 连续 N 次失败才切离线、连续 N 次成功才切回、切换后有冷却。
-    /** 判定器状态：连续计数与冷却起点 */
-    private var stabilityState = StabilityState()
-
-    /** 离线态下的周期探测任务 */
-    private var offlineProbeJob: Job? = null
+    /** 判定器状态：连续计数与冷却起点（B4.2-A：离线控制器切换态时写它，internal） */
+    internal var stabilityState = StabilityState()
 
     /** 用户是否通过设置页「强制离线」明确要求不联网（此时不建 WebSocket、不做周期探测） */
-    private var forcedOffline = false
+    internal var forcedOffline = false
 
     /** 最近一次会话的地址与凭据；离线态重建客户端、恢复在线、发起探测都要用 */
-    private var lastSession: OnlineSession? = null
+    internal var lastSession: OnlineSession? = null
 
-    /** 一次会话的参数快照（不可变） */
-    private data class OnlineSession(
+    /** 一次会话的参数快照（不可变；B4.2-A：离线控制器 enterOfflineMode 也要构造它） */
+    internal data class OnlineSession(
         val serverId: String,
         val hostname: String,
         val port: Int,
@@ -530,7 +537,7 @@ object ConnectionManager {
      * 应该看这个，判定"用户是不是要求别联网"才看设置项。
      */
     val isOffline: Boolean
-        get() = connectionState.value is ConnectionState.OfflineConnected
+        get() = offlineController.isOffline
 
     /**
      * Whether WebSocket is currently connected.
@@ -624,7 +631,7 @@ object ConnectionManager {
         // 回到在线：清掉强制离线标记、重置防抖动判定、停止离线探测
         forcedOffline = false
         stabilityState = StabilityState()
-        stopOfflineProbe()
+        offlineController.stopOfflineProbe()
 
         // Fetch server data (node types and model lists) after connection
         // B4-W2：装配委托给 catalog；client / context / serverId 在调用点显式传参
@@ -646,7 +653,7 @@ object ConnectionManager {
         catalog.bumpGeneration()
         pendingReconnectJob?.cancel()
         pendingReconnectJob = null
-        stopOfflineProbe()
+        offlineController.stopOfflineProbe()
         stabilityState = StabilityState()
         closeWebSocketInternal()
         invalidateAll()
@@ -765,7 +772,8 @@ object ConnectionManager {
         }
     }
 
-    private fun clearConnectionNotice() {
+    // B4.2-A：离线控制器切离线（手动入口）要清提示，开放 internal
+    internal fun clearConnectionNotice() {
         if (_connectionNotice.value != null) {
             _connectionNotice.value = null
         }
@@ -1370,7 +1378,8 @@ object ConnectionManager {
     /**
      * Internal close without logging (used during disconnect)
      */
-    private fun closeWebSocketInternal() {
+    // B4.2-A：离线控制器切离线要关 WebSocket，开放 internal
+    internal fun closeWebSocketInternal() {
         stopKeepalive()
         _vramUsageFraction.value = null
         // 主动关闭：先让当前监听器的回调作废，避免 close() 触发的 onFailure
@@ -1839,8 +1848,8 @@ object ConnectionManager {
     /**
      * 进入离线模式（自动切换 / 登录页 / 弹窗按钮 / 设置页强制离线 的统一入口）。
      *
-     * 与旧实现的区别：不只是改标志位，而是**真的**切过去——加载离线缓存、
-     * 关闭 WebSocket、按需启动周期探测。
+     * B4.2-A：实现迁入 [OfflineModeController.enterOfflineMode]，本方法保留签名
+     * 并转发（全仓调用方零改动）；@Synchronized 锁本单例，与迁移前一致。
      *
      * @param context 上下文
      * @param server 目标服务器（提供 serverId 与恢复在线所需的地址）；null 时用已记住的会话
@@ -1854,201 +1863,27 @@ object ConnectionManager {
         server: Server? = null,
         credentials: AuthCredentials = AuthCredentials.None,
         protocol: String? = null
-    ): Boolean {
-        val ctx = context.applicationContext
-        _applicationContext = ctx
-
-        if (server != null) {
-            // 离线态没有握手，协议沿用"上次成功的"；从未连上过时按 https 起步，
-            // 恢复在线时 testConnection 会重新探测并自动纠正
-            lastSession = OnlineSession(
-                serverId = server.id,
-                hostname = server.hostname,
-                port = server.port,
-                protocol = protocol ?: server.protocol ?: _client?.getWorkingProtocol() ?: "https",
-                credentials = credentials
-            )
-        }
-
-        return enterOfflineModeInternal(ctx, server?.id, notifyOnFailure = false)
-    }
+    ): Boolean = offlineController.enterOfflineMode(context, server, credentials, protocol)
 
     /**
      * 设置「强制离线」（设置页开关）。
      *
-     * 打开：真的切到离线态——加载缓存、关闭 WebSocket、**不启动周期探测**
-     *       （用户明确说了不想联网，后台不得再有任何请求）。
-     * 关闭：恢复在线并重连；此后若又断网，看门狗会重新开始探测。
+     * B4.2-A：实现迁入 [OfflineModeController.setForcedOffline]，本方法保留签名
+     * 并转发；失败回滚（置标志失败即回滚）与 @Synchronized 语义均保持不变。
      *
      * @return 打开时返回是否成功进入离线态（没有可用缓存时为 false，调用方应提示用户）
      */
     @Synchronized
-    fun setForcedOffline(context: Context, forced: Boolean): Boolean {
-        val ctx = context.applicationContext
-        forcedOffline = forced
-        AppSettings.setOfflineMode(ctx, forced)
-
-        if (forced) {
-            stopOfflineProbe()
-            val entered = enterOfflineModeInternal(ctx, notifyOnFailure = false)
-            if (!entered) {
-                // 没有可用缓存，强制离线无从生效：回滚持久化标志，避免"开关开着却仍是在线"
-                DebugLogger.w(TAG, "强制离线未生效：没有可用离线缓存")
-                forcedOffline = false
-                AppSettings.setOfflineMode(ctx, false)
-            }
-            return entered
-        }
-
-        reconnectAttempts = 0
-        stabilityState = StabilityState()
-        return resumeOnlineInternal(ctx)
-    }
-
-    /**
-     * 进入离线态的实际动作（自动切换与手动入口共用）：
-     * 加载离线缓存 → 关闭 WebSocket / 取消重连 → 启动周期探测。
-     *
-     * @param serverId 目标服务器；null 时依次取当前服务器、已选服务器
-     * @param notifyOnFailure 切换失败时是否给用户非阻塞提示（仅自动切换传 true）。
-     *        用户主动点「离线 / 强制离线」失败由各自界面负责提示，不应留下全局横幅。
-     * @return true 表示已进入离线态
-     */
-    @Synchronized
-    private fun enterOfflineModeInternal(
-        context: Context?,
-        serverId: String? = null,
-        notifyOnFailure: Boolean = true
-    ): Boolean {
-        val ctx = (context ?: _applicationContext)?.applicationContext ?: run {
-            DebugLogger.w(TAG, "enterOfflineMode: 缺少 Context，放弃切换")
-            return false
-        }
-        _applicationContext = ctx
-
-        val targetServerId = serverId
-            ?: currentServerId
-            ?: ServerStorage(ctx).getSelectedServer()?.id
-            ?: run {
-                DebugLogger.w(TAG, "enterOfflineMode: 无法确定目标服务器")
-                return false
-            }
-
-        // 没有可用缓存不进离线：进去也是空白，应当明确报连接失败（用户确认的决策）
-        if (!hasOfflineCache(ctx, targetServerId)) {
-            DebugLogger.w(TAG, "enterOfflineMode: 该服务器无离线缓存，保持连接失败状态")
-            if (notifyOnFailure) onOfflineSwitchFailed()
-            return false
-        }
-
-        if (!loadFromOfflineCache(ctx, targetServerId)) {
-            if (notifyOnFailure) onOfflineSwitchFailed()
-            return false
-        }
-
-        // 离线态不联网：关掉 WebSocket、掐掉待执行的重连
-        pendingReconnectJob?.cancel()
-        pendingReconnectJob = null
-        reconnectBlocked = true  // 离线态由看门狗负责恢复探测，残留重连一律阻断
-        closeWebSocketInternal()
-        clearConnectionAlert()
-        if (notifyOnFailure) {
-            // 自动切离线（断网降级）：横幅继续提示"后台正在重试"，离线看门狗恢复在线后
-            // 由 connect() 清除；用户主动进离线则不显示任何"正在重连"字样。
-            _connectionNotice.value = ConnectionNotice(ConnectionFailure.NETWORK)
-        } else {
-            clearConnectionNotice()
-        }
-
-        // 判定器同步到离线，并记下切换时刻（冷却起点）
-        stabilityState = StabilityState(
-            mode = StabilityMode.OFFLINE,
-            lastSwitchAtMs = SystemClock.elapsedRealtime()
-        )
-
-        // 准备好客户端（**不**打开 WebSocket）：周期探测与恢复在线都要用它
-        ensureClientForSession(ctx)
-
-        startOfflineProbeIfAllowed()
-        return true
-    }
-
-    /**
-     * 「切离线失败」的兜底（P3，自动切换专用）。
-     *
-     * 没有离线缓存时进不去离线态，但**绝不能把用户困在失败终态**：
-     * 1. 判定器拉回 ONLINE —— 否则它仍记着 OFFLINE，下一次成功信号会被误判成
-     *    「离线恢复」而多触发一次 connect；
-     * 2. 只发非阻塞横幅，不弹模态 —— 当前界面的数据原样保留；
-     * 3. 若后台没有在途重连，补排一条退避重连，横幅上的"正在自动重试"才名副其实。
-     *
-     * 冷却时间沿用判定器已有的 lastSwitchAtMs，避免刚失败就立刻再切一次离线。
-     */
-    private fun onOfflineSwitchFailed() {
-        val lastSwitchAt = stabilityState.lastSwitchAtMs
-        stabilityState = StabilityState(
-            mode = StabilityMode.ONLINE,
-            lastSwitchAtMs = lastSwitchAt
-        )
-        showConnectionNotice(ConnectionFailure.NETWORK)
-    }
-
-    /**
-     * 从离线态恢复在线：重建客户端、打开 WebSocket、刷新服务端数据。
-     *
-     * @return true 表示已发起恢复；false 表示拿不到服务器信息，只能留在离线
-     */
-    @Synchronized
-    private fun resumeOnlineInternal(context: Context? = null): Boolean {
-        val ctx = (context ?: _applicationContext)?.applicationContext ?: return false
-        val session = resolveSession(ctx) ?: run {
-            DebugLogger.w(TAG, "resumeOnline: 没有可用的服务器信息，保持离线")
-            return false
-        }
-
-        DebugLogger.i(TAG, "从离线态恢复在线")
-        stopOfflineProbe()
-        forcedOffline = false
-        reconnectAttempts = 0
-
-        connect(
-            context = ctx,
-            serverId = session.serverId,
-            hostname = session.hostname,
-            port = session.port,
-            protocol = session.protocol,
-            credentials = session.credentials
-        )
-
-        // 恢复在线走的是**不重建 Activity** 的路径（离线看门狗自动恢复、关闭强制离线），
-        // 而 connect() 内部的 invalidateAll() 会清掉 MediaCache 的上下文与 JobRegistry 的跟踪——
-        // 这两样平时靠 Activity.onCreate 补回来。不在这里补的后果：
-        // - 停留在画廊/查看器时，之后所有走 MediaCache 的读取直接返回 null，缩略图/原图一直空白
-        //   （LazyBitmap 只取一次、不重试，不会自愈），直到用户退出重进该 Activity；
-        // - 断线前在跑的任务恢复后丢失进度跟踪。
-        MediaCache.ensureInitialized(ctx)
-        JobRegistry.restoreState(ctx)
-
-        // 记下这次切换的时刻：恢复在线后的冷却窗口内，不会被刚建连时的连续失败
-        // 立刻掀回离线（否则半死链路会让界面在这两个状态之间来回跳）
-        stabilityState = StabilityState(
-            mode = StabilityMode.ONLINE,
-            lastSwitchAtMs = SystemClock.elapsedRealtime()
-        )
-        // 离线期间 WebSocket 是关着的，恢复后要重新挂上才能收进度/预览
-        openWebSocket()
-        // 队列状态同步一次（与 Activity 初始化同一套动作）：补回总排队数与执行中任务，
-        // 并顺势剪掉"恢复出来但服务器队列里已经没有"的陈旧任务
-        pollQueueStatus()
-        return true
-    }
+    fun setForcedOffline(context: Context, forced: Boolean): Boolean =
+        offlineController.setForcedOffline(context, forced)
 
     /**
      * 确保存在可用的客户端实例（不打开 WebSocket）。
      * 离线态下的周期探测与恢复在线都要用它；启动即离线时这里才第一次建客户端。
      */
+    // B4.2-A：离线控制器 enterOfflineModeInternal 第八步要调，开放 internal（锁语义不变）
     @Synchronized
-    private fun ensureClientForSession(context: Context): Boolean {
+    internal fun ensureClientForSession(context: Context): Boolean {
         if (_client != null) return true
 
         val session = resolveSession(context) ?: run {
@@ -2080,8 +1915,9 @@ object ConnectionManager {
      * 取当前会话参数；没有记录过会话时回落到"已选服务器 + 其凭据"。
      * 协议沿用上次成功的那个，恢复在线时 testConnection 会重新校验并纠正。
      */
+    // B4.2-A：离线控制器恢复在线 / 备客户端要调，开放 internal（锁语义不变）
     @Synchronized
-    private fun resolveSession(context: Context): OnlineSession? {
+    internal fun resolveSession(context: Context): OnlineSession? {
         lastSession?.let { return it }
 
         val server = ServerStorage(context).getSelectedServer() ?: return null
@@ -2101,7 +1937,8 @@ object ConnectionManager {
      * 可被任意线程调用（WebSocket 回调也在其中）：判定与计数在同步块内完成，
      * 真正的切换动作投递到主线程执行——它要碰 MediaCache / GalleryRepository。
      */
-    private fun reportProbeOutcome(outcome: ProbeOutcome) {
+    // B4.2-A：离线看门狗的探测结果要从 controller 汇报进来，开放 internal
+    internal fun reportProbeOutcome(outcome: ProbeOutcome) {
         val decision = synchronized(this) {
             val evaluated = ConnectionStability.evaluate(
                 stabilityState,
@@ -2115,11 +1952,11 @@ object ConnectionManager {
         when (decision.switch) {
             StabilitySwitch.TO_OFFLINE -> {
                 DebugLogger.i(TAG, "连续 ${ConnectionStability.REQUIRED_FAILURES} 次失败：自动切到离线")
-                scope.launch { enterOfflineModeInternal(_applicationContext) }
+                scope.launch { offlineController.enterOfflineModeInternal(_applicationContext) }
             }
             StabilitySwitch.TO_ONLINE -> {
                 DebugLogger.i(TAG, "连续 ${ConnectionStability.REQUIRED_SUCCESSES} 次成功：自动回到在线")
-                scope.launch { resumeOnlineInternal() }
+                scope.launch { offlineController.resumeOnlineInternal() }
             }
             null -> Unit
         }
@@ -2145,123 +1982,32 @@ object ConnectionManager {
         reportProbeOutcome(ProbeOutcome.FAILURE)
     }
 
-    /**
-     * 启动离线态周期探测（看门狗）。
-     *
-     * 强制离线时**不启动**：用户在设置页明确表示不想联网，这是设置开关的语义，
-     * 也意味着这种情况下不会产生任何后台请求。
-     */
-    private fun startOfflineProbeIfAllowed() {
-        val ctx = _applicationContext
-        if (forcedOffline || (ctx != null && AppSettings.isOfflineMode(ctx))) {
-            forcedOffline = true
-            DebugLogger.i(TAG, "强制离线：不启动周期探测")
-            stopOfflineProbe()
-            return
-        }
-
-        if (_connectionState.value !is ConnectionState.OfflineConnected) return
-
-        offlineProbeJob?.cancel()
-        offlineProbeJob = scope.launch {
-            DebugLogger.i(TAG, "离线看门狗启动（短超时 /system_stats，先快后稳）")
-            var probes = 0
-            while (isActive && _connectionState.value is ConnectionState.OfflineConnected) {
-                delay(ConnectionStability.nextProbeDelayMs(probes))
-                if (!isActive || _connectionState.value !is ConnectionState.OfflineConnected) break
-                val reachable = probeOnce()
-                probes++
-                reportProbeOutcome(if (reachable) ProbeOutcome.SUCCESS else ProbeOutcome.FAILURE)
-            }
-            DebugLogger.d(TAG, "离线看门狗退出")
-        }
-    }
-
-    /** 停止离线周期探测。 */
-    private fun stopOfflineProbe() {
-        offlineProbeJob?.cancel()
-        offlineProbeJob = null
-    }
-
-    /** 单次轻量探测（挂起到有结果或短超时为止）。 */
-    private suspend fun probeOnce(): Boolean {
-        val client = _client ?: return false
-        return withContext(Dispatchers.IO) {
-            suspendCancellableCoroutine<Boolean> { continuation ->
-                client.probeReachability(ConnectionStability.PROBE_TIMEOUT_MS) { reachable ->
-                    if (continuation.isActive) {
-                        continuation.resume(reachable)
-                    }
-                }
-            }
-        }
-    }
+    // B4.2-A：startOfflineProbeIfAllowed / stopOfflineProbe / probeOnce（离线看门狗）
+    // 已整体迁入 OfflineModeController（探测循环与 reportProbeOutcome 判定器衔接不变）。
 
     /**
      * Load server data from offline cache.
      *
-     * 用于离线态（用户强制离线、启动时连不上而自动切换、运行中断线自动切换）：
-     * 把 `/object_info` 的磁盘缓存灌进节点注册表与模型列表，并把连接状态置为
-     * [ConnectionState.OfflineConnected]（此后 [currentServerId] 依然可用）。
+     * B4.2-A：实现迁入 [OfflineModeController.loadFromOfflineCache]，本方法保留
+     * 签名并转发（全仓调用方零改动）。
      *
      * @param context Application context for cache access
      * @param serverId Server ID to load cache for
      * @return true if cache was loaded successfully, false otherwise
      */
-    fun loadFromOfflineCache(context: Context, serverId: String): Boolean {
-        DebugLogger.i(TAG, "Loading server data from offline cache for server: $serverId")
-
-        if (!ObjectInfoCache.hasCache(context, serverId)) {
-            DebugLogger.w(TAG, "No offline cache available for server: $serverId")
-            return false
-        }
-
-        val objectInfo = ObjectInfoCache.loadObjectInfo(context, serverId)
-        if (objectInfo == null) {
-            DebugLogger.e(TAG, "Failed to load offline cache for server: $serverId")
-            return false
-        }
-
-        // Store application context for cache operations
-        _applicationContext = context.applicationContext
-
-        // Set offline connected state so currentServerId is available
-        _connectionState.value = ConnectionState.OfflineConnected(serverId = serverId)
-
-        // Parse node definitions for workflow editor + 让注册表就绪（动态参数可正常推导类型）
-        // + Extract model lists for generation screens 并按离线语义发布
-        // （B4-W2：四步整体委托给 catalog，parse → ready → extract 走同一把原子段锁）
-        val models = catalog.applyOfflineObjectInfo(objectInfo)
-
-        DebugLogger.i(TAG, "Offline cache loaded: ${models.checkpoints.size} checkpoints, " +
-                "${models.unets.size} unets, ${models.vaes.size} vaes, " +
-                "${models.clips.size} clips, ${models.loras.size} loras")
-
-        // Initialize MediaCache with context and set cache mode from user preferences
-        // This must happen BEFORE gallery preload so images can be fetched from disk cache
-        val isMemoryFirst = AppSettings.isMemoryFirstCache(context)
-        MediaCache.ensureInitialized(context)
-        MediaCache.setMemoryFirstMode(isMemoryFirst)
-        DebugLogger.d(TAG, "MediaCache initialized for offline mode (memoryFirst=$isMemoryFirst)")
-
-        // Trigger gallery preload from cache
-        GalleryRepository.getInstance().apply {
-            initialize(context)
-            startBackgroundPreload()
-        }
-
-        return true
-    }
+    fun loadFromOfflineCache(context: Context, serverId: String): Boolean =
+        offlineController.loadFromOfflineCache(context, serverId)
 
     /**
      * Check if offline cache is available for a server.
+     *
+     * B4.2-A：实现迁入 [OfflineModeController.hasOfflineCache]，本方法保留签名并转发。
      *
      * @param context Application context for cache access
      * @param serverId Server ID to check
      * @return true if cache exists, false otherwise
      */
-    fun hasOfflineCache(context: Context, serverId: String): Boolean {
-        return ObjectInfoCache.hasCache(context, serverId)
-    }
+    fun hasOfflineCache(context: Context, serverId: String): Boolean =
+        offlineController.hasOfflineCache(context, serverId)
 }
 
