@@ -323,12 +323,15 @@ class VideoStateSnapshot() : VideoGenerationState {
  *
  * 状态写入约束：data class 的 `copy()` 无法跨接口调用，所以共享函数统一走
  * [updateVideo]（快照改字段 → 子类 [applyVideoSnapshot] 一次性回拷）。
- * 时序红线：init 里 modelCache 监听的「空快照守卫 + deferred 清 null」同监听体迁移；
+ * 时序红线：modelCache 监听的「空快照守卫 + deferred 清 null」同监听体迁移（现为
+ * [startCoreObservations]，由子类 init 启动）；
  * onWorkflowChange 的 saveWorkflowValues(旧流) → loadWorkflowValues(新流) 链序不变；
  * restorePreferences 三步序不变；loadValues 在前、cache 快照在后的原序不变。
  *
  * @param videoOwnerId 本页在 GenerationViewModel 里的注册键。必须走构造参数：
- *        基类 init 要拿它注册标签库桥接，抽象属性在基类构造期读不到（子类属性尚未初始化）。
+ *        桥接注册（[registerToPromptBridge]）要拿它做键，抽象属性在构造期读不到
+ *        （子类属性尚未初始化）——观察与桥接因此都由子类 init 末尾显式启动，见
+ *        [startCoreObservations] 的时序说明。
  */
 abstract class BaseVideoGenerationViewModel<UiState : VideoGenerationState, Event>(
     private val videoOwnerId: String
@@ -425,21 +428,22 @@ abstract class BaseVideoGenerationViewModel<UiState : VideoGenerationState, Even
     }
 
     init {
-        // 注册到标签库桥接：使标签库页面可以读写本页的正/负向提示词（需求 5.2）。
-        PromptBridge.register(
-            PromptTargetFactory.create(
-                targetOwnerId = generationOwnerId,
-                workflowId = uiState.map { it.selectedWorkflowId }
-                    .stateIn(viewModelScope, SharingStarted.Eagerly, ""),
-                workflowName = uiState.map { it.selectedWorkflow }
-                    .stateIn(viewModelScope, SharingStarted.Eagerly, ""),
-                readPositive = { uiState.value.positivePrompt },
-                writePositive = { onPositivePromptChange(it) },
-                readNegative = { uiState.value.negativePrompt },
-                writeNegative = { onNegativePromptChange(it) }
-            )
-        )
+        // 父类 init 保持空操作：viewModelScope 用 Dispatchers.Main.immediate，主线程上
+        // launch 体（含 collect 的首个发射）会**同步内联执行**，此时尚未越过子类属性
+        // 初始化，读子类成员（logTag / initialState 等）都是 null → NPE。观察与桥接
+        // 一律由子类 init 末尾显式启动（startCoreObservations / registerToPromptBridge）。
+    }
 
+    /**
+     * 启动视频页的三条共享观察（模型缓存 / 节点注册表就绪 / 工作流列表版本）。
+     *
+     * ⚠️ 必须由子类 init 在所有属性初始化器之后调用，不能放父类 init：launch 体在
+     * Main.immediate + 主线程上是同步内联执行的，collect 的首个发射会立刻跑
+     * （模型缓存快照的跳过分支读 [logTag]、注册表已就绪时读 `_uiState`）——父类 init
+     * 阶段这些子类成员尚未初始化，读到 null 直接 NPE（2026-11-28 模拟器冷启动实抓的
+     * 同族崩溃路径，由 BaseVideoGenerationInitOrderTest 钉住）。
+     */
+    protected fun startCoreObservations() {
         // Observe model cache from ConnectionManager
         viewModelScope.launch {
             ConnectionManager.modelCache.collect { cache ->
@@ -561,6 +565,32 @@ abstract class BaseVideoGenerationViewModel<UiState : VideoGenerationState, Even
                 loadWorkflows()
             }
         }
+    }
+
+    /**
+     * 注册到标签库桥接：使标签库页面可以读写本页的正/负向提示词（需求 5.2）。
+     *
+     * ⚠️ 为什么不能放父类 init：Kotlin 父类 init 先于子类属性初始化执行，而这里的
+     * `uiState.map { }.stateIn(Eagerly)` 会在主线程（viewModelScope 用
+     * `Dispatchers.Main.immediate`）同步触发 `uiState` 的 by-lazy → 读到子类**尚未初始化**
+     * 的 `initialState`，把 null 塞进 StateFlow，map transform 对 null receiver 直接 NPE
+     * （2026-11-28 模拟器冷启动实抓，崩溃栈：MainContainerActivity.onCreate → 本类 :433）。
+     * 因此调用时机必须在**子类 init 末尾**（TTV/ITV 各自的属性初始化器全部跑完之后）。
+     */
+    protected fun registerToPromptBridge() {
+        PromptBridge.register(
+            PromptTargetFactory.create(
+                targetOwnerId = generationOwnerId,
+                workflowId = uiState.map { it.selectedWorkflowId }
+                    .stateIn(viewModelScope, SharingStarted.Eagerly, ""),
+                workflowName = uiState.map { it.selectedWorkflow }
+                    .stateIn(viewModelScope, SharingStarted.Eagerly, ""),
+                readPositive = { uiState.value.positivePrompt },
+                writePositive = { onPositivePromptChange(it) },
+                readNegative = { uiState.value.negativePrompt },
+                writeNegative = { onNegativePromptChange(it) }
+            )
+        )
     }
 
     override fun onCleared() {

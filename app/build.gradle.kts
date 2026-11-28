@@ -209,6 +209,9 @@ dependencies {
     testImplementation(libs.junit)
     // 仅测试域：JVM 单元测试要真实的 org.json（不进 APK）
     testImplementation(libs.json)
+    // 仅测试域：Dispatchers.setMain 用——构造含 viewModelScope(Eagerly) 的 ViewModel 时
+    // 让 Main.immediate 真跑（防冷启动 init 顺序回归，见 BaseVideoGenerationInitOrderTest）
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     // 3D 手势的 instrumented 验证：需要 setContent + captureToImage（模拟器无法用 adb 注入双指，

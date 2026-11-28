@@ -528,6 +528,19 @@ class ImageToVideoViewModel :
 
     override val previewMediaKey: MediaStateHolder.MediaKey = MediaStateHolder.MediaKey.ItvPreview
 
+    /**
+     * 标签库桥接注册与共享观察启动必须在子类 init **末尾**（所有属性初始化器之后）调用：
+     * 父类 init 先于子类属性初始化执行，且 Main.immediate 下 launch 体同步内联执行，
+     * 过早启动会读到未初始化的子类成员（initialState / logTag → NPE），
+     * 详见 [BaseVideoGenerationViewModel.registerToPromptBridge] /
+     * [BaseVideoGenerationViewModel.startCoreObservations] 的说明。
+     * 与 B4.2-B 之前的原 init 顺序一致：先注册桥接、再启动观察。
+     */
+    init {
+        registerToPromptBridge()
+        startCoreObservations()
+    }
+
     override fun showToastEvent(messageResId: Int) {
         viewModelScope.launch { _events.emit(ImageToVideoEvent.ShowToast(messageResId)) }
     }
